@@ -3746,7 +3746,8 @@ function titleFromFilename(filename: string) {
 
 function AccessGate() {
   const [state, setState] = useState<"checking" | "required" | "granted">("checking");
-  const [keyInput, setKeyInput] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [gateError, setGateError] = useState<string | null>(null);
   const [verifying, setVerifying] = useState(false);
 
@@ -3769,20 +3770,28 @@ function AccessGate() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const candidate = keyInput.trim();
-    if (!candidate) return;
+    if (!username.trim() || !password) return;
     setVerifying(true);
     setGateError(null);
     try {
-      const result = await checkAuth(candidate);
-      if (result.ok) {
-        setApiKey(candidate);
+      const body = new FormData();
+      body.set("username", username.trim());
+      body.set("password", password);
+      const response = await fetch(`${API_BASE}/api/auth/login`, { method: "POST", body });
+      if (response.status === 401) {
+        setGateError("Usuario o contraseña incorrectos.");
+        return;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { ok: boolean; token: string };
+      if (data.ok) {
+        if (data.token) setApiKey(data.token);
         setState("granted");
       } else {
-        setGateError("Invalid access key.");
+        setGateError("Usuario o contraseña incorrectos.");
       }
     } catch {
-      setGateError("Could not reach the backend. Try again.");
+      setGateError("No se pudo conectar con el servidor. Intenta de nuevo.");
     } finally {
       setVerifying(false);
     }
@@ -3805,21 +3814,32 @@ function AccessGate() {
       <form className="access-card" onSubmit={handleSubmit}>
         <p className="product-name">Sentient</p>
         <h1>Cortex</h1>
-        <p className="access-copy">Enter your access key to continue.</p>
+        <p className="access-copy">Inicia sesión para continuar.</p>
         <label>
-          Access key
+          Usuario
           <input
-            type="password"
-            value={keyInput}
-            onChange={(event) => setKeyInput(event.target.value)}
-            placeholder="Paste your access key"
+            type="text"
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+            placeholder="Usuario"
+            autoComplete="username"
             autoFocus
           />
         </label>
+        <label>
+          Contraseña
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            placeholder="Contraseña"
+            autoComplete="current-password"
+          />
+        </label>
         {gateError ? <div className="inline-error">{gateError}</div> : null}
-        <button className="primary-button" disabled={verifying || !keyInput.trim()}>
+        <button className="primary-button" disabled={verifying || !username.trim() || !password}>
           {verifying ? <Loader2 className="spin" size={16} /> : <Lock size={16} />}
-          {verifying ? "Verifying..." : "Enter"}
+          {verifying ? "Verificando..." : "Entrar"}
         </button>
       </form>
     </div>

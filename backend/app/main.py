@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -27,6 +28,8 @@ from .config import (
     OCR_BATCH_SIZE,
     OCR_CROP_REGION,
     PREDICT_API_KEY,
+    PREDICT_PASSWORD,
+    PREDICT_USERNAME,
     UPLOAD_DIR,
     VIDEO_DIR,
     ensure_directories,
@@ -78,7 +81,7 @@ async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
         # login probe and validates the key itself.
         if (
             (path.startswith("/api") or path.startswith("/media"))
-            and path not in {"/api/health", "/api/auth/check"}
+            and path not in {"/api/health", "/api/auth/check", "/api/auth/login"}
         ):
             provided = request.headers.get("x-api-key") or request.query_params.get("token")
             if provided != PREDICT_API_KEY:
@@ -110,6 +113,21 @@ def auth_check(request: Request) -> dict[str, Any]:
         return {"auth_required": False, "ok": True}
     provided = request.headers.get("x-api-key") or request.query_params.get("token")
     return {"auth_required": True, "ok": provided == PREDICT_API_KEY}
+
+
+@app.post("/api/auth/login")
+def auth_login(
+    username: Annotated[str, Form()],
+    password: Annotated[str, Form()],
+) -> dict[str, Any]:
+    if not PREDICT_API_KEY:
+        return {"ok": True, "token": ""}
+    if secrets.compare_digest(username.strip(), PREDICT_USERNAME) and secrets.compare_digest(
+        password, PREDICT_PASSWORD or ""
+    ):
+        return {"ok": True, "token": PREDICT_API_KEY}
+    time.sleep(0.8)  # slow down brute-force attempts
+    raise HTTPException(status_code=401, detail="Invalid username or password.")
 
 
 @app.get("/api/health")
