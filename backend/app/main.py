@@ -74,7 +74,8 @@ app.add_middleware(
 async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
     if PREDICT_API_KEY and request.method != "OPTIONS":
         path = request.url.path
-        if path.startswith("/api") or path.startswith("/media"):
+        # /api/health stays open: Render's health checker sends no headers.
+        if (path.startswith("/api") or path.startswith("/media")) and path != "/api/health":
             provided = request.headers.get("x-api-key") or request.query_params.get("token")
             if provided != PREDICT_API_KEY:
                 from fastapi.responses import JSONResponse
