@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -74,8 +74,12 @@ app.add_middleware(
 async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
     if PREDICT_API_KEY and request.method != "OPTIONS":
         path = request.url.path
-        # /api/health stays open: Render's health checker sends no headers.
-        if (path.startswith("/api") or path.startswith("/media")) and path != "/api/health":
+        # /api/health stays open (Render health checks); /api/auth/check is the
+        # login probe and validates the key itself.
+        if (
+            (path.startswith("/api") or path.startswith("/media"))
+            and path not in {"/api/health", "/api/auth/check"}
+        ):
             provided = request.headers.get("x-api-key") or request.query_params.get("token")
             if provided != PREDICT_API_KEY:
                 from fastapi.responses import JSONResponse
@@ -98,6 +102,14 @@ _PREDICTION_MODEL_CACHE: dict[str, Any] = {}
 _PREDICTION_V2_CACHE: dict[str, Any] = {}
 _MODEL_LOG = logging.getLogger("uvicorn.error")
 _FIT_LOCK = threading.Lock()
+
+
+@app.get("/api/auth/check")
+def auth_check(request: Request) -> dict[str, Any]:
+    if not PREDICT_API_KEY:
+        return {"auth_required": False, "ok": True}
+    provided = request.headers.get("x-api-key") or request.query_params.get("token")
+    return {"auth_required": True, "ok": provided == PREDICT_API_KEY}
 
 
 @app.get("/api/health")

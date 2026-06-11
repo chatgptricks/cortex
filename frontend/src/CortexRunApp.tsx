@@ -12,6 +12,7 @@ import {
   ImagePlus,
   ListChecks,
   Loader2,
+  Lock,
   Pencil,
   RefreshCcw,
   Save,
@@ -27,6 +28,7 @@ import { ChangeEvent, FormEvent, useEffect, useId, useMemo, useRef, useState } f
 import { createPortal } from "react-dom";
 import * as THREE from "three";
 import {
+  API_BASE,
   analyzePost,
   createAbTest,
   createBatchPosts,
@@ -45,6 +47,7 @@ import {
   mediaUrl,
   updatePost
 } from "./cortexRunApi";
+import { getApiKey, setApiKey } from "./auth";
 import { runModalOcrBatch } from "./cortexRunOcrApi";
 import fsaverageMesh from "./assets/fsaverage5-pial.json";
 import type {
@@ -3741,4 +3744,93 @@ function titleFromFilename(filename: string) {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-export default CortexRunApp;
+function AccessGate() {
+  const [state, setState] = useState<"checking" | "required" | "granted">("checking");
+  const [keyInput, setKeyInput] = useState("");
+  const [gateError, setGateError] = useState<string | null>(null);
+  const [verifying, setVerifying] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await checkAuth(getApiKey());
+        if (cancelled) return;
+        setState(!result.auth_required || result.ok ? "granted" : "required");
+      } catch {
+        // Backend unreachable: let the app render and show its own error state.
+        if (!cancelled) setState("granted");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const candidate = keyInput.trim();
+    if (!candidate) return;
+    setVerifying(true);
+    setGateError(null);
+    try {
+      const result = await checkAuth(candidate);
+      if (result.ok) {
+        setApiKey(candidate);
+        setState("granted");
+      } else {
+        setGateError("Invalid access key.");
+      }
+    } catch {
+      setGateError("Could not reach the backend. Try again.");
+    } finally {
+      setVerifying(false);
+    }
+  }
+
+  if (state === "granted") return <CortexRunApp />;
+  if (state === "checking") {
+    return (
+      <div className="access-gate">
+        <div className="access-card">
+          <p className="product-name">Sentient</p>
+          <h1>Cortex</h1>
+          <p className="access-copy">Checking access...</p>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="access-gate">
+      <form className="access-card" onSubmit={handleSubmit}>
+        <p className="product-name">Sentient</p>
+        <h1>Cortex</h1>
+        <p className="access-copy">Enter your access key to continue.</p>
+        <label>
+          Access key
+          <input
+            type="password"
+            value={keyInput}
+            onChange={(event) => setKeyInput(event.target.value)}
+            placeholder="Paste your access key"
+            autoFocus
+          />
+        </label>
+        {gateError ? <div className="inline-error">{gateError}</div> : null}
+        <button className="primary-button" disabled={verifying || !keyInput.trim()}>
+          {verifying ? <Loader2 className="spin" size={16} /> : <Lock size={16} />}
+          {verifying ? "Verifying..." : "Enter"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+async function checkAuth(key: string | null): Promise<{ auth_required: boolean; ok: boolean }> {
+  const headers: Record<string, string> = key ? { "X-API-Key": key } : {};
+  const response = await fetch(`${API_BASE}/api/auth/check`, { headers });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+export default AccessGate;
