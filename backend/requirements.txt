@@ -1,0 +1,12 @@
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9,<1.0
+pillow>=10,<13
+imageio-ffmpeg>=0.5,<1.0
+huggingface-hub[inference]>=0.31,<2.0
+httpx>=0.27,<1.0
+browser-cookie3>=0.20,<1
+numpy==2.2.6
+scikit-learn>=1.4,<2
+nilearn>=0.12,<0.13
+tribev2 @ git+https://github.com/facebookresearch/tribev2.git@34f52344e5ba96660fac877393e1954e399d3ef3

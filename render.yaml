@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: cortex-api
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r backend/requirements-server.txt
+    startCommand: uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    disk:
+      name: cortex-data
+      mountPath: /var/data
+      sizeGB: 2
+    envVars:
+      - key: PREDICT_DATA_DIR
+        value: /var/data
+      - key: PREDICT_API_KEY
+        sync: false
+      - key: PREDICT_ALLOWED_ORIGINS
+        sync: false # e.g. https://YOUR_USER.github.io
+      - key: HF_TOKEN
+        sync: false
+      - key: REMOTE_TRIBE_URL
+        sync: false
+      - key: REMOTE_TRIBE_TOKEN
+        sync: false
+      - key: REMOTE_OCR_URL
+        sync: false
+      - key: MIN_CALIBRATION_SAMPLES
+        value: "3"
