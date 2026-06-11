@@ -793,18 +793,19 @@ function GroupStatList({ stats, empty }: { stats: GroupStat[]; empty: string }) 
 function HealthBanner({ health }: { health: Health | null }) {
   if (!health) return <div className="status-strip muted">Checking backend connection...</div>;
   const tribe = health.tribev2;
-  if (!tribe.installed) {
+  const remoteTribe = Boolean(health.remote_tribe?.configured);
+  if (!tribe.installed && !remoteTribe) {
     return (
       <div className="status-strip warning">
         <CircleAlert size={18} />
-        TRIBE v2 is not installed in the backend. The app cannot generate results until the real dependencies are installed.
+        TRIBE v2 is not installed in the backend and no remote GPU is configured. The app cannot generate results until one is available.
       </div>
     );
   }
   return (
     <div className="status-strip">
       <CheckCircle2 size={18} />
-      <span>TRIBE v2 installed</span>
+      <span>{tribe.installed ? "TRIBE v2 installed" : "TRIBE v2 via remote GPU"}</span>
       <span>Model: {tribe.model_id}</span>
       <span>Device: {tribe.device}</span>
       <span>{tribe.hf_token_present ? "HF token detected" : "HF token missing"}</span>
