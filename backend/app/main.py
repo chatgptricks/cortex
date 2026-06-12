@@ -243,9 +243,8 @@ def list_posts(section: str | None = Query(default=None)) -> dict[str, Any]:
         posts = [_lightweight_historical_post(row_to_post(row)) for row in rows]
     else:
         percentile_values = _tribe_percentile_reference(all_p)
-        pred_model = _fit_prediction_model_cached(all_p)
         posts = [
-            decorate_post(row_to_post(row), all_p, calib, pred_model, percentile_values)
+            decorate_post(row_to_post(row), all_p, calib, None, percentile_values)
             for row in rows
         ]
     return {"posts": posts, "calibration": _calibration_payload(calib)}
@@ -746,15 +745,11 @@ def get_ab_test(test_id: int) -> dict[str, Any]:
 
     test_data = dict(test)
     all_p = _all_posts()
-    calib = _fit_calibration_cached(all_p)
-    pred_model = _fit_prediction_model_cached(all_p)
-    candidates = [decorate_post(row_to_post(row), all_p, calib, pred_model) for row in rows]
+    candidates = [decorate_post(row_to_post(row), all_p) for row in rows]
     ranked = rank_candidates(
         candidates,
         winner_post_id=test_data.get("winner_post_id"),
         all_posts=all_p,
-        calibration_model=calib,
-        prediction_model=pred_model,
     )
     return {"test": test_data, "candidates": ranked}
 
@@ -892,17 +887,20 @@ def decorate_post(
         # so imports/uploads return immediately.
         post["calibrated_prediction"] = None
     else:
-        if calibration_model is None:
-            calibration_model = _fit_calibration_cached(all_posts)
-        if prediction_model is None:
-            prediction_model = _fit_prediction_model_cached(all_posts)
+        # Memory-lean chain: only fall back to the legacy models when v2 is not
+        # ready. Fitting all three at once OOMs small instances.
         if prediction_v2_model is None:
             prediction_v2_model = _fit_prediction_v2_cached(all_posts)
-        post["calibrated_prediction"] = (
-            predict_multi_signal(post, prediction_v2_model)
-            or predict_performance(post, prediction_model)
-            or predict_likes(post, calibration_model, all_posts=all_posts)
-        )
+        prediction = predict_multi_signal(post, prediction_v2_model)
+        if prediction is None:
+            if prediction_model is None:
+                prediction_model = _fit_prediction_model_cached(all_posts)
+            prediction = predict_performance(post, prediction_model)
+        if prediction is None:
+            if calibration_model is None:
+                calibration_model = _fit_calibration_cached(all_posts)
+            prediction = predict_likes(post, calibration_model, all_posts=all_posts)
+        post["calibrated_prediction"] = prediction
     post["tribe_percentile"] = _tribe_percentile(post, all_posts, percentile_values)
     return post
 
@@ -937,19 +935,19 @@ def rank_candidates(
 ) -> list[dict[str, Any]]:
     if all_posts is None:
         all_posts = _all_posts()
-    if calibration_model is None:
-        calibration_model = _fit_calibration_cached(all_posts)
-    if prediction_model is None:
-        prediction_model = _fit_prediction_model_cached(all_posts)
     if prediction_v2_model is None:
         prediction_v2_model = _fit_prediction_v2_cached(all_posts)
     decorated = []
     for candidate in candidates:
-        prediction = (
-            predict_multi_signal(candidate, prediction_v2_model)
-            or predict_performance(candidate, prediction_model)
-            or predict_likes(candidate, calibration_model, all_posts=all_posts)
-        )
+        prediction = predict_multi_signal(candidate, prediction_v2_model)
+        if prediction is None:
+            if prediction_model is None:
+                prediction_model = _fit_prediction_model_cached(all_posts)
+            prediction = predict_performance(candidate, prediction_model)
+        if prediction is None:
+            if calibration_model is None:
+                calibration_model = _fit_calibration_cached(all_posts)
+            prediction = predict_likes(candidate, calibration_model, all_posts=all_posts)
         summary = candidate.get("analysis_summary") or {}
         metric = ((summary.get("metrics") or {}).get("global_mean_abs") or 0.0)
         ranking_value = prediction.get("ranking_value", prediction["predicted_likes"]) if prediction else metric
@@ -1003,9 +1001,7 @@ def _sync_ab_test_decision(test_id: int) -> None:
         ).fetchall()
 
     all_p = _all_posts()
-    calib = _fit_calibration_cached(all_p)
-    pred_model = _fit_prediction_model_cached(all_p)
-    candidates = [decorate_post(row_to_post(row), all_p, calib, pred_model) for row in rows]
+    candidates = [decorate_post(row_to_post(row), all_p) for row in rows]
     if not candidates:
         with connect() as conn:
             conn.execute(
@@ -1034,8 +1030,6 @@ def _sync_ab_test_decision(test_id: int) -> None:
     winner = rank_candidates(
         completed,
         all_posts=all_p,
-        calibration_model=calib,
-        prediction_model=pred_model,
     )[0]
     with connect() as conn:
         conn.execute(

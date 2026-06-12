@@ -414,8 +414,9 @@ def fit_calibration(posts: list[dict[str, Any]]) -> CalibrationModel:
     model_stub.coefficients = beta[1:].tolist()
     model_stub.blend_alpha = float(best_alpha)
     model_stub.knn_k = int(best_k)
-    model_stub.train_vectors_scaled = x_scaled.tolist()
-    model_stub.train_likes = y_raw.tolist()
+    # Keep as numpy arrays: list-of-lists of Python floats costs ~10x the RAM.
+    model_stub.train_vectors_scaled = x_scaled  # type: ignore[assignment]
+    model_stub.train_likes = y_raw  # type: ignore[assignment]
     model_stub.r2_training = r2
     model_stub.r2_validation = best_r2
     model_stub.mae_training = mae_training
