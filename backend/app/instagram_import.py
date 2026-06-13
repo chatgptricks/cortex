@@ -84,7 +84,7 @@ def fetch_instagram_post(
             if oembed.status_code == 200:
                 payload = oembed.json()
                 caption = _clean_caption(payload.get("title"))
-                image_url = _clean_url(payload.get("thumbnail_url"))
+                image_url = _clean_url(payload.get("thumbnail_url")) or image_url
         except Exception:
             pass
 
@@ -100,6 +100,18 @@ def fetch_instagram_post(
             caption = caption or json_caption
             image_url = image_url or json_image
             image_url = image_url or _extract_embedded_image(html_text)
+
+        if not caption or not image_url:
+            embed = client.get(_instagram_embed_url(clean_url))
+            if embed.status_code < 400:
+                embed_text = embed.text
+                meta = _extract_meta(embed_text)
+                caption = caption or _clean_caption(meta.get("og:description") or meta.get("description"))
+                image_url = image_url or _clean_url(meta.get("og:image") or meta.get("twitter:image"))
+                json_caption, json_image = _extract_json_ld(embed_text)
+                caption = caption or json_caption
+                image_url = image_url or json_image
+                image_url = image_url or _extract_embedded_image(embed_text)
 
         if not caption or not image_url:
             api_caption, api_image_url = _fetch_from_instagram_api(shortcode, timeout)
@@ -149,6 +161,10 @@ def _shortcode(url: str) -> str:
     if not match:
         raise InstagramImportError("Could not read the Instagram shortcode from that URL.")
     return match.group(1)
+
+
+def _instagram_embed_url(url: str) -> str:
+    return f"{url.rstrip('/')}/embed/captioned/"
 
 
 def _fetch_from_instagram_api(shortcode: str, timeout: float) -> tuple[str | None, str | None]:
