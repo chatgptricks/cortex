@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -134,6 +135,10 @@ def auth_login(
 def health() -> dict[str, Any]:
     return {
         "ok": True,
+        "deployment": {
+            "commit": os.getenv("RENDER_GIT_COMMIT"),
+            "service": os.getenv("RENDER_SERVICE_NAME"),
+        },
         "tribev2": tribe_status(),
         "llm_report": llm_report_status(),
         "remote_tribe": remote_tribe_status(),
