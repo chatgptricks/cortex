@@ -12,6 +12,7 @@ import {
   ImagePlus,
   ListChecks,
   Loader2,
+  Lock,
   Pencil,
   RefreshCcw,
   Save,
@@ -27,6 +28,7 @@ import { ChangeEvent, FormEvent, useEffect, useId, useMemo, useRef, useState } f
 import { createPortal } from "react-dom";
 import * as THREE from "three";
 import {
+  API_BASE,
   analyzePost,
   createAbTest,
   createBatchPosts,
@@ -45,6 +47,7 @@ import {
   mediaUrl,
   updatePost
 } from "./cortexRunApi";
+import { getApiKey, setApiKey } from "./auth";
 import { runModalOcrBatch } from "./cortexRunOcrApi";
 import fsaverageMesh from "./assets/fsaverage5-pial.json";
 import type {
@@ -793,18 +796,19 @@ function GroupStatList({ stats, empty }: { stats: GroupStat[]; empty: string }) 
 function HealthBanner({ health }: { health: Health | null }) {
   if (!health) return <div className="status-strip muted">Checking backend connection...</div>;
   const tribe = health.tribev2;
-  if (!tribe.installed) {
+  const remoteTribe = Boolean(health.remote_tribe?.configured);
+  if (!tribe.installed && !remoteTribe) {
     return (
       <div className="status-strip warning">
         <CircleAlert size={18} />
-        TRIBE v2 is not installed in the backend. The app cannot generate results until the real dependencies are installed.
+        TRIBE v2 is not installed in the backend and no remote GPU is configured. The app cannot generate results until one is available.
       </div>
     );
   }
   return (
     <div className="status-strip">
       <CheckCircle2 size={18} />
-      <span>TRIBE v2 installed</span>
+      <span>{tribe.installed ? "TRIBE v2 installed" : "TRIBE v2 via remote GPU"}</span>
       <span>Model: {tribe.model_id}</span>
       <span>Device: {tribe.device}</span>
       <span>{tribe.hf_token_present ? "HF token detected" : "HF token missing"}</span>
@@ -3740,4 +3744,113 @@ function titleFromFilename(filename: string) {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-export default CortexRunApp;
+function AccessGate() {
+  const [state, setState] = useState<"checking" | "required" | "granted">("checking");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [gateError, setGateError] = useState<string | null>(null);
+  const [verifying, setVerifying] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await checkAuth(getApiKey());
+        if (cancelled) return;
+        setState(!result.auth_required || result.ok ? "granted" : "required");
+      } catch {
+        // Backend unreachable: let the app render and show its own error state.
+        if (!cancelled) setState("granted");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!username.trim() || !password) return;
+    setVerifying(true);
+    setGateError(null);
+    try {
+      const body = new FormData();
+      body.set("username", username.trim());
+      body.set("password", password);
+      const response = await fetch(`${API_BASE}/api/auth/login`, { method: "POST", body });
+      if (response.status === 401) {
+        setGateError("Usuario o contraseña incorrectos.");
+        return;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { ok: boolean; token: string };
+      if (data.ok) {
+        if (data.token) setApiKey(data.token);
+        setState("granted");
+      } else {
+        setGateError("Usuario o contraseña incorrectos.");
+      }
+    } catch {
+      setGateError("No se pudo conectar con el servidor. Intenta de nuevo.");
+    } finally {
+      setVerifying(false);
+    }
+  }
+
+  if (state === "granted") return <CortexRunApp />;
+  if (state === "checking") {
+    return (
+      <div className="access-gate">
+        <div className="access-card">
+          <p className="product-name">Sentient</p>
+          <h1>Cortex</h1>
+          <p className="access-copy">Checking access...</p>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="access-gate">
+      <form className="access-card" onSubmit={handleSubmit}>
+        <p className="product-name">Sentient</p>
+        <h1>Cortex</h1>
+        <p className="access-copy">Inicia sesión para continuar.</p>
+        <label>
+          Usuario
+          <input
+            type="text"
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+            placeholder="Usuario"
+            autoComplete="username"
+            autoFocus
+          />
+        </label>
+        <label>
+          Contraseña
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            placeholder="Contraseña"
+            autoComplete="current-password"
+          />
+        </label>
+        {gateError ? <div className="inline-error">{gateError}</div> : null}
+        <button className="primary-button" disabled={verifying || !username.trim() || !password}>
+          {verifying ? <Loader2 className="spin" size={16} /> : <Lock size={16} />}
+          {verifying ? "Verificando..." : "Entrar"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+async function checkAuth(key: string | null): Promise<{ auth_required: boolean; ok: boolean }> {
+  const headers: Record<string, string> = key ? { "X-API-Key": key } : {};
+  const response = await fetch(`${API_BASE}/api/auth/check`, { headers });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+export default AccessGate;

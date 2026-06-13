@@ -47,6 +47,12 @@ MIN_CALIBRATION_SAMPLES = int(os.getenv("MIN_CALIBRATION_SAMPLES", "3"))
 # (X-API-Key header or ?token= query param). Leave unset for local dev.
 PREDICT_API_KEY = os.getenv("PREDICT_API_KEY", "").strip() or None
 
+# Login credentials for the web UI. The login endpoint exchanges valid
+# credentials for the API key, so the key never ships in the frontend bundle.
+# Password defaults to the API key until PREDICT_PASSWORD is set.
+PREDICT_USERNAME = os.getenv("PREDICT_USERNAME", "admin").strip()
+PREDICT_PASSWORD = os.getenv("PREDICT_PASSWORD", "").strip() or PREDICT_API_KEY
+
 # Comma-separated extra CORS origins for deployed frontends
 # (e.g. "https://user.github.io").
 EXTRA_CORS_ORIGINS = [

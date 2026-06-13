@@ -6,6 +6,7 @@ import os
 import pickle
 import re
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urlparse
@@ -28,14 +29,14 @@ class InstagramPostImport:
 
 
 SHORTCODE_RE = re.compile(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", re.IGNORECASE)
-META_RE = re.compile(
-    r"<meta\s+[^>]*(?:property|name)=[\"'](?P<name>og:image|og:description|twitter:image|description)[\"'][^>]*>",
-    re.IGNORECASE,
-)
-CONTENT_RE = re.compile(r"content=[\"'](?P<content>.*?)[\"']", re.IGNORECASE | re.DOTALL)
 JSON_LD_RE = re.compile(
-    r"<script\s+[^>]*type=[\"']application/ld\\+json[\"'][^>]*>(?P<body>.*?)</script>",
+    r"<script\s+[^>]*type=[\"']application/ld\+json[\"'][^>]*>(?P<body>.*?)</script>",
     re.IGNORECASE | re.DOTALL,
+)
+EMBEDDED_IMAGE_PATTERNS = (
+    re.compile(r'"display_url"\s*:\s*"(?P<url>(?:\\.|[^"\\])*)"', re.IGNORECASE),
+    re.compile(r'"thumbnail_src"\s*:\s*"(?P<url>(?:\\.|[^"\\])*)"', re.IGNORECASE),
+    re.compile(r'"thumbnail_url"\s*:\s*"(?P<url>(?:\\.|[^"\\])*)"', re.IGNORECASE),
 )
 SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 WEB_HEADERS = {
@@ -98,6 +99,7 @@ def fetch_instagram_post(
             json_caption, json_image = _extract_json_ld(html_text)
             caption = caption or json_caption
             image_url = image_url or json_image
+            image_url = image_url or _extract_embedded_image(html_text)
 
         if not caption or not image_url:
             api_caption, api_image_url = _fetch_from_instagram_api(shortcode, timeout)
@@ -301,14 +303,28 @@ def _load_browser_cookies() -> dict[str, str]:
     }
 
 
+class _MetaParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.values: dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "meta":
+            return
+        attributes = {name.lower(): value for name, value in attrs if value is not None}
+        name = (attributes.get("property") or attributes.get("name") or "").lower()
+        content = attributes.get("content")
+        if name in {"og:image", "og:description", "twitter:image", "description"} and content:
+            self.values[name] = content
+
+
 def _extract_meta(html_text: str) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for match in META_RE.finditer(html_text):
-        tag = match.group(0)
-        content_match = CONTENT_RE.search(tag)
-        if content_match:
-            values[match.group("name").lower()] = html.unescape(content_match.group("content"))
-    return values
+    parser = _MetaParser()
+    try:
+        parser.feed(html_text)
+    except Exception:
+        pass
+    return parser.values
 
 
 def _extract_json_ld(html_text: str) -> tuple[str | None, str | None]:
@@ -331,6 +347,19 @@ def _extract_json_ld(html_text: str) -> tuple[str | None, str | None]:
             if caption or image_url:
                 return caption, image_url
     return None, None
+
+
+def _extract_embedded_image(html_text: str) -> str | None:
+    for pattern in EMBEDDED_IMAGE_PATTERNS:
+        for match in pattern.finditer(html_text):
+            try:
+                value = json.loads(f'"{match.group("url")}"')
+            except (json.JSONDecodeError, TypeError):
+                continue
+            image_url = _clean_url(value)
+            if image_url:
+                return image_url
+    return None
 
 
 def _clean_caption(value: Any) -> str | None:

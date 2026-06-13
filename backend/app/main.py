@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -12,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -27,6 +28,8 @@ from .config import (
     OCR_BATCH_SIZE,
     OCR_CROP_REGION,
     PREDICT_API_KEY,
+    PREDICT_PASSWORD,
+    PREDICT_USERNAME,
     UPLOAD_DIR,
     VIDEO_DIR,
     ensure_directories,
@@ -74,7 +77,12 @@ app.add_middleware(
 async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
     if PREDICT_API_KEY and request.method != "OPTIONS":
         path = request.url.path
-        if path.startswith("/api") or path.startswith("/media"):
+        # /api/health stays open (Render health checks); /api/auth/check is the
+        # login probe and validates the key itself.
+        if (
+            (path.startswith("/api") or path.startswith("/media"))
+            and path not in {"/api/health", "/api/auth/check", "/api/auth/login"}
+        ):
             provided = request.headers.get("x-api-key") or request.query_params.get("token")
             if provided != PREDICT_API_KEY:
                 from fastapi.responses import JSONResponse
@@ -97,6 +105,29 @@ _PREDICTION_MODEL_CACHE: dict[str, Any] = {}
 _PREDICTION_V2_CACHE: dict[str, Any] = {}
 _MODEL_LOG = logging.getLogger("uvicorn.error")
 _FIT_LOCK = threading.Lock()
+
+
+@app.get("/api/auth/check")
+def auth_check(request: Request) -> dict[str, Any]:
+    if not PREDICT_API_KEY:
+        return {"auth_required": False, "ok": True}
+    provided = request.headers.get("x-api-key") or request.query_params.get("token")
+    return {"auth_required": True, "ok": provided == PREDICT_API_KEY}
+
+
+@app.post("/api/auth/login")
+def auth_login(
+    username: Annotated[str, Form()],
+    password: Annotated[str, Form()],
+) -> dict[str, Any]:
+    if not PREDICT_API_KEY:
+        return {"ok": True, "token": ""}
+    if secrets.compare_digest(username.strip(), PREDICT_USERNAME) and secrets.compare_digest(
+        password, PREDICT_PASSWORD or ""
+    ):
+        return {"ok": True, "token": PREDICT_API_KEY}
+    time.sleep(0.8)  # slow down brute-force attempts
+    raise HTTPException(status_code=401, detail="Invalid username or password.")
 
 
 @app.get("/api/health")
@@ -212,9 +243,8 @@ def list_posts(section: str | None = Query(default=None)) -> dict[str, Any]:
         posts = [_lightweight_historical_post(row_to_post(row)) for row in rows]
     else:
         percentile_values = _tribe_percentile_reference(all_p)
-        pred_model = _fit_prediction_model_cached(all_p)
         posts = [
-            decorate_post(row_to_post(row), all_p, calib, pred_model, percentile_values)
+            decorate_post(row_to_post(row), all_p, calib, None, percentile_values)
             for row in rows
         ]
     return {"posts": posts, "calibration": _calibration_payload(calib)}
@@ -715,15 +745,11 @@ def get_ab_test(test_id: int) -> dict[str, Any]:
 
     test_data = dict(test)
     all_p = _all_posts()
-    calib = _fit_calibration_cached(all_p)
-    pred_model = _fit_prediction_model_cached(all_p)
-    candidates = [decorate_post(row_to_post(row), all_p, calib, pred_model) for row in rows]
+    candidates = [decorate_post(row_to_post(row), all_p) for row in rows]
     ranked = rank_candidates(
         candidates,
         winner_post_id=test_data.get("winner_post_id"),
         all_posts=all_p,
-        calibration_model=calib,
-        prediction_model=pred_model,
     )
     return {"test": test_data, "candidates": ranked}
 
@@ -861,17 +887,20 @@ def decorate_post(
         # so imports/uploads return immediately.
         post["calibrated_prediction"] = None
     else:
-        if calibration_model is None:
-            calibration_model = _fit_calibration_cached(all_posts)
-        if prediction_model is None:
-            prediction_model = _fit_prediction_model_cached(all_posts)
+        # Memory-lean chain: only fall back to the legacy models when v2 is not
+        # ready. Fitting all three at once OOMs small instances.
         if prediction_v2_model is None:
             prediction_v2_model = _fit_prediction_v2_cached(all_posts)
-        post["calibrated_prediction"] = (
-            predict_multi_signal(post, prediction_v2_model)
-            or predict_performance(post, prediction_model)
-            or predict_likes(post, calibration_model, all_posts=all_posts)
-        )
+        prediction = predict_multi_signal(post, prediction_v2_model)
+        if prediction is None:
+            if prediction_model is None:
+                prediction_model = _fit_prediction_model_cached(all_posts)
+            prediction = predict_performance(post, prediction_model)
+        if prediction is None:
+            if calibration_model is None:
+                calibration_model = _fit_calibration_cached(all_posts)
+            prediction = predict_likes(post, calibration_model, all_posts=all_posts)
+        post["calibrated_prediction"] = prediction
     post["tribe_percentile"] = _tribe_percentile(post, all_posts, percentile_values)
     return post
 
@@ -906,19 +935,19 @@ def rank_candidates(
 ) -> list[dict[str, Any]]:
     if all_posts is None:
         all_posts = _all_posts()
-    if calibration_model is None:
-        calibration_model = _fit_calibration_cached(all_posts)
-    if prediction_model is None:
-        prediction_model = _fit_prediction_model_cached(all_posts)
     if prediction_v2_model is None:
         prediction_v2_model = _fit_prediction_v2_cached(all_posts)
     decorated = []
     for candidate in candidates:
-        prediction = (
-            predict_multi_signal(candidate, prediction_v2_model)
-            or predict_performance(candidate, prediction_model)
-            or predict_likes(candidate, calibration_model, all_posts=all_posts)
-        )
+        prediction = predict_multi_signal(candidate, prediction_v2_model)
+        if prediction is None:
+            if prediction_model is None:
+                prediction_model = _fit_prediction_model_cached(all_posts)
+            prediction = predict_performance(candidate, prediction_model)
+        if prediction is None:
+            if calibration_model is None:
+                calibration_model = _fit_calibration_cached(all_posts)
+            prediction = predict_likes(candidate, calibration_model, all_posts=all_posts)
         summary = candidate.get("analysis_summary") or {}
         metric = ((summary.get("metrics") or {}).get("global_mean_abs") or 0.0)
         ranking_value = prediction.get("ranking_value", prediction["predicted_likes"]) if prediction else metric
@@ -972,9 +1001,7 @@ def _sync_ab_test_decision(test_id: int) -> None:
         ).fetchall()
 
     all_p = _all_posts()
-    calib = _fit_calibration_cached(all_p)
-    pred_model = _fit_prediction_model_cached(all_p)
-    candidates = [decorate_post(row_to_post(row), all_p, calib, pred_model) for row in rows]
+    candidates = [decorate_post(row_to_post(row), all_p) for row in rows]
     if not candidates:
         with connect() as conn:
             conn.execute(
@@ -1003,8 +1030,6 @@ def _sync_ab_test_decision(test_id: int) -> None:
     winner = rank_candidates(
         completed,
         all_posts=all_p,
-        calibration_model=calib,
-        prediction_model=pred_model,
     )[0]
     with connect() as conn:
         conn.execute(
