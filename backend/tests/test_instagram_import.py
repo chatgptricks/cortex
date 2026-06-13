@@ -90,13 +90,30 @@ class InstagramImportFlowTests(unittest.TestCase):
         )
 
     @patch("httpx.Client", FakeClient)
+    def test_fetch_uses_api_oembed_thumbnail(self) -> None:
+        post_url = "https://www.instagram.com/p/ABC123/"
+        image_url = "https://cdn.example.com/oembed-cover.jpg"
+        FakeClient.responses = {
+            f"https://www.instagram.com/api/v1/oembed/?url=https%3A%2F%2Fwww.instagram.com%2Fp%2FABC123%2F": FakeResponse(
+                payload={"title": "Caption", "thumbnail_url": image_url}
+            ),
+            image_url: FakeResponse(content=b"oembed", content_type="image/jpeg"),
+        }
+
+        imported = fetch_instagram_post(post_url)
+
+        self.assertEqual(imported.image_url, image_url)
+        self.assertEqual(imported.image_bytes, b"oembed")
+        self.assertNotIn(post_url, FakeClient.requested_urls)
+
+    @patch("httpx.Client", FakeClient)
     @patch("app.instagram_import._fetch_from_instagram_api", return_value=(None, None))
     def test_fetch_uses_public_embed_when_post_page_has_no_image(self, _: object) -> None:
         post_url = "https://www.instagram.com/p/ABC123/"
         embed_url = f"{post_url}embed/captioned/"
         image_url = "https://cdn.example.com/embed-cover.jpg"
         FakeClient.responses = {
-            f"https://www.instagram.com/oembed/?url=https%3A%2F%2Fwww.instagram.com%2Fp%2FABC123%2F": FakeResponse(
+            f"https://www.instagram.com/api/v1/oembed/?url=https%3A%2F%2Fwww.instagram.com%2Fp%2FABC123%2F": FakeResponse(
                 status_code=404
             ),
             post_url: FakeResponse(text="<html>Login to Instagram</html>"),
@@ -117,7 +134,7 @@ class InstagramImportFlowTests(unittest.TestCase):
         post_url = "https://www.instagram.com/p/ABC123/"
         image_url = "https://cdn.example.com/manual-cover.jpg"
         FakeClient.responses = {
-            f"https://www.instagram.com/oembed/?url=https%3A%2F%2Fwww.instagram.com%2Fp%2FABC123%2F": FakeResponse(
+            f"https://www.instagram.com/api/v1/oembed/?url=https%3A%2F%2Fwww.instagram.com%2Fp%2FABC123%2F": FakeResponse(
                 payload={"title": "Caption", "thumbnail_url": None}
             ),
             image_url: FakeResponse(content=b"manual", content_type="image/jpeg"),

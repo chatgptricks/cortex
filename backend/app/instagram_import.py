@@ -80,7 +80,7 @@ def fetch_instagram_post(
         headers=WEB_HEADERS,
     ) as client:
         try:
-            oembed = client.get(f"https://www.instagram.com/oembed/?url={quote_plus(clean_url)}")
+            oembed = client.get(f"https://www.instagram.com/api/v1/oembed/?url={quote_plus(clean_url)}")
             if oembed.status_code == 200:
                 payload = oembed.json()
                 caption = _clean_caption(payload.get("title"))
