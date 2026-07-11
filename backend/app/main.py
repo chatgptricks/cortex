@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -67,7 +68,9 @@ DEFAULT_POST_TYPE_OPTIONS = ["Tricks", "News", "Promo", "Reel", "Meme"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", *EXTRA_CORS_ORIGINS],
-    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):517[0-9]$",
+    # Local Vite projects in this workspace use different ports (including the
+    # standalone Tricks Dash on 4175). Production origins remain explicit.
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,6 +86,10 @@ async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
         if (
             (path.startswith("/api") or path.startswith("/media"))
             and path not in {"/api/health", "/api/auth/check", "/api/auth/login"}
+            # The standalone Tricks Dash is a read-only public explorer. Its
+            # tightly scoped routes replace the static JSON and public covers
+            # that were already deployed by the dashboard.
+            and not path.startswith("/api/tricks-dash/")
         ):
             provided = request.headers.get("x-api-key") or request.query_params.get("token")
             if provided != PREDICT_API_KEY:
@@ -144,6 +151,76 @@ def health() -> dict[str, Any]:
         "remote_tribe": remote_tribe_status(),
         "remote_ocr": remote_ocr_status(),
     }
+
+
+@app.get("/api/tricks-dash/posts")
+def tricks_dash_posts() -> dict[str, Any]:
+    """Return the public, read-only projection used by Tricks Dash."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, title, caption, published_at, likes, comments,
+                   post_type_label, shortcode, image_path, is_animated,
+                   source_row_number, created_at
+            FROM posts
+            WHERE section = 'historical'
+            ORDER BY
+                CASE WHEN published_at IS NULL OR TRIM(published_at) = '' THEN 1 ELSE 0 END,
+                published_at DESC,
+                created_at DESC
+            """
+        ).fetchall()
+
+    posts: list[dict[str, Any]] = []
+    for index, row in enumerate(rows, start=1):
+        post = dict(row)
+        shortcode = str(post.get("shortcode") or "").strip()
+        post_type = str(post.get("post_type_label") or "").strip() or "Image"
+        # video_path is the generated MP4 used for analysis, not the Instagram
+        # media type. Only the original label/animation decides the Dash filter.
+        has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
+        posts.append(
+            {
+                "rank": post.get("source_row_number") or index,
+                "postDate": post.get("published_at"),
+                "likes": int(post.get("likes") or 0),
+                "comments": int(post.get("comments") or 0),
+                "type": post_type,
+                "video": "Yes" if has_video or post_type.lower().startswith("video") else "No",
+                "shortcode": shortcode or f"post-{post['id']}",
+                "permalink": f"https://www.instagram.com/p/{shortcode}/" if shortcode else "",
+                "caption": post.get("caption") or post.get("title") or "",
+                "excerpt": post.get("title") or "",
+                "coverUrl": f"/api/tricks-dash/covers/{post['id']}",
+            }
+        )
+
+    total_likes = sum(post["likes"] for post in posts)
+    return {
+        "posts": posts,
+        "summary": {
+            "Exported posts": len(posts),
+            "Total likes": total_likes,
+            "Average likes": round(total_likes / len(posts)) if posts else 0,
+        },
+    }
+
+
+@app.get("/api/tricks-dash/covers/{post_id}")
+def tricks_dash_cover(post_id: int) -> FileResponse:
+    """Serve only a historical post cover to the public dashboard."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT image_path FROM posts WHERE id = ? AND section = 'historical'",
+            (post_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Post cover not found.")
+
+    image_path = Path(str(row["image_path"]))
+    if not image_path.is_file():
+        raise HTTPException(status_code=404, detail="Post cover file is unavailable.")
+    return FileResponse(image_path)
 
 
 @app.get("/api/calibration")

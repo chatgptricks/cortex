@@ -10,7 +10,8 @@ running on Modal GPU, so the server stays small.
    Starter web service with a 2GB persistent disk mounted at `/var/data`.
 3. Set the env vars Render asks for:
    - `PREDICT_API_KEY` — generate one: `openssl rand -hex 24`. This locks the API.
-   - `PREDICT_ALLOWED_ORIGINS` — `https://YOUR_USER.github.io`
+   - `PREDICT_ALLOWED_ORIGINS` — `https://YOUR_USER.github.io` (this permits both
+     the Cortex and Tricks Dash Pages URLs on that GitHub account).
    - `HF_TOKEN`, `REMOTE_TRIBE_URL`, `REMOTE_TRIBE_TOKEN`, `REMOTE_OCR_URL` — same values as your local `.env`.
 4. Upload your data once (DB + media). From your Mac, with the service running:
    the simplest path is Render's SSH: `render ssh cortex-api`, then `scp` (or use
@@ -40,3 +41,10 @@ running on Modal GPU, so the server stays small.
   GPU analysis still uses `backend/requirements.txt`.
 - First boot after this update strips brain-surface arrays from historical DB
   rows and VACUUMs: the DB shrinks ~630MB → ~40MB (one-time, takes a minute).
+
+## Tricks Dash
+
+`https://YOUR_USER.github.io/tricks-dash/` is a separate, read-only frontend.
+It reads `GET /api/tricks-dash/posts` from this service, so the historical Post
+DB remains the sole source of truth. Configure its GitHub Pages build with the
+same `VITE_API_BASE` value used by Cortex.

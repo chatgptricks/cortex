@@ -461,6 +461,10 @@ function CortexRunApp() {
             </button>
           );
         })}
+        <a className="tab" href="https://chatgptricks.github.io/tricks-dash/">
+          <BarChart3 size={18} />
+          Tricks Dash
+        </a>
       </nav>
 
       {activeTab === "analyze" ? (
