@@ -159,7 +159,7 @@ def tricks_dash_posts() -> dict[str, Any]:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, title, caption, published_at, likes, comments,
+            SELECT id, title, caption, hook_text, published_at, likes, comments,
                    post_type_label, shortcode, image_path, is_animated,
                    source_row_number, created_at
             FROM posts
@@ -191,6 +191,9 @@ def tricks_dash_posts() -> dict[str, Any]:
                 "permalink": f"https://www.instagram.com/p/{shortcode}/" if shortcode else "",
                 "caption": post.get("caption") or post.get("title") or "",
                 "excerpt": post.get("title") or "",
+                # hook_text is the normalized OCR result for the cover image.
+                # Tricks Dash already indexes ocrText in its search field.
+                "ocrText": post.get("hook_text") or "",
                 "coverUrl": f"/api/tricks-dash/covers/{post['id']}",
             }
         )
