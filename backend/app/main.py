@@ -290,6 +290,51 @@ def run_post_db_modal_ocr_batch(
     }
 
 
+@app.post("/api/post-db/ocr/missing")
+def run_post_db_missing_ocr_batch(
+    limit: int = Query(default=OCR_BATCH_SIZE),
+    crop_region: str = Query(default="full"),
+) -> dict[str, Any]:
+    eligible_count, rows = _eligible_missing_ocr_posts(limit=limit)
+    if not rows:
+        return {
+            "eligible_count": eligible_count,
+            "processed_count": 0,
+            "updated_count": 0,
+            "crop_region": crop_region,
+            "posts": [],
+        }
+    try:
+        results = extract_images_text_remote([Path(row["image_path"]) for row in rows], crop_region=crop_region)
+    except RemoteOcrUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    updated_ids: list[int] = []
+    with connect() as conn:
+        for row, result in zip(rows, results, strict=False):
+            text = str(result.get("text") or "").strip() if isinstance(result, dict) else ""
+            if not text:
+                continue
+            conn.execute(
+                """
+                UPDATE posts
+                SET hook_text = ?, updated_at = ?
+                WHERE id = ?
+                  AND TRIM(COALESCE(hook_text, '')) = ''
+                """,
+                (text, utc_now(), int(row["id"])),
+            )
+            updated_ids.append(int(row["id"]))
+
+    return {
+        "eligible_count": eligible_count,
+        "processed_count": len(results),
+        "updated_count": len(updated_ids),
+        "crop_region": crop_region,
+        "posts": [decorate_post(_get_post_or_404(post_id)) for post_id in updated_ids],
+    }
+
+
 @app.get("/api/posts")
 def list_posts(section: str | None = Query(default=None)) -> dict[str, Any]:
     if section == "historical":
@@ -1269,6 +1314,45 @@ def _eligible_modal_ocr_posts(start: int, limit: int) -> tuple[int, list[dict[st
                 {
                     "id": int(row["id"]),
                     "source_row_number": int(row["source_row_number"] or 0),
+                    "image_path": image_path,
+                }
+            )
+    return eligible_count, records
+
+
+def _eligible_missing_ocr_posts(limit: int) -> tuple[int, list[dict[str, Any]]]:
+    with connect() as conn:
+        eligible_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM posts
+                WHERE TRIM(COALESCE(hook_text, '')) = ''
+                  AND image_path IS NOT NULL
+                  AND TRIM(COALESCE(image_path, '')) <> ''
+                """
+            ).fetchone()[0]
+        )
+        rows = conn.execute(
+            """
+            SELECT id, image_path
+            FROM posts
+            WHERE TRIM(COALESCE(hook_text, '')) = ''
+              AND image_path IS NOT NULL
+              AND TRIM(COALESCE(image_path, '')) <> ''
+            ORDER BY created_at, id
+            LIMIT ?
+            """,
+            (max(1, limit),),
+        ).fetchall()
+
+    records = []
+    for row in rows:
+        image_path = row["image_path"]
+        if image_path and Path(image_path).exists():
+            records.append(
+                {
+                    "id": int(row["id"]),
                     "image_path": image_path,
                 }
             )
