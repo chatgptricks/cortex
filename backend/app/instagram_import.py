@@ -5,6 +5,7 @@ import json
 import os
 import pickle
 import re
+from datetime import UTC, datetime
 from itertools import islice
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -27,6 +28,9 @@ class InstagramPostImport:
     image_bytes: bytes
     image_suffix: str
     image_content_type: str | None
+    published_at: str | None = None
+    likes: int | None = None
+    comments: int | None = None
 
 
 SHORTCODE_RE = re.compile(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", re.IGNORECASE)
@@ -205,6 +209,7 @@ def sync_instagram_profile_posts(
     analyze_post: Callable[[int, int], None] | None = None,
     prune_missing: bool = False,
     stop_on_existing: bool = True,
+    refresh_existing: bool = False,
     start_after_shortcode: str | None = None,
 ) -> dict[str, Any]:
     from .config import UPLOAD_DIR
@@ -215,6 +220,7 @@ def sync_instagram_profile_posts(
         "found": 0,
         "imported": 0,
         "skipped": 0,
+        "updated": 0,
         "failed": 0,
         "dry_run": 0,
         "deleted": 0,
@@ -249,22 +255,61 @@ def sync_instagram_profile_posts(
             summary["found"] += 1
             keep_shortcodes.add(shortcode)
             source_ref = f"instagram:{shortcode}"
+            metadata = _timeline_item_metadata(item)
             with connect() as conn:
                 existing = conn.execute("SELECT id FROM posts WHERE source_ref = ?", (source_ref,)).fetchone()
             if existing:
                 summary["skipped"] += 1
-                summary["items"].append(
-                    {
-                        "url": post_url,
-                        "source_ref": source_ref,
-                        "status": "skipped",
-                        "post_id": int(existing["id"]),
-                    }
-                )
+                if refresh_existing and not dry_run:
+                    with connect() as conn:
+                        conn.execute(
+                            """
+                            UPDATE posts
+                            SET title = ?,
+                                caption = COALESCE(NULLIF(?, ''), caption),
+                                published_at = COALESCE(?, published_at),
+                                likes = COALESCE(?, likes),
+                                comments = COALESCE(?, comments),
+                                post_type_label = ?,
+                                shortcode = ?,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                metadata["title"],
+                                metadata["caption"],
+                                metadata["published_at"],
+                                metadata["likes"],
+                                metadata["comments"],
+                                metadata["post_type_label"],
+                                shortcode,
+                                utc_now(),
+                                int(existing["id"]),
+                            ),
+                        )
+                    summary["updated"] += 1
+                    summary["items"].append(
+                        {
+                            "url": post_url,
+                            "source_ref": source_ref,
+                            "status": "updated",
+                            "post_id": int(existing["id"]),
+                        }
+                    )
+                else:
+                    summary["items"].append(
+                        {
+                            "url": post_url,
+                            "source_ref": source_ref,
+                            "status": "skipped",
+                            "post_id": int(existing["id"]),
+                        }
+                    )
                 if stop_on_existing:
                     stopped_on_existing = source_ref
                     break
                 continue
+
             try:
                 imported = _timeline_item_to_import(item, post_url)
             except InstagramImportError as exc:
@@ -291,17 +336,21 @@ def sync_instagram_profile_posts(
                 cursor = conn.execute(
                     """
                     INSERT INTO posts (
-                        section, title, caption, source_ref, shortcode,
+                        section, title, caption, published_at, likes, comments, post_type_label, source_ref, shortcode,
                         image_path, original_filename, status, progress_percent,
                         progress_message, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         "single",
-                        imported.title,
-                        imported.caption,
+                        metadata["title"],
+                        metadata["caption"],
+                        metadata["published_at"],
+                        metadata["likes"],
+                        metadata["comments"],
+                        metadata["post_type_label"],
                         source_ref,
-                        imported.shortcode,
+                        shortcode,
                         str(image_path),
                         f"instagram-{imported.shortcode}{imported.image_suffix}",
                         "queued",
@@ -557,7 +606,60 @@ def _timeline_item_to_import(item: dict[str, Any], post_url: str) -> InstagramPo
         image_bytes=image.content,
         image_suffix=suffix,
         image_content_type=content_type,
+        published_at=_timeline_item_published_at(item),
+        likes=_optional_int(item.get("like_count")),
+        comments=_optional_int(item.get("comment_count")),
     )
+
+
+def _timeline_item_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    shortcode = str(item.get("code") or "").strip()
+    caption_obj = item.get("caption")
+    caption_text = caption_obj.get("text") if isinstance(caption_obj, dict) else None
+    caption = _clean_caption(caption_text)
+    title = _title_from_caption(caption)
+    if not title:
+        title = f"Instagram post {shortcode}" if shortcode else "Instagram post"
+    product_type = str(item.get("product_type") or "").lower()
+    carousel_media = item.get("carousel_media")
+    is_carousel = (isinstance(carousel_media, list) and len(carousel_media) > 1) or "carousel" in product_type
+    return {
+        "shortcode": shortcode,
+        "caption": caption,
+        "title": title,
+        "published_at": _timeline_item_published_at(item),
+        "likes": _optional_int(item.get("like_count")),
+        "comments": _optional_int(item.get("comment_count")),
+        "post_type_label": "Video" if product_type.startswith("clips") else "Carousel" if is_carousel else "Image",
+    }
+
+
+def _timeline_item_published_at(item: dict[str, Any]) -> str | None:
+    value = item.get("taken_at")
+    if value is None:
+        value = item.get("taken_at_timestamp")
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        timestamp = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return timestamp.isoformat(timespec="seconds")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        text = str(value).strip()
+        return text or None
+    if not numeric:
+        return None
+    return datetime.fromtimestamp(numeric, tz=UTC).isoformat(timespec="seconds")
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return None
 
 
 def _fetch_profile_post_urls_from_timeline(

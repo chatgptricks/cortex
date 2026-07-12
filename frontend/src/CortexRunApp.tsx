@@ -3216,12 +3216,16 @@ function InstagramProfileSyncPanel({
             <span>Dry run</span>
             <input name="dry_run" type="checkbox" />
           </label>
+          <label className="checkbox-field checkbox-field-inline">
+            <span>Refresh existing</span>
+            <input name="refresh_existing" type="checkbox" />
+          </label>
         </div>
       </section>
       <FormSubmitBar
         loading={loading}
         label="Sync Instagram profile"
-        helper="Imports unseen posts from the profile. Use Dry run to preview the current page without writing."
+        helper="Imports unseen posts from the profile. Use Refresh existing to backfill dates and engagement on rows already in the DB."
       />
     </form>
   );

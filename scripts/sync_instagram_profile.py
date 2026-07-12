@@ -70,6 +70,11 @@ def main() -> None:
         default=True,
         help="Stop at the first shortcode already in the DB. Use --no-stop-on-existing to keep scanning older posts.",
     )
+    parser.add_argument(
+        "--refresh-existing",
+        action="store_true",
+        help="Update existing Instagram rows with the latest metadata while scanning the timeline.",
+    )
     args = parser.parse_args()
 
     os.chdir(ROOT_DIR)
@@ -92,6 +97,7 @@ def main() -> None:
             analyze_post=run_analysis_job,
             prune_missing=args.prune_missing,
             stop_on_existing=args.stop_on_existing,
+            refresh_existing=args.refresh_existing,
             start_after_shortcode=args.start_after_shortcode or None,
         )
     except InstagramImportError as exc:

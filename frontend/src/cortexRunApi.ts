@@ -65,6 +65,7 @@ export function syncInstagramProfile(form: FormData) {
     found: number;
     imported: number;
     skipped: number;
+    updated: number;
     failed: number;
     dry_run: number;
     items: Array<Record<string, unknown>>;
