@@ -64,6 +64,12 @@ def main() -> None:
         default="",
         help="Skip newer posts until this shortcode is seen, then continue importing older posts.",
     )
+    parser.add_argument(
+        "--stop-on-existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop at the first shortcode already in the DB. Use --no-stop-on-existing to keep scanning older posts.",
+    )
     args = parser.parse_args()
 
     os.chdir(ROOT_DIR)
@@ -85,6 +91,7 @@ def main() -> None:
             duration_seconds=args.duration_seconds,
             analyze_post=run_analysis_job,
             prune_missing=args.prune_missing,
+            stop_on_existing=args.stop_on_existing,
             start_after_shortcode=args.start_after_shortcode or None,
         )
     except InstagramImportError as exc:

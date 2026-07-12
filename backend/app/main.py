@@ -551,6 +551,7 @@ def sync_posts_from_instagram_profile(
     duration_seconds: Annotated[int, Form()] = DEFAULT_VIDEO_SECONDS,
     analyze_now: Annotated[bool, Form()] = True,
     dry_run: Annotated[bool, Form()] = False,
+    stop_on_existing: Annotated[bool, Form()] = True,
 ) -> dict[str, Any]:
     try:
         return sync_instagram_profile_posts(
@@ -560,6 +561,7 @@ def sync_posts_from_instagram_profile(
             analyze_now=analyze_now,
             duration_seconds=duration_seconds,
             analyze_post=run_analysis_job,
+            stop_on_existing=stop_on_existing,
         )
     except InstagramImportError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
