@@ -1,11 +1,17 @@
 import unittest
+import sys
+import types
 from unittest.mock import patch
 
 from app.instagram_import import (
     _extract_embedded_image,
     _extract_json_ld,
     _extract_meta,
+    _extract_profile_post_urls,
+    _canonical_instagram_profile_url,
     _instagram_embed_url,
+    _fetch_profile_post_urls_from_timeline,
+    discover_instagram_profile_post_urls,
     fetch_instagram_post,
 )
 
@@ -45,9 +51,9 @@ class FakeClient:
     def __exit__(self, *_: object) -> None:
         return None
 
-    def get(self, url: str) -> FakeResponse:
+    def get(self, url: str, **_: object) -> FakeResponse:
         self.requested_urls.append(url)
-        return self.responses[url]
+        return self.responses.get(url, FakeResponse(status_code=404))
 
 
 class InstagramImportParserTests(unittest.TestCase):
@@ -77,11 +83,47 @@ class InstagramImportParserTests(unittest.TestCase):
 
         self.assertEqual(image_url, "https://cdn.example.com/cover.jpg?x=1&y=2")
 
+    def test_extract_profile_post_urls_dedupes_and_preserves_order(self) -> None:
+        urls = _extract_profile_post_urls(
+            """
+            <a href="/p/ABC123/">first</a>
+            <a href="/p/ABC123/?img_index=1">duplicate</a>
+            <a href="/reel/XYZ789/">second</a>
+            <a href="/tv/TV456/">third</a>
+            """
+        )
+
+        self.assertEqual(
+            urls,
+            [
+                "https://www.instagram.com/p/ABC123/",
+                "https://www.instagram.com/reel/XYZ789/",
+                "https://www.instagram.com/tv/TV456/",
+            ],
+        )
+
+    def test_canonical_instagram_profile_url_accepts_username_or_url(self) -> None:
+        self.assertEqual(
+            _canonical_instagram_profile_url("@some.profile_1"),
+            "https://www.instagram.com/some.profile_1/",
+        )
+        self.assertEqual(
+            _canonical_instagram_profile_url("https://www.instagram.com/some.profile_1/?hl=en"),
+            "https://www.instagram.com/some.profile_1/",
+        )
+
 
 class InstagramImportFlowTests(unittest.TestCase):
     def setUp(self) -> None:
         FakeClient.responses = {}
         FakeClient.requested_urls = []
+        self._httpx_module = types.ModuleType("httpx")
+        self._httpx_module.Client = FakeClient
+        self._httpx_patch = patch.dict(sys.modules, {"httpx": self._httpx_module})
+        self._httpx_patch.start()
+
+    def tearDown(self) -> None:
+        self._httpx_patch.stop()
 
     def test_embed_url_preserves_post_kind_and_shortcode(self) -> None:
         self.assertEqual(
@@ -89,7 +131,6 @@ class InstagramImportFlowTests(unittest.TestCase):
             "https://www.instagram.com/reel/ABC_123-/embed/captioned/",
         )
 
-    @patch("httpx.Client", FakeClient)
     def test_fetch_uses_api_oembed_thumbnail(self) -> None:
         post_url = "https://www.instagram.com/p/ABC123/"
         image_url = "https://cdn.example.com/oembed-cover.jpg"
@@ -106,7 +147,6 @@ class InstagramImportFlowTests(unittest.TestCase):
         self.assertEqual(imported.image_bytes, b"oembed")
         self.assertNotIn(post_url, FakeClient.requested_urls)
 
-    @patch("httpx.Client", FakeClient)
     @patch("app.instagram_import._fetch_from_instagram_api", return_value=(None, None))
     def test_fetch_uses_public_embed_when_post_page_has_no_image(self, _: object) -> None:
         post_url = "https://www.instagram.com/p/ABC123/"
@@ -129,7 +169,6 @@ class InstagramImportFlowTests(unittest.TestCase):
         self.assertEqual(imported.image_bytes, b"image")
         self.assertIn(embed_url, FakeClient.requested_urls)
 
-    @patch("httpx.Client", FakeClient)
     def test_manual_cover_url_survives_empty_oembed_thumbnail(self) -> None:
         post_url = "https://www.instagram.com/p/ABC123/"
         image_url = "https://cdn.example.com/manual-cover.jpg"
@@ -145,6 +184,70 @@ class InstagramImportFlowTests(unittest.TestCase):
         self.assertEqual(imported.image_url, image_url)
         self.assertEqual(imported.caption, "Caption")
         self.assertNotIn(post_url, FakeClient.requested_urls)
+
+    def test_discover_profile_posts_from_html(self) -> None:
+        profile_url = "https://www.instagram.com/some.profile_1/"
+        FakeClient.responses = {
+            profile_url: FakeResponse(
+                text="""
+                    <html>
+                      <a href="/p/ABC123/">First</a>
+                      <a href="/p/ABC123/?img_index=1">Repeat</a>
+                      <a href="/reel/XYZ789/">Second</a>
+                    </html>
+                """
+            )
+        }
+
+        urls = discover_instagram_profile_post_urls(profile_url)
+
+        self.assertEqual(
+            urls,
+            [
+                "https://www.instagram.com/p/ABC123/",
+                "https://www.instagram.com/reel/XYZ789/",
+            ],
+        )
+
+    def test_fetch_profile_posts_from_timeline(self) -> None:
+        profile_url = "https://www.instagram.com/some.profile_1/"
+        timeline_url = "https://www.instagram.com/api/v1/feed/user/some.profile_1/username/?count=50"
+        next_timeline_url = (
+            "https://www.instagram.com/api/v1/feed/user/some.profile_1/username/?count=50&max_id=CURSOR2"
+        )
+        FakeClient.responses = {
+            timeline_url: FakeResponse(
+                payload={
+                    "items": [
+                        {"code": "ABC123", "product_type": "carousel_container"},
+                        {"code": "XYZ789", "product_type": "clips"},
+                        {"code": "ABC123", "product_type": "carousel_container"},
+                    ],
+                    "more_available": True,
+                    "next_max_id": "CURSOR2",
+                }
+            ),
+            next_timeline_url: FakeResponse(
+                payload={
+                    "items": [
+                        {"code": "LMN456", "product_type": "carousel_container"},
+                        {"code": "XYZ789", "product_type": "clips"},
+                    ],
+                    "more_available": False,
+                }
+            )
+        }
+
+        urls = _fetch_profile_post_urls_from_timeline(FakeClient(), profile_url, limit=12)
+
+        self.assertEqual(
+            urls,
+            [
+                "https://www.instagram.com/p/ABC123/",
+                "https://www.instagram.com/reel/XYZ789/",
+                "https://www.instagram.com/p/LMN456/",
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -5,10 +5,11 @@ import json
 import os
 import pickle
 import re
+from itertools import islice
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote_plus, urlparse
 
 
@@ -29,6 +30,14 @@ class InstagramPostImport:
 
 
 SHORTCODE_RE = re.compile(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", re.IGNORECASE)
+PROFILE_POST_LINK_RE = re.compile(
+    r'href=[\"\']/(?P<kind>p|reel|tv)/(?P<shortcode>[A-Za-z0-9_-]+)/?(?:\?[^\"\']*)?[\"\']',
+    re.IGNORECASE,
+)
+TIMELINE_POST_URL_RE = re.compile(
+    r"/api/v1/feed/user/(?P<username>[A-Za-z0-9._]+)/username/",
+    re.IGNORECASE,
+)
 JSON_LD_RE = re.compile(
     r"<script\s+[^>]*type=[\"']application/ld\+json[\"'][^>]*>(?P<body>.*?)</script>",
     re.IGNORECASE | re.DOTALL,
@@ -78,6 +87,7 @@ def fetch_instagram_post(
         timeout=timeout,
         follow_redirects=True,
         headers=WEB_HEADERS,
+        cookies=_load_instagram_cookies(),
     ) as client:
         try:
             oembed = client.get(f"https://www.instagram.com/api/v1/oembed/?url={quote_plus(clean_url)}")
@@ -142,6 +152,215 @@ def fetch_instagram_post(
     )
 
 
+def discover_instagram_profile_post_urls(
+    profile: str,
+    limit: int = 12,
+    timeout: float = 25.0,
+) -> list[str]:
+    profile_url = _canonical_instagram_profile_url(profile)
+
+    try:
+        import httpx
+    except ImportError as exc:
+        raise InstagramImportError("httpx is not installed in the backend environment.") from exc
+
+    with httpx.Client(
+        timeout=timeout,
+        follow_redirects=False,
+        headers=WEB_HEADERS,
+        cookies=_load_instagram_cookies(),
+    ) as client:
+        urls = list(islice(_iter_profile_post_urls_from_timeline(client, profile_url), limit or None))
+        if not urls:
+            response = client.get(profile_url)
+            if response.status_code >= 400:
+                raise InstagramImportError(
+                    f"Instagram returned HTTP {response.status_code} for that profile URL."
+                )
+            if response.status_code in {301, 302, 303, 307, 308} and response.headers.get("location"):
+                followup = client.get(response.headers["location"])
+                if followup.status_code >= 400:
+                    raise InstagramImportError(
+                        f"Instagram returned HTTP {followup.status_code} for that profile URL."
+                    )
+                response = followup
+            urls = _extract_profile_post_urls(response.text)
+            if not urls:
+                # Instagram often rewrites the page body, so a second pass over the
+                # same HTML with a stricter canonicalizer is cheap and catches odd
+                # quote/encoding combinations.
+                urls = _extract_profile_post_urls(html.unescape(response.text))
+
+    if limit > 0:
+        return urls[:limit]
+    return urls
+
+
+def sync_instagram_profile_posts(
+    profile: str,
+    limit: int = 12,
+    dry_run: bool = False,
+    analyze_now: bool = True,
+    duration_seconds: int = 2,
+    analyze_post: Callable[[int, int], None] | None = None,
+    prune_missing: bool = False,
+    stop_on_existing: bool = True,
+    start_after_shortcode: str | None = None,
+) -> dict[str, Any]:
+    from .config import UPLOAD_DIR
+    from .db import connect, utc_now
+
+    summary: dict[str, Any] = {
+        "profile": profile,
+        "found": 0,
+        "imported": 0,
+        "skipped": 0,
+        "failed": 0,
+        "dry_run": 0,
+        "deleted": 0,
+        "items": [],
+    }
+    keep_shortcodes: set[str] = set()
+    stopped_on_existing: str | None = None
+    seen_resume_anchor = start_after_shortcode is None
+
+    try:
+        import httpx
+    except ImportError as exc:
+        raise InstagramImportError("httpx is not installed in the backend environment.") from exc
+
+    profile_url = _canonical_instagram_profile_url(profile)
+    with httpx.Client(
+        timeout=25.0,
+        follow_redirects=False,
+        headers=WEB_HEADERS,
+        cookies=_load_instagram_cookies(),
+    ) as client:
+        for item in _iter_profile_timeline_items(client, profile_url):
+            shortcode = str(item.get("code") or "").strip()
+            if not shortcode:
+                continue
+            kind = "reel" if str(item.get("product_type") or "").lower().startswith("clips") else "p"
+            post_url = f"https://www.instagram.com/{kind}/{shortcode}/"
+            if not seen_resume_anchor:
+                if shortcode == start_after_shortcode:
+                    seen_resume_anchor = True
+                continue
+            summary["found"] += 1
+            keep_shortcodes.add(shortcode)
+            source_ref = f"instagram:{shortcode}"
+            with connect() as conn:
+                existing = conn.execute("SELECT id FROM posts WHERE source_ref = ?", (source_ref,)).fetchone()
+            if existing:
+                summary["skipped"] += 1
+                summary["items"].append(
+                    {
+                        "url": post_url,
+                        "source_ref": source_ref,
+                        "status": "skipped",
+                        "post_id": int(existing["id"]),
+                    }
+                )
+                if stop_on_existing:
+                    stopped_on_existing = source_ref
+                    break
+                continue
+            try:
+                imported = _timeline_item_to_import(item, post_url)
+            except InstagramImportError as exc:
+                summary["failed"] += 1
+                summary["items"].append({"url": post_url, "status": "fetch_failed", "error": str(exc)})
+                continue
+
+            if dry_run:
+                summary["dry_run"] += 1
+                summary["items"].append(
+                    {
+                        "url": post_url,
+                        "source_ref": source_ref,
+                        "status": "dry_run",
+                        "title": imported.title,
+                    }
+                )
+                continue
+
+            image_path = UPLOAD_DIR / f"{os.urandom(16).hex()}{imported.image_suffix}"
+            image_path.write_bytes(imported.image_bytes)
+            now = utc_now()
+            with connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO posts (
+                        section, title, caption, source_ref, shortcode,
+                        image_path, original_filename, status, progress_percent,
+                        progress_message, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "single",
+                        imported.title,
+                        imported.caption,
+                        source_ref,
+                        imported.shortcode,
+                        str(image_path),
+                        f"instagram-{imported.shortcode}{imported.image_suffix}",
+                        "queued",
+                        5,
+                        "Queued",
+                        now,
+                        now,
+                    ),
+                )
+                post_id = int(cursor.lastrowid)
+
+            if analyze_now and analyze_post is not None:
+                analyze_post(post_id, duration_seconds)
+
+            summary["imported"] += 1
+            summary["items"].append(
+                {
+                    "url": post_url,
+                    "source_ref": source_ref,
+                    "status": "imported",
+                    "post_id": post_id,
+                    "title": imported.title,
+                    "image_path": str(image_path),
+                    "analyzed": bool(analyze_now and analyze_post is not None),
+                }
+            )
+    if prune_missing and keep_shortcodes and not stopped_on_existing:
+        with connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, shortcode
+                FROM posts
+                WHERE source_ref LIKE 'instagram:%'
+                """
+            ).fetchall()
+        for row in rows:
+            shortcode = str(row["shortcode"] or "").strip()
+            if not shortcode or shortcode in keep_shortcodes:
+                continue
+            post_id = int(row["id"])
+            deleted_files = _delete_post_files(post_id)
+            with connect() as conn:
+                conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
+            summary["deleted"] += 1
+            summary["items"].append(
+                {
+                    "post_id": post_id,
+                    "source_ref": f"instagram:{shortcode}",
+                    "status": "deleted",
+                    "deleted_files": deleted_files,
+                }
+            )
+
+    if stopped_on_existing:
+        summary["stopped_on_existing"] = stopped_on_existing
+
+    return summary
+
+
 def _canonical_instagram_url(value: str) -> str:
     url = value.strip()
     if not url:
@@ -156,11 +375,225 @@ def _canonical_instagram_url(value: str) -> str:
     return f"https://www.instagram.com/{kind}/{shortcode}/"
 
 
+def _canonical_instagram_profile_url(value: str) -> str:
+    profile = value.strip()
+    if not profile:
+        raise InstagramImportError("Instagram profile is required.")
+    if profile.startswith("@"):
+        profile = profile[1:]
+    if not profile.startswith(("http://", "https://")):
+        profile = f"https://www.instagram.com/{profile.lstrip('/')}/"
+    parsed = urlparse(profile)
+    if parsed.netloc.lower().removeprefix("www.") != "instagram.com":
+        raise InstagramImportError("Paste a valid instagram.com profile URL or username.")
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if not path_parts:
+        raise InstagramImportError("Paste a valid Instagram profile URL or username.")
+    first = path_parts[0]
+    if first.lower() in {"p", "reel", "tv"}:
+        raise InstagramImportError("Paste a profile username, not a post URL.")
+    if not re.fullmatch(r"[A-Za-z0-9._]+", first):
+        raise InstagramImportError("Instagram usernames can only contain letters, numbers, periods, and underscores.")
+    return f"https://www.instagram.com/{first}/"
+
+
 def _shortcode(url: str) -> str:
     match = SHORTCODE_RE.search(url)
     if not match:
         raise InstagramImportError("Could not read the Instagram shortcode from that URL.")
     return match.group(1)
+
+
+def _extract_profile_post_urls(html_text: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in PROFILE_POST_LINK_RE.finditer(html_text):
+        kind = match.group("kind").lower()
+        shortcode = match.group("shortcode")
+        url = f"https://www.instagram.com/{kind}/{shortcode}/"
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
+def _iter_profile_post_urls_from_timeline(
+    client: Any,
+    profile_url: str,
+):
+    username = Path(urlparse(profile_url).path).name
+    if not username:
+        return
+    headers = {**WEB_HEADERS, "X-IG-App-ID": IG_API_HEADERS["X-IG-App-ID"]}
+
+    seen: set[str] = set()
+    cursor: str | None = None
+    page_size = 50
+
+    while True:
+        params = [f"count={page_size}"]
+        if cursor:
+            params.append(f"max_id={cursor}")
+        request_url = f"https://www.instagram.com/api/v1/feed/user/{username}/username/?{'&'.join(params)}"
+        response = client.get(request_url, headers=headers)
+        if response.status_code >= 400:
+            break
+        try:
+            payload = response.json()
+        except Exception:
+            return
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not items:
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            shortcode = str(item.get("code") or "").strip()
+            if not shortcode:
+                continue
+            kind = "reel" if str(item.get("product_type") or "").lower().startswith("clips") else "p"
+            url = f"https://www.instagram.com/{kind}/{shortcode}/"
+            if url in seen:
+                continue
+            seen.add(url)
+            yield url
+        if not payload.get("more_available"):
+            return
+        next_cursor = str(payload.get("next_max_id") or "").strip()
+        if not next_cursor or next_cursor == cursor:
+            return
+        cursor = next_cursor
+
+
+def _iter_profile_timeline_items(
+    client: Any,
+    profile_url: str,
+):
+    username = Path(urlparse(profile_url).path).name
+    if not username:
+        return
+    headers = {**WEB_HEADERS, "X-IG-App-ID": IG_API_HEADERS["X-IG-App-ID"]}
+
+    seen: set[str] = set()
+    cursor: str | None = None
+    page_size = 50
+
+    while True:
+        params = [f"count={page_size}"]
+        if cursor:
+            params.append(f"max_id={cursor}")
+        request_url = f"https://www.instagram.com/api/v1/feed/user/{username}/username/?{'&'.join(params)}"
+        response = client.get(request_url, headers=headers)
+        if response.status_code >= 400:
+            return
+        try:
+            payload = response.json()
+        except Exception:
+            return
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not items:
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            shortcode = str(item.get("code") or "").strip()
+            if not shortcode or shortcode in seen:
+                continue
+            seen.add(shortcode)
+            yield item
+        if not payload.get("more_available"):
+            return
+        next_cursor = str(payload.get("next_max_id") or "").strip()
+        if not next_cursor or next_cursor == cursor:
+            return
+        cursor = next_cursor
+
+
+def _timeline_item_to_import(item: dict[str, Any], post_url: str) -> InstagramPostImport:
+    shortcode = str(item.get("code") or "").strip()
+    if not shortcode:
+        raise InstagramImportError("Instagram timeline item is missing a shortcode.")
+
+    caption_obj = item.get("caption")
+    caption_text = caption_obj.get("text") if isinstance(caption_obj, dict) else None
+    caption = _clean_caption(caption_text)
+    image_url = _clean_url(item.get("display_uri")) or _best_image_candidate(item)
+    carousel_media = item.get("carousel_media")
+    if not image_url and isinstance(carousel_media, list) and carousel_media:
+        first_candidate = carousel_media[0]
+        if isinstance(first_candidate, dict):
+            image_url = _clean_url(first_candidate.get("display_uri")) or _best_image_candidate(first_candidate)
+    if not image_url:
+        raise InstagramImportError("Could not find a cover image on the Instagram timeline item.")
+
+    try:
+        import httpx
+    except ImportError as exc:
+        raise InstagramImportError("httpx is not installed in the backend environment.") from exc
+
+    with httpx.Client(
+        timeout=25.0,
+        follow_redirects=True,
+        headers=WEB_HEADERS,
+        cookies=_load_instagram_cookies(),
+    ) as client:
+        image = client.get(image_url)
+    if image.status_code >= 400:
+        raise InstagramImportError(f"Instagram image download returned HTTP {image.status_code}.")
+
+    content_type = image.headers.get("content-type")
+    suffix = _image_suffix(image_url, content_type)
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise InstagramImportError(f"Instagram cover image type is not supported: {content_type or suffix}.")
+
+    title = _title_from_caption(caption) or f"Instagram post {shortcode}"
+    return InstagramPostImport(
+        url=post_url,
+        shortcode=shortcode,
+        caption=caption,
+        title=title,
+        image_url=image_url,
+        image_bytes=image.content,
+        image_suffix=suffix,
+        image_content_type=content_type,
+    )
+
+
+def _fetch_profile_post_urls_from_timeline(
+    client: Any,
+    profile_url: str,
+    limit: int,
+) -> list[str]:
+    urls = list(islice(_iter_profile_post_urls_from_timeline(client, profile_url), limit or None))
+    return urls
+
+
+def _delete_post_files(post_id: int) -> int:
+    from .db import connect
+
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT image_path, video_path, analysis_path FROM posts WHERE id = ?",
+            (post_id,),
+        ).fetchone()
+
+    if not row:
+        return 0
+
+    deleted = 0
+    for field in ("image_path", "video_path", "analysis_path"):
+        raw_path = row[field]
+        if not raw_path:
+            continue
+        path = Path(str(raw_path))
+        try:
+            if path.exists():
+                path.unlink()
+                deleted += 1
+        except Exception:
+            continue
+    return deleted
 
 
 def _instagram_embed_url(url: str) -> str:

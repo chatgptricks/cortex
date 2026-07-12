@@ -59,6 +59,21 @@ export function createPostFromInstagramLink(form: FormData) {
   });
 }
 
+export function syncInstagramProfile(form: FormData) {
+  return request<{
+    profile: string;
+    found: number;
+    imported: number;
+    skipped: number;
+    failed: number;
+    dry_run: number;
+    items: Array<Record<string, unknown>>;
+  }>("/api/posts/instagram-profile-sync", {
+    method: "POST",
+    body: form
+  });
+}
+
 export function createBatchPosts(form: FormData) {
   return request<{ posts: Post[] }>("/api/posts/batch", {
     method: "POST",

@@ -37,7 +37,11 @@ from .config import (
     ensure_directories,
 )
 from .db import connect, init_db, row_to_post, utc_now
-from .instagram_import import InstagramImportError, fetch_instagram_post
+from .instagram_import import (
+    InstagramImportError,
+    fetch_instagram_post,
+    sync_instagram_profile_posts,
+)
 from .llm_report import LlmReportUnavailable, generate_llm_report, llm_report_status
 from .prediction_model import fit_advanced_prediction, predict_performance, prediction_payload
 from .prediction_v2 import fit_multi_signal, multi_signal_payload, predict_multi_signal
@@ -161,9 +165,8 @@ def tricks_dash_posts() -> dict[str, Any]:
             """
             SELECT id, title, caption, hook_text, published_at, likes, comments,
                    post_type_label, shortcode, image_path, is_animated,
-                   source_row_number, created_at
+                   source_row_number, created_at, section
             FROM posts
-            WHERE section = 'historical'
             ORDER BY
                 CASE WHEN published_at IS NULL OR TRIM(published_at) = '' THEN 1 ELSE 0 END,
                 published_at DESC,
@@ -191,6 +194,7 @@ def tricks_dash_posts() -> dict[str, Any]:
                 "permalink": f"https://www.instagram.com/p/{shortcode}/" if shortcode else "",
                 "caption": post.get("caption") or post.get("title") or "",
                 "excerpt": post.get("title") or "",
+                "section": post.get("section") or "",
                 # hook_text is the normalized OCR result for the cover image.
                 # Tricks Dash already indexes ocrText in its search field.
                 "ocrText": post.get("hook_text") or "",
@@ -211,12 +215,9 @@ def tricks_dash_posts() -> dict[str, Any]:
 
 @app.get("/api/tricks-dash/covers/{post_id}")
 def tricks_dash_cover(post_id: int) -> FileResponse:
-    """Serve only a historical post cover to the public dashboard."""
+    """Serve a post cover to the public dashboard."""
     with connect() as conn:
-        row = conn.execute(
-            "SELECT image_path FROM posts WHERE id = ? AND section = 'historical'",
-            (post_id,),
-        ).fetchone()
+        row = conn.execute("SELECT image_path FROM posts WHERE id = ?", (post_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Post cover not found.")
 
@@ -541,6 +542,27 @@ def create_post_from_instagram_link(
     if analyze_now:
         background_tasks.add_task(run_analysis_job, post_id, duration_seconds)
     return {"post": decorate_post(_get_post_or_404(post_id)), "created": True}
+
+
+@app.post("/api/posts/instagram-profile-sync")
+def sync_posts_from_instagram_profile(
+    profile: Annotated[str, Form()],
+    limit: Annotated[int, Form()] = 12,
+    duration_seconds: Annotated[int, Form()] = DEFAULT_VIDEO_SECONDS,
+    analyze_now: Annotated[bool, Form()] = True,
+    dry_run: Annotated[bool, Form()] = False,
+) -> dict[str, Any]:
+    try:
+        return sync_instagram_profile_posts(
+            profile,
+            limit=limit,
+            dry_run=dry_run,
+            analyze_now=analyze_now,
+            duration_seconds=duration_seconds,
+            analyze_post=run_analysis_job,
+        )
+    except InstagramImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/posts/batch")

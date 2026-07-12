@@ -45,6 +45,7 @@ import {
   getPost,
   getPosts,
   mediaUrl,
+  syncInstagramProfile,
   updatePost
 } from "./cortexRunApi";
 import { getApiKey, setApiKey } from "./auth";
@@ -338,6 +339,23 @@ function CortexRunApp() {
     }
   }
 
+  async function submitInstagramProfileSync(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    setLoading(true);
+    setError(null);
+    try {
+      const form = new FormData(formElement);
+      await syncInstagramProfile(form);
+      formElement.reset();
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not sync that Instagram profile.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function submitPostDbBatch(form: FormData) {
     setLoading(true);
     setError(null);
@@ -471,6 +489,7 @@ function CortexRunApp() {
         <section className="workspace-grid analyze-workspace">
           <div className="stack">
             <InstagramLinkPanel onSubmit={submitInstagramLink} loading={loading} />
+            <InstagramProfileSyncPanel onSubmit={submitInstagramProfileSync} loading={loading} />
             <UploadPanel
               title="New cover"
               description="Upload an image. The backend turns it into a short silent MP4 before sending it to TRIBE v2."
@@ -3147,6 +3166,62 @@ function InstagramLinkPanel({
         loading={loading}
         label="Import Instagram post"
         helper="Imports caption and cover, then starts analysis when Analyze now is checked."
+      />
+    </form>
+  );
+}
+
+function InstagramProfileSyncPanel({
+  onSubmit,
+  loading
+}: {
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  loading: boolean;
+}) {
+  return (
+    <form className="panel upload-panel instagram-link-panel form-workflow" onSubmit={onSubmit}>
+      <div className="panel-title">
+        <RefreshCcw size={20} />
+        <div>
+          <h2>Instagram profile sync</h2>
+          <p>Scan a profile for the newest visible posts, skip shortcodes already in the DB, and import the rest.</p>
+        </div>
+      </div>
+      <section className="analyze-section import-section">
+        <FormStepHeader
+          step="IG"
+          title="Sync recent posts"
+          description="Use a username or profile URL. The sync reads current post links from the profile page."
+        />
+        <label>
+          Profile
+          <input name="profile" type="text" placeholder="@username or https://www.instagram.com/username/" required />
+        </label>
+        <div className="form-row">
+          <label>
+            Limit
+            <input name="limit" type="number" min="1" max="50" defaultValue="12" />
+          </label>
+          <label>
+            Video duration
+            <input name="duration_seconds" type="number" min="2" max="10" defaultValue="2" />
+          </label>
+        </div>
+        <div className="form-row">
+          <label className="checkbox-field checkbox-field-inline">
+            <span>Analyze now</span>
+            <input name="analyze_now" type="checkbox" defaultChecked />
+          </label>
+          <label className="checkbox-field checkbox-field-inline">
+            <span>Dry run</span>
+            <input name="dry_run" type="checkbox" />
+          </label>
+        </div>
+      </section>
+      <FormSubmitBar
+        loading={loading}
+        label="Sync Instagram profile"
+        helper="Imports unseen posts from the profile. Use Dry run to preview the current page without writing."
       />
     </form>
   );
