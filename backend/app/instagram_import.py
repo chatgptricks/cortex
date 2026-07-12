@@ -257,10 +257,24 @@ def sync_instagram_profile_posts(
             source_ref = f"instagram:{shortcode}"
             metadata = _timeline_item_metadata(item)
             with connect() as conn:
-                existing = conn.execute("SELECT id FROM posts WHERE source_ref = ?", (source_ref,)).fetchone()
+                existing = conn.execute(
+                    """
+                    SELECT id, section, source_ref
+                    FROM posts
+                    WHERE source_ref = ? OR shortcode = ?
+                    ORDER BY
+                        CASE WHEN source_ref = ? THEN 0 ELSE 1 END,
+                        CASE WHEN section = 'historical' THEN 0 ELSE 1 END,
+                        created_at ASC,
+                        id ASC
+                    LIMIT 1
+                    """,
+                    (source_ref, shortcode, source_ref),
+                ).fetchone()
             if existing:
                 summary["skipped"] += 1
-                if refresh_existing and not dry_run:
+                existing_source_ref = str(existing["source_ref"] or "")
+                if refresh_existing and not dry_run and existing_source_ref == source_ref:
                     with connect() as conn:
                         conn.execute(
                             """
@@ -305,7 +319,7 @@ def sync_instagram_profile_posts(
                             "post_id": int(existing["id"]),
                         }
                     )
-                if stop_on_existing:
+                if stop_on_existing and existing_source_ref == source_ref:
                     stopped_on_existing = source_ref
                     break
                 continue
