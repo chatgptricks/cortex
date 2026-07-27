@@ -33,6 +33,7 @@ from .config import (
     PREDICT_API_KEY,
     PREDICT_PASSWORD,
     PREDICT_USERNAME,
+    TRICKS_DASH_REFRESH_PASSWORD,
     UPLOAD_DIR,
     VIDEO_DIR,
     ensure_directories,
@@ -232,11 +233,14 @@ def tricks_dash_cover(post_id: int) -> FileResponse:
 def tricks_dash_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
     """Public but password-gated: pulls new @chatgptricks posts from Apify's
     paid Instagram Scraper and inserts anything missing from the DB. Gated
-    with PREDICT_API_KEY (not the blanket /api middleware, since tricks-dash
-    routes are deliberately public) because each call costs Apify credits and
-    writes to the live database.
+    with TRICKS_DASH_REFRESH_PASSWORD (a dedicated password, separate from
+    PREDICT_API_KEY, since tricks-dash routes are deliberately public and this
+    password may be shared with non-admins) because each call costs Apify
+    credits and writes to the live database.
     """
-    if not PREDICT_API_KEY or not secrets.compare_digest(password.strip(), PREDICT_API_KEY):
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
     try:
         return sync_new_posts_from_apify()

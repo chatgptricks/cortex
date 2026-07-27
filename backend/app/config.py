@@ -47,6 +47,11 @@ MIN_CALIBRATION_SAMPLES = int(os.getenv("MIN_CALIBRATION_SAMPLES", "3"))
 # (X-API-Key header or ?token= query param). Leave unset for local dev.
 PREDICT_API_KEY = os.getenv("PREDICT_API_KEY", "").strip() or None
 
+# Separate password gating the public Tricks Dash "Refresh" button
+# (POST /api/tricks-dash/refresh). Kept independent of PREDICT_API_KEY so it
+# can be shared with non-admins without exposing the main API key.
+TRICKS_DASH_REFRESH_PASSWORD = os.getenv("TRICKS_DASH_REFRESH_PASSWORD", "").strip() or None
+
 # Login credentials for the web UI. The login endpoint exchanges valid
 # credentials for the API key, so the key never ships in the frontend bundle.
 # Password defaults to the API key until PREDICT_PASSWORD is set.
