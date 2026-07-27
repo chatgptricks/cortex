@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .apify_sync import ApifySyncError, sync_new_posts_from_apify
+from .apify_sync import ApifySyncError, refresh_recent_engagement, sync_new_posts_from_apify
 from .calibration import fit_calibration, predict_likes
 from .config import (
     ALLOWED_IMAGE_SUFFIXES,
@@ -232,18 +232,23 @@ def tricks_dash_cover(post_id: int) -> FileResponse:
 @app.post("/api/tricks-dash/refresh")
 def tricks_dash_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
     """Public but password-gated: pulls new @chatgptricks posts from Apify's
-    paid Instagram Scraper and inserts anything missing from the DB. Gated
-    with TRICKS_DASH_REFRESH_PASSWORD (a dedicated password, separate from
-    PREDICT_API_KEY, since tricks-dash routes are deliberately public and this
-    password may be shared with non-admins) because each call costs Apify
-    credits and writes to the live database.
+    paid Instagram Scraper and inserts anything missing from the DB, then
+    refreshes likes/comments on existing posts that are 10 days old or less
+    (plus one final check at exactly 30 days old -- posts 11-29 or 31+ days
+    old are left untouched). Gated with TRICKS_DASH_REFRESH_PASSWORD (a
+    dedicated password, separate from PREDICT_API_KEY, since tricks-dash
+    routes are deliberately public and this password may be shared with
+    non-admins) because each call costs Apify credits and writes to the live
+    database.
     """
     if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
         password.strip(), TRICKS_DASH_REFRESH_PASSWORD
     ):
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
     try:
-        return sync_new_posts_from_apify()
+        result = sync_new_posts_from_apify()
+        result["engagement_refresh"] = refresh_recent_engagement()
+        return result
     except ApifySyncError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +62,43 @@ def _apify_date_filter(value: str) -> str | None:
     except ValueError:
         return None
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _apply_likes_floor(raw: Any) -> int:
+    """Instagram/Apify sometimes reports a very low or sentinel (-1, hidden)
+    like count for a post. Per product decision, any value of 3 or below
+    (including missing/negative/non-numeric) is treated as "unknown" and
+    reported as a baseline of 500 instead of the tiny/inaccurate number.
+    """
+    if isinstance(raw, bool):
+        return 500
+    if isinstance(raw, int) and raw > 3:
+        return raw
+    return 500
+
+
+def _post_age_days(published_at: str | None, now: datetime) -> int | None:
+    if not published_at:
+        return None
+    text = str(published_at).strip()
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return (now - dt).days
+
+
+def _is_eligible_for_engagement_refresh(published_at: str | None, now: datetime) -> bool:
+    """Update rule: refresh likes/comments for posts that are 10 days old or
+    less. Once a post turns 11+ days old, stop touching it -- except for one
+    final check at exactly 30 days old.
+    """
+    age = _post_age_days(published_at, now)
+    if age is None:
+        return False
+    return age <= 10 or age == 30
 
 
 def sync_new_posts_from_apify(results_limit: int = 60) -> dict[str, Any]:
@@ -158,8 +195,7 @@ def sync_new_posts_from_apify(results_limit: int = 60) -> dict[str, Any]:
             caption = _clean_text(item.get("caption"))
             title = _title_from_caption(caption) or f"Instagram post {shortcode}"
             post_type_label, is_video = _post_type_label(item)
-            likes = item.get("likesCount")
-            likes = likes if isinstance(likes, int) and likes >= 0 else 0
+            likes = _apply_likes_floor(item.get("likesCount"))
             comments = item.get("commentsCount") or 0
             now = utc_now()
 
@@ -197,5 +233,92 @@ def sync_new_posts_from_apify(results_limit: int = 60) -> dict[str, Any]:
             existing_shortcodes.add(shortcode)
             summary["added"] += 1
             summary["items"].append({"shortcode": shortcode, "status": "added", "published_at": _published_at(item)})
+
+    return summary
+
+
+def refresh_recent_engagement(window_days: int = 35, results_limit: int = 200) -> dict[str, Any]:
+    """Re-scrape recent posts for IG_HANDLE and update likes/comments on
+    existing rows that are eligible for a refresh: posts 10 days old or
+    less get refreshed every time; posts 11-29 or 31+ days old are left
+    alone; posts exactly 30 days old get one final refresh. Any like count
+    of 3 or below (including hidden/-1 values Apify sometimes returns) is
+    floored to 500 via _apply_likes_floor.
+    """
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    if not token:
+        raise ApifySyncError("APIFY_TOKEN is not configured on the server.")
+
+    try:
+        import httpx
+    except ImportError as exc:
+        raise ApifySyncError("httpx is not installed in the backend environment.") from exc
+
+    from .db import connect, utc_now
+
+    now = datetime.now(UTC)
+
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, shortcode, published_at, likes FROM posts WHERE shortcode IS NOT NULL AND shortcode != ''"
+        ).fetchall()
+
+    eligible_by_shortcode: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        shortcode = row["shortcode"]
+        if not shortcode or shortcode.startswith("post-"):
+            continue
+        if not _is_eligible_for_engagement_refresh(row["published_at"], now):
+            continue
+        eligible_by_shortcode[shortcode] = {"id": row["id"], "likes": row["likes"]}
+
+    summary: dict[str, Any] = {"checked": len(eligible_by_shortcode), "updated": 0, "unmatched": 0}
+    if not eligible_by_shortcode:
+        return summary
+
+    window_start = now - timedelta(days=window_days)
+    payload: dict[str, Any] = {
+        "directUrls": [f"https://www.instagram.com/{IG_HANDLE}/"],
+        "resultsType": "posts",
+        "resultsLimit": results_limit,
+        "skipPinnedPosts": True,
+        "onlyPostsNewerThan": window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
+    try:
+        with httpx.Client(timeout=180.0) as client:
+            response = client.post(url, params={"token": token}, json=payload)
+            response.raise_for_status()
+            items = response.json()
+    except httpx.HTTPError as exc:
+        raise ApifySyncError(f"Apify engagement refresh request failed: {exc}") from exc
+
+    if not isinstance(items, list):
+        raise ApifySyncError("Apify returned an unexpected response shape for engagement refresh.")
+
+    items_by_shortcode = {it.get("shortCode"): it for it in items if it.get("shortCode")}
+    now_iso = utc_now()
+
+    for shortcode, info in eligible_by_shortcode.items():
+        item = items_by_shortcode.get(shortcode)
+        if not item:
+            summary["unmatched"] += 1
+            continue
+        likes = _apply_likes_floor(item.get("likesCount"))
+        comments = item.get("commentsCount")
+        comments = comments if isinstance(comments, int) and comments >= 0 else None
+        with connect() as conn:
+            if comments is not None:
+                conn.execute(
+                    "UPDATE posts SET likes = ?, comments = ?, updated_at = ? WHERE id = ?",
+                    (likes, comments, now_iso, info["id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE posts SET likes = ?, updated_at = ? WHERE id = ?",
+                    (likes, now_iso, info["id"]),
+                )
+        summary["updated"] += 1
 
     return summary
