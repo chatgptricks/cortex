@@ -727,6 +727,8 @@ def update_post(
     hook_text: Annotated[str | None, Form()] = None,
     is_animated: Annotated[bool | None, Form()] = None,
     comments: Annotated[str | None, Form()] = None,
+    shortcode: Annotated[str | None, Form()] = None,
+    source_ref: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
     post = _get_post_or_404(post_id)
     fields = {
@@ -739,6 +741,8 @@ def update_post(
         "tags": tags,
         "hook_text": hook_text,
         "is_animated": int(is_animated) if is_animated is not None else None,
+        "shortcode": shortcode,
+        "source_ref": source_ref,
     }
     if likes is not None:
         fields["likes"] = _normalized_likes(likes, post.get("section") or "")
