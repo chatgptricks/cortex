@@ -50,6 +50,20 @@ def _published_at(item: dict[str, Any]) -> str | None:
     return str(ts)
 
 
+def _apify_date_filter(value: str) -> str | None:
+    """Convert a stored published_at value into the date format Apify's
+    onlyPostsNewerThan expects: YYYY-MM-DDThh:mm:ssZ (no +00:00 offset).
+    Returns None if the value can't be parsed, so the caller can safely
+    omit the filter rather than send a request Apify will reject with 400.
+    """
+    text = str(value).strip()
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def sync_new_posts_from_apify(results_limit: int = 60) -> dict[str, Any]:
     """Pull new posts for IG_HANDLE from Apify's Instagram Scraper and insert
     any that aren't already in the posts table (matched by shortcode). Mirrors
@@ -74,7 +88,7 @@ def sync_new_posts_from_apify(results_limit: int = 60) -> dict[str, Any]:
         rows = conn.execute("SELECT shortcode, published_at FROM posts").fetchall()
     existing_shortcodes = {row["shortcode"] for row in rows if row["shortcode"]}
     known_dates = [row["published_at"] for row in rows if row["published_at"]]
-    newer_than = max(known_dates) if known_dates else None
+    newer_than = _apify_date_filter(max(known_dates)) if known_dates else None
 
     payload: dict[str, Any] = {
         "directUrls": [f"https://www.instagram.com/{IG_HANDLE}/"],
