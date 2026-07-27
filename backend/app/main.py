@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from .apify_sync import ApifySyncError, sync_new_posts_from_apify
 from .calibration import fit_calibration, predict_likes
 from .config import (
     ALLOWED_IMAGE_SUFFIXES,
@@ -225,6 +226,22 @@ def tricks_dash_cover(post_id: int) -> FileResponse:
     if not image_path.is_file():
         raise HTTPException(status_code=404, detail="Post cover file is unavailable.")
     return FileResponse(image_path)
+
+
+@app.post("/api/tricks-dash/refresh")
+def tricks_dash_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
+    """Public but password-gated: pulls new @chatgptricks posts from Apify's
+    paid Instagram Scraper and inserts anything missing from the DB. Gated
+    with PREDICT_API_KEY (not the blanket /api middleware, since tricks-dash
+    routes are deliberately public) because each call costs Apify credits and
+    writes to the live database.
+    """
+    if not PREDICT_API_KEY or not secrets.compare_digest(password.strip(), PREDICT_API_KEY):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    try:
+        return sync_new_posts_from_apify()
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/calibration")
