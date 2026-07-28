@@ -382,7 +382,7 @@ def admin_list_accounts() -> dict[str, Any]:
 
 
 @app.get("/api/admin/_temp-apify-status")
-def temp_apify_status() -> dict[str, Any]:
+def temp_apify_status(path: str = "users/me") -> dict[str, Any]:
     """TEMPORARY diagnostic -- checks the Apify account behind APIFY_TOKEN
     (plan, usage, limits) to explain a 403 from the scraper actor. Remove
     after use."""
@@ -395,7 +395,7 @@ def temp_apify_status() -> dict[str, Any]:
         return {"error": "APIFY_TOKEN not set on the server."}
     try:
         with httpx.Client(timeout=20.0) as client:
-            response = client.get("https://api.apify.com/v2/users/me", params={"token": token})
+            response = client.get(f"https://api.apify.com/v2/{path}", params={"token": token})
         return {"status_code": response.status_code, "body": response.json() if response.content else None}
     except httpx.HTTPError as exc:
         return {"error": str(exc)}
