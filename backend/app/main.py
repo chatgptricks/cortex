@@ -446,7 +446,7 @@ def admin_deactivate_account(handle: str, password: Annotated[str, Form()]) -> d
 def admin_backfill_account(
     handle: str,
     password: Annotated[str, Form()],
-    results_limit: Annotated[int, Form()] = 800,
+    results_limit: Annotated[int, Form()] = 5000,
     date_from: Annotated[str | None, Form()] = None,
     date_to: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:

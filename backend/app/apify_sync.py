@@ -581,7 +581,7 @@ def run_manual_refresh(account: str) -> dict[str, Any]:
 
 def run_backfill(
     account: str,
-    results_limit: int = 800,
+    results_limit: int = 5000,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> dict[str, Any]:
