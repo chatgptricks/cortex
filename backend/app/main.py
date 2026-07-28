@@ -100,6 +100,7 @@ async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
             # password-gated refresh/import, checked inside the handlers).
             and not path.startswith("/api/tricks-dash/")
             and not path.startswith("/api/traselveloreal/")
+            and path != "/api/admin/reset-hot-check"
         ):
             provided = request.headers.get("x-api-key") or request.query_params.get("token")
             if provided != PREDICT_API_KEY:
@@ -235,6 +236,57 @@ def tricks_dash_cover(post_id: int) -> FileResponse:
     if not image_path.is_file():
         raise HTTPException(status_code=404, detail="Post cover file is unavailable.")
     return FileResponse(image_path)
+
+
+@app.post("/api/admin/reset-hot-check")
+def reset_hot_check(password: Annotated[str, Form()], account: Annotated[str, Form()]) -> dict[str, Any]:
+    """One-off utility: clears hot_checked (and the derived is_hot/likes_at_1h/
+    hot_rate_multiplier fields) for posts still <=24h old, so the next
+    short-term cycle re-evaluates them under the current HOT-detection
+    rules/threshold. Useful after tuning the threshold or check formula so
+    already-checked recent posts aren't stuck with a stale verdict.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    table = {"chatgptricks": "posts", "traselveloreal": "traselveloreal_posts"}.get(account)
+    if not table:
+        raise HTTPException(status_code=400, detail="Unknown account.")
+
+    from datetime import UTC, datetime
+
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT id, published_at FROM {table} WHERE hot_checked = 1"
+        ).fetchall()
+
+    now = datetime.now(UTC)
+    reset_ids: list[int] = []
+    for row in rows:
+        published_at = row["published_at"]
+        if not published_at:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(published_at).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        age_hours = (now - dt).total_seconds() / 3600.0
+        if age_hours <= 24:
+            reset_ids.append(row["id"])
+
+    if reset_ids:
+        placeholders = ", ".join("?" for _ in reset_ids)
+        with connect() as conn:
+            conn.execute(
+                f"UPDATE {table} SET hot_checked = 0, is_hot = 0, likes_at_1h = NULL, "
+                f"hot_marked_at = NULL, hot_rate_multiplier = NULL WHERE id IN ({placeholders})",
+                reset_ids,
+            )
+
+    return {"account": account, "reset": len(reset_ids)}
 
 
 @app.post("/api/tricks-dash/refresh")
