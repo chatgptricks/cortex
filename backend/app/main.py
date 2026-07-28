@@ -383,6 +383,16 @@ def admin_list_accounts() -> dict[str, Any]:
     return {"accounts": list_accounts(active_only=False)}
 
 
+@app.post("/api/admin/_temp-backfill/{handle}")
+def temp_backfill(handle: str, results_limit: int = 900) -> dict[str, Any]:
+    """TEMPORARY -- one-off: top up post history past the earlier 800 cap.
+    Remove after use."""
+    try:
+        return run_backfill(handle, results_limit=results_limit)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.get("/api/admin/accounts/preview")
 def admin_preview_account(handle: str) -> dict[str, Any]:
     """Read-only lookup used by the add-account wizard's first step to show

@@ -670,6 +670,7 @@ def fetch_profile_preview(handle: str) -> dict[str, Any]:
         "full_name": item.get("fullName"),
         "profile_pic_url": item.get("profilePicUrlHD") or item.get("profilePicUrl"),
         "followers_count": item.get("followersCount"),
+        "posts_count": item.get("postsCount"),
         "verified": bool(item.get("verified")),
         "private": bool(item.get("private")),
     }
