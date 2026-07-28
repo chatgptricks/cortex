@@ -374,16 +374,6 @@ def dashboard_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
     return results
 
 
-@app.get("/api/admin/cleanup-natgeo-oneoff")
-def cleanup_natgeo_oneoff() -> dict[str, Any]:
-    """TEMPORARY, no-auth: removes leftover natgeo test account/rows from
-    an earlier overlapping test run. Remove this endpoint after use."""
-    with connect() as conn:
-        d1 = conn.execute("DELETE FROM dashboard_posts WHERE account = 'natgeo'").rowcount
-        d2 = conn.execute("DELETE FROM accounts WHERE handle = 'natgeo'").rowcount
-    return {"deleted_posts": d1, "deleted_accounts": d2}
-
-
 @app.get("/api/admin/accounts")
 def admin_list_accounts() -> dict[str, Any]:
     """Full roster including inactive accounts, for the admin UI."""
