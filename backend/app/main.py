@@ -394,7 +394,7 @@ def temp_backfill(handle: str, results_limit: int = 5000) -> dict[str, Any]:
 
 
 @app.get("/api/admin/_temp-apify-runs")
-def temp_apify_runs() -> dict[str, Any]:
+def temp_apify_runs(limit: int = 10) -> dict[str, Any]:
     """TEMPORARY -- read-only: list recent Apify actor runs (status,
     duration, cost) so we can see what's actually happening on their side
     instead of guessing from our own request timing. Remove after use."""
@@ -407,7 +407,7 @@ def temp_apify_runs() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="APIFY_TOKEN not configured.")
     url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs"
     with httpx.Client(timeout=30.0) as client:
-        response = client.get(url, params={"token": token, "limit": 10, "desc": "true"})
+        response = client.get(url, params={"token": token, "limit": limit, "desc": "true"})
         response.raise_for_status()
         data = response.json()
     items = data.get("data", {}).get("items", [])
