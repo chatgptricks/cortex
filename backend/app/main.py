@@ -393,6 +393,39 @@ def temp_backfill(handle: str, results_limit: int = 5000) -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.get("/api/admin/_temp-apify-runs")
+def temp_apify_runs() -> dict[str, Any]:
+    """TEMPORARY -- read-only: list recent Apify actor runs (status,
+    duration, cost) so we can see what's actually happening on their side
+    instead of guessing from our own request timing. Remove after use."""
+    import httpx
+
+    from .apify_sync import APIFY_ACTOR_ID
+
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(status_code=500, detail="APIFY_TOKEN not configured.")
+    url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs"
+    with httpx.Client(timeout=30.0) as client:
+        response = client.get(url, params={"token": token, "limit": 10, "desc": "true"})
+        response.raise_for_status()
+        data = response.json()
+    items = data.get("data", {}).get("items", [])
+    return {
+        "runs": [
+            {
+                "id": item.get("id"),
+                "status": item.get("status"),
+                "startedAt": item.get("startedAt"),
+                "finishedAt": item.get("finishedAt"),
+                "usageTotalUsd": item.get("usageTotalUsd"),
+                "statusMessage": item.get("statusMessage"),
+            }
+            for item in items
+        ]
+    }
+
+
 @app.get("/api/admin/accounts/preview")
 def admin_preview_account(handle: str) -> dict[str, Any]:
     """Read-only lookup used by the add-account wizard's first step to show
