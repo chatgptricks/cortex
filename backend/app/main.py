@@ -172,7 +172,7 @@ def tricks_dash_posts() -> dict[str, Any]:
             """
             SELECT id, title, caption, hook_text, published_at, likes, comments,
                    post_type_label, shortcode, image_path, is_animated,
-                   source_row_number, created_at, section, is_hot
+                   source_row_number, created_at, section, is_hot, hot_rate_multiplier
             FROM posts
             ORDER BY
                 CASE WHEN published_at IS NULL OR TRIM(published_at) = '' THEN 1 ELSE 0 END,
@@ -207,6 +207,7 @@ def tricks_dash_posts() -> dict[str, Any]:
                 "ocrText": post.get("hook_text") or "",
                 "coverUrl": f"/api/tricks-dash/covers/{post['id']}",
                 "isHot": bool(post.get("is_hot")),
+                "hotMultiplier": post.get("hot_rate_multiplier"),
                 "account": "chatgptricks",
             }
         )
@@ -270,7 +271,7 @@ def traselveloreal_posts() -> dict[str, Any]:
         rows = conn.execute(
             """
             SELECT id, shortcode, published_at, likes, comments, caption,
-                   post_type_label, is_animated, permalink, is_hot,
+                   post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
                    cover_image_path, cover_source_url, created_at
             FROM traselveloreal_posts
             ORDER BY
@@ -302,6 +303,7 @@ def traselveloreal_posts() -> dict[str, Any]:
                 "ocrText": "",
                 "coverUrl": f"/api/traselveloreal/covers/{post['id']}",
                 "isHot": bool(post.get("is_hot")),
+                "hotMultiplier": post.get("hot_rate_multiplier"),
                 "account": "traselveloreal",
             }
         )

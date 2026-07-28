@@ -21,8 +21,8 @@ ACCOUNT_CONFIG: dict[str, dict[str, Any]] = {
     "traselveloreal": {
         "ig_handle": "traselveloreal",
         "table": "traselveloreal_posts",
-        # Rule: 1200 likes accumulated within the first hour of posting.
-        "hot_threshold": 1200,
+        # Rule: 1500 likes accumulated within the first hour of posting.
+        "hot_threshold": 1500,
     },
 }
 
@@ -365,9 +365,19 @@ def run_short_term_cycle(account: str, results_limit: int = 80) -> dict[str, Any
             set_clauses.append("comments = ?")
             params.append(comments)
         if not info["hot_checked"] and info["age_hours"] >= 1.0:
-            is_hot = 1 if likes >= cfg["hot_threshold"] else 0
-            set_clauses += ["is_hot = ?", "likes_at_1h = ?", "hot_checked = 1"]
-            params += [is_hot, likes]
+            # Checks land on a fixed 30-min grid, so a post is rarely
+            # observed at exactly 1.0h old (could be 1.0-1.5h, or much more
+            # overnight). Rather than compare the raw like count, compute
+            # the actual accumulation rate (likes / real elapsed hours) and
+            # compare THAT against the account's per-hour threshold -- this
+            # stays accurate regardless of exactly when the check happens to
+            # land relative to the post's real publish time.
+            rate_per_hour = likes / info["age_hours"]
+            threshold = cfg["hot_threshold"]
+            multiplier = round(rate_per_hour / threshold, 3) if threshold else 0.0
+            is_hot = 1 if rate_per_hour >= threshold else 0
+            set_clauses += ["is_hot = ?", "likes_at_1h = ?", "hot_checked = 1", "hot_rate_multiplier = ?"]
+            params += [is_hot, likes, multiplier]
             if is_hot:
                 set_clauses.append("hot_marked_at = ?")
                 params.append(now_iso)

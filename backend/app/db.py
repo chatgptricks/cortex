@@ -126,6 +126,7 @@ def init_db() -> None:
                 likes_at_1h INTEGER,
                 hot_checked INTEGER NOT NULL DEFAULT 0,
                 hot_marked_at TEXT,
+                hot_rate_multiplier REAL,
                 refreshed_30d INTEGER NOT NULL DEFAULT 0,
                 refreshed_120d INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -135,6 +136,7 @@ def init_db() -> None:
                 ON traselveloreal_posts(published_at DESC);
             """
         )
+        _ensure_column(conn, "traselveloreal_posts", "hot_rate_multiplier", "hot_rate_multiplier REAL")
         _ensure_column(conn, "posts", "progress_percent", "progress_percent INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "posts", "progress_message", "progress_message TEXT")
         _ensure_column(conn, "posts", "llm_report", "llm_report TEXT")
@@ -158,6 +160,7 @@ def init_db() -> None:
         _ensure_column(conn, "posts", "hot_marked_at", "hot_marked_at TEXT")
         _ensure_column(conn, "posts", "refreshed_30d", "refreshed_30d INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "posts", "refreshed_120d", "refreshed_120d INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "posts", "hot_rate_multiplier", "hot_rate_multiplier REAL")
         conn.execute(
             """
             UPDATE posts
