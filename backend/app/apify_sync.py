@@ -191,6 +191,80 @@ def _fetch_apify_items(payload: dict[str, Any], timeout: float = 180.0) -> list[
     return items
 
 
+def _run_apify_actor_and_fetch(
+    payload: dict[str, Any],
+    max_wait_seconds: float = 1800.0,
+    poll_interval: float = 8.0,
+) -> list[dict[str, Any]]:
+    """Starts the actor run and polls for completion with short, separate
+    requests instead of holding one long-lived connection open for the
+    entire scrape the way run-sync-get-dataset-items does.
+
+    We confirmed via Apify's own run history that large scrapes routinely
+    SUCCEED and get billed on Apify's side while our synchronous call never
+    receives the response -- something in the long-held connection path
+    between Render and Apify drops it silently, so the completed results
+    are paid for but lost. Starting the run, polling its status with quick
+    (~30s) calls, then fetching the finished dataset separately never holds
+    one connection open for more than a few seconds, so it can't be dropped
+    mid-scrape like that.
+    """
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    if not token:
+        raise ApifySyncError("APIFY_TOKEN is not configured on the server.")
+    try:
+        import httpx
+    except ImportError as exc:
+        raise ApifySyncError("httpx is not installed in the backend environment.") from exc
+    import time
+
+    start_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs"
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            start_response = client.post(start_url, params={"token": token}, json=payload)
+            start_response.raise_for_status()
+            run = start_response.json().get("data", {})
+    except httpx.HTTPError as exc:
+        raise ApifySyncError(f"Failed to start Apify run: {exc}") from exc
+
+    run_id = run.get("id")
+    if not run_id:
+        raise ApifySyncError("Apify did not return a run id.")
+
+    status_url = f"https://api.apify.com/v2/actor-runs/{run_id}"
+    deadline = time.monotonic() + max_wait_seconds
+    dataset_id = run.get("defaultDatasetId")
+    status = run.get("status")
+    while status in ("READY", "RUNNING") and time.monotonic() < deadline:
+        time.sleep(poll_interval)
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                status_response = client.get(status_url, params={"token": token})
+                status_response.raise_for_status()
+                run = status_response.json().get("data", {})
+        except httpx.HTTPError as exc:
+            raise ApifySyncError(f"Failed to poll Apify run status: {exc}") from exc
+        status = run.get("status")
+        dataset_id = run.get("defaultDatasetId") or dataset_id
+
+    if status != "SUCCEEDED":
+        raise ApifySyncError(f"Apify run did not finish successfully (status={status}).")
+    if not dataset_id:
+        raise ApifySyncError("Apify run succeeded but returned no dataset id.")
+
+    items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            items_response = client.get(items_url, params={"token": token, "format": "json"})
+            items_response.raise_for_status()
+            items = items_response.json()
+    except httpx.HTTPError as exc:
+        raise ApifySyncError(f"Failed to fetch Apify dataset items: {exc}") from exc
+    if not isinstance(items, list):
+        raise ApifySyncError("Apify dataset returned an unexpected response shape.")
+    return items
+
+
 # ---------------------------------------------------------------------------
 # New-post insertion
 # ---------------------------------------------------------------------------
@@ -612,13 +686,14 @@ def run_backfill(
     }
     if date_from:
         payload["onlyPostsNewerThan"] = date_from
-    # Large/full-history pulls (hundreds to low thousands of posts) can
-    # legitimately take well past 5 minutes to scrape. The old 300s timeout
-    # here meant our own HTTP client gave up on Apify's response before big
-    # accounts finished -- the actor run kept going (and billing) on Apify's
-    # side regardless, but we never received or stored its results because
-    # we'd already disconnected. Give it real headroom instead.
-    items = _fetch_apify_items(payload, timeout=1800.0)
+    # Large/full-history pulls (hundreds to low thousands of posts) can take
+    # many minutes to scrape. run-sync-get-dataset-items holds one HTTP
+    # connection open for the whole duration, and we confirmed via Apify's
+    # own run history that this reliably gets dropped somewhere in the
+    # Render<->Apify path on longer scrapes -- the run still SUCCEEDS and
+    # gets billed, but we never receive the response. Start-and-poll instead
+    # so no single connection needs to stay open for more than ~30s.
+    items = _run_apify_actor_and_fetch(payload, max_wait_seconds=1800.0)
 
     if date_to:
         try:
