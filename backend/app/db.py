@@ -134,9 +134,99 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_trasel_published
                 ON traselveloreal_posts(published_at DESC);
+
+            -- Self-serve account registry for Sentient Dash. Every account
+            -- except the canonical `chatgptricks` (which lives in `posts`,
+            -- shared with Predict's prediction model) writes into the
+            -- generic `dashboard_posts` table below, keyed by `account`.
+            -- This is what lets new accounts (Sentient or Competitors) be
+            -- added without a new SQL table or a code deploy per account.
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                handle TEXT NOT NULL UNIQUE,
+                label TEXT NOT NULL,
+                group_name TEXT NOT NULL CHECK(group_name IN ('sentient', 'competitors')),
+                hot_threshold INTEGER NOT NULL DEFAULT 600,
+                is_canonical INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            -- Generic per-post storage shared by every non-canonical
+            -- account. Deliberately never merged into `posts`.
+            CREATE TABLE IF NOT EXISTS dashboard_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account TEXT NOT NULL,
+                shortcode TEXT NOT NULL,
+                published_at TEXT,
+                likes INTEGER,
+                comments INTEGER,
+                caption TEXT,
+                post_type_label TEXT,
+                is_animated INTEGER NOT NULL DEFAULT 0,
+                permalink TEXT,
+                cover_source_url TEXT,
+                cover_image_path TEXT,
+                is_hot INTEGER NOT NULL DEFAULT 0,
+                likes_at_1h INTEGER,
+                hot_checked INTEGER NOT NULL DEFAULT 0,
+                hot_marked_at TEXT,
+                hot_rate_multiplier REAL,
+                refreshed_30d INTEGER NOT NULL DEFAULT 0,
+                refreshed_120d INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(account, shortcode)
+            );
+            CREATE INDEX IF NOT EXISTS idx_dashboard_posts_account_published
+                ON dashboard_posts(account, published_at DESC);
             """
         )
         _ensure_column(conn, "traselveloreal_posts", "hot_rate_multiplier", "hot_rate_multiplier REAL")
+
+        # Seed the two existing accounts on first run (idempotent -- INSERT
+        # OR IGNORE keyed by the UNIQUE handle column).
+        _seed_now = utc_now()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO accounts
+                (handle, label, group_name, hot_threshold, is_canonical, is_active, created_at, updated_at)
+            VALUES ('chatgptricks', 'chatgptricks', 'sentient', 600, 1, 1, ?, ?)
+            """,
+            (_seed_now, _seed_now),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO accounts
+                (handle, label, group_name, hot_threshold, is_canonical, is_active, created_at, updated_at)
+            VALUES ('traselveloreal', 'traselveloreal', 'sentient', 1500, 0, 1, ?, ?)
+            """,
+            (_seed_now, _seed_now),
+        )
+
+        # One-time (idempotent, safe to re-run every startup) migration of
+        # the old dedicated traselveloreal_posts table into the generic
+        # dashboard_posts table. UNIQUE(account, shortcode) means re-running
+        # this only ever inserts genuinely new rows.
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO dashboard_posts (
+                account, shortcode, published_at, likes, comments, caption,
+                post_type_label, is_animated, permalink, cover_source_url,
+                cover_image_path, is_hot, likes_at_1h, hot_checked,
+                hot_marked_at, hot_rate_multiplier, refreshed_30d,
+                refreshed_120d, created_at, updated_at
+            )
+            SELECT
+                'traselveloreal', shortcode, published_at, likes, comments, caption,
+                post_type_label, is_animated, permalink, cover_source_url,
+                cover_image_path, is_hot, likes_at_1h, hot_checked,
+                hot_marked_at, hot_rate_multiplier, refreshed_30d,
+                refreshed_120d, created_at, updated_at
+            FROM traselveloreal_posts
+            """
+        )
         _ensure_column(conn, "posts", "progress_percent", "progress_percent INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "posts", "progress_message", "progress_message TEXT")
         _ensure_column(conn, "posts", "llm_report", "llm_report TEXT")

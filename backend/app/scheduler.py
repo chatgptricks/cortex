@@ -16,8 +16,6 @@ _SHORT_JOB_START = (7, 30)  # 7:30am CST
 _SHORT_JOB_END = (23, 30)  # 11:30pm CST
 _DAILY_JOB_AT = (7, 0)  # 7:00am CST, right before the short-term window opens
 
-_ACCOUNTS = ("chatgptricks", "traselveloreal")
-
 _last_short_bucket: str | None = None
 _last_daily_date: str | None = None
 _started = False
@@ -37,10 +35,24 @@ def _bucket_key(now_cst: datetime) -> str:
     return now_cst.strftime("%Y-%m-%dT%H:") + f"{bucket_minute:02d}"
 
 
+def _active_account_handles() -> list[str]:
+    """Pulled fresh from the DB on every run (not cached) so a new account
+    added via the self-serve /api/admin/accounts endpoint is automatically
+    picked up on the very next tick, with no redeploy needed.
+    """
+    from .apify_sync import list_accounts
+
+    try:
+        return [account["handle"] for account in list_accounts(active_only=True)]
+    except Exception:
+        logger.exception("Failed to load active accounts for scheduler tick")
+        return []
+
+
 def _run_short_term_jobs() -> None:
     from .apify_sync import ApifySyncError, run_short_term_cycle
 
-    for account in _ACCOUNTS:
+    for account in _active_account_handles():
         try:
             result = run_short_term_cycle(account)
             logger.info("Short-term engagement cycle (%s): %s", account, result)
@@ -53,7 +65,7 @@ def _run_short_term_jobs() -> None:
 def _run_daily_jobs() -> None:
     from .apify_sync import ApifySyncError, run_daily_cycle
 
-    for account in _ACCOUNTS:
+    for account in _active_account_handles():
         try:
             result = run_daily_cycle(account)
             logger.info("Daily engagement cycle (%s): %s", account, result)

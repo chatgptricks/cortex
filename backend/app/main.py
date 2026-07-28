@@ -19,7 +19,14 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .apify_sync import ApifySyncError, run_manual_refresh
+from .apify_sync import (
+    ApifySyncError,
+    create_account,
+    get_account_config,
+    list_accounts,
+    run_backfill,
+    run_manual_refresh,
+)
 from .calibration import fit_calibration, predict_likes
 from .config import (
     ALLOWED_IMAGE_SUFFIXES,
@@ -93,13 +100,11 @@ async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
         if (
             (path.startswith("/api") or path.startswith("/media"))
             and path not in {"/api/health", "/api/auth/check", "/api/auth/login"}
-            # The standalone Tricks Dash is a read-only public explorer. Its
-            # tightly scoped routes replace the static JSON and public covers
-            # that were already deployed by the dashboard. @traselveloreal's
-            # routes are the same kind of public, read-only surface (plus a
-            # password-gated refresh/import, checked inside the handlers).
-            and not path.startswith("/api/tricks-dash/")
-            and not path.startswith("/api/traselveloreal/")
+            # Sentient Dash's unified account/post routes are a read-only
+            # public explorer (plus password-gated refresh, checked inside
+            # the handlers), same pattern as the old tricks-dash/
+            # traselveloreal/ routes it replaced.
+            and not path.startswith("/api/dashboard/")
             # /api/admin/* routes are individually password-gated inside
             # their own handlers (TRICKS_DASH_REFRESH_PASSWORD), same as
             # tricks-dash/traselveloreal -- no need to also require the
@@ -169,54 +174,108 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.get("/api/tricks-dash/posts")
-def tricks_dash_posts() -> dict[str, Any]:
-    """Return the public, read-only projection used by Tricks Dash."""
+@app.get("/api/dashboard/accounts")
+def dashboard_accounts() -> dict[str, Any]:
+    """Public roster of every account (Sentient + Competitors) driving
+    Sentient Dash. New accounts are added via POST /api/admin/accounts --
+    no code changes or redeploys needed to add the next one.
+    """
+    return {"accounts": list_accounts(active_only=True)}
+
+
+@app.get("/api/dashboard/posts")
+def dashboard_posts() -> dict[str, Any]:
+    """Unified, public, read-only projection across every account. Each
+    post is tagged with `account` and `group` (sentient/competitors) so the
+    frontend can build the All/Sentient/Competitors tabs and per-tab account
+    filter from a single fetch.
+    """
+    accounts = list_accounts(active_only=True)
+    group_by_handle = {a["handle"]: a["group"] for a in accounts}
+    canonical = next((a for a in accounts if a["is_canonical"]), None)
+
+    posts: list[dict[str, Any]] = []
+
     with connect() as conn:
-        rows = conn.execute(
+        if canonical:
+            canonical_rows = conn.execute(
+                """
+                SELECT id, title, caption, hook_text, published_at, likes, comments,
+                       post_type_label, shortcode, image_path, is_animated,
+                       source_row_number, created_at, section, is_hot, hot_rate_multiplier
+                FROM posts
+                """
+            ).fetchall()
+        else:
+            canonical_rows = []
+        dashboard_rows = conn.execute(
             """
-            SELECT id, title, caption, hook_text, published_at, likes, comments,
-                   post_type_label, shortcode, image_path, is_animated,
-                   source_row_number, created_at, section, is_hot, hot_rate_multiplier
-            FROM posts
-            ORDER BY
-                CASE WHEN published_at IS NULL OR TRIM(published_at) = '' THEN 1 ELSE 0 END,
-                published_at DESC,
-                created_at DESC
+            SELECT id, account, shortcode, published_at, likes, comments, caption,
+                   post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier
+            FROM dashboard_posts
             """
         ).fetchall()
 
-    posts: list[dict[str, Any]] = []
-    for index, row in enumerate(rows, start=1):
+    if canonical:
+        handle = canonical["handle"]
+        for row in canonical_rows:
+            post = dict(row)
+            shortcode = str(post.get("shortcode") or "").strip()
+            post_type = str(post.get("post_type_label") or "").strip() or "Image"
+            has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
+            posts.append(
+                {
+                    "rank": post.get("source_row_number") or post["id"],
+                    "postDate": post.get("published_at"),
+                    "likes": int(post.get("likes") or 0),
+                    "comments": int(post.get("comments") or 0),
+                    "type": post_type,
+                    "video": "Yes" if has_video else "No",
+                    "shortcode": shortcode or f"post-{post['id']}",
+                    "permalink": f"https://www.instagram.com/p/{shortcode}/" if shortcode else "",
+                    "caption": post.get("caption") or post.get("title") or "",
+                    "excerpt": post.get("title") or "",
+                    "section": post.get("section") or "",
+                    # hook_text is the normalized OCR result for the cover
+                    # image; already indexed in the frontend's search field.
+                    "ocrText": post.get("hook_text") or "",
+                    "coverUrl": f"/api/dashboard/covers/{handle}/{post['id']}",
+                    "isHot": bool(post.get("is_hot")),
+                    "hotMultiplier": post.get("hot_rate_multiplier"),
+                    "account": handle,
+                    "group": group_by_handle.get(handle, "sentient"),
+                }
+            )
+
+    for row in dashboard_rows:
         post = dict(row)
+        account = post.get("account")
         shortcode = str(post.get("shortcode") or "").strip()
         post_type = str(post.get("post_type_label") or "").strip() or "Image"
-        # video_path is the generated MP4 used for analysis, not the Instagram
-        # media type. Only the original label/animation decides the Dash filter.
         has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
         posts.append(
             {
-                "rank": post.get("source_row_number") or index,
+                "rank": post["id"],
                 "postDate": post.get("published_at"),
                 "likes": int(post.get("likes") or 0),
                 "comments": int(post.get("comments") or 0),
                 "type": post_type,
-                "video": "Yes" if has_video or post_type.lower().startswith("video") else "No",
-                "shortcode": shortcode or f"post-{post['id']}",
-                "permalink": f"https://www.instagram.com/p/{shortcode}/" if shortcode else "",
-                "caption": post.get("caption") or post.get("title") or "",
-                "excerpt": post.get("title") or "",
-                "section": post.get("section") or "",
-                # hook_text is the normalized OCR result for the cover image.
-                # Tricks Dash already indexes ocrText in its search field.
-                "ocrText": post.get("hook_text") or "",
-                "coverUrl": f"/api/tricks-dash/covers/{post['id']}",
+                "video": "Yes" if has_video else "No",
+                "shortcode": shortcode,
+                "permalink": post.get("permalink") or (f"https://www.instagram.com/p/{shortcode}/" if shortcode else ""),
+                "caption": post.get("caption") or "",
+                "excerpt": post.get("caption") or "",
+                "section": "single",
+                "ocrText": "",
+                "coverUrl": f"/api/dashboard/covers/{account}/{post['id']}",
                 "isHot": bool(post.get("is_hot")),
                 "hotMultiplier": post.get("hot_rate_multiplier"),
-                "account": "chatgptricks",
+                "account": account,
+                "group": group_by_handle.get(account, "competitors"),
             }
         )
 
+    posts.sort(key=lambda p: p.get("postDate") or "", reverse=True)
     total_likes = sum(post["likes"] for post in posts)
     return {
         "posts": posts,
@@ -228,18 +287,163 @@ def tricks_dash_posts() -> dict[str, Any]:
     }
 
 
-@app.get("/api/tricks-dash/covers/{post_id}")
-def tricks_dash_cover(post_id: int) -> FileResponse:
-    """Serve a post cover to the public dashboard."""
+@app.get("/api/dashboard/covers/{account}/{post_id}")
+def dashboard_cover(account: str, post_id: int) -> FileResponse:
+    """Serve a post cover for any account. Non-canonical accounts lazily
+    download and cache from the original CDN URL on first request (avoids
+    eagerly downloading covers for every post during import/backfill).
+    """
+    try:
+        cfg = get_account_config(account)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=404, detail="Unknown account.") from exc
+
+    if cfg["is_canonical"]:
+        with connect() as conn:
+            row = conn.execute("SELECT image_path FROM posts WHERE id = ?", (post_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Post cover not found.")
+        image_path = Path(str(row["image_path"]))
+        if not image_path.is_file():
+            raise HTTPException(status_code=404, detail="Post cover file is unavailable.")
+        return FileResponse(image_path)
+
     with connect() as conn:
-        row = conn.execute("SELECT image_path FROM posts WHERE id = ?", (post_id,)).fetchone()
+        row = conn.execute(
+            "SELECT cover_image_path, cover_source_url FROM dashboard_posts WHERE id = ? AND account = ?",
+            (post_id, account),
+        ).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Post cover not found.")
 
-    image_path = Path(str(row["image_path"]))
-    if not image_path.is_file():
-        raise HTTPException(status_code=404, detail="Post cover file is unavailable.")
-    return FileResponse(image_path)
+    image_path = Path(str(row["cover_image_path"])) if row["cover_image_path"] else None
+    if image_path and image_path.is_file():
+        return FileResponse(image_path)
+
+    cover_source_url = row["cover_source_url"]
+    if not cover_source_url:
+        raise HTTPException(status_code=404, detail="Post cover is unavailable.")
+
+    import httpx
+
+    try:
+        response = httpx.get(cover_source_url, timeout=20.0, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch cover: {exc}") from exc
+
+    suffix = ".jpg"
+    content_type = response.headers.get("content-type", "")
+    if "png" in content_type:
+        suffix = ".png"
+    elif "webp" in content_type:
+        suffix = ".webp"
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    new_path = UPLOAD_DIR / f"dash-{account}-{os.urandom(16).hex()}{suffix}"
+    new_path.write_bytes(response.content)
+
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dashboard_posts SET cover_image_path = ? WHERE id = ?",
+            (str(new_path), post_id),
+        )
+
+    return FileResponse(new_path)
+
+
+@app.post("/api/dashboard/refresh")
+def dashboard_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
+    """Password-gated manual override: runs the short-term (<=24h + HOT
+    check) and daily (>24h-10day, 30d, 120d) engagement cycles for every
+    active account -- Sentient and Competitors alike. Gated because each
+    call costs Apify credits and writes to the live database.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+
+    results: dict[str, Any] = {}
+    for account in list_accounts(active_only=True):
+        handle = account["handle"]
+        try:
+            results[handle] = run_manual_refresh(handle)
+        except ApifySyncError as exc:
+            results[handle] = {"error": str(exc)}
+    return results
+
+
+@app.get("/api/admin/accounts")
+def admin_list_accounts() -> dict[str, Any]:
+    """Full roster including inactive accounts, for the admin UI."""
+    return {"accounts": list_accounts(active_only=False)}
+
+
+@app.post("/api/admin/accounts")
+def admin_create_account(
+    password: Annotated[str, Form()],
+    handle: Annotated[str, Form()],
+    label: Annotated[str, Form()] = "",
+    group: Annotated[str, Form()] = "competitors",
+    hot_threshold: Annotated[int, Form()] = 600,
+) -> dict[str, Any]:
+    """Self-serve account creation: register a new IG handle under Sentient
+    or Competitors, no code changes or redeploy required. Always
+    non-canonical -- writes into the generic dashboard_posts table, never
+    Predict's `posts`. Automatically picked up by the scheduler on its next
+    tick; call the backfill endpoint below afterward to seed initial history.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    try:
+        account = create_account(handle, label, group, hot_threshold)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"account": account}
+
+
+@app.post("/api/admin/accounts/{handle}/deactivate")
+def admin_deactivate_account(handle: str, password: Annotated[str, Form()]) -> dict[str, Any]:
+    """Soft-disable an account: stops the scheduler from touching it and
+    hides it from the public roster, without deleting its post history.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    if handle == "chatgptricks":
+        raise HTTPException(status_code=400, detail="Cannot deactivate the canonical account.")
+    with connect() as conn:
+        cursor = conn.execute(
+            "UPDATE accounts SET is_active = 0, updated_at = ? WHERE handle = ?",
+            (utc_now(), handle),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Unknown account.")
+    return {"ok": True, "handle": handle, "deactivated": True}
+
+
+@app.post("/api/admin/accounts/{handle}/backfill")
+def admin_backfill_account(
+    handle: str,
+    password: Annotated[str, Form()],
+    results_limit: Annotated[int, Form()] = 200,
+) -> dict[str, Any]:
+    """One-time initial history import for a freshly self-serve-added
+    account, so it has a real post history before the scheduler starts
+    incrementally refreshing it.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    try:
+        return run_backfill(handle, results_limit=results_limit)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/admin/reset-hot-check")
@@ -254,15 +458,19 @@ def reset_hot_check(password: Annotated[str, Form()], account: Annotated[str, Fo
         password.strip(), TRICKS_DASH_REFRESH_PASSWORD
     ):
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
-    table = {"chatgptricks": "posts", "traselveloreal": "traselveloreal_posts"}.get(account)
-    if not table:
-        raise HTTPException(status_code=400, detail="Unknown account.")
+    try:
+        cfg = get_account_config(account)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=400, detail="Unknown account.") from exc
+    table = cfg["table"]
+    scope_sql = " AND account = ?" if table == "dashboard_posts" else ""
+    scope_params: tuple[Any, ...] = (account,) if table == "dashboard_posts" else ()
 
     from datetime import UTC, datetime
 
     with connect() as conn:
         rows = conn.execute(
-            f"SELECT id, published_at FROM {table} WHERE hot_checked = 1"
+            f"SELECT id, published_at FROM {table} WHERE hot_checked = 1{scope_sql}", scope_params
         ).fetchall()
 
     now = datetime.now(UTC)
@@ -316,14 +524,12 @@ def create_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
     ):
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
 
-    from .apify_sync import ACCOUNT_CONFIG
-
-    threshold = ACCOUNT_CONFIG["traselveloreal"]["hot_threshold"]
+    threshold = get_account_config("traselveloreal")["hot_threshold"]
 
     with connect() as conn:
         sample = conn.execute(
-            "SELECT cover_image_path, cover_source_url FROM traselveloreal_posts "
-            "WHERE cover_image_path IS NOT NULL AND shortcode NOT LIKE ? LIMIT 1",
+            "SELECT cover_image_path, cover_source_url FROM dashboard_posts "
+            "WHERE account = 'traselveloreal' AND cover_image_path IS NOT NULL AND shortcode NOT LIKE ? LIMIT 1",
             (f"{_TEST_HOT_SHORTCODE_PREFIX}%",),
         ).fetchone()
     cover_image_path = sample["cover_image_path"] if sample else None
@@ -333,20 +539,20 @@ def create_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
     created = []
     with connect() as conn:
         conn.execute(
-            "DELETE FROM traselveloreal_posts WHERE shortcode LIKE ?",
+            "DELETE FROM dashboard_posts WHERE account = 'traselveloreal' AND shortcode LIKE ?",
             (f"{_TEST_HOT_SHORTCODE_PREFIX}%",),
         )
         for shortcode, multiplier, note in _TEST_HOT_SCENARIOS:
             likes = int(round(multiplier * threshold))
             conn.execute(
                 """
-                INSERT INTO traselveloreal_posts (
-                    shortcode, published_at, likes, comments, caption,
+                INSERT INTO dashboard_posts (
+                    account, shortcode, published_at, likes, comments, caption,
                     post_type_label, is_animated, permalink,
                     cover_source_url, cover_image_path,
                     is_hot, likes_at_1h, hot_checked, hot_marked_at, hot_rate_multiplier,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?, ?, ?)
+                ) VALUES ('traselveloreal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?, ?, ?)
                 """,
                 (
                     shortcode,
@@ -380,267 +586,11 @@ def delete_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
     with connect() as conn:
         cursor = conn.execute(
-            "DELETE FROM traselveloreal_posts WHERE shortcode LIKE ?",
+            "DELETE FROM dashboard_posts WHERE shortcode LIKE ?",
             (f"{_TEST_HOT_SHORTCODE_PREFIX}%",),
         )
         deleted = cursor.rowcount
     return {"deleted": deleted}
-
-
-@app.post("/api/tricks-dash/refresh")
-def tricks_dash_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
-    """Public but password-gated manual override: runs the same short-term
-    (<=24h + HOT check) and daily (>24h-10day, 30d, 120d) engagement cycles
-    that also run automatically on schedule. Gated with
-    TRICKS_DASH_REFRESH_PASSWORD (a dedicated password, separate from
-    PREDICT_API_KEY, since tricks-dash routes are deliberately public and
-    this password may be shared with non-admins) because each call costs
-    Apify credits and writes to the live database.
-    """
-    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
-        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
-    ):
-        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
-    try:
-        return run_manual_refresh("chatgptricks")
-    except ApifySyncError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
-# ---------------------------------------------------------------------------
-# @traselveloreal -- Sentient Dash's second account. Lives in its own table
-# (traselveloreal_posts), fully separate from `posts` / Predict's canonical
-# Post DB, per prior product decision.
-# ---------------------------------------------------------------------------
-
-
-@app.get("/api/traselveloreal/posts")
-def traselveloreal_posts() -> dict[str, Any]:
-    """Public, read-only projection for Sentient Dash's second account."""
-    with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, shortcode, published_at, likes, comments, caption,
-                   post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
-                   cover_image_path, cover_source_url, created_at
-            FROM traselveloreal_posts
-            ORDER BY
-                CASE WHEN published_at IS NULL OR TRIM(published_at) = '' THEN 1 ELSE 0 END,
-                published_at DESC,
-                created_at DESC
-            """
-        ).fetchall()
-
-    posts: list[dict[str, Any]] = []
-    for index, row in enumerate(rows, start=1):
-        post = dict(row)
-        shortcode = str(post.get("shortcode") or "").strip()
-        post_type = str(post.get("post_type_label") or "").strip() or "Image"
-        has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
-        posts.append(
-            {
-                "rank": index,
-                "postDate": post.get("published_at"),
-                "likes": int(post.get("likes") or 0),
-                "comments": int(post.get("comments") or 0),
-                "type": post_type,
-                "video": "Yes" if has_video else "No",
-                "shortcode": shortcode,
-                "permalink": post.get("permalink") or (f"https://www.instagram.com/p/{shortcode}/" if shortcode else ""),
-                "caption": post.get("caption") or "",
-                "excerpt": post.get("caption") or "",
-                "section": "single",
-                "ocrText": "",
-                "coverUrl": f"/api/traselveloreal/covers/{post['id']}",
-                "isHot": bool(post.get("is_hot")),
-                "hotMultiplier": post.get("hot_rate_multiplier"),
-                "account": "traselveloreal",
-            }
-        )
-
-    total_likes = sum(post["likes"] for post in posts)
-    return {
-        "posts": posts,
-        "summary": {
-            "Exported posts": len(posts),
-            "Total likes": total_likes,
-            "Average likes": round(total_likes / len(posts)) if posts else 0,
-        },
-    }
-
-
-@app.get("/api/traselveloreal/covers/{post_id}")
-def traselveloreal_cover(post_id: int) -> FileResponse:
-    """Serves a traselveloreal cover, lazily downloading and caching it from
-    the original Instagram CDN URL on first request if not already stored
-    locally (avoids eagerly downloading thousands of covers during import).
-    """
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT cover_image_path, cover_source_url FROM traselveloreal_posts WHERE id = ?", (post_id,)
-        ).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Post cover not found.")
-
-    image_path = Path(str(row["cover_image_path"])) if row["cover_image_path"] else None
-    if image_path and image_path.is_file():
-        return FileResponse(image_path)
-
-    cover_source_url = row["cover_source_url"]
-    if not cover_source_url:
-        raise HTTPException(status_code=404, detail="Post cover is unavailable.")
-
-    import httpx
-
-    try:
-        response = httpx.get(cover_source_url, timeout=20.0, headers={"User-Agent": "Mozilla/5.0"})
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Could not fetch cover: {exc}") from exc
-
-    suffix = ".jpg"
-    content_type = response.headers.get("content-type", "")
-    if "png" in content_type:
-        suffix = ".png"
-    elif "webp" in content_type:
-        suffix = ".webp"
-
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    new_path = UPLOAD_DIR / f"trasel-{os.urandom(16).hex()}{suffix}"
-    new_path.write_bytes(response.content)
-
-    with connect() as conn:
-        conn.execute(
-            "UPDATE traselveloreal_posts SET cover_image_path = ? WHERE id = ?",
-            (str(new_path), post_id),
-        )
-
-    return FileResponse(new_path)
-
-
-@app.post("/api/traselveloreal/refresh")
-def traselveloreal_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
-    """Manual override for @traselveloreal, mirroring /api/tricks-dash/refresh."""
-    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
-        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
-    ):
-        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
-    try:
-        return run_manual_refresh("traselveloreal")
-    except ApifySyncError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
-@app.post("/api/traselveloreal/import-legacy")
-def traselveloreal_import_legacy(
-    password: Annotated[str, Form()],
-    payload: Annotated[str, Form()],
-) -> dict[str, Any]:
-    """One-time bulk import for migrating the previously-static @traselveloreal
-    dataset onto this live backend. `payload` is a JSON array of objects with
-    shortcode/postDate/likes/comments/type/video/caption/permalink/coverUrl
-    (the same shape as the bundled traselveloreal-posts.json). Idempotent:
-    posts already present (matched by shortcode) are skipped.
-    """
-    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
-        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
-    ):
-        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
-
-    try:
-        items = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
-    if not isinstance(items, list):
-        raise HTTPException(status_code=400, detail="Payload must be a JSON array.")
-
-    with connect() as conn:
-        existing = {row["shortcode"] for row in conn.execute("SELECT shortcode FROM traselveloreal_posts").fetchall()}
-
-    now = utc_now()
-    added = 0
-    skipped = 0
-    failed = 0
-    for item in items:
-        shortcode = str(item.get("shortcode") or "").strip()
-        if not shortcode or shortcode in existing:
-            skipped += 1
-            continue
-        post_type = str(item.get("type") or "Image")
-        is_video = 1 if str(item.get("video") or "").lower() == "yes" else 0
-        cover_url = item.get("coverUrl") or ""
-        # Legacy JSON rewrote reel covers to relative frontend paths
-        # (/traselveloreal-covers/<shortcode>.jpg) for local static serving.
-        # Those aren't fetchable CDN URLs, so leave cover_source_url empty
-        # for them -- local files get pushed separately via the covers
-        # upload step, which sets cover_image_path directly.
-        cover_source_url = cover_url if str(cover_url).startswith("http") else None
-        try:
-            with connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO traselveloreal_posts (
-                        shortcode, published_at, likes, comments, caption,
-                        post_type_label, is_animated, permalink,
-                        cover_source_url, cover_image_path, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-                    """,
-                    (
-                        shortcode,
-                        item.get("postDate"),
-                        int(item.get("likes") or 0),
-                        int(item.get("comments") or 0),
-                        item.get("caption") or "",
-                        post_type,
-                        is_video,
-                        item.get("permalink") or f"https://www.instagram.com/p/{shortcode}/",
-                        cover_source_url,
-                        now,
-                        now,
-                    ),
-                )
-            existing.add(shortcode)
-            added += 1
-        except Exception:
-            failed += 1
-
-    return {"received": len(items), "added": added, "skipped": skipped, "failed": failed}
-
-
-@app.post("/api/traselveloreal/covers/{shortcode}/upload")
-def traselveloreal_upload_cover(
-    shortcode: str,
-    password: Annotated[str, Form()],
-    file: UploadFile = File(...),
-) -> dict[str, Any]:
-    """Pushes a locally-held cover image (used for the 496 reel covers that
-    were already downloaded during the earlier static-site era) directly
-    into backend storage, bypassing the CDN (which may have expired).
-    """
-    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
-        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
-    ):
-        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
-
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT id FROM traselveloreal_posts WHERE shortcode = ?", (shortcode,)
-        ).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Unknown shortcode.")
-
-    suffix = Path(file.filename or "cover.jpg").suffix or ".jpg"
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    new_path = UPLOAD_DIR / f"trasel-{os.urandom(16).hex()}{suffix}"
-    new_path.write_bytes(file.file.read())
-
-    with connect() as conn:
-        conn.execute(
-            "UPDATE traselveloreal_posts SET cover_image_path = ? WHERE id = ?",
-            (str(new_path), row["id"]),
-        )
-
-    return {"ok": True, "shortcode": shortcode}
 
 
 @app.get("/api/calibration")

@@ -7,28 +7,103 @@ from typing import Any
 
 APIFY_ACTOR_ID = "apify~instagram-scraper"
 
-# Per-account config for the automated like-refresh system. chatgptricks
-# lives in the canonical `posts` table (shared with Predict's prediction
-# model); traselveloreal is a fully separate table/dataset that must never
-# be mixed into `posts` (explicit prior product decision -- see README).
-ACCOUNT_CONFIG: dict[str, dict[str, Any]] = {
-    "chatgptricks": {
-        "ig_handle": "chatgptricks",
-        "table": "posts",
-        # Rule: 600 likes accumulated within the first hour of posting.
-        "hot_threshold": 600,
-    },
-    "traselveloreal": {
-        "ig_handle": "traselveloreal",
-        "table": "traselveloreal_posts",
-        # Rule: 1500 likes accumulated within the first hour of posting.
-        "hot_threshold": 1500,
-    },
-}
+VALID_GROUPS = ("sentient", "competitors")
+
+# The only canonical account is chatgptricks -- it lives in `posts`, the
+# table shared with Predict's prediction model. Every other account (self-
+# serve or seeded) lives in the generic `dashboard_posts` table, keyed by
+# `account`, and must never be merged into `posts` (explicit prior product
+# decision -- see README).
+_CANONICAL_HANDLE = "chatgptricks"
 
 
 class ApifySyncError(RuntimeError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Account registry (DB-driven, self-serve -- see /api/admin/accounts)
+# ---------------------------------------------------------------------------
+
+
+def get_account_config(handle: str) -> dict[str, Any]:
+    from .db import connect
+
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM accounts WHERE handle = ?", (handle,)).fetchone()
+    if row is None:
+        raise ApifySyncError(f"Unknown account '{handle}'.")
+    is_canonical = bool(row["is_canonical"])
+    return {
+        "handle": row["handle"],
+        "label": row["label"],
+        "group": row["group_name"],
+        "hot_threshold": row["hot_threshold"],
+        "is_canonical": is_canonical,
+        "is_active": bool(row["is_active"]),
+        "table": "posts" if is_canonical else "dashboard_posts",
+    }
+
+
+def list_accounts(active_only: bool = False) -> list[dict[str, Any]]:
+    from .db import connect
+
+    query = "SELECT * FROM accounts"
+    if active_only:
+        query += " WHERE is_active = 1"
+    query += " ORDER BY group_name, handle"
+    with connect() as conn:
+        rows = conn.execute(query).fetchall()
+    return [
+        {
+            "handle": row["handle"],
+            "label": row["label"],
+            "group": row["group_name"],
+            "hot_threshold": row["hot_threshold"],
+            "is_canonical": bool(row["is_canonical"]),
+            "is_active": bool(row["is_active"]),
+        }
+        for row in rows
+    ]
+
+
+def create_account(handle: str, label: str, group: str, hot_threshold: int) -> dict[str, Any]:
+    """Self-serve account creation. Always non-canonical -- new accounts
+    always write into the generic dashboard_posts table, never `posts`.
+    """
+    from .db import connect, utc_now
+
+    handle = handle.strip().lstrip("@").lower()
+    if not handle:
+        raise ApifySyncError("Account handle is required.")
+    if group not in VALID_GROUPS:
+        raise ApifySyncError(f"Group must be one of {VALID_GROUPS}.")
+    label = (label or handle).strip()
+    now_iso = utc_now()
+
+    with connect() as conn:
+        existing = conn.execute("SELECT handle FROM accounts WHERE handle = ?", (handle,)).fetchone()
+        if existing:
+            raise ApifySyncError(f"Account '{handle}' already exists.")
+        conn.execute(
+            """
+            INSERT INTO accounts (handle, label, group_name, hot_threshold, is_canonical, is_active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 0, 1, ?, ?)
+            """,
+            (handle, label, group, hot_threshold, now_iso, now_iso),
+        )
+
+    return get_account_config(handle)
+
+
+def _account_scope(table: str, account: str) -> tuple[str, tuple]:
+    """Extra WHERE-clause SQL + params to scope a query to one account when
+    reading/writing the shared dashboard_posts table. The canonical `posts`
+    table has no account column (chatgptricks only), so no scoping needed.
+    """
+    if table == "dashboard_posts":
+        return " AND account = ?", (account,)
+    return "", ()
 
 
 def _clean_text(value: Any) -> str:
@@ -116,7 +191,7 @@ def _fetch_apify_items(payload: dict[str, Any], timeout: float = 180.0) -> list[
 
 
 # ---------------------------------------------------------------------------
-# New-post insertion (account-specific: different tables/columns)
+# New-post insertion
 # ---------------------------------------------------------------------------
 
 
@@ -210,9 +285,9 @@ def _insert_new_chatgptricks_posts(new_items: list[dict[str, Any]]) -> dict[str,
     return summary
 
 
-def _insert_new_traselveloreal_posts(new_items: list[dict[str, Any]]) -> dict[str, Any]:
-    """Same shape as the chatgptricks insert, but writes into the standalone
-    traselveloreal_posts table (never into `posts` / Predict's Post DB).
+def _insert_new_dashboard_posts(account: str, new_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Generic insert used by every non-canonical account (Sentient or
+    Competitors) into the shared dashboard_posts table, scoped by `account`.
     """
     import httpx
 
@@ -240,7 +315,7 @@ def _insert_new_traselveloreal_posts(new_items: list[dict[str, Any]]) -> dict[st
                         suffix = ".png"
                     elif "webp" in content_type:
                         suffix = ".webp"
-                    image_path = UPLOAD_DIR / f"trasel-{os.urandom(16).hex()}{suffix}"
+                    image_path = UPLOAD_DIR / f"dash-{account}-{os.urandom(16).hex()}{suffix}"
                     image_path.write_bytes(image_response.content)
                     cover_path = str(image_path)
                 except httpx.HTTPError:
@@ -257,13 +332,14 @@ def _insert_new_traselveloreal_posts(new_items: list[dict[str, Any]]) -> dict[st
                 with connect() as conn:
                     conn.execute(
                         """
-                        INSERT INTO traselveloreal_posts (
-                            shortcode, published_at, likes, comments, caption,
+                        INSERT INTO dashboard_posts (
+                            account, shortcode, published_at, likes, comments, caption,
                             post_type_label, is_animated, permalink,
                             cover_source_url, cover_image_path, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
+                            account,
                             shortcode,
                             _published_at(item),
                             likes,
@@ -289,10 +365,10 @@ def _insert_new_traselveloreal_posts(new_items: list[dict[str, Any]]) -> dict[st
     return summary
 
 
-_INSERT_FUNCS = {
-    "chatgptricks": _insert_new_chatgptricks_posts,
-    "traselveloreal": _insert_new_traselveloreal_posts,
-}
+def _insert_new_posts(account: str, cfg: dict[str, Any], new_items: list[dict[str, Any]]) -> dict[str, Any]:
+    if cfg["is_canonical"]:
+        return _insert_new_chatgptricks_posts(new_items)
+    return _insert_new_dashboard_posts(account, new_items)
 
 
 # ---------------------------------------------------------------------------
@@ -307,12 +383,13 @@ def run_short_term_cycle(account: str, results_limit: int = 80) -> dict[str, Any
     >=1h old: is_hot=1 if likes >= the account's per-hour threshold at that
     point. Both pieces reuse a single Apify fetch to minimize API calls.
     """
-    cfg = ACCOUNT_CONFIG[account]
+    cfg = get_account_config(account)
     table = cfg["table"]
+    scope_sql, scope_params = _account_scope(table, account)
     now = datetime.now(UTC)
 
     payload: dict[str, Any] = {
-        "directUrls": [f"https://www.instagram.com/{cfg['ig_handle']}/"],
+        "directUrls": [f"https://www.instagram.com/{cfg['handle']}/"],
         "resultsType": "posts",
         "resultsLimit": results_limit,
         "skipPinnedPosts": True,
@@ -323,18 +400,22 @@ def run_short_term_cycle(account: str, results_limit: int = 80) -> dict[str, Any
     from .db import connect, utc_now
 
     with connect() as conn:
-        existing_rows = conn.execute(f"SELECT shortcode FROM {table}").fetchall()
+        existing_rows = conn.execute(
+            f"SELECT shortcode FROM {table} WHERE 1=1{scope_sql}", scope_params
+        ).fetchall()
     existing_shortcodes = {row["shortcode"] for row in existing_rows if row["shortcode"]}
 
     new_items = [it for it in items if it.get("shortCode") and it["shortCode"] not in existing_shortcodes]
     new_items.sort(key=lambda it: it.get("timestamp") or "")
-    insert_summary = _INSERT_FUNCS[account](new_items)
+    insert_summary = _insert_new_posts(account, cfg, new_items)
 
     # Re-read so freshly-inserted posts are also eligible for the engagement
     # pass below (a post that's brand new is, by definition, well within the
     # <=24h window).
     with connect() as conn:
-        rows = conn.execute(f"SELECT id, shortcode, published_at, hot_checked FROM {table}").fetchall()
+        rows = conn.execute(
+            f"SELECT id, shortcode, published_at, hot_checked FROM {table} WHERE 1=1{scope_sql}", scope_params
+        ).fetchall()
 
     eligible: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -402,18 +483,17 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
     untouched. <=24h posts are excluded here -- they're handled by
     run_short_term_cycle instead.
 
-    Instead of re-scraping the whole profile (which used to mean paginating
-    up to 125 days / 550 posts back on the off chance a post was turning 30
-    or 120 days old today), this looks up the exact set of eligible post IDs
-    in our own database first, then asks Apify to scrape *only those specific
-    post URLs* (resultsType="details" against directUrls of individual posts).
-    Cost scales with how many posts actually need a refresh today (typically
-    a few dozen), not with a fixed 125-day/550-post ceiling re-walked daily.
+    Looks up the exact set of eligible post IDs in our own database first,
+    then asks Apify to scrape *only those specific post URLs*
+    (resultsType="details" against directUrls of individual posts). Cost
+    scales with how many posts actually need a refresh today (typically a
+    few dozen), not with a fixed lookback window re-walked daily.
     """
-    cfg = ACCOUNT_CONFIG[account]
+    cfg = get_account_config(account)
     table = cfg["table"]
+    scope_sql, scope_params = _account_scope(table, account)
     now = datetime.now(UTC)
-    has_permalink_column = table == "traselveloreal_posts"
+    has_permalink_column = table == "dashboard_posts"
 
     from .db import connect, utc_now
 
@@ -423,7 +503,9 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
 
     with connect() as conn:
         rows = conn.execute(
-            f"SELECT {select_cols} FROM {table} WHERE shortcode IS NOT NULL AND shortcode != ''"
+            f"SELECT {select_cols} FROM {table} "
+            f"WHERE shortcode IS NOT NULL AND shortcode != ''{scope_sql}",
+            scope_params,
         ).fetchall()
 
     eligible: dict[str, dict[str, Any]] = {}
@@ -494,3 +576,35 @@ def run_manual_refresh(account: str) -> dict[str, Any]:
     short_term = run_short_term_cycle(account)
     daily = run_daily_cycle(account)
     return {"short_term": short_term, "daily": daily}
+
+
+def run_backfill(account: str, results_limit: int = 200) -> dict[str, Any]:
+    """One-time initial history import for a freshly self-serve-added
+    account: pulls up to `results_limit` recent posts (no date filter) and
+    inserts any not already known. Meant to be triggered once right after
+    an account is created via /api/admin/accounts, so it has a real post
+    history before the normal scheduler starts incrementally refreshing it.
+    """
+    cfg = get_account_config(account)
+    table = cfg["table"]
+    scope_sql, scope_params = _account_scope(table, account)
+
+    payload: dict[str, Any] = {
+        "directUrls": [f"https://www.instagram.com/{cfg['handle']}/"],
+        "resultsType": "posts",
+        "resultsLimit": results_limit,
+        "skipPinnedPosts": True,
+    }
+    items = _fetch_apify_items(payload, timeout=300.0)
+
+    from .db import connect
+
+    with connect() as conn:
+        existing_rows = conn.execute(
+            f"SELECT shortcode FROM {table} WHERE 1=1{scope_sql}", scope_params
+        ).fetchall()
+    existing_shortcodes = {row["shortcode"] for row in existing_rows if row["shortcode"]}
+
+    new_items = [it for it in items if it.get("shortCode") and it["shortCode"] not in existing_shortcodes]
+    new_items.sort(key=lambda it: it.get("timestamp") or "")
+    return _insert_new_posts(account, cfg, new_items)
