@@ -371,20 +371,6 @@ def create_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
     return {"created": created}
 
 
-@app.get("/api/admin/delete-test-hot-posts-oneoff")
-def delete_test_hot_posts_oneoff() -> dict[str, Any]:
-    """TEMPORARY, no-auth, one-time cleanup helper -- deletes only the fixed
-    TESTHOT-* dummy rows created for visual QA. Remove this endpoint after use.
-    """
-    with connect() as conn:
-        cursor = conn.execute(
-            "DELETE FROM traselveloreal_posts WHERE shortcode LIKE ?",
-            (f"{_TEST_HOT_SHORTCODE_PREFIX}%",),
-        )
-        deleted = cursor.rowcount
-    return {"deleted": deleted}
-
-
 @app.post("/api/admin/delete-test-hot-posts")
 def delete_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
     """Removes the dummy posts created by /api/admin/create-test-hot-posts."""
