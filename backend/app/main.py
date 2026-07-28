@@ -100,7 +100,11 @@ async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
             # password-gated refresh/import, checked inside the handlers).
             and not path.startswith("/api/tricks-dash/")
             and not path.startswith("/api/traselveloreal/")
-            and path != "/api/admin/reset-hot-check"
+            # /api/admin/* routes are individually password-gated inside
+            # their own handlers (TRICKS_DASH_REFRESH_PASSWORD), same as
+            # tricks-dash/traselveloreal -- no need to also require the
+            # main admin API key.
+            and not path.startswith("/api/admin/")
         ):
             provided = request.headers.get("x-api-key") or request.query_params.get("token")
             if provided != PREDICT_API_KEY:
@@ -287,6 +291,100 @@ def reset_hot_check(password: Annotated[str, Form()], account: Annotated[str, Fo
             )
 
     return {"account": account, "reset": len(reset_ids)}
+
+
+_TEST_HOT_SHORTCODE_PREFIX = "TESTHOT-"
+_TEST_HOT_SCENARIOS = [
+    ("TESTHOT-1x", 1.2, "Tier 1 - just over the line, base badge"),
+    ("TESTHOT-2x", 2.4, "Tier 2 - bigger + brighter badge"),
+    ("TESTHOT-3x", 3.3, "Tier 3 - fire creeping up the card"),
+    ("TESTHOT-5x", 5.6, "Tier 4 - blazing: glare sweep + outer glow"),
+    ("TESTHOT-8x", 8.0, "Tier 4 - extreme case, sanity check"),
+]
+
+
+@app.post("/api/admin/create-test-hot-posts")
+def create_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
+    """TEMPORARY QA utility: inserts a handful of dummy @traselveloreal posts
+    with varying hot_rate_multiplier values so the tiered HOT highlight
+    system (badge scaling, fire >=3x, blazing >=5x) can be checked visually
+    on the live site. Re-running replaces the same fixed set of shortcodes
+    (idempotent). Clean up with /api/admin/delete-test-hot-posts.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+
+    from .apify_sync import ACCOUNT_CONFIG
+
+    threshold = ACCOUNT_CONFIG["traselveloreal"]["hot_threshold"]
+
+    with connect() as conn:
+        sample = conn.execute(
+            "SELECT cover_image_path, cover_source_url FROM traselveloreal_posts "
+            "WHERE cover_image_path IS NOT NULL AND shortcode NOT LIKE ? LIMIT 1",
+            (f"{_TEST_HOT_SHORTCODE_PREFIX}%",),
+        ).fetchone()
+    cover_image_path = sample["cover_image_path"] if sample else None
+    cover_source_url = sample["cover_source_url"] if sample else None
+
+    now_iso = utc_now()
+    created = []
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM traselveloreal_posts WHERE shortcode LIKE ?",
+            (f"{_TEST_HOT_SHORTCODE_PREFIX}%",),
+        )
+        for shortcode, multiplier, note in _TEST_HOT_SCENARIOS:
+            likes = int(round(multiplier * threshold))
+            conn.execute(
+                """
+                INSERT INTO traselveloreal_posts (
+                    shortcode, published_at, likes, comments, caption,
+                    post_type_label, is_animated, permalink,
+                    cover_source_url, cover_image_path,
+                    is_hot, likes_at_1h, hot_checked, hot_marked_at, hot_rate_multiplier,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    shortcode,
+                    now_iso,
+                    likes,
+                    max(1, likes // 20),
+                    f"[TEST DUMMY -- safe to delete] {note}. Rate multiplier {multiplier}x.",
+                    "Image",
+                    0,
+                    "",
+                    cover_source_url,
+                    cover_image_path,
+                    likes,
+                    now_iso,
+                    multiplier,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            created.append({"shortcode": shortcode, "multiplier": multiplier, "likes": likes})
+
+    return {"created": created}
+
+
+@app.post("/api/admin/delete-test-hot-posts")
+def delete_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
+    """Removes the dummy posts created by /api/admin/create-test-hot-posts."""
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    with connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM traselveloreal_posts WHERE shortcode LIKE ?",
+            (f"{_TEST_HOT_SHORTCODE_PREFIX}%",),
+        )
+        deleted = cursor.rowcount
+    return {"deleted": deleted}
 
 
 @app.post("/api/tricks-dash/refresh")
