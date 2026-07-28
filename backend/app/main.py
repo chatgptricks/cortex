@@ -383,17 +383,6 @@ def admin_list_accounts() -> dict[str, Any]:
     return {"accounts": list_accounts(active_only=False)}
 
 
-@app.post("/api/admin/_temp-avatar/{handle}")
-def temp_avatar(handle: str) -> dict[str, Any]:
-    """TEMPORARY -- one-off: cache the avatar for an account created before
-    avatar-caching was wired into account creation. Remove after use."""
-    try:
-        fetch_and_store_avatar(handle)
-        return {"ok": True}
-    except ApifySyncError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
 
 @app.get("/api/admin/accounts/preview")
 def admin_preview_account(handle: str) -> dict[str, Any]:
