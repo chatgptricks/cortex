@@ -381,6 +381,26 @@ def admin_list_accounts() -> dict[str, Any]:
     return {"accounts": list_accounts(active_only=False)}
 
 
+@app.get("/api/admin/_temp-apify-status")
+def temp_apify_status() -> dict[str, Any]:
+    """TEMPORARY diagnostic -- checks the Apify account behind APIFY_TOKEN
+    (plan, usage, limits) to explain a 403 from the scraper actor. Remove
+    after use."""
+    import os
+
+    import httpx
+
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    if not token:
+        return {"error": "APIFY_TOKEN not set on the server."}
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            response = client.get("https://api.apify.com/v2/users/me", params={"token": token})
+        return {"status_code": response.status_code, "body": response.json() if response.content else None}
+    except httpx.HTTPError as exc:
+        return {"error": str(exc)}
+
+
 @app.get("/api/admin/accounts/preview")
 def admin_preview_account(handle: str) -> dict[str, Any]:
     """Read-only lookup used by the add-account wizard's first step to show
