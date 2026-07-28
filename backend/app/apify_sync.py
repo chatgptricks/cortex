@@ -447,7 +447,7 @@ def _insert_new_posts(account: str, cfg: dict[str, Any], new_items: list[dict[st
 
 
 # ---------------------------------------------------------------------------
-# Short-term cycle: every 30 min (7:30am-11:30pm fixed CST), posts <=24h old
+# Short-term cycle: hourly (7:30am-11:30pm fixed CST), posts <=24h old
 # ---------------------------------------------------------------------------
 
 

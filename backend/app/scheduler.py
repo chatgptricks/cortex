@@ -29,10 +29,12 @@ def _in_short_job_window(now_cst: datetime) -> bool:
 
 
 def _bucket_key(now_cst: datetime) -> str:
-    """30-minute bucket identifier, e.g. '2026-07-27T07:30' -- used so a
-    tick loop that wakes every ~30s only fires each job once per bucket."""
-    bucket_minute = 0 if now_cst.minute < 30 else 30
-    return now_cst.strftime("%Y-%m-%dT%H:") + f"{bucket_minute:02d}"
+    """Hourly bucket identifier, e.g. '2026-07-27T07' -- used so a tick loop
+    that wakes every ~30s only fires each job once per bucket. HOT detection
+    still works fine on this coarser cadence: the "first hour" check already
+    computes an actual likes/hour rate from the post's real age rather than
+    assuming exactly 1.0h, so it stays accurate however the tick lands."""
+    return now_cst.strftime("%Y-%m-%dT%H")
 
 
 def _active_account_handles() -> list[str]:
@@ -117,6 +119,6 @@ def start_scheduler() -> None:
     thread = threading.Thread(target=_loop, daemon=True, name="engagement-scheduler")
     thread.start()
     logger.info(
-        "Engagement scheduler started (short-term: every 30min, 7:30am-11:30pm fixed CST; "
+        "Engagement scheduler started (short-term: hourly, 7:30am-11:30pm fixed CST; "
         "daily: 7:00am fixed CST)"
     )
