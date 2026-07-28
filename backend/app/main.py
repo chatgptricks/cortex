@@ -381,26 +381,6 @@ def admin_list_accounts() -> dict[str, Any]:
     return {"accounts": list_accounts(active_only=False)}
 
 
-@app.get("/api/admin/_temp-apify-status")
-def temp_apify_status(path: str = "users/me") -> dict[str, Any]:
-    """TEMPORARY diagnostic -- checks the Apify account behind APIFY_TOKEN
-    (plan, usage, limits) to explain a 403 from the scraper actor. Remove
-    after use."""
-    import os
-
-    import httpx
-
-    token = os.getenv("APIFY_TOKEN", "").strip()
-    if not token:
-        return {"error": "APIFY_TOKEN not set on the server."}
-    try:
-        with httpx.Client(timeout=20.0) as client:
-            response = client.get(f"https://api.apify.com/v2/{path}", params={"token": token})
-        return {"status_code": response.status_code, "body": response.json() if response.content else None}
-    except httpx.HTTPError as exc:
-        return {"error": str(exc)}
-
-
 @app.get("/api/admin/accounts/preview")
 def admin_preview_account(handle: str) -> dict[str, Any]:
     """Read-only lookup used by the add-account wizard's first step to show
@@ -458,16 +438,6 @@ def admin_deactivate_account(handle: str, password: Annotated[str, Form()]) -> d
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Unknown account.")
     return {"ok": True, "handle": handle, "deactivated": True}
-
-
-@app.post("/api/admin/_temp-topup/{handle}")
-def temp_topup_backfill(handle: str, results_limit: int = 800) -> dict[str, Any]:
-    """TEMPORARY -- no-auth top-up for accounts backfilled under the old
-    200-post cap. Remove after use."""
-    try:
-        return run_backfill(handle, results_limit=results_limit)
-    except ApifySyncError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/admin/accounts/{handle}/backfill")
