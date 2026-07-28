@@ -608,3 +608,36 @@ def run_backfill(account: str, results_limit: int = 200) -> dict[str, Any]:
     new_items = [it for it in items if it.get("shortCode") and it["shortCode"] not in existing_shortcodes]
     new_items.sort(key=lambda it: it.get("timestamp") or "")
     return _insert_new_posts(account, cfg, new_items)
+
+
+def fetch_profile_preview(handle: str) -> dict[str, Any]:
+    """Lightweight lookup for the add-account wizard: a single Apify
+    'details' scrape of the profile URL itself (one result, not paginated
+    posts) so the wizard can show the real profile picture, display name,
+    and follower count before the account is actually created. Read-only --
+    doesn't touch the database at all.
+    """
+    clean = handle.strip().lstrip("@")
+    if not clean:
+        raise ApifySyncError("Handle is required.")
+
+    payload: dict[str, Any] = {
+        "directUrls": [f"https://www.instagram.com/{clean}/"],
+        "resultsType": "details",
+    }
+    items = _fetch_apify_items(payload, timeout=60.0)
+    if not items:
+        raise ApifySyncError("Could not find that Instagram account.")
+
+    item = items[0]
+    if item.get("error"):
+        raise ApifySyncError(item.get("errorDescription") or "Could not find that Instagram account.")
+
+    return {
+        "handle": item.get("username") or clean,
+        "full_name": item.get("fullName"),
+        "profile_pic_url": item.get("profilePicUrlHD") or item.get("profilePicUrl"),
+        "followers_count": item.get("followersCount"),
+        "verified": bool(item.get("verified")),
+        "private": bool(item.get("private")),
+    }

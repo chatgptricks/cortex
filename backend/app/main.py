@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from .apify_sync import (
     ApifySyncError,
     create_account,
+    fetch_profile_preview,
     get_account_config,
     list_accounts,
     run_backfill,
@@ -378,6 +379,19 @@ def dashboard_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
 def admin_list_accounts() -> dict[str, Any]:
     """Full roster including inactive accounts, for the admin UI."""
     return {"accounts": list_accounts(active_only=False)}
+
+
+@app.get("/api/admin/accounts/preview")
+def admin_preview_account(handle: str) -> dict[str, Any]:
+    """Read-only lookup used by the add-account wizard's first step to show
+    the real Instagram profile picture/name/follower count for a handle
+    before the account is actually created. No password required (nothing
+    is written), same as the other /api/dashboard/* read endpoints.
+    """
+    try:
+        return fetch_profile_preview(handle)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/api/admin/accounts")
