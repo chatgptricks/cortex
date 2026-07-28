@@ -605,7 +605,10 @@ def run_backfill(
         "directUrls": [f"https://www.instagram.com/{cfg['handle']}/"],
         "resultsType": "posts",
         "resultsLimit": results_limit,
-        "skipPinnedPosts": True,
+        # Unlike the scheduler's incremental refresh, this is a one-time
+        # historical import -- we want manually pinned posts included too
+        # (they still count toward the account's real post history), so
+        # don't skip them here.
     }
     if date_from:
         payload["onlyPostsNewerThan"] = date_from
