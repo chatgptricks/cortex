@@ -374,6 +374,45 @@ def dashboard_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
     return results
 
 
+@app.get("/api/admin/test-account-flow-oneoff")
+def test_account_flow_oneoff() -> dict[str, Any]:
+    """TEMPORARY, no-auth debug helper to verify the new self-serve account
+    flow (create -> backfill -> appears in dashboard -> deactivate) end to
+    end before announcing it's ready. Remove after verifying.
+    """
+    from .apify_sync import create_account, run_backfill, get_account_config, ApifySyncError as _Err
+
+    handle = "natgeo"
+    result: dict[str, Any] = {}
+    try:
+        try:
+            account = create_account(handle, "National Geographic (test)", "competitors", 600)
+            result["create"] = account
+        except _Err as exc:
+            result["create_error"] = str(exc)
+
+        try:
+            backfill = run_backfill(handle, results_limit=5)
+            result["backfill"] = backfill
+        except _Err as exc:
+            result["backfill_error"] = str(exc)
+
+        with connect() as conn:
+            count_row = conn.execute(
+                "SELECT COUNT(*) AS c FROM dashboard_posts WHERE account = ?", (handle,)
+            ).fetchone()
+        result["dashboard_posts_count"] = count_row["c"] if count_row else 0
+
+        result["account_config"] = get_account_config(handle)
+    finally:
+        with connect() as conn:
+            conn.execute("DELETE FROM dashboard_posts WHERE account = ?", (handle,))
+            conn.execute("DELETE FROM accounts WHERE handle = ?", (handle,))
+        result["cleaned_up"] = True
+
+    return result
+
+
 @app.get("/api/admin/accounts")
 def admin_list_accounts() -> dict[str, Any]:
     """Full roster including inactive accounts, for the admin UI."""
