@@ -578,12 +578,23 @@ def run_manual_refresh(account: str) -> dict[str, Any]:
     return {"short_term": short_term, "daily": daily}
 
 
-def run_backfill(account: str, results_limit: int = 200) -> dict[str, Any]:
+def run_backfill(
+    account: str,
+    results_limit: int = 800,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
     """One-time initial history import for a freshly self-serve-added
-    account: pulls up to `results_limit` recent posts (no date filter) and
-    inserts any not already known. Meant to be triggered once right after
-    an account is created via /api/admin/accounts, so it has a real post
-    history before the normal scheduler starts incrementally refreshing it.
+    account: pulls up to `results_limit` recent posts and inserts any not
+    already known. Meant to be triggered once right after an account is
+    created via /api/admin/accounts, so it has a real post history before
+    the normal scheduler starts incrementally refreshing it.
+
+    date_from/date_to (YYYY-MM-DD) let the wizard offer "all posts" (both
+    omitted) vs a specific date range. Apify's actor only supports a lower
+    bound natively (onlyPostsNewerThan); the upper bound, when given, is
+    applied as a post-fetch filter here since the actor has no "older than"
+    input.
     """
     cfg = get_account_config(account)
     table = cfg["table"]
@@ -595,7 +606,27 @@ def run_backfill(account: str, results_limit: int = 200) -> dict[str, Any]:
         "resultsLimit": results_limit,
         "skipPinnedPosts": True,
     }
+    if date_from:
+        payload["onlyPostsNewerThan"] = date_from
     items = _fetch_apify_items(payload, timeout=300.0)
+
+    if date_to:
+        try:
+            upper_bound = datetime.fromisoformat(date_to).replace(tzinfo=UTC)
+        except ValueError:
+            upper_bound = None
+        if upper_bound is not None:
+            def _within_upper_bound(it: dict[str, Any]) -> bool:
+                ts = it.get("timestamp")
+                if not ts:
+                    return True
+                try:
+                    posted_at = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                except ValueError:
+                    return True
+                return posted_at <= upper_bound + timedelta(days=1)
+
+            items = [it for it in items if _within_upper_bound(it)]
 
     from .db import connect
 

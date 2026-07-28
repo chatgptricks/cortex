@@ -445,17 +445,20 @@ def admin_backfill_account(
     handle: str,
     password: Annotated[str, Form()],
     results_limit: Annotated[int, Form()] = 800,
+    date_from: Annotated[str | None, Form()] = None,
+    date_to: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
     """One-time initial history import for a freshly self-serve-added
     account, so it has a real post history before the scheduler starts
-    incrementally refreshing it.
+    incrementally refreshing it. date_from/date_to (YYYY-MM-DD) are optional
+    -- omit both for "all posts" (bounded only by results_limit).
     """
     if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
         password.strip(), TRICKS_DASH_REFRESH_PASSWORD
     ):
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
     try:
-        return run_backfill(handle, results_limit=results_limit)
+        return run_backfill(handle, results_limit=results_limit, date_from=date_from or None, date_to=date_to or None)
     except ApifySyncError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
