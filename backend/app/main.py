@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .apify_sync import ApifySyncError, refresh_recent_engagement, sync_new_posts_from_apify
+from .apify_sync import ApifySyncError, run_manual_refresh
 from .calibration import fit_calibration, predict_likes
 from .config import (
     ALLOWED_IMAGE_SUFFIXES,
@@ -49,6 +49,7 @@ from .prediction_model import fit_advanced_prediction, predict_performance, pred
 from .prediction_v2 import fit_multi_signal, multi_signal_payload, predict_multi_signal
 from .remote_ocr import RemoteOcrUnavailable, extract_images_text_remote, remote_ocr_status
 from .remote_tribe import RemoteTribeUnavailable, analyze_video_remote, remote_tribe_status
+from .scheduler import start_scheduler
 from .tribe_adapter import TribeUnavailable, analyze_video, tribe_status, write_analysis
 from .video import create_static_video
 
@@ -94,8 +95,11 @@ async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
             and path not in {"/api/health", "/api/auth/check", "/api/auth/login"}
             # The standalone Tricks Dash is a read-only public explorer. Its
             # tightly scoped routes replace the static JSON and public covers
-            # that were already deployed by the dashboard.
+            # that were already deployed by the dashboard. @traselveloreal's
+            # routes are the same kind of public, read-only surface (plus a
+            # password-gated refresh/import, checked inside the handlers).
             and not path.startswith("/api/tricks-dash/")
+            and not path.startswith("/api/traselveloreal/")
         ):
             provided = request.headers.get("x-api-key") or request.query_params.get("token")
             if provided != PREDICT_API_KEY:
@@ -109,6 +113,7 @@ async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
 def startup() -> None:
     init_db()
     _seed_default_metadata_options()
+    start_scheduler()
 
 
 ensure_directories()
@@ -167,7 +172,7 @@ def tricks_dash_posts() -> dict[str, Any]:
             """
             SELECT id, title, caption, hook_text, published_at, likes, comments,
                    post_type_label, shortcode, image_path, is_animated,
-                   source_row_number, created_at, section
+                   source_row_number, created_at, section, is_hot
             FROM posts
             ORDER BY
                 CASE WHEN published_at IS NULL OR TRIM(published_at) = '' THEN 1 ELSE 0 END,
@@ -201,6 +206,8 @@ def tricks_dash_posts() -> dict[str, Any]:
                 # Tricks Dash already indexes ocrText in its search field.
                 "ocrText": post.get("hook_text") or "",
                 "coverUrl": f"/api/tricks-dash/covers/{post['id']}",
+                "isHot": bool(post.get("is_hot")),
+                "account": "chatgptricks",
             }
         )
 
@@ -231,26 +238,257 @@ def tricks_dash_cover(post_id: int) -> FileResponse:
 
 @app.post("/api/tricks-dash/refresh")
 def tricks_dash_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
-    """Public but password-gated: pulls new @chatgptricks posts from Apify's
-    paid Instagram Scraper and inserts anything missing from the DB, then
-    refreshes likes/comments on existing posts that are 10 days old or less
-    (plus one final check at exactly 30 days old -- posts 11-29 or 31+ days
-    old are left untouched). Gated with TRICKS_DASH_REFRESH_PASSWORD (a
-    dedicated password, separate from PREDICT_API_KEY, since tricks-dash
-    routes are deliberately public and this password may be shared with
-    non-admins) because each call costs Apify credits and writes to the live
-    database.
+    """Public but password-gated manual override: runs the same short-term
+    (<=24h + HOT check) and daily (>24h-10day, 30d, 120d) engagement cycles
+    that also run automatically on schedule. Gated with
+    TRICKS_DASH_REFRESH_PASSWORD (a dedicated password, separate from
+    PREDICT_API_KEY, since tricks-dash routes are deliberately public and
+    this password may be shared with non-admins) because each call costs
+    Apify credits and writes to the live database.
     """
     if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
         password.strip(), TRICKS_DASH_REFRESH_PASSWORD
     ):
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
     try:
-        result = sync_new_posts_from_apify()
-        result["engagement_refresh"] = refresh_recent_engagement()
-        return result
+        return run_manual_refresh("chatgptricks")
     except ApifySyncError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# @traselveloreal -- Sentient Dash's second account. Lives in its own table
+# (traselveloreal_posts), fully separate from `posts` / Predict's canonical
+# Post DB, per prior product decision.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/traselveloreal/posts")
+def traselveloreal_posts() -> dict[str, Any]:
+    """Public, read-only projection for Sentient Dash's second account."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, shortcode, published_at, likes, comments, caption,
+                   post_type_label, is_animated, permalink, is_hot,
+                   cover_image_path, cover_source_url, created_at
+            FROM traselveloreal_posts
+            ORDER BY
+                CASE WHEN published_at IS NULL OR TRIM(published_at) = '' THEN 1 ELSE 0 END,
+                published_at DESC,
+                created_at DESC
+            """
+        ).fetchall()
+
+    posts: list[dict[str, Any]] = []
+    for index, row in enumerate(rows, start=1):
+        post = dict(row)
+        shortcode = str(post.get("shortcode") or "").strip()
+        post_type = str(post.get("post_type_label") or "").strip() or "Image"
+        has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
+        posts.append(
+            {
+                "rank": index,
+                "postDate": post.get("published_at"),
+                "likes": int(post.get("likes") or 0),
+                "comments": int(post.get("comments") or 0),
+                "type": post_type,
+                "video": "Yes" if has_video else "No",
+                "shortcode": shortcode,
+                "permalink": post.get("permalink") or (f"https://www.instagram.com/p/{shortcode}/" if shortcode else ""),
+                "caption": post.get("caption") or "",
+                "excerpt": post.get("caption") or "",
+                "section": "single",
+                "ocrText": "",
+                "coverUrl": f"/api/traselveloreal/covers/{post['id']}",
+                "isHot": bool(post.get("is_hot")),
+                "account": "traselveloreal",
+            }
+        )
+
+    total_likes = sum(post["likes"] for post in posts)
+    return {
+        "posts": posts,
+        "summary": {
+            "Exported posts": len(posts),
+            "Total likes": total_likes,
+            "Average likes": round(total_likes / len(posts)) if posts else 0,
+        },
+    }
+
+
+@app.get("/api/traselveloreal/covers/{post_id}")
+def traselveloreal_cover(post_id: int) -> FileResponse:
+    """Serves a traselveloreal cover, lazily downloading and caching it from
+    the original Instagram CDN URL on first request if not already stored
+    locally (avoids eagerly downloading thousands of covers during import).
+    """
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT cover_image_path, cover_source_url FROM traselveloreal_posts WHERE id = ?", (post_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Post cover not found.")
+
+    image_path = Path(str(row["cover_image_path"])) if row["cover_image_path"] else None
+    if image_path and image_path.is_file():
+        return FileResponse(image_path)
+
+    cover_source_url = row["cover_source_url"]
+    if not cover_source_url:
+        raise HTTPException(status_code=404, detail="Post cover is unavailable.")
+
+    import httpx
+
+    try:
+        response = httpx.get(cover_source_url, timeout=20.0, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch cover: {exc}") from exc
+
+    suffix = ".jpg"
+    content_type = response.headers.get("content-type", "")
+    if "png" in content_type:
+        suffix = ".png"
+    elif "webp" in content_type:
+        suffix = ".webp"
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    new_path = UPLOAD_DIR / f"trasel-{os.urandom(16).hex()}{suffix}"
+    new_path.write_bytes(response.content)
+
+    with connect() as conn:
+        conn.execute(
+            "UPDATE traselveloreal_posts SET cover_image_path = ? WHERE id = ?",
+            (str(new_path), post_id),
+        )
+
+    return FileResponse(new_path)
+
+
+@app.post("/api/traselveloreal/refresh")
+def traselveloreal_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
+    """Manual override for @traselveloreal, mirroring /api/tricks-dash/refresh."""
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    try:
+        return run_manual_refresh("traselveloreal")
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/traselveloreal/import-legacy")
+def traselveloreal_import_legacy(
+    password: Annotated[str, Form()],
+    payload: Annotated[str, Form()],
+) -> dict[str, Any]:
+    """One-time bulk import for migrating the previously-static @traselveloreal
+    dataset onto this live backend. `payload` is a JSON array of objects with
+    shortcode/postDate/likes/comments/type/video/caption/permalink/coverUrl
+    (the same shape as the bundled traselveloreal-posts.json). Idempotent:
+    posts already present (matched by shortcode) are skipped.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+
+    try:
+        items = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="Payload must be a JSON array.")
+
+    with connect() as conn:
+        existing = {row["shortcode"] for row in conn.execute("SELECT shortcode FROM traselveloreal_posts").fetchall()}
+
+    now = utc_now()
+    added = 0
+    skipped = 0
+    failed = 0
+    for item in items:
+        shortcode = str(item.get("shortcode") or "").strip()
+        if not shortcode or shortcode in existing:
+            skipped += 1
+            continue
+        post_type = str(item.get("type") or "Image")
+        is_video = 1 if str(item.get("video") or "").lower() == "yes" else 0
+        cover_url = item.get("coverUrl") or ""
+        # Legacy JSON rewrote reel covers to relative frontend paths
+        # (/traselveloreal-covers/<shortcode>.jpg) for local static serving.
+        # Those aren't fetchable CDN URLs, so leave cover_source_url empty
+        # for them -- local files get pushed separately via the covers
+        # upload step, which sets cover_image_path directly.
+        cover_source_url = cover_url if str(cover_url).startswith("http") else None
+        try:
+            with connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO traselveloreal_posts (
+                        shortcode, published_at, likes, comments, caption,
+                        post_type_label, is_animated, permalink,
+                        cover_source_url, cover_image_path, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    """,
+                    (
+                        shortcode,
+                        item.get("postDate"),
+                        int(item.get("likes") or 0),
+                        int(item.get("comments") or 0),
+                        item.get("caption") or "",
+                        post_type,
+                        is_video,
+                        item.get("permalink") or f"https://www.instagram.com/p/{shortcode}/",
+                        cover_source_url,
+                        now,
+                        now,
+                    ),
+                )
+            existing.add(shortcode)
+            added += 1
+        except Exception:
+            failed += 1
+
+    return {"received": len(items), "added": added, "skipped": skipped, "failed": failed}
+
+
+@app.post("/api/traselveloreal/covers/{shortcode}/upload")
+def traselveloreal_upload_cover(
+    shortcode: str,
+    password: Annotated[str, Form()],
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    """Pushes a locally-held cover image (used for the 496 reel covers that
+    were already downloaded during the earlier static-site era) directly
+    into backend storage, bypassing the CDN (which may have expired).
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM traselveloreal_posts WHERE shortcode = ?", (shortcode,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Unknown shortcode.")
+
+    suffix = Path(file.filename or "cover.jpg").suffix or ".jpg"
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    new_path = UPLOAD_DIR / f"trasel-{os.urandom(16).hex()}{suffix}"
+    new_path.write_bytes(file.file.read())
+
+    with connect() as conn:
+        conn.execute(
+            "UPDATE traselveloreal_posts SET cover_image_path = ? WHERE id = ?",
+            (str(new_path), row["id"]),
+        )
+
+    return {"ok": True, "shortcode": shortcode}
 
 
 @app.get("/api/calibration")

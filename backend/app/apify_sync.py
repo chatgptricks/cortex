@@ -3,11 +3,28 @@ from __future__ import annotations
 import os
 import re
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 APIFY_ACTOR_ID = "apify~instagram-scraper"
-IG_HANDLE = "chatgptricks"
+
+# Per-account config for the automated like-refresh system. chatgptricks
+# lives in the canonical `posts` table (shared with Predict's prediction
+# model); traselveloreal is a fully separate table/dataset that must never
+# be mixed into `posts` (explicit prior product decision -- see README).
+ACCOUNT_CONFIG: dict[str, dict[str, Any]] = {
+    "chatgptricks": {
+        "ig_handle": "chatgptricks",
+        "table": "posts",
+        # Rule: 600 likes accumulated within the first hour of posting.
+        "hot_threshold": 600,
+    },
+    "traselveloreal": {
+        "ig_handle": "traselveloreal",
+        "table": "traselveloreal_posts",
+        # Rule: 1200 likes accumulated within the first hour of posting.
+        "hot_threshold": 1200,
+    },
+}
 
 
 class ApifySyncError(RuntimeError):
@@ -50,20 +67,6 @@ def _published_at(item: dict[str, Any]) -> str | None:
     return str(ts)
 
 
-def _apify_date_filter(value: str) -> str | None:
-    """Convert a stored published_at value into the date format Apify's
-    onlyPostsNewerThan expects: YYYY-MM-DDThh:mm:ssZ (no +00:00 offset).
-    Returns None if the value can't be parsed, so the caller can safely
-    omit the filter rather than send a request Apify will reject with 400.
-    """
-    text = str(value).strip()
-    try:
-        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _apply_likes_floor(raw: Any) -> int:
     """Instagram/Apify sometimes reports a very low or sentinel (-1, hidden)
     like count for a post. Per product decision, any value of 3 or below
@@ -77,7 +80,7 @@ def _apply_likes_floor(raw: Any) -> int:
     return 500
 
 
-def _post_age_days(published_at: str | None, now: datetime) -> int | None:
+def _post_age_hours(published_at: str | None, now: datetime) -> float | None:
     if not published_at:
         return None
     text = str(published_at).strip()
@@ -87,77 +90,48 @@ def _post_age_days(published_at: str | None, now: datetime) -> int | None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
-    return (now - dt).days
+    return (now - dt).total_seconds() / 3600.0
 
 
-def _is_eligible_for_engagement_refresh(published_at: str | None, now: datetime) -> bool:
-    """Update rule: refresh likes/comments for posts that are 10 days old or
-    less. Once a post turns 11+ days old, stop touching it -- except for one
-    final check at exactly 30 days old.
-    """
-    age = _post_age_days(published_at, now)
-    if age is None:
-        return False
-    return age <= 10 or age == 30
-
-
-def sync_new_posts_from_apify(results_limit: int = 60) -> dict[str, Any]:
-    """Pull new posts for IG_HANDLE from Apify's Instagram Scraper and insert
-    any that aren't already in the posts table (matched by shortcode). Mirrors
-    the insert shape sync_instagram_profile_posts() uses for IG-sourced posts
-    (section="single", source_ref="instagram:<shortcode>", shortcode set),
-    so these stay properly deduplicated against any future sync, unlike rows
-    created through the plain POST /api/posts upload endpoint.
-    """
+def _fetch_apify_items(payload: dict[str, Any], timeout: float = 180.0) -> list[dict[str, Any]]:
     token = os.getenv("APIFY_TOKEN", "").strip()
     if not token:
         raise ApifySyncError("APIFY_TOKEN is not configured on the server.")
-
     try:
         import httpx
     except ImportError as exc:
         raise ApifySyncError("httpx is not installed in the backend environment.") from exc
 
-    from .config import UPLOAD_DIR
-    from .db import connect, utc_now
-
-    with connect() as conn:
-        rows = conn.execute("SELECT shortcode, published_at FROM posts").fetchall()
-    existing_shortcodes = {row["shortcode"] for row in rows if row["shortcode"]}
-    known_dates = [row["published_at"] for row in rows if row["published_at"]]
-    newer_than = _apify_date_filter(max(known_dates)) if known_dates else None
-
-    payload: dict[str, Any] = {
-        "directUrls": [f"https://www.instagram.com/{IG_HANDLE}/"],
-        "resultsType": "posts",
-        "resultsLimit": results_limit,
-        "skipPinnedPosts": True,
-    }
-    if newer_than:
-        payload["onlyPostsNewerThan"] = newer_than
-
     url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
     try:
-        with httpx.Client(timeout=180.0) as client:
+        with httpx.Client(timeout=timeout) as client:
             response = client.post(url, params={"token": token}, json=payload)
             response.raise_for_status()
             items = response.json()
     except httpx.HTTPError as exc:
         raise ApifySyncError(f"Apify request failed: {exc}") from exc
-
     if not isinstance(items, list):
         raise ApifySyncError("Apify returned an unexpected response shape.")
+    return items
 
-    new_items = [it for it in items if it.get("shortCode") and it["shortCode"] not in existing_shortcodes]
-    new_items.sort(key=lambda it: it.get("timestamp") or "")
 
-    summary: dict[str, Any] = {
-        "found": len(items),
-        "added": 0,
-        "failed": 0,
-        "items": [],
-    }
+# ---------------------------------------------------------------------------
+# New-post insertion (account-specific: different tables/columns)
+# ---------------------------------------------------------------------------
 
+
+def _insert_new_chatgptricks_posts(new_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Mirrors the insert shape sync_instagram_profile_posts() uses for
+    IG-sourced posts (section="single", source_ref="instagram:<shortcode>",
+    shortcode set), so these stay properly deduplicated against any future
+    sync, unlike rows created through the plain POST /api/posts endpoint.
+    """
+    import httpx
+
+    from .config import UPLOAD_DIR
+    from .db import connect, utc_now
+
+    summary: dict[str, Any] = {"added": 0, "failed": 0, "items": []}
     if not new_items:
         return summary
 
@@ -197,7 +171,7 @@ def sync_new_posts_from_apify(results_limit: int = 60) -> dict[str, Any]:
             post_type_label, is_video = _post_type_label(item)
             likes = _apply_likes_floor(item.get("likesCount"))
             comments = item.get("commentsCount") or 0
-            now = utc_now()
+            now_iso = utc_now()
 
             with connect() as conn:
                 conn.execute(
@@ -225,82 +199,244 @@ def sync_new_posts_from_apify(results_limit: int = 60) -> dict[str, Any]:
                         5,
                         "Queued",
                         int(is_video),
-                        now,
-                        now,
+                        now_iso,
+                        now_iso,
                     ),
                 )
 
-            existing_shortcodes.add(shortcode)
             summary["added"] += 1
             summary["items"].append({"shortcode": shortcode, "status": "added", "published_at": _published_at(item)})
 
     return summary
 
 
-def refresh_recent_engagement(window_days: int = 35, results_limit: int = 200) -> dict[str, Any]:
-    """Re-scrape recent posts for IG_HANDLE and update likes/comments on
-    existing rows that are eligible for a refresh: posts 10 days old or
-    less get refreshed every time; posts 11-29 or 31+ days old are left
-    alone; posts exactly 30 days old get one final refresh. Any like count
-    of 3 or below (including hidden/-1 values Apify sometimes returns) is
-    floored to 500 via _apply_likes_floor.
+def _insert_new_traselveloreal_posts(new_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Same shape as the chatgptricks insert, but writes into the standalone
+    traselveloreal_posts table (never into `posts` / Predict's Post DB).
     """
-    token = os.getenv("APIFY_TOKEN", "").strip()
-    if not token:
-        raise ApifySyncError("APIFY_TOKEN is not configured on the server.")
+    import httpx
 
-    try:
-        import httpx
-    except ImportError as exc:
-        raise ApifySyncError("httpx is not installed in the backend environment.") from exc
+    from .config import UPLOAD_DIR
+    from .db import connect, utc_now
+
+    summary: dict[str, Any] = {"added": 0, "failed": 0, "items": []}
+    if not new_items:
+        return summary
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    with httpx.Client(timeout=60.0, headers={"User-Agent": "Mozilla/5.0"}) as image_client:
+        for item in new_items:
+            shortcode = str(item["shortCode"]).strip()
+            image_url = item.get("displayUrl") or next(iter(item.get("images") or []), None)
+            cover_path: str | None = None
+            if image_url:
+                try:
+                    image_response = image_client.get(image_url)
+                    image_response.raise_for_status()
+                    suffix = ".jpg"
+                    content_type = image_response.headers.get("content-type", "")
+                    if "png" in content_type:
+                        suffix = ".png"
+                    elif "webp" in content_type:
+                        suffix = ".webp"
+                    image_path = UPLOAD_DIR / f"trasel-{os.urandom(16).hex()}{suffix}"
+                    image_path.write_bytes(image_response.content)
+                    cover_path = str(image_path)
+                except httpx.HTTPError:
+                    cover_path = None
+
+            caption = _clean_text(item.get("caption"))
+            post_type_label, is_video = _post_type_label(item)
+            likes = _apply_likes_floor(item.get("likesCount"))
+            comments = item.get("commentsCount") or 0
+            permalink = item.get("url") or f"https://www.instagram.com/p/{shortcode}/"
+            now_iso = utc_now()
+
+            try:
+                with connect() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO traselveloreal_posts (
+                            shortcode, published_at, likes, comments, caption,
+                            post_type_label, is_animated, permalink,
+                            cover_source_url, cover_image_path, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            shortcode,
+                            _published_at(item),
+                            likes,
+                            comments,
+                            caption,
+                            post_type_label,
+                            int(is_video),
+                            permalink,
+                            image_url,
+                            cover_path,
+                            now_iso,
+                            now_iso,
+                        ),
+                    )
+            except Exception as exc:  # e.g. UNIQUE constraint on a race re-add
+                summary["failed"] += 1
+                summary["items"].append({"shortcode": shortcode, "status": "failed", "error": str(exc)})
+                continue
+
+            summary["added"] += 1
+            summary["items"].append({"shortcode": shortcode, "status": "added", "published_at": _published_at(item)})
+
+    return summary
+
+
+_INSERT_FUNCS = {
+    "chatgptricks": _insert_new_chatgptricks_posts,
+    "traselveloreal": _insert_new_traselveloreal_posts,
+}
+
+
+# ---------------------------------------------------------------------------
+# Short-term cycle: every 30 min (7:30am-11:30pm fixed CST), posts <=24h old
+# ---------------------------------------------------------------------------
+
+
+def run_short_term_cycle(account: str, results_limit: int = 80) -> dict[str, Any]:
+    """(1) Pulls the last ~30h of posts and inserts any brand-new ones, and
+    (2) refreshes likes/comments on all existing posts <=24h old, doing a
+    one-time "first hour" HOT check the first time each post is observed at
+    >=1h old: is_hot=1 if likes >= the account's per-hour threshold at that
+    point. Both pieces reuse a single Apify fetch to minimize API calls.
+    """
+    cfg = ACCOUNT_CONFIG[account]
+    table = cfg["table"]
+    now = datetime.now(UTC)
+
+    payload: dict[str, Any] = {
+        "directUrls": [f"https://www.instagram.com/{cfg['ig_handle']}/"],
+        "resultsType": "posts",
+        "resultsLimit": results_limit,
+        "skipPinnedPosts": True,
+        "onlyPostsNewerThan": (now - timedelta(hours=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    items = _fetch_apify_items(payload)
 
     from .db import connect, utc_now
 
-    now = datetime.now(UTC)
-
     with connect() as conn:
-        rows = conn.execute(
-            "SELECT id, shortcode, published_at, likes FROM posts WHERE shortcode IS NOT NULL AND shortcode != ''"
-        ).fetchall()
+        existing_rows = conn.execute(f"SELECT shortcode FROM {table}").fetchall()
+    existing_shortcodes = {row["shortcode"] for row in existing_rows if row["shortcode"]}
 
-    eligible_by_shortcode: dict[str, dict[str, Any]] = {}
+    new_items = [it for it in items if it.get("shortCode") and it["shortCode"] not in existing_shortcodes]
+    new_items.sort(key=lambda it: it.get("timestamp") or "")
+    insert_summary = _INSERT_FUNCS[account](new_items)
+
+    # Re-read so freshly-inserted posts are also eligible for the engagement
+    # pass below (a post that's brand new is, by definition, well within the
+    # <=24h window).
+    with connect() as conn:
+        rows = conn.execute(f"SELECT id, shortcode, published_at, hot_checked FROM {table}").fetchall()
+
+    eligible: dict[str, dict[str, Any]] = {}
     for row in rows:
         shortcode = row["shortcode"]
         if not shortcode or shortcode.startswith("post-"):
             continue
-        if not _is_eligible_for_engagement_refresh(row["published_at"], now):
+        age_hours = _post_age_hours(row["published_at"], now)
+        if age_hours is None or age_hours > 24:
             continue
-        eligible_by_shortcode[shortcode] = {"id": row["id"], "likes": row["likes"]}
+        eligible[shortcode] = {"id": row["id"], "hot_checked": bool(row["hot_checked"]), "age_hours": age_hours}
 
-    summary: dict[str, Any] = {"checked": len(eligible_by_shortcode), "updated": 0, "unmatched": 0}
-    if not eligible_by_shortcode:
+    items_by_shortcode = {it.get("shortCode"): it for it in items if it.get("shortCode")}
+    now_iso = utc_now()
+    engagement_summary: dict[str, Any] = {"checked": len(eligible), "updated": 0, "hot_marked": 0, "unmatched": 0}
+
+    for shortcode, info in eligible.items():
+        item = items_by_shortcode.get(shortcode)
+        if not item:
+            engagement_summary["unmatched"] += 1
+            continue
+        likes = _apply_likes_floor(item.get("likesCount"))
+        comments = item.get("commentsCount")
+        comments = comments if isinstance(comments, int) and comments >= 0 else None
+
+        set_clauses = ["likes = ?", "updated_at = ?"]
+        params: list[Any] = [likes, now_iso]
+        if comments is not None:
+            set_clauses.append("comments = ?")
+            params.append(comments)
+        if not info["hot_checked"] and info["age_hours"] >= 1.0:
+            is_hot = 1 if likes >= cfg["hot_threshold"] else 0
+            set_clauses += ["is_hot = ?", "likes_at_1h = ?", "hot_checked = 1"]
+            params += [is_hot, likes]
+            if is_hot:
+                set_clauses.append("hot_marked_at = ?")
+                params.append(now_iso)
+                engagement_summary["hot_marked"] += 1
+        params.append(info["id"])
+        with connect() as conn:
+            conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE id = ?", params)
+        engagement_summary["updated"] += 1
+
+    return {"new_posts": insert_summary, "engagement": engagement_summary}
+
+
+# ---------------------------------------------------------------------------
+# Daily cycle: once/day, posts >24h-10 days, plus exactly 30d / 120d
+# ---------------------------------------------------------------------------
+
+
+def run_daily_cycle(account: str, results_limit: int = 550, window_days: int = 125) -> dict[str, Any]:
+    """Refreshes likes/comments on posts >24h and <=10 days old (every day),
+    plus one-time checks at exactly 30 days and exactly 120 days old. Posts
+    outside those windows (11-29 days, 31-119 days, 121+ days) are left
+    untouched. <=24h posts are excluded here -- they're handled by
+    run_short_term_cycle instead.
+    """
+    cfg = ACCOUNT_CONFIG[account]
+    table = cfg["table"]
+    now = datetime.now(UTC)
+
+    from .db import connect, utc_now
+
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT id, shortcode, published_at, refreshed_30d, refreshed_120d FROM {table} "
+            f"WHERE shortcode IS NOT NULL AND shortcode != ''"
+        ).fetchall()
+
+    eligible: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        shortcode = row["shortcode"]
+        if not shortcode or shortcode.startswith("post-"):
+            continue
+        age_hours = _post_age_hours(row["published_at"], now)
+        if age_hours is None:
+            continue
+        age_days = int(age_hours // 24)
+        in_daily_window = 24 < age_hours <= 240
+        mark_30 = age_days == 30 and not row["refreshed_30d"]
+        mark_120 = age_days == 120 and not row["refreshed_120d"]
+        if not (in_daily_window or mark_30 or mark_120):
+            continue
+        eligible[shortcode] = {"id": row["id"], "mark_30": mark_30, "mark_120": mark_120}
+
+    summary: dict[str, Any] = {"checked": len(eligible), "updated": 0, "unmatched": 0}
+    if not eligible:
         return summary
 
     window_start = now - timedelta(days=window_days)
     payload: dict[str, Any] = {
-        "directUrls": [f"https://www.instagram.com/{IG_HANDLE}/"],
+        "directUrls": [f"https://www.instagram.com/{cfg['ig_handle']}/"],
         "resultsType": "posts",
         "resultsLimit": results_limit,
         "skipPinnedPosts": True,
         "onlyPostsNewerThan": window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-
-    url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
-    try:
-        with httpx.Client(timeout=180.0) as client:
-            response = client.post(url, params={"token": token}, json=payload)
-            response.raise_for_status()
-            items = response.json()
-    except httpx.HTTPError as exc:
-        raise ApifySyncError(f"Apify engagement refresh request failed: {exc}") from exc
-
-    if not isinstance(items, list):
-        raise ApifySyncError("Apify returned an unexpected response shape for engagement refresh.")
-
+    items = _fetch_apify_items(payload, timeout=300.0)
     items_by_shortcode = {it.get("shortCode"): it for it in items if it.get("shortCode")}
     now_iso = utc_now()
 
-    for shortcode, info in eligible_by_shortcode.items():
+    for shortcode, info in eligible.items():
         item = items_by_shortcode.get(shortcode)
         if not item:
             summary["unmatched"] += 1
@@ -308,17 +444,26 @@ def refresh_recent_engagement(window_days: int = 35, results_limit: int = 200) -
         likes = _apply_likes_floor(item.get("likesCount"))
         comments = item.get("commentsCount")
         comments = comments if isinstance(comments, int) and comments >= 0 else None
+
+        set_clauses = ["likes = ?", "updated_at = ?"]
+        params: list[Any] = [likes, now_iso]
+        if comments is not None:
+            set_clauses.append("comments = ?")
+            params.append(comments)
+        if info["mark_30"]:
+            set_clauses.append("refreshed_30d = 1")
+        if info["mark_120"]:
+            set_clauses.append("refreshed_120d = 1")
+        params.append(info["id"])
         with connect() as conn:
-            if comments is not None:
-                conn.execute(
-                    "UPDATE posts SET likes = ?, comments = ?, updated_at = ? WHERE id = ?",
-                    (likes, comments, now_iso, info["id"]),
-                )
-            else:
-                conn.execute(
-                    "UPDATE posts SET likes = ?, updated_at = ? WHERE id = ?",
-                    (likes, now_iso, info["id"]),
-                )
+            conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE id = ?", params)
         summary["updated"] += 1
 
     return summary
+
+
+def run_manual_refresh(account: str) -> dict[str, Any]:
+    """Manual 'Refresh' button override: runs both cycles immediately."""
+    short_term = run_short_term_cycle(account)
+    daily = run_daily_cycle(account)
+    return {"short_term": short_term, "daily": daily}

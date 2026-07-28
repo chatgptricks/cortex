@@ -105,6 +105,34 @@ def init_db() -> None:
                 ON ab_candidates(ab_test_id);
             CREATE INDEX IF NOT EXISTS idx_metadata_options_kind
                 ON metadata_options(kind, label);
+
+            -- Standalone dataset for @traselveloreal (Sentient Dash's second
+            -- account). Deliberately separate from `posts`, which is the
+            -- canonical Predict Post DB used for prediction/calibration --
+            -- traselveloreal must never be mixed into that table.
+            CREATE TABLE IF NOT EXISTS traselveloreal_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shortcode TEXT NOT NULL UNIQUE,
+                published_at TEXT,
+                likes INTEGER,
+                comments INTEGER,
+                caption TEXT,
+                post_type_label TEXT,
+                is_animated INTEGER NOT NULL DEFAULT 0,
+                permalink TEXT,
+                cover_source_url TEXT,
+                cover_image_path TEXT,
+                is_hot INTEGER NOT NULL DEFAULT 0,
+                likes_at_1h INTEGER,
+                hot_checked INTEGER NOT NULL DEFAULT 0,
+                hot_marked_at TEXT,
+                refreshed_30d INTEGER NOT NULL DEFAULT 0,
+                refreshed_120d INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_trasel_published
+                ON traselveloreal_posts(published_at DESC);
             """
         )
         _ensure_column(conn, "posts", "progress_percent", "progress_percent INTEGER NOT NULL DEFAULT 0")
@@ -123,6 +151,13 @@ def init_db() -> None:
         _ensure_column(conn, "posts", "brain_global_mean_abs", "brain_global_mean_abs REAL")
         _ensure_column(conn, "posts", "brain_global_peak_abs", "brain_global_peak_abs REAL")
         _ensure_column(conn, "posts", "virality_potential", "virality_potential REAL")
+        # Engagement-refresh / HOT-detection tracking (see apify_sync.py).
+        _ensure_column(conn, "posts", "is_hot", "is_hot INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "posts", "likes_at_1h", "likes_at_1h INTEGER")
+        _ensure_column(conn, "posts", "hot_checked", "hot_checked INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "posts", "hot_marked_at", "hot_marked_at TEXT")
+        _ensure_column(conn, "posts", "refreshed_30d", "refreshed_30d INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "posts", "refreshed_120d", "refreshed_120d INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             """
             UPDATE posts
