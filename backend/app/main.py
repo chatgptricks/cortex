@@ -380,35 +380,46 @@ def test_account_flow_oneoff() -> dict[str, Any]:
     flow (create -> backfill -> appears in dashboard -> deactivate) end to
     end before announcing it's ready. Remove after verifying.
     """
-    from .apify_sync import create_account, run_backfill, get_account_config, ApifySyncError as _Err
+    import traceback
+    from .apify_sync import create_account, run_backfill, get_account_config
 
     handle = "natgeo"
     result: dict[str, Any] = {}
     try:
         try:
+            with connect() as conn:
+                conn.execute("DELETE FROM dashboard_posts WHERE account = ?", (handle,))
+                conn.execute("DELETE FROM accounts WHERE handle = ?", (handle,))
             account = create_account(handle, "National Geographic (test)", "competitors", 600)
             result["create"] = account
-        except _Err as exc:
-            result["create_error"] = str(exc)
+        except Exception as exc:
+            result["create_error"] = f"{type(exc).__name__}: {exc}"
+            result["create_traceback"] = traceback.format_exc()
 
         try:
             backfill = run_backfill(handle, results_limit=5)
             result["backfill"] = backfill
-        except _Err as exc:
-            result["backfill_error"] = str(exc)
+        except Exception as exc:
+            result["backfill_error"] = f"{type(exc).__name__}: {exc}"
+            result["backfill_traceback"] = traceback.format_exc()
 
-        with connect() as conn:
-            count_row = conn.execute(
-                "SELECT COUNT(*) AS c FROM dashboard_posts WHERE account = ?", (handle,)
-            ).fetchone()
-        result["dashboard_posts_count"] = count_row["c"] if count_row else 0
-
-        result["account_config"] = get_account_config(handle)
+        try:
+            with connect() as conn:
+                count_row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM dashboard_posts WHERE account = ?", (handle,)
+                ).fetchone()
+            result["dashboard_posts_count"] = count_row["c"] if count_row else 0
+            result["account_config"] = get_account_config(handle)
+        except Exception as exc:
+            result["verify_error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        with connect() as conn:
-            conn.execute("DELETE FROM dashboard_posts WHERE account = ?", (handle,))
-            conn.execute("DELETE FROM accounts WHERE handle = ?", (handle,))
-        result["cleaned_up"] = True
+        try:
+            with connect() as conn:
+                conn.execute("DELETE FROM dashboard_posts WHERE account = ?", (handle,))
+                conn.execute("DELETE FROM accounts WHERE handle = ?", (handle,))
+            result["cleaned_up"] = True
+        except Exception as exc:
+            result["cleanup_error"] = str(exc)
 
     return result
 
