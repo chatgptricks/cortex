@@ -383,6 +383,23 @@ def admin_list_accounts() -> dict[str, Any]:
     return {"accounts": list_accounts(active_only=False)}
 
 
+@app.post("/api/admin/_temp-catchup/{handle}")
+def temp_catchup(handle: str, results_limit: int = 800) -> dict[str, Any]:
+    """TEMPORARY -- one-off: cache the real avatar + top up post history for
+    an account added before these existed. Remove after use."""
+    result: dict[str, Any] = {}
+    try:
+        fetch_and_store_avatar(handle)
+        result["avatar"] = "ok"
+    except ApifySyncError as exc:
+        result["avatar_error"] = str(exc)
+    try:
+        result["backfill"] = run_backfill(handle, results_limit=results_limit)
+    except ApifySyncError as exc:
+        result["backfill_error"] = str(exc)
+    return result
+
+
 @app.get("/api/admin/accounts/preview")
 def admin_preview_account(handle: str) -> dict[str, Any]:
     """Read-only lookup used by the add-account wizard's first step to show
