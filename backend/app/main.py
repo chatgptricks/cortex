@@ -440,11 +440,21 @@ def admin_deactivate_account(handle: str, password: Annotated[str, Form()]) -> d
     return {"ok": True, "handle": handle, "deactivated": True}
 
 
+@app.post("/api/admin/_temp-topup/{handle}")
+def temp_topup_backfill(handle: str, results_limit: int = 800) -> dict[str, Any]:
+    """TEMPORARY -- no-auth top-up for accounts backfilled under the old
+    200-post cap. Remove after use."""
+    try:
+        return run_backfill(handle, results_limit=results_limit)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.post("/api/admin/accounts/{handle}/backfill")
 def admin_backfill_account(
     handle: str,
     password: Annotated[str, Form()],
-    results_limit: Annotated[int, Form()] = 200,
+    results_limit: Annotated[int, Form()] = 800,
 ) -> dict[str, Any]:
     """One-time initial history import for a freshly self-serve-added
     account, so it has a real post history before the scheduler starts
