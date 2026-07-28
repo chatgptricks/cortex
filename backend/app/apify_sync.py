@@ -612,7 +612,13 @@ def run_backfill(
     }
     if date_from:
         payload["onlyPostsNewerThan"] = date_from
-    items = _fetch_apify_items(payload, timeout=300.0)
+    # Large/full-history pulls (hundreds to low thousands of posts) can
+    # legitimately take well past 5 minutes to scrape. The old 300s timeout
+    # here meant our own HTTP client gave up on Apify's response before big
+    # accounts finished -- the actor run kept going (and billing) on Apify's
+    # side regardless, but we never received or stored its results because
+    # we'd already disconnected. Give it real headroom instead.
+    items = _fetch_apify_items(payload, timeout=1800.0)
 
     if date_to:
         try:
