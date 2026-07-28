@@ -395,23 +395,35 @@ def run_short_term_cycle(account: str, results_limit: int = 80) -> dict[str, Any
 # ---------------------------------------------------------------------------
 
 
-def run_daily_cycle(account: str, results_limit: int = 550, window_days: int = 125) -> dict[str, Any]:
+def run_daily_cycle(account: str) -> dict[str, Any]:
     """Refreshes likes/comments on posts >24h and <=10 days old (every day),
     plus one-time checks at exactly 30 days and exactly 120 days old. Posts
     outside those windows (11-29 days, 31-119 days, 121+ days) are left
     untouched. <=24h posts are excluded here -- they're handled by
     run_short_term_cycle instead.
+
+    Instead of re-scraping the whole profile (which used to mean paginating
+    up to 125 days / 550 posts back on the off chance a post was turning 30
+    or 120 days old today), this looks up the exact set of eligible post IDs
+    in our own database first, then asks Apify to scrape *only those specific
+    post URLs* (resultsType="details" against directUrls of individual posts).
+    Cost scales with how many posts actually need a refresh today (typically
+    a few dozen), not with a fixed 125-day/550-post ceiling re-walked daily.
     """
     cfg = ACCOUNT_CONFIG[account]
     table = cfg["table"]
     now = datetime.now(UTC)
+    has_permalink_column = table == "traselveloreal_posts"
 
     from .db import connect, utc_now
 
+    select_cols = "id, shortcode, published_at, refreshed_30d, refreshed_120d"
+    if has_permalink_column:
+        select_cols += ", permalink"
+
     with connect() as conn:
         rows = conn.execute(
-            f"SELECT id, shortcode, published_at, refreshed_30d, refreshed_120d FROM {table} "
-            f"WHERE shortcode IS NOT NULL AND shortcode != ''"
+            f"SELECT {select_cols} FROM {table} WHERE shortcode IS NOT NULL AND shortcode != ''"
         ).fetchall()
 
     eligible: dict[str, dict[str, Any]] = {}
@@ -428,21 +440,26 @@ def run_daily_cycle(account: str, results_limit: int = 550, window_days: int = 1
         mark_120 = age_days == 120 and not row["refreshed_120d"]
         if not (in_daily_window or mark_30 or mark_120):
             continue
-        eligible[shortcode] = {"id": row["id"], "mark_30": mark_30, "mark_120": mark_120}
+        permalink = (row["permalink"] if has_permalink_column else None) or f"https://www.instagram.com/p/{shortcode}/"
+        eligible[shortcode] = {"id": row["id"], "mark_30": mark_30, "mark_120": mark_120, "permalink": permalink}
 
     summary: dict[str, Any] = {"checked": len(eligible), "updated": 0, "unmatched": 0}
     if not eligible:
         return summary
 
-    window_start = now - timedelta(days=window_days)
-    payload: dict[str, Any] = {
-        "directUrls": [f"https://www.instagram.com/{cfg['ig_handle']}/"],
-        "resultsType": "posts",
-        "resultsLimit": results_limit,
-        "skipPinnedPosts": True,
-        "onlyPostsNewerThan": window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    items = _fetch_apify_items(payload, timeout=300.0)
+    # Batch the specific post URLs in chunks so one oversized day (unlikely
+    # at current posting volume, but not impossible) doesn't blow past any
+    # per-run item cap the actor enforces.
+    all_urls = [info["permalink"] for info in eligible.values()]
+    items: list[dict[str, Any]] = []
+    for i in range(0, len(all_urls), 200):
+        batch = all_urls[i : i + 200]
+        payload: dict[str, Any] = {
+            "directUrls": batch,
+            "resultsType": "details",
+        }
+        items.extend(_fetch_apify_items(payload, timeout=300.0))
+
     items_by_shortcode = {it.get("shortCode"): it for it in items if it.get("shortCode")}
     now_iso = utc_now()
 

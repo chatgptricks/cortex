@@ -371,6 +371,17 @@ def create_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
     return {"created": created}
 
 
+@app.get("/api/admin/test-daily-cycle-oneoff")
+def test_daily_cycle_oneoff(account: str) -> dict[str, Any]:
+    """TEMPORARY, no-auth debug helper to verify the rewritten run_daily_cycle
+    (targeted per-post scrape instead of a full profile re-walk) actually
+    matches Apify's response shape before it's wired into the live scheduler.
+    Remove after verifying.
+    """
+    from .apify_sync import run_daily_cycle
+    return run_daily_cycle(account)
+
+
 @app.post("/api/admin/delete-test-hot-posts")
 def delete_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
     """Removes the dummy posts created by /api/admin/create-test-hot-posts."""
