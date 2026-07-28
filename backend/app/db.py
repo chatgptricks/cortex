@@ -184,6 +184,10 @@ def init_db() -> None:
             """
         )
         _ensure_column(conn, "traselveloreal_posts", "hot_rate_multiplier", "hot_rate_multiplier REAL")
+        # Locally-cached profile picture path for each account -- Instagram's
+        # own CDN URLs (via Apify) are signed and expire, so we download once
+        # and serve our own copy instead of persisting the raw CDN URL.
+        _ensure_column(conn, "accounts", "avatar_path", "avatar_path TEXT")
 
         # Seed the two existing accounts on first run (idempotent -- INSERT
         # OR IGNORE keyed by the UNIQUE handle column).

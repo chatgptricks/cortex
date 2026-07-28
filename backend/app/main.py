@@ -22,11 +22,13 @@ from fastapi.staticfiles import StaticFiles
 from .apify_sync import (
     ApifySyncError,
     create_account,
+    fetch_and_store_avatar,
     fetch_profile_preview,
     get_account_config,
     list_accounts,
     run_backfill,
     run_manual_refresh,
+    store_avatar_from_url,
 )
 from .calibration import fit_calibration, predict_likes
 from .config import (
@@ -461,6 +463,44 @@ def admin_backfill_account(
         return run_backfill(handle, results_limit=results_limit, date_from=date_from or None, date_to=date_to or None)
     except ApifySyncError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/accounts/{handle}/avatar")
+def admin_fetch_avatar(
+    handle: str,
+    password: Annotated[str, Form()],
+    image_url: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Caches the account's real Instagram profile picture locally (served
+    via GET /api/dashboard/avatar/{handle}). Pass image_url when it's
+    already known (e.g. from the add-account wizard's own preview fetch)
+    to skip a redundant Apify call; omit it to look the picture up fresh.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    try:
+        if image_url:
+            store_avatar_from_url(handle, image_url)
+        else:
+            fetch_and_store_avatar(handle)
+        return {"ok": True, "handle": handle}
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/dashboard/avatar/{handle}")
+def dashboard_avatar(handle: str) -> FileResponse:
+    """Serves a cached local copy of the account's profile picture."""
+    with connect() as conn:
+        row = conn.execute("SELECT avatar_path FROM accounts WHERE handle = ?", (handle,)).fetchone()
+    if not row or not row["avatar_path"]:
+        raise HTTPException(status_code=404, detail="No profile picture cached for this account.")
+    avatar_path = Path(str(row["avatar_path"]))
+    if not avatar_path.is_file():
+        raise HTTPException(status_code=404, detail="Profile picture file is unavailable.")
+    return FileResponse(avatar_path)
 
 
 @app.post("/api/admin/reset-hot-check")

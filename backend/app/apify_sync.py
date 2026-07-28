@@ -62,6 +62,7 @@ def list_accounts(active_only: bool = False) -> list[dict[str, Any]]:
             "hot_threshold": row["hot_threshold"],
             "is_canonical": bool(row["is_canonical"]),
             "is_active": bool(row["is_active"]),
+            "has_avatar": bool(row["avatar_path"]),
         }
         for row in rows
     ]
@@ -672,3 +673,53 @@ def fetch_profile_preview(handle: str) -> dict[str, Any]:
         "verified": bool(item.get("verified")),
         "private": bool(item.get("private")),
     }
+
+
+def store_avatar_from_url(handle: str, image_url: str) -> str:
+    """Downloads a profile picture from a known URL into UPLOAD_DIR and
+    records it on the account. Instagram's CDN URLs (via Apify) are signed
+    and expire within a day or two, so we keep our own copy and serve it
+    through /api/dashboard/avatar/{handle} instead of the raw CDN URL.
+    """
+    import httpx
+
+    from .config import UPLOAD_DIR
+    from .db import connect, utc_now
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    clean = handle.strip().lstrip("@").lower()
+    suffix = ".jpg"
+    try:
+        with httpx.Client(timeout=30.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            response = client.get(image_url)
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if "png" in content_type:
+                suffix = ".png"
+            elif "webp" in content_type:
+                suffix = ".webp"
+            avatar_path = UPLOAD_DIR / f"avatar-{clean}{suffix}"
+            avatar_path.write_bytes(response.content)
+    except httpx.HTTPError as exc:
+        raise ApifySyncError(f"Could not download the profile picture: {exc}") from exc
+
+    with connect() as conn:
+        conn.execute(
+            "UPDATE accounts SET avatar_path = ?, updated_at = ? WHERE handle = ?",
+            (str(avatar_path), utc_now(), clean),
+        )
+    return str(avatar_path)
+
+
+def fetch_and_store_avatar(handle: str) -> str:
+    """Looks up the account's current profile picture via Apify (one
+    lightweight 'details' scrape) and caches it locally. Use
+    store_avatar_from_url() directly instead when the URL is already known
+    (e.g. the add-account wizard's own preview fetch) to avoid a second,
+    redundant Apify call.
+    """
+    preview = fetch_profile_preview(handle)
+    image_url = preview.get("profile_pic_url")
+    if not image_url:
+        raise ApifySyncError(f"No profile picture available for '{handle}'.")
+    return store_avatar_from_url(handle, image_url)
