@@ -372,14 +372,69 @@ def create_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
 
 
 @app.get("/api/admin/test-daily-cycle-oneoff")
-def test_daily_cycle_oneoff(account: str) -> dict[str, Any]:
+def test_daily_cycle_oneoff(account: str, limit: int = 0) -> dict[str, Any]:
     """TEMPORARY, no-auth debug helper to verify the rewritten run_daily_cycle
     (targeted per-post scrape instead of a full profile re-walk) actually
     matches Apify's response shape before it's wired into the live scheduler.
-    Remove after verifying.
+    Remove after verifying. limit=N caps how many eligible post URLs are
+    actually sent to Apify, for a fast smoke test.
     """
-    from .apify_sync import run_daily_cycle
-    return run_daily_cycle(account)
+    from .apify_sync import ACCOUNT_CONFIG, _fetch_apify_items, _post_age_hours, _apply_likes_floor
+    from .db import connect, utc_now
+    from datetime import UTC, datetime
+
+    cfg = ACCOUNT_CONFIG[account]
+    table = cfg["table"]
+    now = datetime.now(UTC)
+    has_permalink_column = table == "traselveloreal_posts"
+    select_cols = "id, shortcode, published_at, refreshed_30d, refreshed_120d"
+    if has_permalink_column:
+        select_cols += ", permalink"
+
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT {select_cols} FROM {table} WHERE shortcode IS NOT NULL AND shortcode != ''"
+        ).fetchall()
+
+    eligible = {}
+    for row in rows:
+        shortcode = row["shortcode"]
+        if not shortcode or shortcode.startswith("post-"):
+            continue
+        age_hours = _post_age_hours(row["published_at"], now)
+        if age_hours is None:
+            continue
+        age_days = int(age_hours // 24)
+        in_daily_window = 24 < age_hours <= 240
+        mark_30 = age_days == 30 and not row["refreshed_30d"]
+        mark_120 = age_days == 120 and not row["refreshed_120d"]
+        if not (in_daily_window or mark_30 or mark_120):
+            continue
+        permalink = (row["permalink"] if has_permalink_column else None) or f"https://www.instagram.com/p/{shortcode}/"
+        eligible[shortcode] = {"id": row["id"], "permalink": permalink, "old_likes": None}
+
+    total_eligible = len(eligible)
+    items_to_test = dict(list(eligible.items())[:limit]) if limit else eligible
+    urls = [info["permalink"] for info in items_to_test.values()]
+    if not urls:
+        return {"total_eligible": total_eligible, "tested": 0, "results": []}
+
+    payload = {"directUrls": urls, "resultsType": "details"}
+    apify_items = _fetch_apify_items(payload, timeout=120.0)
+    by_shortcode = {it.get("shortCode"): it for it in apify_items if it.get("shortCode")}
+
+    results = []
+    for shortcode, info in items_to_test.items():
+        item = by_shortcode.get(shortcode)
+        results.append({
+            "shortcode": shortcode,
+            "url_sent": info["permalink"],
+            "matched": item is not None,
+            "likesCount": item.get("likesCount") if item else None,
+            "commentsCount": item.get("commentsCount") if item else None,
+        })
+
+    return {"total_eligible": total_eligible, "tested": len(urls), "raw_item_count": len(apify_items), "results": results}
 
 
 @app.post("/api/admin/delete-test-hot-posts")
