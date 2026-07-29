@@ -475,6 +475,18 @@ def temp_disk() -> dict[str, Any]:
             if s >= 100_000:
                 big += 1
     usage = shutil.disk_usage(str(DATA_DIR))
+    with connect() as conn:
+        state = {
+            r["key"]: {"value": r["value"], "updated_at": r["updated_at"]}
+            for r in conn.execute("SELECT key, value, updated_at FROM scheduler_state").fetchall()
+        }
+        webp = conn.execute(
+            "SELECT COUNT(*) c FROM dashboard_posts WHERE lower(cover_image_path) LIKE '%.webp'"
+        ).fetchone()["c"]
+        nonwebp = conn.execute(
+            "SELECT COUNT(*) c FROM dashboard_posts WHERE cover_image_path IS NOT NULL "
+            "AND cover_image_path != '' AND lower(cover_image_path) NOT LIKE '%.webp'"
+        ).fetchone()["c"]
     return {
         "uploads_files": count,
         "uploads_mb": round(total / 1024 / 1024, 1),
@@ -482,6 +494,9 @@ def temp_disk() -> dict[str, Any]:
         "disk_total_gb": round(usage.total / 1024**3, 2),
         "disk_used_gb": round(usage.used / 1024**3, 2),
         "disk_free_gb": round(usage.free / 1024**3, 2),
+        "covers_webp": webp,
+        "covers_not_webp": nonwebp,
+        "scheduler_state": state,
     }
 
 
