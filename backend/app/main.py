@@ -186,6 +186,20 @@ def dashboard_accounts() -> dict[str, Any]:
     return {"accounts": list_accounts(active_only=True)}
 
 
+def _likes_or_null(raw: Any) -> int | None:
+    """Surfaces "we don't know" as null instead of a number. Covers both the
+    legacy 500 placeholder rows and Instagram's hidden/under-reported counts
+    (0-3), so the UI can render a dash rather than invent engagement.
+    """
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 3 else None
+
+
 def _clean_ocr_text(raw: Any) -> str:
     """hook_text carries a '-' sentinel for covers we can never OCR (file gone,
     expired CDN link). It exists only to keep those rows out of the retry
@@ -240,7 +254,7 @@ def dashboard_posts() -> dict[str, Any]:
                 {
                     "rank": post.get("source_row_number") or post["id"],
                     "postDate": post.get("published_at"),
-                    "likes": int(post.get("likes") or 0),
+                    "likes": _likes_or_null(post.get("likes")),
                     "comments": int(post.get("comments") or 0),
                     "type": post_type,
                     "video": "Yes" if has_video else "No",
@@ -270,7 +284,7 @@ def dashboard_posts() -> dict[str, Any]:
             {
                 "rank": post["id"],
                 "postDate": post.get("published_at"),
-                "likes": int(post.get("likes") or 0),
+                "likes": _likes_or_null(post.get("likes")),
                 "comments": int(post.get("comments") or 0),
                 "type": post_type,
                 "video": "Yes" if has_video else "No",

@@ -363,6 +363,17 @@ def _likes_are_known(raw: Any) -> bool:
     return isinstance(raw, int) and not isinstance(raw, bool) and raw > 3
 
 
+def _likes_or_none(raw: Any) -> int | None:
+    """Real like count, or None when Instagram hid/under-reported it. Replaces
+    the old 500 placeholder: inventing a number made unknown posts look like
+    they had real (and identical) engagement, and it polluted sorting, totals
+    and the HOT rate math. NULL is honest and the UI renders it as a dash.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw if raw > 3 else None
+
+
 def _apply_likes_floor(raw: Any) -> int:
     """Instagram/Apify sometimes reports a very low or sentinel (-1, hidden)
     like count for a post. Per product decision, any value of 3 or below
@@ -536,7 +547,7 @@ def _insert_new_chatgptricks_posts(new_items: list[dict[str, Any]]) -> dict[str,
             caption = _clean_text(item.get("caption"))
             title = _title_from_caption(caption) or f"Instagram post {shortcode}"
             post_type_label, is_video = _post_type_label(item)
-            likes = _apply_likes_floor(item.get("likesCount"))
+            likes = _likes_or_none(item.get("likesCount"))
             comments = item.get("commentsCount") or 0
             now_iso = utc_now()
 
@@ -613,7 +624,7 @@ def _insert_new_dashboard_posts(account: str, new_items: list[dict[str, Any]]) -
 
             caption = _clean_text(item.get("caption"))
             post_type_label, is_video = _post_type_label(item)
-            likes = _apply_likes_floor(item.get("likesCount"))
+            likes = _likes_or_none(item.get("likesCount"))
             comments = item.get("commentsCount") or 0
             permalink = item.get("url") or f"https://www.instagram.com/p/{shortcode}/"
             now_iso = utc_now()
@@ -728,7 +739,7 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
         if not item:
             engagement_summary["unmatched"] += 1
             continue
-        likes = _apply_likes_floor(item.get("likesCount"))
+        likes = _likes_or_none(item.get("likesCount"))
         comments = item.get("commentsCount")
         comments = comments if isinstance(comments, int) and comments >= 0 else None
 
@@ -917,7 +928,7 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
         if not item:
             summary["unmatched"] += 1
             continue
-        likes = _apply_likes_floor(item.get("likesCount"))
+        likes = _likes_or_none(item.get("likesCount"))
         comments = item.get("commentsCount")
         comments = comments if isinstance(comments, int) and comments >= 0 else None
 
