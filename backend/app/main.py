@@ -572,10 +572,31 @@ def temp_import_run(handle: str, run_id: str) -> dict[str, Any]:
             if r["shortcode"]
         }
 
+    # Guard against importing the wrong run: everything gets stored under
+    # `handle`, so a dataset belonging to another profile would silently
+    # corrupt this account's history. Only accept items whose ownerUsername
+    # matches (items without the field are kept -- some payloads omit it).
+    target = cfg["handle"].lower()
+    owners = {str(i.get("ownerUsername") or "").lower() for i in items if i.get("ownerUsername")}
+    foreign = {o for o in owners if o != target}
+    if owners and target not in owners:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Dataset belongs to {sorted(owners)}, not '{target}'. Refusing to import.",
+        )
+    items = [i for i in items if str(i.get("ownerUsername") or target).lower() == target]
+
     new_items = [i for i in items if i.get("shortCode") and i["shortCode"] not in existing]
     new_items.sort(key=lambda i: i.get("timestamp") or "")
     result = _insert_new_posts(handle, cfg, new_items)
-    return {"run_status": data.get("status"), "dataset_items": len(items), "new": len(new_items), "result": result}
+    return {
+        "run_status": data.get("status"),
+        "dataset_items": len(items),
+        "skipped_foreign": sorted(foreign),
+        "already_had": len(existing),
+        "new": len(new_items),
+        "result": result,
+    }
 
 
 @app.post("/api/admin/_temp-backfill-bg/{handle}")
