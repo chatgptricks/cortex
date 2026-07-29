@@ -383,39 +383,6 @@ def admin_list_accounts() -> dict[str, Any]:
     return {"accounts": list_accounts(active_only=False)}
 
 
-@app.get("/api/admin/_temp-spend")
-def temp_spend(limit: int = 500) -> dict[str, Any]:
-    """TEMPORARY -- read-only Apify spend audit. Remove after use."""
-    import httpx
-
-    from .apify_sync import APIFY_ACTOR_ID
-
-    token = os.getenv("APIFY_TOKEN", "").strip()
-    if not token:
-        raise HTTPException(status_code=500, detail="APIFY_TOKEN not configured.")
-    out: dict[str, Any] = {}
-    with httpx.Client(timeout=45.0) as client:
-        limits = client.get("https://api.apify.com/v2/users/me/limits", params={"token": token})
-        if limits.status_code == 200:
-            out["limits"] = limits.json().get("data", {})
-        runs = client.get(
-            f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs",
-            params={"token": token, "limit": limit, "desc": "true"},
-        )
-        runs.raise_for_status()
-        items = runs.json().get("data", {}).get("items", [])
-    out["runs"] = [
-        {
-            "startedAt": i.get("startedAt"),
-            "finishedAt": i.get("finishedAt"),
-            "status": i.get("status"),
-            "usd": i.get("usageTotalUsd"),
-        }
-        for i in items
-    ]
-    return out
-
-
 
 
 
