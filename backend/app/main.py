@@ -398,49 +398,23 @@ _OCR_RUN_LOCK = threading.Lock()
 
 
 def _ocr_worker(crop_region: str, batch_size: int, max_batches: int) -> None:
-    """Runs the OCR sweep in a background thread. The HTTP request that starts
-    it returns immediately -- a client disconnect was aborting the request
-    mid-batch, which made a 4k-image sweep impossible to drive from curl.
+    """Drains the OCR backlog by calling the exact same run_ocr_sweep() the
+    hourly scheduler uses -- just in a tight loop instead of once per tick, so
+    the one-time backlog clears in hours rather than days. Running the real
+    production path (not a parallel copy) means this also exercises the cover
+    re-download and canonical-posts handling.
     """
+    from .apify_sync import run_ocr_sweep
+
     try:
         for _ in range(max_batches):
-            with connect() as conn:
-                rows = conn.execute(
-                    "SELECT id, cover_image_path FROM dashboard_posts "
-                    "WHERE TRIM(COALESCE(hook_text, '')) = '' AND ocr_checked = 0 "
-                    "AND cover_image_path IS NOT NULL AND cover_image_path != '' "
-                    "ORDER BY published_at DESC LIMIT ?",
-                    (batch_size,),
-                ).fetchall()
-            if not rows:
-                break
-
-            present, missing = [], []
-            for r in rows:
-                p = Path(str(r["cover_image_path"]))
-                (present if p.is_file() else missing).append((int(r["id"]), p))
-
-            if missing:
-                with connect() as conn:
-                    conn.executemany(
-                        "UPDATE dashboard_posts SET ocr_checked = 1 WHERE id = ?", [(i,) for i, _ in missing]
-                    )
-            if not present:
-                continue
-
-            results = extract_images_text_remote([p for _, p in present], crop_region=crop_region)
-            now_iso = utc_now()
-            with connect() as conn:
-                for (post_id, _), result in zip(present, results, strict=False):
-                    text = str(result.get("text") or "").strip() if isinstance(result, dict) else ""
-                    if text:
-                        _OCR_RUN["with_text"] += 1
-                    conn.execute(
-                        "UPDATE dashboard_posts SET hook_text = ?, ocr_checked = 1, updated_at = ? WHERE id = ?",
-                        (text or None, now_iso, post_id),
-                    )
-                    _OCR_RUN["done"] += 1
+            result = run_ocr_sweep(limit=batch_size, crop_region=crop_region)
+            _OCR_RUN["done"] += int(result.get("sent") or 0)
+            _OCR_RUN["with_text"] += int(result.get("with_text") or 0)
+            _OCR_RUN["skipped"] = _OCR_RUN.get("skipped", 0) + int(result.get("skipped") or 0)
             _OCR_RUN["batches"] += 1
+            if not result.get("sent") and not result.get("skipped"):
+                break
     except Exception as exc:
         _OCR_RUN["error"] = str(exc)
     finally:
@@ -469,12 +443,18 @@ def temp_ocr_start(crop_region: str = "full", batch_size: int = 50, max_batches:
 def temp_ocr_status() -> dict[str, Any]:
     """TEMPORARY -- progress of the background OCR sweep. Remove after use."""
     with connect() as conn:
+        # Mirrors run_ocr_sweep's own queue: rows with no local cover file are
+        # no longer excluded (the sweep re-downloads them), and the canonical
+        # posts table counts too.
         remaining = conn.execute(
-            "SELECT COUNT(*) c FROM dashboard_posts WHERE TRIM(COALESCE(hook_text, '')) = '' "
-            "AND ocr_checked = 0 AND cover_image_path IS NOT NULL AND cover_image_path != ''"
+            "SELECT (SELECT COUNT(*) FROM dashboard_posts "
+            "        WHERE TRIM(COALESCE(hook_text,''))='' AND ocr_checked=0) "
+            "     + (SELECT COUNT(*) FROM posts "
+            "        WHERE TRIM(COALESCE(hook_text,''))='' AND image_path IS NOT NULL AND image_path != '') AS c"
         ).fetchone()["c"]
         done = conn.execute(
-            "SELECT COUNT(*) c FROM dashboard_posts WHERE TRIM(COALESCE(hook_text, '')) != ''"
+            "SELECT (SELECT COUNT(*) FROM dashboard_posts WHERE TRIM(COALESCE(hook_text,'')) NOT IN ('','-')) "
+            "     + (SELECT COUNT(*) FROM posts WHERE TRIM(COALESCE(hook_text,'')) NOT IN ('','-')) AS c"
         ).fetchone()["c"]
     return {"remaining": remaining, "with_text_total": done, **_OCR_RUN}
 
