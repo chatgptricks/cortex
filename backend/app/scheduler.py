@@ -12,9 +12,11 @@ logger = logging.getLogger("uvicorn.error")
 # year-round rather than shifting with daylight saving.
 _CST = timezone(timedelta(hours=-6))
 
-_SHORT_JOB_START = (7, 30)  # 7:30am CST
-_SHORT_JOB_END = (23, 30)  # 11:30pm CST
-_DAILY_JOB_AT = (7, 0)  # 7:00am CST, right before the short-term window opens
+# The short-term job (new posts + <=24h engagement + the one-time HOT check)
+# now runs every hour around the clock. It used to pause overnight, which meant
+# anything published between 11:30pm and 7:30am got its first look hours late --
+# by then the post is no longer "new" and the chance to surface it early is gone.
+_DAILY_JOB_AT = (7, 0)  # 7:00am CST
 
 _started = False
 _lock = threading.Lock()
@@ -59,10 +61,6 @@ def _state_set(key: str, value: str) -> None:
         logger.exception("Failed to persist scheduler state %s", key)
 
 
-def _in_short_job_window(now_cst: datetime) -> bool:
-    start = now_cst.replace(hour=_SHORT_JOB_START[0], minute=_SHORT_JOB_START[1], second=0, microsecond=0)
-    end = now_cst.replace(hour=_SHORT_JOB_END[0], minute=_SHORT_JOB_END[1], second=0, microsecond=0)
-    return start <= now_cst <= end
 
 
 def _bucket_key(now_cst: datetime) -> str:
@@ -138,14 +136,15 @@ def _run_ocr_job() -> None:
 def _tick() -> None:
     now_cst = datetime.now(_CST)
 
-    if _in_short_job_window(now_cst):
-        bucket = _bucket_key(now_cst)
-        if bucket != _state_get(_SHORT_BUCKET_KEY):
-            # Claim the bucket *before* running so a crash mid-job doesn't
-            # leave it unclaimed and re-fire on the next 30s tick.
-            _state_set(_SHORT_BUCKET_KEY, bucket)
-            _run_short_term_jobs()
-            _run_ocr_job()
+    # Runs every hour, 24/7 -- no overnight pause, so a post published at 2am
+    # still gets its first-hour HOT check on time.
+    bucket = _bucket_key(now_cst)
+    if bucket != _state_get(_SHORT_BUCKET_KEY):
+        # Claim the bucket *before* running so a crash mid-job doesn't leave
+        # it unclaimed and re-fire on the next 30s tick.
+        _state_set(_SHORT_BUCKET_KEY, bucket)
+        _run_short_term_jobs()
+        _run_ocr_job()
 
     daily_trigger = now_cst.replace(hour=_DAILY_JOB_AT[0], minute=_DAILY_JOB_AT[1], second=0, microsecond=0)
     today = now_cst.strftime("%Y-%m-%d")
@@ -179,6 +178,6 @@ def start_scheduler() -> None:
     thread = threading.Thread(target=_loop, daemon=True, name="engagement-scheduler")
     thread.start()
     logger.info(
-        "Engagement scheduler started (short-term: hourly, 7:30am-11:30pm fixed CST; "
+        "Engagement scheduler started (short-term: hourly, 24/7; "
         "daily: 7:00am fixed CST)"
     )

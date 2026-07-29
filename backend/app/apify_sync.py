@@ -673,7 +673,7 @@ def _insert_new_posts(account: str, cfg: dict[str, Any], new_items: list[dict[st
 
 
 # ---------------------------------------------------------------------------
-# Short-term cycle: hourly (7:30am-11:30pm fixed CST), posts <=24h old
+# Short-term cycle: hourly, 24/7 -- posts <=24h old
 # ---------------------------------------------------------------------------
 
 
@@ -733,6 +733,7 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
     items_by_shortcode = {it.get("shortCode"): it for it in items if it.get("shortCode")}
     now_iso = utc_now()
     engagement_summary: dict[str, Any] = {"checked": len(eligible), "updated": 0, "hot_marked": 0, "unmatched": 0}
+    pending_alerts: list[dict[str, Any]] = []
 
     for shortcode, info in eligible.items():
         item = items_by_shortcode.get(shortcode)
@@ -772,10 +773,37 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
                 set_clauses.append("hot_marked_at = ?")
                 params.append(now_iso)
                 engagement_summary["hot_marked"] += 1
+                # Queue the alert; it's sent only after the row is committed,
+                # so a Slack hiccup can never leave us having announced a post
+                # we failed to actually mark as HOT.
+                pending_alerts.append(
+                    {
+                        "account": account,
+                        "post_id": info["id"],
+                        "likes": likes,
+                        "multiplier": multiplier,
+                        "rate_per_hour": round(rate_per_hour),
+                        "threshold": threshold,
+                        "age_hours": info["age_hours"],
+                        "permalink": item.get("url") or f"https://www.instagram.com/p/{shortcode}/",
+                        "caption": _clean_text(item.get("caption")),
+                    }
+                )
         params.append(info["id"])
         with connect() as conn:
             conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE id = ?", params)
         engagement_summary["updated"] += 1
+
+    if pending_alerts:
+        from .slack_alerts import cover_url_for, notify_hot_post, slack_configured
+
+        if slack_configured():
+            sent = 0
+            for alert in pending_alerts:
+                alert["cover_url"] = cover_url_for(alert["account"], alert["post_id"])
+                if notify_hot_post(alert):
+                    sent += 1
+            engagement_summary["slack_alerts_sent"] = sent
 
     return {"new_posts": insert_summary, "engagement": engagement_summary}
 

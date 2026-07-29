@@ -405,6 +405,43 @@ def dashboard_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
     return results
 
 
+@app.post("/api/admin/slack-test")
+def admin_slack_test(password: Annotated[str, Form()]) -> dict[str, Any]:
+    """Sends a sample HOT alert so the Slack webhook can be verified without
+    waiting for a real post to cross its threshold."""
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+
+    from .slack_alerts import notify_hot_post, slack_configured
+
+    if not slack_configured():
+        raise HTTPException(status_code=503, detail="SLACK_WEBHOOK_URL is not set on the server.")
+
+    sent = notify_hot_post(
+        {
+            "account": "chatgptricks",
+            "likes": 4200,
+            "multiplier": 2.35,
+            "rate_per_hour": 1410,
+            "threshold": 600,
+            "age_hours": 3.0,
+            "permalink": "https://www.instagram.com/chatgptricks/",
+            "caption": "Test alert from Sentient Dash — if you can read this, HOT alerts are wired up.",
+        }
+    )
+    return {"sent": sent}
+
+
+@app.get("/api/admin/slack-status")
+def admin_slack_status() -> dict[str, Any]:
+    """Whether the server has a Slack webhook configured (never exposes it)."""
+    from .slack_alerts import slack_configured
+
+    return {"configured": slack_configured()}
+
+
 @app.get("/api/admin/accounts")
 def admin_list_accounts() -> dict[str, Any]:
     """Full roster including inactive accounts, for the admin UI."""
