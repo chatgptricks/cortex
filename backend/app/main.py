@@ -192,7 +192,7 @@ def _clean_ocr_text(raw: Any) -> str:
     queue, so it must never surface as real cover text or pollute search.
     """
     text = str(raw or "").strip()
-    return "" if text == "-" else text
+    return "" if text in {"-", "~"} else text
 
 
 @app.get("/api/dashboard/posts")
@@ -418,25 +418,45 @@ def _ocr_worker(crop_region: str, batch_size: int, max_batches: int) -> None:
     except Exception as exc:
         _OCR_RUN["error"] = str(exc)
     finally:
-        _OCR_RUN["running"] = False
+        with _OCR_RUN_LOCK:
+            _OCR_RUN["workers_live"] = max(0, int(_OCR_RUN.get("workers_live", 1)) - 1)
+            if _OCR_RUN["workers_live"] == 0:
+                _OCR_RUN["running"] = False
 
 
 @app.post("/api/admin/_temp-ocr-start")
-def temp_ocr_start(crop_region: str = "full", batch_size: int = 50, max_batches: int = 200) -> dict[str, Any]:
-    """TEMPORARY -- kick off the background OCR sweep. Remove after use."""
+def temp_ocr_start(
+    crop_region: str = "full", batch_size: int = 100, max_batches: int = 200, workers: int = 3
+) -> dict[str, Any]:
+    """TEMPORARY -- kick off the background OCR sweep. `workers` threads run in
+    parallel; row claiming is serialized so they never process the same cover
+    twice. Remove after use.
+    """
+    from .apify_sync import reset_stuck_ocr_claims
+
     with _OCR_RUN_LOCK:
         if _OCR_RUN["running"]:
             return {"already_running": True, **_OCR_RUN}
+        released = reset_stuck_ocr_claims()
+        workers = max(1, min(workers, 6))
         _OCR_RUN.update(
-            {"running": True, "done": 0, "with_text": 0, "batches": 0, "error": None, "started": utc_now()}
+            {
+                "running": True,
+                "done": 0,
+                "with_text": 0,
+                "skipped": 0,
+                "batches": 0,
+                "error": None,
+                "started": utc_now(),
+                "workers_live": workers,
+            }
         )
-    threading.Thread(
-        target=_ocr_worker,
-        args=(crop_region, max(1, min(batch_size, 100)), max_batches),
-        daemon=True,
-        name="ocr-sweep",
-    ).start()
-    return {"started": True, "crop_region": crop_region, "batch_size": batch_size}
+    size = max(1, min(batch_size, 100))
+    for i in range(workers):
+        threading.Thread(
+            target=_ocr_worker, args=(crop_region, size, max_batches), daemon=True, name=f"ocr-sweep-{i}"
+        ).start()
+    return {"started": True, "crop_region": crop_region, "batch_size": size, "workers": workers, "released": released}
 
 
 @app.get("/api/admin/_temp-ocr-status")

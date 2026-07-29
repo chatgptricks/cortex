@@ -181,6 +181,22 @@ def _compress_cover(raw: bytes) -> tuple[bytes, str]:
     return compressed, ".webp"
 
 
+_OCR_CLAIM_LOCK = __import__("threading").Lock()
+
+
+def reset_stuck_ocr_claims() -> int:
+    """Releases rows left in the 'in flight' state by a thread that died (a
+    Render restart mid-batch). Called before a bulk sweep so nothing is
+    stranded and skipped forever.
+    """
+    from .db import connect
+
+    with connect() as conn:
+        a = conn.execute("UPDATE dashboard_posts SET ocr_checked = 0 WHERE ocr_checked = 2").rowcount
+        b = conn.execute("UPDATE posts SET hook_text = '' WHERE hook_text = '~'").rowcount
+    return int(a or 0) + int(b or 0)
+
+
 def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> Path | None:
     """Downloads + compresses a cover that was never cached locally (covers are
     fetched lazily, so thousands of rows have a source URL but no file). Returns
@@ -227,21 +243,39 @@ def run_ocr_sweep(limit: int = 30, crop_region: str = "full") -> dict[str, Any]:
 
     summary: dict[str, Any] = {"sent": 0, "with_text": 0, "skipped": 0, "remaining": 0}
 
-    with connect() as conn:
-        dash = conn.execute(
-            "SELECT id, account, shortcode, cover_image_path, cover_source_url FROM dashboard_posts "
-            "WHERE TRIM(COALESCE(hook_text, '')) = '' AND ocr_checked = 0 "
-            "ORDER BY published_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        canon = []
-        if len(dash) < limit:
-            canon = conn.execute(
-                "SELECT id, shortcode, image_path FROM posts "
-                "WHERE TRIM(COALESCE(hook_text, '')) = '' AND image_path IS NOT NULL AND image_path != '' "
-                "ORDER BY id DESC LIMIT ?",
-                (limit - len(dash),),
+    # Claim rows under a process-wide lock so several sweep threads can run in
+    # parallel without two of them grabbing the same cover -- that would OCR
+    # (and bill) the same image twice. ocr_checked=2 means "in flight"; the
+    # slow Modal call happens outside the lock so threads actually overlap.
+    with _OCR_CLAIM_LOCK:
+        with connect() as conn:
+            dash = conn.execute(
+                "SELECT id, account, shortcode, cover_image_path, cover_source_url FROM dashboard_posts "
+                "WHERE TRIM(COALESCE(hook_text, '')) = '' AND ocr_checked = 0 "
+                "ORDER BY published_at DESC LIMIT ?",
+                (limit,),
             ).fetchall()
+            if dash:
+                conn.executemany(
+                    "UPDATE dashboard_posts SET ocr_checked = 2 WHERE id = ?",
+                    [(int(r["id"]),) for r in dash],
+                )
+            canon = []
+            if len(dash) < limit:
+                canon = conn.execute(
+                    "SELECT id, shortcode, image_path FROM posts "
+                    "WHERE TRIM(COALESCE(hook_text, '')) = '' AND image_path IS NOT NULL AND image_path != '' "
+                    "ORDER BY id DESC LIMIT ?",
+                    (limit - len(dash),),
+                ).fetchall()
+                if canon:
+                    # posts has no ocr_checked column; the in-flight marker is
+                    # a placeholder hook_text that _clean_ocr_text hides.
+                    conn.executemany(
+                        "UPDATE posts SET hook_text = '~' WHERE id = ?", [(int(r["id"]),) for r in canon]
+                    )
+
+    with connect() as conn:
         summary["remaining"] = conn.execute(
             "SELECT (SELECT COUNT(*) FROM dashboard_posts "
             "        WHERE TRIM(COALESCE(hook_text,''))='' AND ocr_checked=0) "
@@ -288,7 +322,19 @@ def run_ocr_sweep(limit: int = 30, crop_region: str = "full") -> dict[str, Any]:
     if not jobs:
         return summary
 
-    results = extract_images_text_remote([p for _, _, p in jobs], crop_region=crop_region)
+    try:
+        results = extract_images_text_remote([p for _, _, p in jobs], crop_region=crop_region)
+    except Exception:
+        # Release the claims so a later pass retries these instead of leaving
+        # them stranded in the in-flight state.
+        with connect() as conn:
+            for table, row_id, _ in jobs:
+                if table == "dashboard_posts":
+                    conn.execute("UPDATE dashboard_posts SET ocr_checked = 0 WHERE id = ?", (row_id,))
+                else:
+                    conn.execute("UPDATE posts SET hook_text = '' WHERE id = ?", (row_id,))
+        raise
+
     now_iso = utc_now()
     with connect() as conn:
         for (table, row_id, _), result in zip(jobs, results, strict=False):
