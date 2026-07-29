@@ -214,7 +214,8 @@ def dashboard_posts() -> dict[str, Any]:
         dashboard_rows = conn.execute(
             """
             SELECT id, account, shortcode, published_at, likes, comments, caption,
-                   post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier
+                   post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
+                   hook_text
             FROM dashboard_posts
             """
         ).fetchall()
