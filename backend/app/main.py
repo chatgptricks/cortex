@@ -442,6 +442,37 @@ def _ocr_worker(crop_region: str, batch_size: int, max_batches: int) -> None:
                 _OCR_RUN["running"] = False
 
 
+_BACKFILL_RUN: dict[str, Any] = {"running": False, "handle": None, "result": None, "error": None}
+
+
+def _backfill_worker(handle: str, results_limit: int) -> None:
+    try:
+        _BACKFILL_RUN["result"] = run_backfill(handle, results_limit=results_limit)
+    except Exception as exc:
+        _BACKFILL_RUN["error"] = str(exc)
+    finally:
+        _BACKFILL_RUN["running"] = False
+
+
+@app.post("/api/admin/_temp-backfill-bg/{handle}")
+def temp_backfill_bg(handle: str, results_limit: int = 2000) -> dict[str, Any]:
+    """TEMPORARY -- runs a backfill in a background thread so a client
+    disconnect (or a slow scrape) can't abort it. Remove after use."""
+    if _BACKFILL_RUN["running"]:
+        return {"already_running": True, **_BACKFILL_RUN}
+    _BACKFILL_RUN.update({"running": True, "handle": handle, "result": None, "error": None})
+    threading.Thread(
+        target=_backfill_worker, args=(handle, results_limit), daemon=True, name=f"backfill-{handle}"
+    ).start()
+    return {"started": True, "handle": handle, "results_limit": results_limit}
+
+
+@app.get("/api/admin/_temp-backfill-status")
+def temp_backfill_status() -> dict[str, Any]:
+    """TEMPORARY -- progress of the background backfill. Remove after use."""
+    return dict(_BACKFILL_RUN)
+
+
 @app.post("/api/admin/_temp-ocr-start")
 def temp_ocr_start(
     crop_region: str = "full", batch_size: int = 100, max_batches: int = 200, workers: int = 3
