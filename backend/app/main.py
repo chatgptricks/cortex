@@ -186,6 +186,15 @@ def dashboard_accounts() -> dict[str, Any]:
     return {"accounts": list_accounts(active_only=True)}
 
 
+def _clean_ocr_text(raw: Any) -> str:
+    """hook_text carries a '-' sentinel for covers we can never OCR (file gone,
+    expired CDN link). It exists only to keep those rows out of the retry
+    queue, so it must never surface as real cover text or pollute search.
+    """
+    text = str(raw or "").strip()
+    return "" if text == "-" else text
+
+
 @app.get("/api/dashboard/posts")
 def dashboard_posts() -> dict[str, Any]:
     """Unified, public, read-only projection across every account. Each
@@ -242,7 +251,7 @@ def dashboard_posts() -> dict[str, Any]:
                     "section": post.get("section") or "",
                     # hook_text is the normalized OCR result for the cover
                     # image; already indexed in the frontend's search field.
-                    "ocrText": post.get("hook_text") or "",
+                    "ocrText": _clean_ocr_text(post.get("hook_text")),
                     "coverUrl": f"/api/dashboard/covers/{handle}/{post['id']}",
                     "isHot": bool(post.get("is_hot")),
                     "hotMultiplier": post.get("hot_rate_multiplier"),
@@ -270,7 +279,7 @@ def dashboard_posts() -> dict[str, Any]:
                 "caption": post.get("caption") or "",
                 "excerpt": post.get("caption") or "",
                 "section": "single",
-                "ocrText": post.get("hook_text") or "",
+                "ocrText": _clean_ocr_text(post.get("hook_text")),
                 "coverUrl": f"/api/dashboard/covers/{account}/{post['id']}",
                 "isHot": bool(post.get("is_hot")),
                 "hotMultiplier": post.get("hot_rate_multiplier"),

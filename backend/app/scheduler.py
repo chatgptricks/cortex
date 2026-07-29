@@ -22,6 +22,11 @@ _lock = threading.Lock()
 _SHORT_BUCKET_KEY = "last_short_bucket"
 _DAILY_DATE_KEY = "last_daily_date"
 
+# Covers OCR'd per hourly tick. New posts arrive at a few per account per day,
+# so this keeps up easily while also chipping away at any backlog without
+# making one tick run long.
+_OCR_PER_TICK = 30
+
 
 def _state_get(key: str) -> str | None:
     """Scheduler run markers live in the DB, not memory: Render restarts the
@@ -115,6 +120,21 @@ def _run_daily_jobs() -> None:
             logger.exception("Daily engagement cycle (%s) crashed", account)
 
 
+def _run_ocr_job() -> None:
+    """Keeps cover OCR current without anyone running it by hand: each hourly
+    tick tops up a bounded number of covers still missing hook_text, so posts
+    that arrived since the last tick become text-searchable on their own.
+    """
+    from .apify_sync import run_ocr_sweep
+
+    try:
+        result = run_ocr_sweep(limit=_OCR_PER_TICK)
+        if result.get("sent") or result.get("skipped"):
+            logger.info("Cover OCR sweep: %s", result)
+    except Exception:
+        logger.exception("Cover OCR sweep crashed")
+
+
 def _tick() -> None:
     now_cst = datetime.now(_CST)
 
@@ -125,6 +145,7 @@ def _tick() -> None:
             # leave it unclaimed and re-fire on the next 30s tick.
             _state_set(_SHORT_BUCKET_KEY, bucket)
             _run_short_term_jobs()
+            _run_ocr_job()
 
     daily_trigger = now_cst.replace(hour=_DAILY_JOB_AT[0], minute=_DAILY_JOB_AT[1], second=0, microsecond=0)
     today = now_cst.strftime("%Y-%m-%d")

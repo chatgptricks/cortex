@@ -180,6 +180,134 @@ def _compress_cover(raw: bytes) -> tuple[bytes, str]:
     return compressed, ".webp"
 
 
+def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> Path | None:
+    """Downloads + compresses a cover that was never cached locally (covers are
+    fetched lazily, so thousands of rows have a source URL but no file). Returns
+    the local path, or None if there's no URL or the CDN link has expired --
+    Instagram's URLs are signed and die after a few days, so this fails often
+    for older posts and the caller should treat None as "give up on this row".
+    """
+    if not cover_source_url:
+        return None
+
+    import httpx
+
+    from .config import UPLOAD_DIR
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with httpx.Client(timeout=30.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            response = client.get(cover_source_url)
+            response.raise_for_status()
+        data, suffix = _compress_cover(response.content)
+    except Exception:
+        return None
+
+    path = UPLOAD_DIR / f"{dest_stem}{suffix}"
+    try:
+        path.write_bytes(data)
+    except OSError:
+        return None
+    return path
+
+
+def run_ocr_sweep(limit: int = 30, crop_region: str = "full") -> dict[str, Any]:
+    """Fills in cover OCR text (hook_text) for any post still missing it, across
+    BOTH tables -- dashboard_posts and the canonical posts table. Downloads the
+    cover first when it was never cached locally.
+
+    Sized for the scheduler: processes at most `limit` covers per call so a
+    single tick stays bounded, and marks every row it touches as checked so
+    blank/failed ones are never retried (and re-billed) on the next pass.
+    """
+    from .db import connect, utc_now
+
+    from .remote_ocr import extract_images_text_remote
+
+    summary: dict[str, Any] = {"sent": 0, "with_text": 0, "skipped": 0, "remaining": 0}
+
+    with connect() as conn:
+        dash = conn.execute(
+            "SELECT id, account, shortcode, cover_image_path, cover_source_url FROM dashboard_posts "
+            "WHERE TRIM(COALESCE(hook_text, '')) = '' AND ocr_checked = 0 "
+            "ORDER BY published_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        canon = []
+        if len(dash) < limit:
+            canon = conn.execute(
+                "SELECT id, shortcode, image_path FROM posts "
+                "WHERE TRIM(COALESCE(hook_text, '')) = '' AND image_path IS NOT NULL AND image_path != '' "
+                "ORDER BY id DESC LIMIT ?",
+                (limit - len(dash),),
+            ).fetchall()
+        summary["remaining"] = conn.execute(
+            "SELECT (SELECT COUNT(*) FROM dashboard_posts "
+            "        WHERE TRIM(COALESCE(hook_text,''))='' AND ocr_checked=0) "
+            "     + (SELECT COUNT(*) FROM posts "
+            "        WHERE TRIM(COALESCE(hook_text,''))='' AND image_path IS NOT NULL AND image_path != '') AS c"
+        ).fetchone()["c"]
+
+    jobs: list[tuple[str, int, Path]] = []
+    give_up: list[tuple[str, int]] = []
+
+    for row in dash:
+        path = Path(str(row["cover_image_path"])) if row["cover_image_path"] else None
+        if path is None or not path.is_file():
+            stem = f"dash-{row['account']}-{str(row['shortcode'] or row['id']).strip()}"
+            path = ensure_local_cover(row["cover_source_url"], stem)
+            if path is None:
+                give_up.append(("dashboard_posts", int(row["id"])))
+                continue
+            with connect() as conn:
+                conn.execute(
+                    "UPDATE dashboard_posts SET cover_image_path = ? WHERE id = ?", (str(path), int(row["id"]))
+                )
+        jobs.append(("dashboard_posts", int(row["id"]), path))
+
+    for row in canon:
+        path = Path(str(row["image_path"]))
+        if not path.is_file():
+            give_up.append(("posts", int(row["id"])))
+            continue
+        jobs.append(("posts", int(row["id"]), path))
+
+    # Rows we can never OCR (no file, dead CDN link) get marked so they don't
+    # clog the queue forever. posts has no ocr_checked column, so a sentinel
+    # keeps it out of the "blank hook_text" set without faking real text.
+    if give_up:
+        with connect() as conn:
+            for table, row_id in give_up:
+                if table == "dashboard_posts":
+                    conn.execute("UPDATE dashboard_posts SET ocr_checked = 1 WHERE id = ?", (row_id,))
+                else:
+                    conn.execute("UPDATE posts SET hook_text = '-' WHERE id = ?", (row_id,))
+        summary["skipped"] = len(give_up)
+
+    if not jobs:
+        return summary
+
+    results = extract_images_text_remote([p for _, _, p in jobs], crop_region=crop_region)
+    now_iso = utc_now()
+    with connect() as conn:
+        for (table, row_id, _), result in zip(jobs, results, strict=False):
+            text = str(result.get("text") or "").strip() if isinstance(result, dict) else ""
+            if text:
+                summary["with_text"] += 1
+            if table == "dashboard_posts":
+                conn.execute(
+                    "UPDATE dashboard_posts SET hook_text = ?, ocr_checked = 1, updated_at = ? WHERE id = ?",
+                    (text or None, now_iso, row_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE posts SET hook_text = ?, updated_at = ? WHERE id = ?",
+                    (text or "-", now_iso, row_id),
+                )
+    summary["sent"] = len(jobs)
+    return summary
+
+
 def _likes_are_known(raw: Any) -> bool:
     """True only when Instagram/Apify gave us a real like count. Mirrors the
     condition in _apply_likes_floor -- anything it would replace with the 500
