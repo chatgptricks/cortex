@@ -143,6 +143,51 @@ def _published_at(item: dict[str, Any]) -> str | None:
     return str(ts)
 
 
+# Cover images dominate the 2GB Render disk: ~180KB each x thousands of posts.
+# Instagram's own JPEGs are already well optimized, so re-encoding them as JPEG
+# saves almost nothing (measured: ~8% at q75, and q80+ actually grew the file).
+# WebP at q82 measured ~31% smaller at the SAME pixel dimensions -- no downscale,
+# so the 1080px-wide sidebar preview stays sharp on retina (it renders at
+# 531x843 CSS px, i.e. ~1062px wide at DPR2).
+_COVER_MAX_WIDTH = 1080
+_COVER_QUALITY = 82
+
+
+def _compress_cover(raw: bytes) -> tuple[bytes, str]:
+    """Returns (bytes, suffix). Falls back to the original bytes untouched if
+    the image can't be decoded or if re-encoding wouldn't actually shrink it,
+    so a codec edge case never loses or bloats a cover.
+    """
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(raw)) as img:
+            img = img.convert("RGB")
+            # Only ever downscale oversized sources (some are 1600px wide);
+            # never upscale, and never shrink below what the UI renders.
+            if img.width > _COVER_MAX_WIDTH:
+                new_height = int(img.height * _COVER_MAX_WIDTH / img.width)
+                img = img.resize((_COVER_MAX_WIDTH, new_height), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="WEBP", quality=_COVER_QUALITY, method=6)
+        compressed = buf.getvalue()
+    except Exception:
+        return raw, ".jpg"
+    if len(compressed) >= len(raw):
+        return raw, ".jpg"
+    return compressed, ".webp"
+
+
+def _likes_are_known(raw: Any) -> bool:
+    """True only when Instagram/Apify gave us a real like count. Mirrors the
+    condition in _apply_likes_floor -- anything it would replace with the 500
+    baseline is "unknown", not a genuine 500.
+    """
+    return isinstance(raw, int) and not isinstance(raw, bool) and raw > 3
+
+
 def _apply_likes_floor(raw: Any) -> int:
     """Instagram/Apify sometimes reports a very low or sentinel (-1, hidden)
     like count for a post. Per product decision, any value of 3 or below
@@ -306,14 +351,11 @@ def _insert_new_chatgptricks_posts(new_items: list[dict[str, Any]]) -> dict[str,
                 summary["items"].append({"shortcode": shortcode, "status": "failed", "error": str(exc)})
                 continue
 
-            suffix = ".jpg"
-            content_type = image_response.headers.get("content-type", "")
-            if "png" in content_type:
-                suffix = ".png"
-            elif "webp" in content_type:
-                suffix = ".webp"
-
-            image_path = UPLOAD_DIR / f"{os.urandom(16).hex()}{suffix}"
+            image_bytes, suffix = _compress_cover(image_bytes)
+            # Keyed by shortcode rather than random bytes: re-importing a post
+            # overwrites its own cover instead of orphaning the old file on
+            # disk with no way to ever find or clean it up.
+            image_path = UPLOAD_DIR / f"cover-{shortcode}{suffix}"
             image_path.write_bytes(image_bytes)
 
             caption = _clean_text(item.get("caption"))
@@ -384,14 +426,12 @@ def _insert_new_dashboard_posts(account: str, new_items: list[dict[str, Any]]) -
                 try:
                     image_response = image_client.get(image_url)
                     image_response.raise_for_status()
-                    suffix = ".jpg"
-                    content_type = image_response.headers.get("content-type", "")
-                    if "png" in content_type:
-                        suffix = ".png"
-                    elif "webp" in content_type:
-                        suffix = ".webp"
-                    image_path = UPLOAD_DIR / f"dash-{account}-{os.urandom(16).hex()}{suffix}"
-                    image_path.write_bytes(image_response.content)
+                    image_bytes, suffix = _compress_cover(image_response.content)
+                    # Keyed by account+shortcode rather than random bytes so a
+                    # re-import overwrites its own cover instead of orphaning
+                    # the previous file on disk forever.
+                    image_path = UPLOAD_DIR / f"dash-{account}-{shortcode}{suffix}"
+                    image_path.write_bytes(image_bytes)
                     cover_path = str(image_path)
                 except httpx.HTTPError:
                     cover_path = None
@@ -522,7 +562,13 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
         if comments is not None:
             set_clauses.append("comments = ?")
             params.append(comments)
-        if not info["hot_checked"] and info["age_hours"] >= 1.0:
+        # Only run the one-time HOT check when the like count is real. With an
+        # unknown/hidden count, _apply_likes_floor returns the 500 baseline,
+        # which at the ~1h mark computes to a rate of ~500/hr and would
+        # permanently mark the post HOT for any account whose threshold is
+        # <=500 -- purely as an artifact of the placeholder. Leave hot_checked
+        # unset instead so a later cycle can decide on real data.
+        if not info["hot_checked"] and info["age_hours"] >= 1.0 and _likes_are_known(item.get("likesCount")):
             # Checks land on a fixed 30-min grid, so a post is rarely
             # observed at exactly 1.0h old (could be 1.0-1.5h, or much more
             # overnight). Rather than compare the raw like count, compute

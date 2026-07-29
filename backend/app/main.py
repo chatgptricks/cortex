@@ -383,7 +383,121 @@ def admin_list_accounts() -> dict[str, Any]:
     return {"accounts": list_accounts(active_only=False)}
 
 
+@app.post("/api/admin/_temp-compress-covers")
+def temp_compress_covers(limit: int = 300) -> dict[str, Any]:
+    """TEMPORARY -- one-off: convert already-stored cover images to WebP.
+    New covers are compressed on download, but ~6.6k pre-existing ones were
+    saved at full Instagram size and are the bulk of the 2GB Render disk.
 
+    Converts the file AND rewrites the DB path in the same step, because the
+    cover endpoint serves via FileResponse, which infers Content-Type from the
+    extension -- writing WebP bytes into a .jpg path would serve them
+    mislabelled as image/jpeg. Idempotent and restartable: rows already
+    pointing at .webp are skipped, so it can be called repeatedly until
+    remaining == 0. Remove after use.
+    """
+    from .apify_sync import _compress_cover
+
+    targets: list[tuple[str, int, str]] = []  # (table, id, path)
+    with connect() as conn:
+        remaining_dash = conn.execute(
+            "SELECT COUNT(*) c FROM dashboard_posts WHERE cover_image_path IS NOT NULL "
+            "AND cover_image_path != '' AND lower(cover_image_path) NOT LIKE '%.webp'"
+        ).fetchone()["c"]
+        remaining_posts = conn.execute(
+            "SELECT COUNT(*) c FROM posts WHERE image_path IS NOT NULL "
+            "AND image_path != '' AND lower(image_path) NOT LIKE '%.webp'"
+        ).fetchone()["c"]
+        for row in conn.execute(
+            "SELECT id, cover_image_path p FROM dashboard_posts WHERE cover_image_path IS NOT NULL "
+            "AND cover_image_path != '' AND lower(cover_image_path) NOT LIKE '%.webp' LIMIT ?",
+            (limit,),
+        ).fetchall():
+            targets.append(("dashboard_posts", row["id"], row["p"]))
+        if len(targets) < limit:
+            for row in conn.execute(
+                "SELECT id, image_path p FROM posts WHERE image_path IS NOT NULL "
+                "AND image_path != '' AND lower(image_path) NOT LIKE '%.webp' LIMIT ?",
+                (limit - len(targets),),
+            ).fetchall():
+                targets.append(("posts", row["id"], row["p"]))
+
+    converted = skipped = 0
+    before_total = after_total = 0
+    errors: list[str] = []
+    col = {"dashboard_posts": "cover_image_path", "posts": "image_path"}
+
+    for table, row_id, old_path_str in targets:
+        try:
+            old_path = Path(old_path_str)
+            if not old_path.is_file():
+                skipped += 1
+                continue
+            raw = old_path.read_bytes()
+            compressed, suffix = _compress_cover(raw)
+            if suffix != ".webp" or len(compressed) >= len(raw):
+                skipped += 1
+                continue
+            new_path = old_path.with_suffix(".webp")
+            new_path.write_bytes(compressed)
+            with connect() as conn:
+                conn.execute(f"UPDATE {table} SET {col[table]} = ? WHERE id = ?", (str(new_path), row_id))
+            if new_path != old_path:
+                old_path.unlink(missing_ok=True)
+            before_total += len(raw)
+            after_total += len(compressed)
+            converted += 1
+        except Exception as exc:
+            errors.append(f"{table}:{row_id}: {exc}")
+
+    return {
+        "converted": converted,
+        "skipped": skipped,
+        "remaining_before_this_pass": remaining_dash + remaining_posts,
+        "freed_mb": round((before_total - after_total) / 1024 / 1024, 2),
+        "errors": errors[:5],
+    }
+
+
+@app.get("/api/admin/_temp-disk")
+def temp_disk() -> dict[str, Any]:
+    """TEMPORARY -- read-only disk usage snapshot. Remove after use."""
+    import shutil
+
+    from .config import DATA_DIR, UPLOAD_DIR
+
+    total = count = big = 0
+    for p in UPLOAD_DIR.glob("*"):
+        if p.is_file():
+            s = p.stat().st_size
+            total += s
+            count += 1
+            if s >= 100_000:
+                big += 1
+    usage = shutil.disk_usage(str(DATA_DIR))
+    return {
+        "uploads_files": count,
+        "uploads_mb": round(total / 1024 / 1024, 1),
+        "uploads_over_100kb": big,
+        "disk_total_gb": round(usage.total / 1024**3, 2),
+        "disk_used_gb": round(usage.used / 1024**3, 2),
+        "disk_free_gb": round(usage.free / 1024**3, 2),
+    }
+
+
+
+
+
+# The preview endpoint is deliberately unauthenticated -- the add-account
+# wizard shows a live profile picture in step 1, before the user has entered
+# the refresh password. But every call spends Apify credits, so without a
+# throttle it's an open tap anyone with the URL could run up. Cache repeat
+# lookups of the same handle and cap the global rate.
+_PREVIEW_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_PREVIEW_CACHE_TTL = 600.0  # seconds
+_PREVIEW_CALLS: list[float] = []
+_PREVIEW_MAX_PER_MIN = 10
+_PREVIEW_LOCK = threading.Lock()
 
 
 @app.get("/api/admin/accounts/preview")
@@ -391,12 +505,32 @@ def admin_preview_account(handle: str) -> dict[str, Any]:
     """Read-only lookup used by the add-account wizard's first step to show
     the real Instagram profile picture/name/follower count for a handle
     before the account is actually created. No password required (nothing
-    is written), same as the other /api/dashboard/* read endpoints.
+    is written), but rate-limited and cached because it costs Apify credits.
     """
+    key = handle.strip().lstrip("@").lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="Handle is required.")
+
+    now = time.monotonic()
+    with _PREVIEW_LOCK:
+        cached = _PREVIEW_CACHE.get(key)
+        if cached and now - cached[0] < _PREVIEW_CACHE_TTL:
+            return cached[1]
+        # Typing a handle fires several debounced lookups, so allow a small
+        # burst but refuse sustained hammering.
+        _PREVIEW_CALLS[:] = [t for t in _PREVIEW_CALLS if now - t < 60.0]
+        if len(_PREVIEW_CALLS) >= _PREVIEW_MAX_PER_MIN:
+            raise HTTPException(status_code=429, detail="Too many lookups. Try again in a moment.")
+        _PREVIEW_CALLS.append(now)
+
     try:
-        return fetch_profile_preview(handle)
+        result = fetch_profile_preview(handle)
     except ApifySyncError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    with _PREVIEW_LOCK:
+        _PREVIEW_CACHE[key] = (time.monotonic(), result)
+    return result
 
 
 @app.post("/api/admin/accounts")

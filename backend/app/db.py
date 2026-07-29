@@ -181,6 +181,17 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_dashboard_posts_account_published
                 ON dashboard_posts(account, published_at DESC);
+
+            /* Scheduler bookkeeping. Previously the "last run" markers lived
+               only in module-level memory, so every redeploy reset them and
+               the jobs re-fired immediately -- including the full daily
+               engagement cycle, which costs real Apify credits on every
+               restart. Persisting them here makes restarts free. */
+            CREATE TABLE IF NOT EXISTS scheduler_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         _ensure_column(conn, "traselveloreal_posts", "hot_rate_multiplier", "hot_rate_multiplier REAL")

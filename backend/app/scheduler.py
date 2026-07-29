@@ -16,10 +16,42 @@ _SHORT_JOB_START = (7, 30)  # 7:30am CST
 _SHORT_JOB_END = (23, 30)  # 11:30pm CST
 _DAILY_JOB_AT = (7, 0)  # 7:00am CST, right before the short-term window opens
 
-_last_short_bucket: str | None = None
-_last_daily_date: str | None = None
 _started = False
 _lock = threading.Lock()
+
+_SHORT_BUCKET_KEY = "last_short_bucket"
+_DAILY_DATE_KEY = "last_daily_date"
+
+
+def _state_get(key: str) -> str | None:
+    """Scheduler run markers live in the DB, not memory: Render restarts the
+    process on every deploy, and in-memory markers meant both jobs re-fired
+    immediately on boot -- re-running the full daily engagement cycle (real
+    Apify credits) once per deploy.
+    """
+    from .db import connect
+
+    try:
+        with connect() as conn:
+            row = conn.execute("SELECT value FROM scheduler_state WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+    except Exception:
+        logger.exception("Failed to read scheduler state %s", key)
+        return None
+
+
+def _state_set(key: str, value: str) -> None:
+    from .db import connect, utc_now
+
+    try:
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO scheduler_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, value, utc_now()),
+            )
+    except Exception:
+        logger.exception("Failed to persist scheduler state %s", key)
 
 
 def _in_short_job_window(now_cst: datetime) -> bool:
@@ -84,19 +116,20 @@ def _run_daily_jobs() -> None:
 
 
 def _tick() -> None:
-    global _last_short_bucket, _last_daily_date
     now_cst = datetime.now(_CST)
 
     if _in_short_job_window(now_cst):
         bucket = _bucket_key(now_cst)
-        if bucket != _last_short_bucket:
-            _last_short_bucket = bucket
+        if bucket != _state_get(_SHORT_BUCKET_KEY):
+            # Claim the bucket *before* running so a crash mid-job doesn't
+            # leave it unclaimed and re-fire on the next 30s tick.
+            _state_set(_SHORT_BUCKET_KEY, bucket)
             _run_short_term_jobs()
 
     daily_trigger = now_cst.replace(hour=_DAILY_JOB_AT[0], minute=_DAILY_JOB_AT[1], second=0, microsecond=0)
     today = now_cst.strftime("%Y-%m-%d")
-    if now_cst >= daily_trigger and _last_daily_date != today:
-        _last_daily_date = today
+    if now_cst >= daily_trigger and _state_get(_DAILY_DATE_KEY) != today:
+        _state_set(_DAILY_DATE_KEY, today)
         _run_daily_jobs()
 
 
