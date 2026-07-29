@@ -575,31 +575,45 @@ def run_short_term_cycle_batch(accounts: list[str], results_limit: int = 80) -> 
     are matched back to each account via the post's ownerUsername field. This
     avoids paying a separate actor-run overhead per account every cycle.
 
-    Falls back gracefully per-account: if the batched Apify item set doesn't
-    include a given account's posts for some reason (e.g. a private/renamed
-    profile), that account just sees zero new items and zero engagement
-    updates for this cycle rather than the whole batch failing.
+    Failures are isolated per account, matching the old one-call-per-account
+    behavior: a single account with a bad config, a private/renamed profile,
+    or a DB error can't take down the whole batch and silently skip HOT
+    detection for every other account. Only a failure of the shared Apify
+    fetch itself (which no per-account handling could rescue) propagates.
     """
     if not accounts:
         return {}
 
     now = datetime.now(UTC)
-    configs = {account: get_account_config(account) for account in accounts}
-    handles = [configs[account]["handle"] for account in accounts]
+
+    configs: dict[str, dict[str, Any]] = {}
+    results: dict[str, dict[str, Any]] = {}
+    for account in accounts:
+        try:
+            configs[account] = get_account_config(account)
+        except Exception as exc:
+            results[account] = {"error": f"config lookup failed: {exc}"}
+
+    if not configs:
+        return results
+
+    handles = [cfg["handle"] for cfg in configs.values()]
     payload = _short_term_payload(handles, results_limit, now)
     items = _fetch_apify_items(payload)
 
-    handle_to_account = {configs[account]["handle"].lower(): account for account in accounts}
-    items_by_account: dict[str, list[dict[str, Any]]] = {account: [] for account in accounts}
+    handle_to_account = {cfg["handle"].lower(): account for account, cfg in configs.items()}
+    items_by_account: dict[str, list[dict[str, Any]]] = {account: [] for account in configs}
     for item in items:
         owner = (item.get("ownerUsername") or "").lower()
         account = handle_to_account.get(owner)
         if account:
             items_by_account[account].append(item)
 
-    results: dict[str, dict[str, Any]] = {}
-    for account in accounts:
-        results[account] = _process_short_term_items(account, configs[account], items_by_account[account], now)
+    for account, cfg in configs.items():
+        try:
+            results[account] = _process_short_term_items(account, cfg, items_by_account[account], now)
+        except Exception as exc:
+            results[account] = {"error": f"processing failed: {exc}"}
     return results
 
 
