@@ -303,13 +303,17 @@ def dashboard_posts() -> dict[str, Any]:
         )
 
     posts.sort(key=lambda p: p.get("postDate") or "", reverse=True)
-    total_likes = sum(post["likes"] for post in posts)
+    # Posts with an unknown like count are null now, so they're excluded from
+    # both the total and the average -- averaging them in as 0 would drag the
+    # figure down with data we simply don't have.
+    known_likes = [post["likes"] for post in posts if post["likes"] is not None]
+    total_likes = sum(known_likes)
     return {
         "posts": posts,
         "summary": {
             "Exported posts": len(posts),
             "Total likes": total_likes,
-            "Average likes": round(total_likes / len(posts)) if posts else 0,
+            "Average likes": round(total_likes / len(known_likes)) if known_likes else 0,
         },
     }
 
