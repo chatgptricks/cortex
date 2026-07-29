@@ -383,6 +383,92 @@ def admin_list_accounts() -> dict[str, Any]:
     return {"accounts": list_accounts(active_only=False)}
 
 
+_OCR_RUN: dict[str, Any] = {"running": False, "done": 0, "with_text": 0, "batches": 0, "error": None, "started": None}
+_OCR_RUN_LOCK = threading.Lock()
+
+
+def _ocr_worker(crop_region: str, batch_size: int, max_batches: int) -> None:
+    """Runs the OCR sweep in a background thread. The HTTP request that starts
+    it returns immediately -- a client disconnect was aborting the request
+    mid-batch, which made a 4k-image sweep impossible to drive from curl.
+    """
+    try:
+        for _ in range(max_batches):
+            with connect() as conn:
+                rows = conn.execute(
+                    "SELECT id, cover_image_path FROM dashboard_posts "
+                    "WHERE TRIM(COALESCE(hook_text, '')) = '' AND ocr_checked = 0 "
+                    "AND cover_image_path IS NOT NULL AND cover_image_path != '' "
+                    "ORDER BY published_at DESC LIMIT ?",
+                    (batch_size,),
+                ).fetchall()
+            if not rows:
+                break
+
+            present, missing = [], []
+            for r in rows:
+                p = Path(str(r["cover_image_path"]))
+                (present if p.is_file() else missing).append((int(r["id"]), p))
+
+            if missing:
+                with connect() as conn:
+                    conn.executemany(
+                        "UPDATE dashboard_posts SET ocr_checked = 1 WHERE id = ?", [(i,) for i, _ in missing]
+                    )
+            if not present:
+                continue
+
+            results = extract_images_text_remote([p for _, p in present], crop_region=crop_region)
+            now_iso = utc_now()
+            with connect() as conn:
+                for (post_id, _), result in zip(present, results, strict=False):
+                    text = str(result.get("text") or "").strip() if isinstance(result, dict) else ""
+                    if text:
+                        _OCR_RUN["with_text"] += 1
+                    conn.execute(
+                        "UPDATE dashboard_posts SET hook_text = ?, ocr_checked = 1, updated_at = ? WHERE id = ?",
+                        (text or None, now_iso, post_id),
+                    )
+                    _OCR_RUN["done"] += 1
+            _OCR_RUN["batches"] += 1
+    except Exception as exc:
+        _OCR_RUN["error"] = str(exc)
+    finally:
+        _OCR_RUN["running"] = False
+
+
+@app.post("/api/admin/_temp-ocr-start")
+def temp_ocr_start(crop_region: str = "full", batch_size: int = 50, max_batches: int = 200) -> dict[str, Any]:
+    """TEMPORARY -- kick off the background OCR sweep. Remove after use."""
+    with _OCR_RUN_LOCK:
+        if _OCR_RUN["running"]:
+            return {"already_running": True, **_OCR_RUN}
+        _OCR_RUN.update(
+            {"running": True, "done": 0, "with_text": 0, "batches": 0, "error": None, "started": utc_now()}
+        )
+    threading.Thread(
+        target=_ocr_worker,
+        args=(crop_region, max(1, min(batch_size, 100)), max_batches),
+        daemon=True,
+        name="ocr-sweep",
+    ).start()
+    return {"started": True, "crop_region": crop_region, "batch_size": batch_size}
+
+
+@app.get("/api/admin/_temp-ocr-status")
+def temp_ocr_status() -> dict[str, Any]:
+    """TEMPORARY -- progress of the background OCR sweep. Remove after use."""
+    with connect() as conn:
+        remaining = conn.execute(
+            "SELECT COUNT(*) c FROM dashboard_posts WHERE TRIM(COALESCE(hook_text, '')) = '' "
+            "AND ocr_checked = 0 AND cover_image_path IS NOT NULL AND cover_image_path != ''"
+        ).fetchone()["c"]
+        done = conn.execute(
+            "SELECT COUNT(*) c FROM dashboard_posts WHERE TRIM(COALESCE(hook_text, '')) != ''"
+        ).fetchone()["c"]
+    return {"remaining": remaining, "with_text_total": done, **_OCR_RUN}
+
+
 @app.post("/api/admin/_temp-ocr-dashboard")
 def temp_ocr_dashboard(
     limit: int = 30,
