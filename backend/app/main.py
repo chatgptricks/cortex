@@ -383,6 +383,19 @@ def admin_list_accounts() -> dict[str, Any]:
     return {"accounts": list_accounts(active_only=False)}
 
 
+@app.post("/api/admin/_temp-test-batch")
+def temp_test_batch() -> dict[str, Any]:
+    """TEMPORARY -- one-off verification that the new batched short-term
+    cycle correctly matches results back to each account. Remove after use."""
+    from .apify_sync import ApifySyncError, run_short_term_cycle_batch
+
+    accounts = [a["handle"] for a in list_accounts(active_only=True)]
+    try:
+        return {"accounts": accounts, "results": run_short_term_cycle_batch(accounts)}
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 
 @app.get("/api/admin/accounts/preview")
 def admin_preview_account(handle: str) -> dict[str, Any]:
