@@ -451,26 +451,28 @@ def _insert_new_posts(account: str, cfg: dict[str, Any], new_items: list[dict[st
 # ---------------------------------------------------------------------------
 
 
-def run_short_term_cycle(account: str, results_limit: int = 80) -> dict[str, Any]:
-    """(1) Pulls the last ~30h of posts and inserts any brand-new ones, and
-    (2) refreshes likes/comments on all existing posts <=24h old, doing a
-    one-time "first hour" HOT check the first time each post is observed at
-    >=1h old: is_hot=1 if likes >= the account's per-hour threshold at that
-    point. Both pieces reuse a single Apify fetch to minimize API calls.
-    """
-    cfg = get_account_config(account)
-    table = cfg["table"]
-    scope_sql, scope_params = _account_scope(table, account)
-    now = datetime.now(UTC)
-
-    payload: dict[str, Any] = {
-        "directUrls": [f"https://www.instagram.com/{cfg['handle']}/"],
+def _short_term_payload(handles: list[str], results_limit: int, now: datetime) -> dict[str, Any]:
+    return {
+        "directUrls": [f"https://www.instagram.com/{handle}/" for handle in handles],
         "resultsType": "posts",
+        # Per Apify's own docs this is "results limit PER URL", so batching
+        # multiple accounts into one call still fetches up to this many
+        # posts for each profile individually -- it doesn't get divided up
+        # across accounts.
         "resultsLimit": results_limit,
         "skipPinnedPosts": True,
         "onlyPostsNewerThan": (now - timedelta(hours=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    items = _fetch_apify_items(payload)
+
+
+def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
+    """Shared per-account logic: insert brand-new posts from `items`, then
+    refresh likes/comments (and do the one-time HOT check) on every existing
+    post <=24h old. `items` is whatever this account's slice of a (possibly
+    multi-account, batched) Apify fetch turned out to be.
+    """
+    table = cfg["table"]
+    scope_sql, scope_params = _account_scope(table, account)
 
     from .db import connect, utc_now
 
@@ -546,15 +548,70 @@ def run_short_term_cycle(account: str, results_limit: int = 80) -> dict[str, Any
     return {"new_posts": insert_summary, "engagement": engagement_summary}
 
 
+def run_short_term_cycle(account: str, results_limit: int = 80) -> dict[str, Any]:
+    """Single-account entry point: (1) pulls the last ~30h of posts and
+    inserts any brand-new ones, and (2) refreshes likes/comments on all
+    existing posts <=24h old, doing a one-time "first hour" HOT check the
+    first time each post is observed at >=1h old. Both pieces reuse a single
+    Apify fetch to minimize API calls.
+
+    The scheduler doesn't call this directly anymore -- see
+    run_short_term_cycle_batch, which does the same thing for every active
+    account in one Apify call instead of one call each. Kept for manual/
+    single-account use (e.g. testing a specific account in isolation).
+    """
+    cfg = get_account_config(account)
+    now = datetime.now(UTC)
+    payload = _short_term_payload([cfg["handle"]], results_limit, now)
+    items = _fetch_apify_items(payload)
+    return _process_short_term_items(account, cfg, items, now)
+
+
+def run_short_term_cycle_batch(accounts: list[str], results_limit: int = 80) -> dict[str, dict[str, Any]]:
+    """Same job as run_short_term_cycle, but for every account in one Apify
+    call: a single actor run scrapes all accounts' profile URLs at once
+    (resultsLimit is documented as "per URL", so each account still gets up
+    to `results_limit` posts -- it isn't split across accounts), and results
+    are matched back to each account via the post's ownerUsername field. This
+    avoids paying a separate actor-run overhead per account every cycle.
+
+    Falls back gracefully per-account: if the batched Apify item set doesn't
+    include a given account's posts for some reason (e.g. a private/renamed
+    profile), that account just sees zero new items and zero engagement
+    updates for this cycle rather than the whole batch failing.
+    """
+    if not accounts:
+        return {}
+
+    now = datetime.now(UTC)
+    configs = {account: get_account_config(account) for account in accounts}
+    handles = [configs[account]["handle"] for account in accounts]
+    payload = _short_term_payload(handles, results_limit, now)
+    items = _fetch_apify_items(payload)
+
+    handle_to_account = {configs[account]["handle"].lower(): account for account in accounts}
+    items_by_account: dict[str, list[dict[str, Any]]] = {account: [] for account in accounts}
+    for item in items:
+        owner = (item.get("ownerUsername") or "").lower()
+        account = handle_to_account.get(owner)
+        if account:
+            items_by_account[account].append(item)
+
+    results: dict[str, dict[str, Any]] = {}
+    for account in accounts:
+        results[account] = _process_short_term_items(account, configs[account], items_by_account[account], now)
+    return results
+
+
 # ---------------------------------------------------------------------------
-# Daily cycle: once/day, posts >24h-10 days, plus exactly 30d / 120d
+# Daily cycle: once/day, posts >24h-7 days, plus exactly 30d / 120d
 # ---------------------------------------------------------------------------
 
 
 def run_daily_cycle(account: str) -> dict[str, Any]:
-    """Refreshes likes/comments on posts >24h and <=10 days old (every day),
+    """Refreshes likes/comments on posts >24h and <=7 days old (every day),
     plus one-time checks at exactly 30 days and exactly 120 days old. Posts
-    outside those windows (11-29 days, 31-119 days, 121+ days) are left
+    outside those windows (8-29 days, 31-119 days, 121+ days) are left
     untouched. <=24h posts are excluded here -- they're handled by
     run_short_term_cycle instead.
 
@@ -592,7 +649,7 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
         if age_hours is None:
             continue
         age_days = int(age_hours // 24)
-        in_daily_window = 24 < age_hours <= 240
+        in_daily_window = 24 < age_hours <= 168
         mark_30 = age_days == 30 and not row["refreshed_30d"]
         mark_120 = age_days == 120 and not row["refreshed_120d"]
         if not (in_daily_window or mark_30 or mark_120):
@@ -655,7 +712,7 @@ def run_manual_refresh(account: str) -> dict[str, Any]:
 
 def run_backfill(
     account: str,
-    results_limit: int = 5000,
+    results_limit: int = 2000,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> dict[str, Any]:

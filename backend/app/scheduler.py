@@ -52,16 +52,22 @@ def _active_account_handles() -> list[str]:
 
 
 def _run_short_term_jobs() -> None:
-    from .apify_sync import ApifySyncError, run_short_term_cycle
+    from .apify_sync import ApifySyncError, run_short_term_cycle_batch
 
-    for account in _active_account_handles():
-        try:
-            result = run_short_term_cycle(account)
-            logger.info("Short-term engagement cycle (%s): %s", account, result)
-        except ApifySyncError as exc:
-            logger.error("Short-term engagement cycle (%s) failed: %s", account, exc)
-        except Exception:
-            logger.exception("Short-term engagement cycle (%s) crashed", account)
+    accounts = _active_account_handles()
+    if not accounts:
+        return
+    # One Apify call for every active account (each still gets its own
+    # up-to-results_limit posts -- resultsLimit is a per-URL cap, not a
+    # shared total) instead of one call per account, cutting per-run
+    # overhead N-fold.
+    try:
+        results = run_short_term_cycle_batch(accounts)
+        logger.info("Short-term engagement cycle (batched, %d accounts): %s", len(accounts), results)
+    except ApifySyncError as exc:
+        logger.error("Short-term engagement cycle (batched) failed: %s", exc)
+    except Exception:
+        logger.exception("Short-term engagement cycle (batched) crashed")
 
 
 def _run_daily_jobs() -> None:
