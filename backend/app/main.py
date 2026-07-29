@@ -454,6 +454,93 @@ def _backfill_worker(handle: str, results_limit: int) -> None:
         _BACKFILL_RUN["running"] = False
 
 
+@app.get("/api/admin/_temp-runs")
+def temp_runs(limit: int = 15) -> dict[str, Any]:
+    """TEMPORARY -- recent Apify runs so a finished-but-unsaved one can be
+    reused instead of paying to scrape the same profile again. Remove after use."""
+    import httpx
+
+    from .apify_sync import APIFY_ACTOR_ID
+
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    with httpx.Client(timeout=30.0) as client:
+        r = client.get(
+            f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs",
+            params={"token": token, "limit": limit, "desc": "true"},
+        )
+        r.raise_for_status()
+        items = r.json().get("data", {}).get("items", [])
+    return {
+        "runs": [
+            {
+                "id": i.get("id"),
+                "status": i.get("status"),
+                "startedAt": i.get("startedAt"),
+                "finishedAt": i.get("finishedAt"),
+                "usd": i.get("usageTotalUsd"),
+                "datasetId": i.get("defaultDatasetId"),
+            }
+            for i in items
+        ]
+    }
+
+
+@app.post("/api/admin/_temp-abort-run/{run_id}")
+def temp_abort_run(run_id: str) -> dict[str, Any]:
+    """TEMPORARY -- stop an in-flight Apify run so it stops billing. Remove after use."""
+    import httpx
+
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    with httpx.Client(timeout=30.0) as client:
+        r = client.post(f"https://api.apify.com/v2/actor-runs/{run_id}/abort", params={"token": token})
+    return {"status_code": r.status_code, "body": r.text[:300]}
+
+
+@app.post("/api/admin/_temp-import-run/{handle}")
+def temp_import_run(handle: str, run_id: str) -> dict[str, Any]:
+    """TEMPORARY -- import posts from an ALREADY-COMPLETED Apify run instead of
+    re-scraping. Apify keeps each run's dataset, so when a scrape succeeded but
+    our side never stored the results (a deploy restart killed the request),
+    this recovers the data for free rather than paying for the same work twice.
+    Remove after use.
+    """
+    import httpx
+
+    from .apify_sync import _account_scope, _insert_new_posts, get_account_config
+
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    with httpx.Client(timeout=60.0) as client:
+        run = client.get(f"https://api.apify.com/v2/actor-runs/{run_id}", params={"token": token})
+        run.raise_for_status()
+        data = run.json().get("data", {})
+        dataset_id = data.get("defaultDatasetId")
+        if not dataset_id:
+            raise HTTPException(status_code=404, detail="Run has no dataset.")
+        items_res = client.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}/items", params={"token": token, "format": "json"}
+        )
+        items_res.raise_for_status()
+        items = items_res.json()
+
+    if not isinstance(items, list):
+        raise HTTPException(status_code=502, detail="Unexpected dataset shape.")
+
+    cfg = get_account_config(handle)
+    table = cfg["table"]
+    scope_sql, scope_params = _account_scope(table, handle)
+    with connect() as conn:
+        existing = {
+            r["shortcode"]
+            for r in conn.execute(f"SELECT shortcode FROM {table} WHERE 1=1{scope_sql}", scope_params).fetchall()
+            if r["shortcode"]
+        }
+
+    new_items = [i for i in items if i.get("shortCode") and i["shortCode"] not in existing]
+    new_items.sort(key=lambda i: i.get("timestamp") or "")
+    result = _insert_new_posts(handle, cfg, new_items)
+    return {"run_status": data.get("status"), "dataset_items": len(items), "new": len(new_items), "result": result}
+
+
 @app.post("/api/admin/_temp-backfill-bg/{handle}")
 def temp_backfill_bg(handle: str, results_limit: int = 2000) -> dict[str, Any]:
     """TEMPORARY -- runs a backfill in a background thread so a client
