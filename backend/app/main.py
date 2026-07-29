@@ -442,6 +442,21 @@ def _ocr_worker(crop_region: str, batch_size: int, max_batches: int) -> None:
                 _OCR_RUN["running"] = False
 
 
+@app.post("/api/admin/_temp-clear-likes-placeholder")
+def temp_clear_likes_placeholder() -> dict[str, Any]:
+    """TEMPORARY -- one-off: the old code wrote a hard-coded 500 whenever
+    Instagram hid the like count, so those rows are indistinguishable from a
+    genuine 500. Every account's real counts are spread across arbitrary
+    values, so an exact-500 cluster is the placeholder. Null them out; any
+    post recent enough still gets its true count from the engagement refresh.
+    Remove after use.
+    """
+    with connect() as conn:
+        dash = conn.execute("UPDATE dashboard_posts SET likes = NULL WHERE likes = 500").rowcount
+        canon = conn.execute("UPDATE posts SET likes = NULL WHERE likes = 500").rowcount
+    return {"dashboard_posts_cleared": dash, "posts_cleared": canon}
+
+
 @app.post("/api/admin/_temp-ocr-start")
 def temp_ocr_start(
     crop_region: str = "full", batch_size: int = 100, max_batches: int = 200, workers: int = 3
