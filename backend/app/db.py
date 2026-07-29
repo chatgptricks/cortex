@@ -199,6 +199,11 @@ def init_db() -> None:
         # own CDN URLs (via Apify) are signed and expire, so we download once
         # and serve our own copy instead of persisting the raw CDN URL.
         _ensure_column(conn, "accounts", "avatar_path", "avatar_path TEXT")
+        # OCR text extracted from the cover image, mirroring posts.hook_text.
+        # Powers the dashboard's "includes cover text" search for every
+        # non-canonical account (previously only chatgptricks had this).
+        _ensure_column(conn, "dashboard_posts", "hook_text", "hook_text TEXT")
+        _ensure_column(conn, "dashboard_posts", "ocr_checked", "ocr_checked INTEGER NOT NULL DEFAULT 0")
 
         # Seed the two existing accounts on first run (idempotent -- INSERT
         # OR IGNORE keyed by the UNIQUE handle column).

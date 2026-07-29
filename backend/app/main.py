@@ -269,7 +269,7 @@ def dashboard_posts() -> dict[str, Any]:
                 "caption": post.get("caption") or "",
                 "excerpt": post.get("caption") or "",
                 "section": "single",
-                "ocrText": "",
+                "ocrText": post.get("hook_text") or "",
                 "coverUrl": f"/api/dashboard/covers/{account}/{post['id']}",
                 "isHot": bool(post.get("is_hot")),
                 "hotMultiplier": post.get("hot_rate_multiplier"),
@@ -381,6 +381,93 @@ def dashboard_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
 def admin_list_accounts() -> dict[str, Any]:
     """Full roster including inactive accounts, for the admin UI."""
     return {"accounts": list_accounts(active_only=False)}
+
+
+@app.post("/api/admin/_temp-ocr-dashboard")
+def temp_ocr_dashboard(
+    limit: int = 30,
+    crop_region: str = "full",
+    account: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """TEMPORARY -- batch OCR for dashboard_posts covers. The Modal worker caps
+    a request at 100 files, and each call must finish inside the HTTP timeout,
+    so this processes `limit` at a time and is meant to be called repeatedly
+    until remaining == 0.
+
+    dry_run returns the extracted text WITHOUT saving, so crop settings can be
+    compared on real covers before committing to a full (paid) run.
+    Remove after use.
+    """
+    where = (
+        "TRIM(COALESCE(hook_text, '')) = '' AND ocr_checked = 0 "
+        "AND cover_image_path IS NOT NULL AND cover_image_path != ''"
+    )
+    params: list[Any] = []
+    if account:
+        where += " AND account = ?"
+        params.append(account)
+
+    with connect() as conn:
+        remaining = conn.execute(f"SELECT COUNT(*) c FROM dashboard_posts WHERE {where}", params).fetchone()["c"]
+        rows = conn.execute(
+            f"SELECT id, account, cover_image_path FROM dashboard_posts WHERE {where} "
+            f"ORDER BY published_at DESC LIMIT ?",
+            (*params, max(1, min(limit, 100))),
+        ).fetchall()
+
+    candidates = [(int(r["id"]), r["account"], Path(str(r["cover_image_path"]))) for r in rows]
+    present = [(pid, acc, p) for pid, acc, p in candidates if p.is_file()]
+    missing_ids = [pid for pid, _, p in candidates if not p.is_file()]
+
+    if not present:
+        # Mark missing-file rows as checked so they don't block the queue.
+        if missing_ids and not dry_run:
+            with connect() as conn:
+                conn.executemany(
+                    "UPDATE dashboard_posts SET ocr_checked = 1 WHERE id = ?", [(i,) for i in missing_ids]
+                )
+        return {"remaining": remaining, "sent": 0, "updated": 0, "missing_files": len(missing_ids)}
+
+    try:
+        results = extract_images_text_remote([p for _, _, p in present], crop_region=crop_region)
+    except RemoteOcrUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    updated = with_text = 0
+    samples: list[dict[str, Any]] = []
+    now_iso = utc_now()
+    for (post_id, acc, path), result in zip(present, results, strict=False):
+        text = str(result.get("text") or "").strip() if isinstance(result, dict) else ""
+        if text:
+            with_text += 1
+        if len(samples) < 8:
+            samples.append({"account": acc, "file": path.name, "text": text[:220]})
+        if dry_run:
+            continue
+        # ocr_checked marks it done either way, so blank results (covers with
+        # genuinely no text) aren't retried and re-billed on every pass.
+        with connect() as conn:
+            conn.execute(
+                "UPDATE dashboard_posts SET hook_text = ?, ocr_checked = 1, updated_at = ? WHERE id = ?",
+                (text or None, now_iso, post_id),
+            )
+        updated += 1
+
+    if missing_ids and not dry_run:
+        with connect() as conn:
+            conn.executemany("UPDATE dashboard_posts SET ocr_checked = 1 WHERE id = ?", [(i,) for i in missing_ids])
+
+    return {
+        "remaining": remaining,
+        "sent": len(present),
+        "updated": updated,
+        "with_text": with_text,
+        "missing_files": len(missing_ids),
+        "crop_region": crop_region,
+        "dry_run": dry_run,
+        "samples": samples,
+    }
 
 
 # The preview endpoint is deliberately unauthenticated -- the add-account
