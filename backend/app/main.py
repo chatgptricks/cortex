@@ -495,10 +495,24 @@ def _backfill_worker(handle: str, results_limit: int) -> None:
         _BACKFILL_RUN["running"] = False
 
 
-@app.get("/api/admin/_temp-runs")
-def temp_runs(limit: int = 15) -> dict[str, Any]:
-    """TEMPORARY -- recent Apify runs so a finished-but-unsaved one can be
-    reused instead of paying to scrape the same profile again. Remove after use."""
+def _require_admin(password: str) -> None:
+    """Shared gate for the admin operations tools. These either spend Apify
+    credits or write to the live database, so they all require the same refresh
+    password the rest of /api/admin/* uses. The read-only *status* endpoints are
+    deliberately left open: they expose only counters, cost nothing to call, and
+    are polled while a long job runs.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        (password or "").strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+
+
+@app.get("/api/admin/apify/runs")
+def temp_runs(password: str, limit: int = 15) -> dict[str, Any]:
+    """recent Apify runs so a finished-but-unsaved one can be
+    reused instead of paying to scrape the same profile again."""
+    _require_admin(password)
     import httpx
 
     from .apify_sync import APIFY_ACTOR_ID
@@ -526,9 +540,10 @@ def temp_runs(limit: int = 15) -> dict[str, Any]:
     }
 
 
-@app.post("/api/admin/_temp-abort-run/{run_id}")
-def temp_abort_run(run_id: str) -> dict[str, Any]:
-    """TEMPORARY -- stop an in-flight Apify run so it stops billing. Remove after use."""
+@app.post("/api/admin/apify/abort-run/{run_id}")
+def temp_abort_run(run_id: str, password: Annotated[str, Form()]) -> dict[str, Any]:
+    """stop an in-flight Apify run so it stops billing."""
+    _require_admin(password)
     import httpx
 
     token = os.getenv("APIFY_TOKEN", "").strip()
@@ -551,10 +566,11 @@ def _enrich_worker(max_runs: int, per_run_limit: int) -> None:
         _ENRICH_RUN["running"] = False
 
 
-@app.post("/api/admin/_temp-enrich")
-def temp_enrich(max_runs: int = 40, per_run_limit: int = 5000) -> dict[str, Any]:
-    """TEMPORARY -- backfill the new columns from already-paid Apify datasets.
+@app.post("/api/admin/apify/enrich")
+def temp_enrich(password: Annotated[str, Form()], max_runs: int = 40, per_run_limit: int = 5000) -> dict[str, Any]:
+    """backfill the new columns from already-paid Apify datasets.
     Runs in a background thread so a client disconnect can't abort it."""
+    _require_admin(password)
     if _ENRICH_RUN["running"]:
         return {"already_running": True, **_ENRICH_RUN}
     _ENRICH_RUN.update({"running": True, "result": None, "error": None})
@@ -562,9 +578,9 @@ def temp_enrich(max_runs: int = 40, per_run_limit: int = 5000) -> dict[str, Any]
     return {"started": True, "max_runs": max_runs}
 
 
-@app.get("/api/admin/_temp-enrich-status")
+@app.get("/api/admin/apify/enrich-status")
 def temp_enrich_status() -> dict[str, Any]:
-    """TEMPORARY -- enrichment progress + how much of the DB now has full data."""
+    """enrichment progress + how much of the DB now has full data."""
     with connect() as conn:
         total = conn.execute("SELECT COUNT(*) c FROM dashboard_posts").fetchone()["c"]
         enriched = conn.execute("SELECT COUNT(*) c FROM dashboard_posts WHERE raw_json IS NOT NULL").fetchone()["c"]
@@ -588,71 +604,14 @@ def temp_enrich_status() -> dict[str, Any]:
     }
 
 
-@app.get("/api/admin/_temp-field-inventory")
-def temp_field_inventory(run_id: str, sample: int = 200) -> dict[str, Any]:
-    """TEMPORARY -- inventory of what an Apify dataset actually contains: which
-    keys appear, how often they're populated, and a truncated sample value.
-    Used to find data we're paying for but discarding. Remove after use."""
-    import httpx
-
-    token = os.getenv("APIFY_TOKEN", "").strip()
-    with httpx.Client(timeout=60.0) as client:
-        run = client.get(f"https://api.apify.com/v2/actor-runs/{run_id}", params={"token": token})
-        run.raise_for_status()
-        dataset_id = run.json().get("data", {}).get("defaultDatasetId")
-        if not dataset_id:
-            raise HTTPException(status_code=404, detail="Run has no dataset.")
-        res = client.get(
-            f"https://api.apify.com/v2/datasets/{dataset_id}/items",
-            params={"token": token, "format": "json", "limit": sample},
-        )
-        res.raise_for_status()
-        items = res.json()
-
-    if not isinstance(items, list) or not items:
-        return {"items": 0, "fields": {}}
-
-    def describe(value: Any) -> str:
-        if isinstance(value, list):
-            return f"list[{len(value)}]"
-        if isinstance(value, dict):
-            return f"dict({','.join(list(value)[:4])})"
-        text = str(value)
-        return text[:80]
-
-    stats: dict[str, dict[str, Any]] = {}
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for key, value in item.items():
-            entry = stats.setdefault(key, {"present": 0, "nonEmpty": 0, "sample": None})
-            entry["present"] += 1
-            if value not in (None, "", [], {}):
-                entry["nonEmpty"] += 1
-                if entry["sample"] is None:
-                    entry["sample"] = describe(value)
-
-    total = len(items)
-    return {
-        "items": total,
-        "fields": {
-            key: {
-                "populated_pct": round(100 * v["nonEmpty"] / total),
-                "sample": v["sample"],
-            }
-            for key, v in sorted(stats.items(), key=lambda kv: -kv[1]["nonEmpty"])
-        },
-    }
-
-
-@app.post("/api/admin/_temp-import-run/{handle}")
-def temp_import_run(handle: str, run_id: str) -> dict[str, Any]:
-    """TEMPORARY -- import posts from an ALREADY-COMPLETED Apify run instead of
+@app.post("/api/admin/apify/import-run/{handle}")
+def temp_import_run(handle: str, run_id: str, password: Annotated[str, Form()]) -> dict[str, Any]:
+    """import posts from an ALREADY-COMPLETED Apify run instead of
     re-scraping. Apify keeps each run's dataset, so when a scrape succeeded but
     our side never stored the results (a deploy restart killed the request),
     this recovers the data for free rather than paying for the same work twice.
-    Remove after use.
     """
+    _require_admin(password)
     import httpx
 
     from .apify_sync import _account_scope, _insert_new_posts, get_account_config
@@ -711,10 +670,11 @@ def temp_import_run(handle: str, run_id: str) -> dict[str, Any]:
     }
 
 
-@app.post("/api/admin/_temp-backfill-bg/{handle}")
-def temp_backfill_bg(handle: str, results_limit: int = 2000) -> dict[str, Any]:
-    """TEMPORARY -- runs a backfill in a background thread so a client
-    disconnect (or a slow scrape) can't abort it. Remove after use."""
+@app.post("/api/admin/accounts/backfill-bg/{handle}")
+def temp_backfill_bg(handle: str, password: Annotated[str, Form()], results_limit: int = 2000) -> dict[str, Any]:
+    """runs a backfill in a background thread so a client
+    disconnect (or a slow scrape) can't abort it."""
+    _require_admin(password)
     if _BACKFILL_RUN["running"]:
         return {"already_running": True, **_BACKFILL_RUN}
     _BACKFILL_RUN.update({"running": True, "handle": handle, "result": None, "error": None})
@@ -724,20 +684,25 @@ def temp_backfill_bg(handle: str, results_limit: int = 2000) -> dict[str, Any]:
     return {"started": True, "handle": handle, "results_limit": results_limit}
 
 
-@app.get("/api/admin/_temp-backfill-status")
+@app.get("/api/admin/accounts/backfill-status")
 def temp_backfill_status() -> dict[str, Any]:
-    """TEMPORARY -- progress of the background backfill. Remove after use."""
+    """progress of the background backfill."""
     return dict(_BACKFILL_RUN)
 
 
-@app.post("/api/admin/_temp-ocr-start")
+@app.post("/api/admin/ocr/start")
 def temp_ocr_start(
-    crop_region: str = "full", batch_size: int = 100, max_batches: int = 200, workers: int = 3
+    password: Annotated[str, Form()],
+    crop_region: str = "full",
+    batch_size: int = 100,
+    max_batches: int = 200,
+    workers: int = 3,
 ) -> dict[str, Any]:
-    """TEMPORARY -- kick off the background OCR sweep. `workers` threads run in
+    """kick off the background OCR sweep. `workers` threads run in
     parallel; row claiming is serialized so they never process the same cover
     twice. Remove after use.
     """
+    _require_admin(password)
     from .apify_sync import reset_stuck_ocr_claims
 
     with _OCR_RUN_LOCK:
@@ -765,9 +730,9 @@ def temp_ocr_start(
     return {"started": True, "crop_region": crop_region, "batch_size": size, "workers": workers, "released": released}
 
 
-@app.get("/api/admin/_temp-ocr-status")
+@app.get("/api/admin/ocr/status")
 def temp_ocr_status() -> dict[str, Any]:
-    """TEMPORARY -- progress of the background OCR sweep. Remove after use."""
+    """progress of the background OCR sweep."""
     with connect() as conn:
         # Mirrors run_ocr_sweep's own queue: rows with no local cover file are
         # no longer excluded (the sweep re-downloads them), and the canonical
@@ -783,105 +748,6 @@ def temp_ocr_status() -> dict[str, Any]:
             "     + (SELECT COUNT(*) FROM posts WHERE TRIM(COALESCE(hook_text,'')) NOT IN ('','-')) AS c"
         ).fetchone()["c"]
     return {"remaining": remaining, "with_text_total": done, **_OCR_RUN}
-
-
-@app.post("/api/admin/_temp-ocr-dashboard")
-def temp_ocr_dashboard(
-    limit: int = 30,
-    crop_region: str = "full",
-    account: str | None = None,
-    dry_run: bool = False,
-) -> dict[str, Any]:
-    """TEMPORARY -- batch OCR for dashboard_posts covers. The Modal worker caps
-    a request at 100 files, and each call must finish inside the HTTP timeout,
-    so this processes `limit` at a time and is meant to be called repeatedly
-    until remaining == 0.
-
-    dry_run returns the extracted text WITHOUT saving, so crop settings can be
-    compared on real covers before committing to a full (paid) run.
-    Remove after use.
-    """
-    where = (
-        "TRIM(COALESCE(hook_text, '')) = '' AND ocr_checked = 0 "
-        "AND cover_image_path IS NOT NULL AND cover_image_path != ''"
-    )
-    params: list[Any] = []
-    if account:
-        where += " AND account = ?"
-        params.append(account)
-
-    with connect() as conn:
-        remaining = conn.execute(f"SELECT COUNT(*) c FROM dashboard_posts WHERE {where}", params).fetchone()["c"]
-        rows = conn.execute(
-            f"SELECT id, account, cover_image_path FROM dashboard_posts WHERE {where} "
-            f"ORDER BY published_at DESC LIMIT ?",
-            (*params, max(1, min(limit, 100))),
-        ).fetchall()
-
-    candidates = [(int(r["id"]), r["account"], Path(str(r["cover_image_path"]))) for r in rows]
-    present = [(pid, acc, p) for pid, acc, p in candidates if p.is_file()]
-    missing_ids = [pid for pid, _, p in candidates if not p.is_file()]
-
-    if not present:
-        # Mark missing-file rows as checked so they don't block the queue.
-        if missing_ids and not dry_run:
-            with connect() as conn:
-                conn.executemany(
-                    "UPDATE dashboard_posts SET ocr_checked = 1 WHERE id = ?", [(i,) for i in missing_ids]
-                )
-        return {"remaining": remaining, "sent": 0, "updated": 0, "missing_files": len(missing_ids)}
-
-    try:
-        results = extract_images_text_remote([p for _, _, p in present], crop_region=crop_region)
-    except RemoteOcrUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    updated = with_text = 0
-    samples: list[dict[str, Any]] = []
-    now_iso = utc_now()
-    for (post_id, acc, path), result in zip(present, results, strict=False):
-        text = str(result.get("text") or "").strip() if isinstance(result, dict) else ""
-        if text:
-            with_text += 1
-        if len(samples) < 8:
-            samples.append({"account": acc, "file": path.name, "text": text[:220]})
-        if dry_run:
-            continue
-        # ocr_checked marks it done either way, so blank results (covers with
-        # genuinely no text) aren't retried and re-billed on every pass.
-        with connect() as conn:
-            conn.execute(
-                "UPDATE dashboard_posts SET hook_text = ?, ocr_checked = 1, updated_at = ? WHERE id = ?",
-                (text or None, now_iso, post_id),
-            )
-        updated += 1
-
-    if missing_ids and not dry_run:
-        with connect() as conn:
-            conn.executemany("UPDATE dashboard_posts SET ocr_checked = 1 WHERE id = ?", [(i,) for i in missing_ids])
-
-    return {
-        "remaining": remaining,
-        "sent": len(present),
-        "updated": updated,
-        "with_text": with_text,
-        "missing_files": len(missing_ids),
-        "crop_region": crop_region,
-        "dry_run": dry_run,
-        "samples": samples,
-    }
-
-
-# The preview endpoint is deliberately unauthenticated -- the add-account
-# wizard shows a live profile picture in step 1, before the user has entered
-# the refresh password. But every call spends Apify credits, so without a
-# throttle it's an open tap anyone with the URL could run up. Cache repeat
-# lookups of the same handle and cap the global rate.
-_PREVIEW_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_PREVIEW_CACHE_TTL = 600.0  # seconds
-_PREVIEW_CALLS: list[float] = []
-_PREVIEW_MAX_PER_MIN = 10
-_PREVIEW_LOCK = threading.Lock()
 
 
 @app.get("/api/admin/accounts/preview")
