@@ -539,6 +539,60 @@ def enrich_from_existing_runs(max_runs: int = 40, per_run_limit: int = 5000) -> 
     return summary
 
 
+def enrich_from_run(run_id: str) -> dict[str, Any]:
+    """Enriches posts from one specific finished run's dataset.
+
+    Companion to enrich_from_existing_runs for the case where a scrape we just
+    paid for completed on Apify's side but the result never reached us -- pulls
+    that exact dataset instead of re-scraping.
+    """
+    import httpx
+
+    from .db import connect, utc_now
+
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    if not token:
+        raise ApifySyncError("APIFY_TOKEN is not configured.")
+
+    with httpx.Client(timeout=90.0) as client:
+        run = client.get(f"https://api.apify.com/v2/actor-runs/{run_id}", params={"token": token})
+        run.raise_for_status()
+        data = run.json().get("data", {})
+        dataset_id = data.get("defaultDatasetId")
+        if not dataset_id:
+            raise ApifySyncError("Run has no dataset.")
+        res = client.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}/items",
+            params={"token": token, "format": "json", "limit": 5000},
+        )
+        res.raise_for_status()
+        items = res.json()
+
+    if not isinstance(items, list):
+        raise ApifySyncError("Unexpected dataset shape.")
+
+    assignments = ", ".join(f"{col} = ?" for col in _EXTRACT_COLUMNS)
+    updated = 0
+    now_iso = utc_now()
+    with connect() as conn:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            shortcode = item.get("shortCode")
+            owner = str(item.get("ownerUsername") or "").strip().lower()
+            if not shortcode or not owner:
+                continue
+            extracted = extract_apify_fields(item)
+            cursor = conn.execute(
+                f"UPDATE dashboard_posts SET {assignments}, enriched_at = ? "
+                f"WHERE account = ? AND shortcode = ? AND raw_json IS NULL",
+                (*(extracted[col] for col in _EXTRACT_COLUMNS), now_iso, owner, shortcode),
+            )
+            updated += cursor.rowcount or 0
+
+    return {"run_status": data.get("status"), "dataset_items": len(items), "updated": updated}
+
+
 def missing_enrichment_breakdown() -> dict[str, Any]:
     """Which posts still lack the full Apify payload, grouped by account, so the
     cost of filling them can be judged before spending anything."""
@@ -598,7 +652,11 @@ def scrape_missing_enrichment(
     for start in range(0, len(targets), batch_size):
         batch = targets[start : start + batch_size]
         payload = {"directUrls": [t[3] for t in batch], "resultsType": "details"}
-        items = _fetch_apify_items(payload, timeout=600.0)
+        # Start-and-poll, never run-sync-get-dataset-items: scraping ~100 post
+        # URLs one by one routinely exceeds Apify's sync-endpoint limit and
+        # returns 408, while the run itself completes and still bills. That's
+        # exactly the silent-loss failure this project already paid for once.
+        items = _run_apify_actor_and_fetch(payload, max_wait_seconds=1800.0)
         by_shortcode = {i.get("shortCode"): i for i in items if isinstance(i, dict) and i.get("shortCode")}
 
         with connect() as conn:

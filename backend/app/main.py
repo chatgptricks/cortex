@@ -700,6 +700,18 @@ def temp_enrich(password: Annotated[str, Form()], max_runs: int = 40, per_run_li
     return {"started": True, "max_runs": max_runs}
 
 
+@app.post("/api/admin/apify/enrich-from-run/{run_id}")
+def admin_enrich_from_run(run_id: str, password: Annotated[str, Form()]) -> dict[str, Any]:
+    """Recovers a specific paid run's dataset into the enrichment columns."""
+    _require_admin(password)
+    from .apify_sync import enrich_from_run
+
+    try:
+        return enrich_from_run(run_id)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.get("/api/admin/apify/missing")
 def admin_missing_enrichment() -> dict[str, Any]:
     """What still lacks the full Apify payload, and what it would cost to fill."""
