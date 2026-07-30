@@ -539,6 +539,84 @@ def enrich_from_existing_runs(max_runs: int = 40, per_run_limit: int = 5000) -> 
     return summary
 
 
+def missing_enrichment_breakdown() -> dict[str, Any]:
+    """Which posts still lack the full Apify payload, grouped by account, so the
+    cost of filling them can be judged before spending anything."""
+    from .db import connect
+
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT account, COUNT(*) c FROM dashboard_posts "
+            "WHERE raw_json IS NULL AND shortcode IS NOT NULL AND shortcode NOT LIKE 'post-%' "
+            "GROUP BY account ORDER BY c DESC"
+        ).fetchall()
+    by_account = {r["account"]: r["c"] for r in rows}
+    total = sum(by_account.values())
+    return {
+        "missing_total": total,
+        "by_account": by_account,
+        # Measured rate from this month's billing: ~$0.0023 per scraped post.
+        "estimated_usd": round(total * 0.0023, 2),
+    }
+
+
+def scrape_missing_enrichment(
+    limit: int = 200, account: str | None = None, batch_size: int = 100
+) -> dict[str, Any]:
+    """Fills in the payload for posts we never captured it for, by scraping their
+    specific post URLs with resultsType='details'.
+
+    Far cheaper than re-running a profile backfill: it touches only the exact
+    posts that are missing, instead of re-walking the whole account history.
+    """
+    from .db import connect, utc_now
+
+    where = "raw_json IS NULL AND shortcode IS NOT NULL AND shortcode NOT LIKE 'post-%'"
+    params: list[Any] = []
+    if account:
+        where += " AND account = ?"
+        params.append(account)
+
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT id, account, shortcode, permalink FROM dashboard_posts WHERE {where} "
+            f"ORDER BY published_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+
+    targets = [
+        (int(r["id"]), r["account"], r["shortcode"], r["permalink"] or f"https://www.instagram.com/p/{r['shortcode']}/")
+        for r in rows
+    ]
+    if not targets:
+        return {"sent": 0, "updated": 0, "unmatched": 0}
+
+    updated = unmatched = 0
+    now_iso = utc_now()
+    assignments = ", ".join(f"{col} = ?" for col in _EXTRACT_COLUMNS)
+
+    for start in range(0, len(targets), batch_size):
+        batch = targets[start : start + batch_size]
+        payload = {"directUrls": [t[3] for t in batch], "resultsType": "details"}
+        items = _fetch_apify_items(payload, timeout=600.0)
+        by_shortcode = {i.get("shortCode"): i for i in items if isinstance(i, dict) and i.get("shortCode")}
+
+        with connect() as conn:
+            for post_id, _acct, shortcode, _url in batch:
+                item = by_shortcode.get(shortcode)
+                if not item:
+                    unmatched += 1
+                    continue
+                extracted = extract_apify_fields(item)
+                conn.execute(
+                    f"UPDATE dashboard_posts SET {assignments}, enriched_at = ? WHERE id = ?",
+                    (*(extracted[col] for col in _EXTRACT_COLUMNS), now_iso, post_id),
+                )
+                updated += 1
+
+    return {"sent": len(targets), "updated": updated, "unmatched": unmatched}
+
+
 def _slack_alerts_cover(group: str | None) -> bool:
     """Which account groups trigger a Slack HOT alert.
 

@@ -700,6 +700,52 @@ def temp_enrich(password: Annotated[str, Form()], max_runs: int = 40, per_run_li
     return {"started": True, "max_runs": max_runs}
 
 
+@app.get("/api/admin/apify/missing")
+def admin_missing_enrichment() -> dict[str, Any]:
+    """What still lacks the full Apify payload, and what it would cost to fill."""
+    from .apify_sync import missing_enrichment_breakdown
+
+    return missing_enrichment_breakdown()
+
+
+_SCRAPE_RUN: dict[str, Any] = {"running": False, "result": None, "error": None}
+
+
+def _scrape_missing_worker(limit: int, account: str | None) -> None:
+    from .apify_sync import scrape_missing_enrichment
+
+    try:
+        _SCRAPE_RUN["result"] = scrape_missing_enrichment(limit=limit, account=account)
+    except Exception as exc:
+        _SCRAPE_RUN["error"] = str(exc)
+    finally:
+        _SCRAPE_RUN["running"] = False
+
+
+@app.post("/api/admin/apify/scrape-missing")
+def admin_scrape_missing(
+    password: Annotated[str, Form()],
+    limit: int = 200,
+    account: str | None = None,
+) -> dict[str, Any]:
+    """Scrapes ONLY the posts still missing their payload (by exact post URL).
+    This spends Apify credits -- roughly $0.0023 per post. Background thread so a
+    disconnect can't abort it."""
+    _require_admin(password)
+    if _SCRAPE_RUN["running"]:
+        return {"already_running": True, **_SCRAPE_RUN}
+    _SCRAPE_RUN.update({"running": True, "result": None, "error": None})
+    threading.Thread(
+        target=_scrape_missing_worker, args=(limit, account), daemon=True, name="scrape-missing"
+    ).start()
+    return {"started": True, "limit": limit, "account": account, "estimated_usd": round(limit * 0.0023, 2)}
+
+
+@app.get("/api/admin/apify/scrape-missing-status")
+def admin_scrape_missing_status() -> dict[str, Any]:
+    return dict(_SCRAPE_RUN)
+
+
 @app.get("/api/admin/apify/enrich-status")
 def temp_enrich_status() -> dict[str, Any]:
     """enrichment progress + how much of the DB now has full data."""
