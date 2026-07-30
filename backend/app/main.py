@@ -421,7 +421,7 @@ def admin_slack_test(password: Annotated[str, Form()]) -> dict[str, Any]:
 
     sent = notify_hot_post(
         {
-            "account": "chatgptricks",
+            "account": "evolving.ai",
             "likes": 4200,
             "multiplier": 2.35,
             "rate_per_hour": 1410,
@@ -439,7 +439,10 @@ def admin_slack_status() -> dict[str, Any]:
     """Whether the server has a Slack webhook configured (never exposes it)."""
     from .slack_alerts import slack_configured
 
-    return {"configured": slack_configured()}
+    return {
+        "configured": slack_configured(),
+        "alert_groups": os.getenv("SLACK_ALERT_GROUPS", "competitors"),
+    }
 
 
 @app.get("/api/admin/accounts")

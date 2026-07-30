@@ -363,6 +363,21 @@ def _likes_are_known(raw: Any) -> bool:
     return isinstance(raw, int) and not isinstance(raw, bool) and raw > 3
 
 
+def _slack_alerts_cover(group: str | None) -> bool:
+    """Which account groups trigger a Slack HOT alert.
+
+    Defaults to competitors only: your own accounts are already being watched
+    in the dashboard, while a competitor breaking out is the thing you'd want
+    pushed to you. Set SLACK_ALERT_GROUPS to "all" for everything, or to a
+    comma-separated list of groups (e.g. "sentient,competitors").
+    """
+    raw = os.getenv("SLACK_ALERT_GROUPS", "competitors").strip().lower()
+    if raw in {"all", "*", ""}:
+        return True
+    allowed = {part.strip() for part in raw.split(",") if part.strip()}
+    return (group or "").lower() in allowed
+
+
 def _likes_or_none(raw: Any) -> int | None:
     """Real like count, or None when Instagram hid/under-reported it. Replaces
     the old 500 placeholder: inventing a number made unknown posts look like
@@ -776,19 +791,25 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
                 # Queue the alert; it's sent only after the row is committed,
                 # so a Slack hiccup can never leave us having announced a post
                 # we failed to actually mark as HOT.
-                pending_alerts.append(
-                    {
-                        "account": account,
-                        "post_id": info["id"],
-                        "likes": likes,
-                        "multiplier": multiplier,
-                        "rate_per_hour": round(rate_per_hour),
-                        "threshold": threshold,
-                        "age_hours": info["age_hours"],
-                        "permalink": item.get("url") or f"https://www.instagram.com/p/{shortcode}/",
-                        "caption": _clean_text(item.get("caption")),
-                    }
-                )
+                #
+                # Scoped to competitor accounts by default: a competitor going
+                # HOT is news you'd want pushed to you, whereas your own posts
+                # are already being watched in the dashboard. Override with
+                # SLACK_ALERT_GROUPS (comma-separated, or "all").
+                if _slack_alerts_cover(cfg["group"]):
+                    pending_alerts.append(
+                        {
+                            "account": account,
+                            "post_id": info["id"],
+                            "likes": likes,
+                            "multiplier": multiplier,
+                            "rate_per_hour": round(rate_per_hour),
+                            "threshold": threshold,
+                            "age_hours": info["age_hours"],
+                            "permalink": item.get("url") or f"https://www.instagram.com/p/{shortcode}/",
+                            "caption": _clean_text(item.get("caption")),
+                        }
+                    )
         params.append(info["id"])
         with connect() as conn:
             conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE id = ?", params)
