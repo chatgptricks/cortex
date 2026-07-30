@@ -1087,7 +1087,13 @@ def _insert_new_posts(account: str, cfg: dict[str, Any], new_items: list[dict[st
 
 
 # ---------------------------------------------------------------------------
-# Short-term cycle: hourly, 24/7 -- posts <=24h old
+# Minimum post age before the one-time HOT decision is made. Matches the
+# scheduler's tightest cadence (30 min during posting hours): once half an hour
+# of data exists the hourly rate can be extrapolated, so waiting a full hour
+# only delays surfacing a post that's already taking off.
+_HOT_MIN_AGE_HOURS = 0.5
+
+# Short-term cycle: every 30min during posting hours, hourly overnight -- posts <=24h old
 # ---------------------------------------------------------------------------
 
 
@@ -1169,14 +1175,21 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
         # permanently mark the post HOT for any account whose threshold is
         # <=500 -- purely as an artifact of the placeholder. Leave hot_checked
         # unset instead so a later cycle can decide on real data.
-        if not info["hot_checked"] and info["age_hours"] >= 1.0 and _likes_are_known(item.get("likesCount")):
-            # Checks land on a fixed 30-min grid, so a post is rarely
-            # observed at exactly 1.0h old (could be 1.0-1.5h, or much more
-            # overnight). Rather than compare the raw like count, compute
-            # the actual accumulation rate (likes / real elapsed hours) and
-            # compare THAT against the account's per-hour threshold -- this
-            # stays accurate regardless of exactly when the check happens to
-            # land relative to the post's real publish time.
+        if (
+            not info["hot_checked"]
+            and info["age_hours"] >= _HOT_MIN_AGE_HOURS
+            and _likes_are_known(item.get("likesCount"))
+        ):
+            # The rate is always likes / real elapsed hours, so the check is
+            # correct whenever the tick happens to land -- at 0.5h it
+            # extrapolates (likes x2), at 1.3h it divides down.
+            #
+            # Caveat worth knowing: early engagement is front-loaded (the most
+            # active followers see a post first), so extrapolating from 30
+            # minutes tends to OVERSTATE the full-hour rate. Expect this to mark
+            # HOT slightly more readily than the 1-hour check did. The observed
+            # multiplier is stored on every post, so the bias can be measured
+            # against real data later and the thresholds tuned if needed.
             rate_per_hour = likes / info["age_hours"]
             threshold = cfg["hot_threshold"]
             multiplier = round(rate_per_hour / threshold, 3) if threshold else 0.0

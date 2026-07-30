@@ -13,9 +13,13 @@ logger = logging.getLogger("uvicorn.error")
 _CST = timezone(timedelta(hours=-6))
 
 # The short-term job (new posts + <=24h engagement + the one-time HOT check)
-# now runs every hour around the clock. It used to pause overnight, which meant
-# anything published between 11:30pm and 7:30am got its first look hours late --
-# by then the post is no longer "new" and the chance to surface it early is gone.
+# runs around the clock, but at two cadences: every 30 minutes during posting
+# hours, and hourly overnight. Detection speed matters most right after a post
+# goes up, and almost nothing is published between midnight and dawn -- so
+# paying for 30-min checks then would be spending without upside. Measured at
+# ~$0.079/cycle: 40 cycles/day here vs 48 if it were 30-min around the clock.
+_ACTIVE_START_HOUR = 7  # 7:00am CST
+_ACTIVE_END_HOUR = 23  # 11:00pm CST (exclusive -- 23:xx is already overnight)
 _DAILY_JOB_AT = (7, 0)  # 7:00am CST
 
 _started = False
@@ -64,11 +68,20 @@ def _state_set(key: str, value: str) -> None:
 
 
 def _bucket_key(now_cst: datetime) -> str:
-    """Hourly bucket identifier, e.g. '2026-07-27T07' -- used so a tick loop
-    that wakes every ~30s only fires each job once per bucket. HOT detection
-    still works fine on this coarser cadence: the "first hour" check already
-    computes an actual likes/hour rate from the post's real age rather than
-    assuming exactly 1.0h, so it stays accurate however the tick lands."""
+    """Identifier for the current slot, so a tick loop that wakes every ~30s only
+    fires the job once per slot.
+
+    During posting hours the slot is half-hourly ('2026-07-27T14:30'); overnight
+    it's hourly ('2026-07-27T03'). The two formats can't collide, so switching
+    cadence across the boundary never re-fires or skips a slot.
+
+    HOT detection is unaffected by the cadence: the "first hour" check computes a
+    real likes/hour rate from the post's actual age rather than assuming exactly
+    1.0h, so it stays accurate wherever the tick lands.
+    """
+    if _ACTIVE_START_HOUR <= now_cst.hour < _ACTIVE_END_HOUR:
+        half = 0 if now_cst.minute < 30 else 30
+        return now_cst.strftime("%Y-%m-%dT%H:") + f"{half:02d}"
     return now_cst.strftime("%Y-%m-%dT%H")
 
 
@@ -136,8 +149,8 @@ def _run_ocr_job() -> None:
 def _tick() -> None:
     now_cst = datetime.now(_CST)
 
-    # Runs every hour, 24/7 -- no overnight pause, so a post published at 2am
-    # still gets its first-hour HOT check on time.
+    # Never pauses: every 30 min during posting hours, hourly overnight. A post
+    # published at 2am still gets its first-hour HOT check on time.
     bucket = _bucket_key(now_cst)
     if bucket != _state_get(_SHORT_BUCKET_KEY):
         # Claim the bucket *before* running so a crash mid-job doesn't leave
@@ -178,6 +191,6 @@ def start_scheduler() -> None:
     thread = threading.Thread(target=_loop, daemon=True, name="engagement-scheduler")
     thread.start()
     logger.info(
-        "Engagement scheduler started (short-term: hourly, 24/7; "
+        "Engagement scheduler started (short-term: every 30min 7am-11pm CST, hourly overnight; "
         "daily: 7:00am fixed CST)"
     )
