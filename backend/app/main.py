@@ -537,6 +537,63 @@ def temp_abort_run(run_id: str) -> dict[str, Any]:
     return {"status_code": r.status_code, "body": r.text[:300]}
 
 
+@app.get("/api/admin/_temp-field-inventory")
+def temp_field_inventory(run_id: str, sample: int = 200) -> dict[str, Any]:
+    """TEMPORARY -- inventory of what an Apify dataset actually contains: which
+    keys appear, how often they're populated, and a truncated sample value.
+    Used to find data we're paying for but discarding. Remove after use."""
+    import httpx
+
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    with httpx.Client(timeout=60.0) as client:
+        run = client.get(f"https://api.apify.com/v2/actor-runs/{run_id}", params={"token": token})
+        run.raise_for_status()
+        dataset_id = run.json().get("data", {}).get("defaultDatasetId")
+        if not dataset_id:
+            raise HTTPException(status_code=404, detail="Run has no dataset.")
+        res = client.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}/items",
+            params={"token": token, "format": "json", "limit": sample},
+        )
+        res.raise_for_status()
+        items = res.json()
+
+    if not isinstance(items, list) or not items:
+        return {"items": 0, "fields": {}}
+
+    def describe(value: Any) -> str:
+        if isinstance(value, list):
+            return f"list[{len(value)}]"
+        if isinstance(value, dict):
+            return f"dict({','.join(list(value)[:4])})"
+        text = str(value)
+        return text[:80]
+
+    stats: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key, value in item.items():
+            entry = stats.setdefault(key, {"present": 0, "nonEmpty": 0, "sample": None})
+            entry["present"] += 1
+            if value not in (None, "", [], {}):
+                entry["nonEmpty"] += 1
+                if entry["sample"] is None:
+                    entry["sample"] = describe(value)
+
+    total = len(items)
+    return {
+        "items": total,
+        "fields": {
+            key: {
+                "populated_pct": round(100 * v["nonEmpty"] / total),
+                "sample": v["sample"],
+            }
+            for key, v in sorted(stats.items(), key=lambda kv: -kv[1]["nonEmpty"])
+        },
+    }
+
+
 @app.post("/api/admin/_temp-import-run/{handle}")
 def temp_import_run(handle: str, run_id: str) -> dict[str, Any]:
     """TEMPORARY -- import posts from an ALREADY-COMPLETED Apify run instead of
