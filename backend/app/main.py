@@ -537,6 +537,57 @@ def temp_abort_run(run_id: str) -> dict[str, Any]:
     return {"status_code": r.status_code, "body": r.text[:300]}
 
 
+_ENRICH_RUN: dict[str, Any] = {"running": False, "result": None, "error": None}
+
+
+def _enrich_worker(max_runs: int, per_run_limit: int) -> None:
+    from .apify_sync import enrich_from_existing_runs
+
+    try:
+        _ENRICH_RUN["result"] = enrich_from_existing_runs(max_runs=max_runs, per_run_limit=per_run_limit)
+    except Exception as exc:
+        _ENRICH_RUN["error"] = str(exc)
+    finally:
+        _ENRICH_RUN["running"] = False
+
+
+@app.post("/api/admin/_temp-enrich")
+def temp_enrich(max_runs: int = 40, per_run_limit: int = 5000) -> dict[str, Any]:
+    """TEMPORARY -- backfill the new columns from already-paid Apify datasets.
+    Runs in a background thread so a client disconnect can't abort it."""
+    if _ENRICH_RUN["running"]:
+        return {"already_running": True, **_ENRICH_RUN}
+    _ENRICH_RUN.update({"running": True, "result": None, "error": None})
+    threading.Thread(target=_enrich_worker, args=(max_runs, per_run_limit), daemon=True, name="enrich").start()
+    return {"started": True, "max_runs": max_runs}
+
+
+@app.get("/api/admin/_temp-enrich-status")
+def temp_enrich_status() -> dict[str, Any]:
+    """TEMPORARY -- enrichment progress + how much of the DB now has full data."""
+    with connect() as conn:
+        total = conn.execute("SELECT COUNT(*) c FROM dashboard_posts").fetchone()["c"]
+        enriched = conn.execute("SELECT COUNT(*) c FROM dashboard_posts WHERE raw_json IS NOT NULL").fetchone()["c"]
+        with_views = conn.execute(
+            "SELECT COUNT(*) c FROM dashboard_posts WHERE video_views IS NOT NULL"
+        ).fetchone()["c"]
+        with_slides = conn.execute(
+            "SELECT COUNT(*) c FROM dashboard_posts WHERE slide_count IS NOT NULL"
+        ).fetchone()["c"]
+        with_tags = conn.execute("SELECT COUNT(*) c FROM dashboard_posts WHERE hashtags IS NOT NULL").fetchone()["c"]
+        with_music = conn.execute("SELECT COUNT(*) c FROM dashboard_posts WHERE music_song IS NOT NULL").fetchone()["c"]
+    return {
+        "total_posts": total,
+        "with_raw_json": enriched,
+        "coverage_pct": round(100 * enriched / total, 1) if total else 0,
+        "with_video_views": with_views,
+        "with_slide_count": with_slides,
+        "with_hashtags": with_tags,
+        "with_music": with_music,
+        **_ENRICH_RUN,
+    }
+
+
 @app.get("/api/admin/_temp-field-inventory")
 def temp_field_inventory(run_id: str, sample: int = 200) -> dict[str, Any]:
     """TEMPORARY -- inventory of what an Apify dataset actually contains: which

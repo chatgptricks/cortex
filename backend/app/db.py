@@ -205,6 +205,38 @@ def init_db() -> None:
         _ensure_column(conn, "dashboard_posts", "hook_text", "hook_text TEXT")
         _ensure_column(conn, "dashboard_posts", "ocr_checked", "ocr_checked INTEGER NOT NULL DEFAULT 0")
 
+        # Apify returns ~36 fields per post and we were persisting 8, throwing
+        # away data we'd already paid for (reel views/plays, carousel slide
+        # counts, hashtags, audio, collaborators...). raw_json keeps the entire
+        # payload so no future feature ever requires a re-scrape, and the
+        # columns below promote the high-value fields so they can be filtered
+        # and sorted without parsing JSON on every query.
+        _ensure_column(conn, "dashboard_posts", "raw_json", "raw_json TEXT")
+        _ensure_column(conn, "dashboard_posts", "video_views", "video_views INTEGER")
+        _ensure_column(conn, "dashboard_posts", "video_plays", "video_plays INTEGER")
+        _ensure_column(conn, "dashboard_posts", "video_duration", "video_duration REAL")
+        _ensure_column(conn, "dashboard_posts", "product_type", "product_type TEXT")
+        _ensure_column(conn, "dashboard_posts", "hashtags", "hashtags TEXT")
+        _ensure_column(conn, "dashboard_posts", "mentions", "mentions TEXT")
+        _ensure_column(conn, "dashboard_posts", "slide_count", "slide_count INTEGER")
+        _ensure_column(conn, "dashboard_posts", "music_song", "music_song TEXT")
+        _ensure_column(conn, "dashboard_posts", "music_artist", "music_artist TEXT")
+        _ensure_column(conn, "dashboard_posts", "uses_original_audio", "uses_original_audio INTEGER")
+        _ensure_column(conn, "dashboard_posts", "paid_partnership", "paid_partnership INTEGER")
+        _ensure_column(conn, "dashboard_posts", "alt_text", "alt_text TEXT")
+        _ensure_column(conn, "dashboard_posts", "first_comment", "first_comment TEXT")
+        _ensure_column(conn, "dashboard_posts", "ig_media_id", "ig_media_id TEXT")
+        _ensure_column(conn, "dashboard_posts", "owner_full_name", "owner_full_name TEXT")
+        _ensure_column(conn, "dashboard_posts", "coauthors", "coauthors TEXT")
+        _ensure_column(conn, "dashboard_posts", "tagged_users", "tagged_users TEXT")
+        _ensure_column(conn, "dashboard_posts", "dimensions", "dimensions TEXT")
+        _ensure_column(conn, "dashboard_posts", "enriched_at", "enriched_at TEXT")
+        # Sorting/filtering by reel performance is the main reason these exist.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dashboard_posts_video_views "
+            "ON dashboard_posts(account, video_views DESC)"
+        )
+
         # Seed the two existing accounts on first run (idempotent -- INSERT
         # OR IGNORE keyed by the UNIQUE handle column).
         _seed_now = utc_now()

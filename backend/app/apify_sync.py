@@ -363,6 +363,182 @@ def _likes_are_known(raw: Any) -> bool:
     return isinstance(raw, int) and not isinstance(raw, bool) and raw > 3
 
 
+# Fields promoted out of the Apify payload into their own columns. Everything
+# else still survives in raw_json -- this list is only about what needs to be
+# queryable/sortable. Shared by the insert path and the retroactive enrichment
+# so both produce identical data.
+_EXTRACT_COLUMNS = (
+    "raw_json",
+    "video_views",
+    "video_plays",
+    "video_duration",
+    "product_type",
+    "hashtags",
+    "mentions",
+    "slide_count",
+    "music_song",
+    "music_artist",
+    "uses_original_audio",
+    "paid_partnership",
+    "alt_text",
+    "first_comment",
+    "ig_media_id",
+    "owner_full_name",
+    "coauthors",
+    "tagged_users",
+    "dimensions",
+)
+
+
+def _as_int(value: Any) -> int | None:
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _join_list(value: Any, key: str | None = None, limit: int = 40) -> str | None:
+    """Flattens a list of strings (or of dicts, pulling `key`) into a compact
+    comma-separated string -- searchable and readable without a JSON parse.
+    """
+    if not isinstance(value, list) or not value:
+        return None
+    parts: list[str] = []
+    for entry in value[:limit]:
+        if key and isinstance(entry, dict):
+            text = entry.get(key)
+        else:
+            text = entry
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return ", ".join(parts) or None
+
+
+def extract_apify_fields(item: dict[str, Any]) -> dict[str, Any]:
+    """Maps one raw Apify post into our promoted columns + the full payload.
+
+    Returns a dict keyed exactly by _EXTRACT_COLUMNS so callers can build an
+    INSERT/UPDATE without restating the field list.
+    """
+    import json as _json
+
+    music = item.get("musicInfo") if isinstance(item.get("musicInfo"), dict) else {}
+    # Carousels expose their slides as childPosts (preferred) or images.
+    children = item.get("childPosts") if isinstance(item.get("childPosts"), list) else None
+    images = item.get("images") if isinstance(item.get("images"), list) else None
+    slide_count = len(children) if children else (len(images) if images else None)
+
+    width = _as_int(item.get("originalWidth")) or _as_int(item.get("dimensionsWidth"))
+    height = _as_int(item.get("originalHeight")) or _as_int(item.get("dimensionsHeight"))
+
+    paid = item.get("paidPartnership")
+    original_audio = music.get("uses_original_audio")
+
+    try:
+        raw_json = _json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        raw_json = None
+
+    return {
+        "raw_json": raw_json,
+        "video_views": _as_int(item.get("videoViewCount")),
+        "video_plays": _as_int(item.get("videoPlayCount")) or _as_int(item.get("igPlayCount")),
+        "video_duration": float(item["videoDuration"]) if isinstance(item.get("videoDuration"), (int, float)) else None,
+        # 'clips' means Reel, which the coarse type field ("Video") can't tell
+        # apart from a plain in-feed video.
+        "product_type": (item.get("productType") or None),
+        "hashtags": _join_list(item.get("hashtags")),
+        "mentions": _join_list(item.get("mentions")),
+        "slide_count": slide_count,
+        "music_song": music.get("song_name") or None,
+        "music_artist": music.get("artist_name") or None,
+        "uses_original_audio": int(bool(original_audio)) if original_audio is not None else None,
+        "paid_partnership": int(bool(paid)) if paid is not None else None,
+        "alt_text": _clean_text(item.get("alt")) or None,
+        "first_comment": _clean_text(item.get("firstComment")) or None,
+        "ig_media_id": str(item.get("id")) if item.get("id") is not None else None,
+        "owner_full_name": _clean_text(item.get("ownerFullName")) or None,
+        "coauthors": _join_list(item.get("coauthorProducers"), key="username"),
+        "tagged_users": _join_list(item.get("taggedUsers"), key="username"),
+        "dimensions": f"{width}x{height}" if width and height else None,
+    }
+
+
+def enrich_from_existing_runs(max_runs: int = 40, per_run_limit: int = 5000) -> dict[str, Any]:
+    """Backfills the newly-added columns from Apify datasets we ALREADY paid for.
+
+    Apify retains each run's dataset, so posts scraped before we started keeping
+    the full payload can be completed for free -- no re-scrape. Coverage is
+    partial by nature: older datasets expire, so anything whose run is gone
+    stays un-enriched (and would need a paid re-scrape to fill).
+
+    Matching is by (ownerUsername, shortCode) so a dataset can never write its
+    fields onto a different account's post.
+    """
+    import httpx
+
+    from .db import connect, utc_now
+
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    if not token:
+        raise ApifySyncError("APIFY_TOKEN is not configured.")
+
+    summary: dict[str, Any] = {"runs_scanned": 0, "runs_with_data": 0, "updated": 0, "expired_runs": 0}
+
+    with httpx.Client(timeout=90.0) as client:
+        runs_res = client.get(
+            f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs",
+            params={"token": token, "limit": max_runs, "desc": "true"},
+        )
+        runs_res.raise_for_status()
+        runs = runs_res.json().get("data", {}).get("items", [])
+
+        for run in runs:
+            dataset_id = run.get("defaultDatasetId")
+            if not dataset_id:
+                continue
+            summary["runs_scanned"] += 1
+            try:
+                items_res = client.get(
+                    f"https://api.apify.com/v2/datasets/{dataset_id}/items",
+                    params={"token": token, "format": "json", "limit": per_run_limit},
+                )
+                if items_res.status_code == 404:
+                    summary["expired_runs"] += 1
+                    continue
+                items_res.raise_for_status()
+                items = items_res.json()
+            except httpx.HTTPError:
+                summary["expired_runs"] += 1
+                continue
+
+            if not isinstance(items, list) or not items:
+                continue
+
+            updated_here = 0
+            with connect() as conn:
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    shortcode = item.get("shortCode")
+                    owner = str(item.get("ownerUsername") or "").strip().lower()
+                    if not shortcode or not owner:
+                        continue
+                    extracted = extract_apify_fields(item)
+                    assignments = ", ".join(f"{col} = ?" for col in _EXTRACT_COLUMNS)
+                    # Only fills rows that were never enriched, so re-running is
+                    # cheap and never clobbers fresher data.
+                    cursor = conn.execute(
+                        f"UPDATE dashboard_posts SET {assignments}, enriched_at = ? "
+                        f"WHERE account = ? AND shortcode = ? AND enriched_at IS NULL",
+                        (*(extracted[col] for col in _EXTRACT_COLUMNS), utc_now(), owner, shortcode),
+                    )
+                    updated_here += cursor.rowcount or 0
+
+            if updated_here:
+                summary["runs_with_data"] += 1
+                summary["updated"] += updated_here
+
+    return summary
+
+
 def _slack_alerts_cover(group: str | None) -> bool:
     """Which account groups trigger a Slack HOT alert.
 
@@ -642,6 +818,7 @@ def _insert_new_dashboard_posts(account: str, new_items: list[dict[str, Any]]) -
             likes = _likes_or_none(item.get("likesCount"))
             comments = item.get("commentsCount") or 0
             permalink = item.get("url") or f"https://www.instagram.com/p/{shortcode}/"
+            extracted = extract_apify_fields(item)
             now_iso = utc_now()
 
             try:
@@ -651,9 +828,13 @@ def _insert_new_dashboard_posts(account: str, new_items: list[dict[str, Any]]) -
                         INSERT INTO dashboard_posts (
                             account, shortcode, published_at, likes, comments, caption,
                             post_type_label, is_animated, permalink,
-                            cover_source_url, cover_image_path, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
+                            cover_source_url, cover_image_path, created_at, updated_at,
+                            enriched_at, {extra_cols}
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {extra_ph})
+                        """.format(
+                            extra_cols=", ".join(_EXTRACT_COLUMNS),
+                            extra_ph=", ".join("?" for _ in _EXTRACT_COLUMNS),
+                        ),
                         (
                             account,
                             shortcode,
@@ -668,6 +849,8 @@ def _insert_new_dashboard_posts(account: str, new_items: list[dict[str, Any]]) -
                             cover_path,
                             now_iso,
                             now_iso,
+                            now_iso,
+                            *(extracted[col] for col in _EXTRACT_COLUMNS),
                         ),
                     )
             except Exception as exc:  # e.g. UNIQUE constraint on a race re-add
