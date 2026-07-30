@@ -109,6 +109,11 @@ async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
             # the handlers), same pattern as the old tricks-dash/
             # traselveloreal/ routes it replaced.
             and not path.startswith("/api/dashboard/")
+            # Same read-only public surface, aggregate projection for the
+            # Insights site. Carries no captions, no cover URLs and no
+            # credentials -- strictly the numbers already visible on the
+            # public dashboard, reshaped for analysis.
+            and not path.startswith("/api/insights/")
             # /api/admin/* routes are individually password-gated inside
             # their own handlers (TRICKS_DASH_REFRESH_PASSWORD), same as
             # tricks-dash/traselveloreal -- no need to also require the
