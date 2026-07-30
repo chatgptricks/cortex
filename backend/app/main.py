@@ -669,7 +669,23 @@ def admin_migrate_canonical(
         except Exception:
             failed += 1
 
-    return {"dry_run": False, "copied": copied, "failed": failed, "total_candidates": len(to_copy)}
+    # Flip the account non-canonical so every downstream path -- sync, cover
+    # serving, OCR sweep, engagement cycles -- resolves to dashboard_posts and
+    # chatgptricks behaves exactly like the other accounts. `posts` keeps its
+    # rows and stays Predict's alone.
+    with connect() as conn:
+        conn.execute(
+            "UPDATE accounts SET is_canonical = 0, updated_at = ? WHERE handle = 'chatgptricks'",
+            (now_iso,),
+        )
+
+    return {
+        "dry_run": False,
+        "copied": copied,
+        "failed": failed,
+        "total_candidates": len(to_copy),
+        "canonical_flag_cleared": True,
+    }
 
 
 @app.post("/api/admin/apify/enrich")
