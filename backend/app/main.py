@@ -210,6 +210,69 @@ def _clean_ocr_text(raw: Any) -> str:
     return "" if text in {"-", "~"} else text
 
 
+@app.get("/api/insights/posts")
+def insights_posts() -> dict[str, Any]:
+    """Compact projection built for analysis rather than browsing.
+
+    Separate from /api/dashboard/posts on purpose: that one carries captions and
+    cover URLs for rendering cards, while this one drops the heavy text and
+    exposes the enrichment columns (reel views, slide counts, hashtags, audio,
+    duration) that make aggregate questions answerable. Arrays are short keys to
+    keep ~11.5k rows light enough to analyse entirely client-side.
+    """
+    accounts = list_accounts(active_only=True)
+    group_by_handle = {a["handle"]: a["group"] for a in accounts}
+    thresholds = {a["handle"]: a["hot_threshold"] for a in accounts}
+
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT account, shortcode, published_at, likes, comments,
+                   post_type_label, product_type, video_views, video_plays,
+                   video_duration, slide_count, hashtags, music_song,
+                   music_artist, uses_original_audio, paid_partnership,
+                   is_hot, hot_rate_multiplier, hook_text, permalink
+            FROM dashboard_posts
+            WHERE published_at IS NOT NULL AND published_at != ''
+            """
+        ).fetchall()
+
+    posts = []
+    for row in rows:
+        p = dict(row)
+        hook = _clean_ocr_text(p.get("hook_text"))
+        posts.append(
+            {
+                "a": p["account"],
+                "g": group_by_handle.get(p["account"], "sentient"),
+                "sc": p["shortcode"],
+                "d": p["published_at"],
+                "l": _likes_or_null(p.get("likes")),
+                "c": p.get("comments") or 0,
+                "t": p.get("post_type_label") or "Image",
+                "pt": p.get("product_type"),
+                "v": p.get("video_views"),
+                "pl": p.get("video_plays"),
+                "dur": p.get("video_duration"),
+                "sl": p.get("slide_count"),
+                "h": p.get("hashtags"),
+                "ms": p.get("music_song"),
+                "oa": p.get("uses_original_audio"),
+                "pp": p.get("paid_partnership"),
+                "hot": 1 if p.get("is_hot") else 0,
+                "hm": p.get("hot_rate_multiplier"),
+                # Truncated: enough for word-frequency mining, not for reading.
+                "ocr": hook[:220] if hook else "",
+                "u": p.get("permalink"),
+            }
+        )
+
+    return {"posts": posts, "accounts": [
+        {"handle": a["handle"], "group": a["group"], "threshold": thresholds.get(a["handle"])}
+        for a in accounts
+    ]}
+
+
 @app.get("/api/dashboard/posts")
 def dashboard_posts() -> dict[str, Any]:
     """Unified, public, read-only projection across every account. Each
