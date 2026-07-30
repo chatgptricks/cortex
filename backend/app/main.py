@@ -678,6 +678,49 @@ def admin_enrich_profile_status() -> dict[str, Any]:
     return dict(_PROFILE_ENRICH)
 
 
+@app.post("/api/admin/_temp-purge-unrecoverable")
+def temp_purge_unrecoverable(password: Annotated[str, Form()], dry_run: bool = True) -> dict[str, Any]:
+    """TEMPORARY -- removes the posts whose Apify payload could not be recovered
+    after two paid attempts (deleted/archived on Instagram, or legacy shortcodes
+    that never mapped to real posts). Deletes their cached cover files too so no
+    orphans stay on the 2GB disk. Dry-run by default. Remove after use."""
+    _require_admin(password)
+
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, account, shortcode, published_at, likes, cover_image_path "
+            "FROM dashboard_posts WHERE raw_json IS NULL "
+            "AND shortcode IS NOT NULL AND shortcode NOT LIKE 'post-%'"
+        ).fetchall()
+
+    targets = [dict(r) for r in rows]
+    if dry_run:
+        return {
+            "dry_run": True,
+            "would_delete": len(targets),
+            "by_account": {a: sum(1 for t in targets if t["account"] == a) for a in {t["account"] for t in targets}},
+            "sample": [
+                {"shortcode": t["shortcode"], "published_at": t["published_at"], "likes": t["likes"]}
+                for t in targets[:5]
+            ],
+        }
+
+    deleted = covers_removed = 0
+    for t in targets:
+        path = Path(str(t["cover_image_path"])) if t["cover_image_path"] else None
+        if path and path.is_file():
+            try:
+                path.unlink()
+                covers_removed += 1
+            except OSError:
+                pass
+        with connect() as conn:
+            conn.execute("DELETE FROM dashboard_posts WHERE id = ?", (t["id"],))
+        deleted += 1
+
+    return {"dry_run": False, "deleted": deleted, "covers_removed": covers_removed}
+
+
 @app.get("/api/admin/apify/missing")
 def admin_missing_enrichment() -> dict[str, Any]:
     """What still lacks the full Apify payload, and what it would cost to fill."""
@@ -1160,88 +1203,6 @@ _TEST_HOT_SCENARIOS = [
     ("TESTHOT-5x", 5.6, "Tier 4 - blazing: glare sweep + outer glow"),
     ("TESTHOT-8x", 8.0, "Tier 4 - extreme case, sanity check"),
 ]
-
-
-@app.post("/api/admin/create-test-hot-posts")
-def create_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
-    """TEMPORARY QA utility: inserts a handful of dummy @traselveloreal posts
-    with varying hot_rate_multiplier values so the tiered HOT highlight
-    system (badge scaling, fire >=3x, blazing >=5x) can be checked visually
-    on the live site. Re-running replaces the same fixed set of shortcodes
-    (idempotent). Clean up with /api/admin/delete-test-hot-posts.
-    """
-    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
-        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
-    ):
-        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
-
-    threshold = get_account_config("traselveloreal")["hot_threshold"]
-
-    with connect() as conn:
-        sample = conn.execute(
-            "SELECT cover_image_path, cover_source_url FROM dashboard_posts "
-            "WHERE account = 'traselveloreal' AND cover_image_path IS NOT NULL AND shortcode NOT LIKE ? LIMIT 1",
-            (f"{_TEST_HOT_SHORTCODE_PREFIX}%",),
-        ).fetchone()
-    cover_image_path = sample["cover_image_path"] if sample else None
-    cover_source_url = sample["cover_source_url"] if sample else None
-
-    now_iso = utc_now()
-    created = []
-    with connect() as conn:
-        conn.execute(
-            "DELETE FROM dashboard_posts WHERE account = 'traselveloreal' AND shortcode LIKE ?",
-            (f"{_TEST_HOT_SHORTCODE_PREFIX}%",),
-        )
-        for shortcode, multiplier, note in _TEST_HOT_SCENARIOS:
-            likes = int(round(multiplier * threshold))
-            conn.execute(
-                """
-                INSERT INTO dashboard_posts (
-                    account, shortcode, published_at, likes, comments, caption,
-                    post_type_label, is_animated, permalink,
-                    cover_source_url, cover_image_path,
-                    is_hot, likes_at_1h, hot_checked, hot_marked_at, hot_rate_multiplier,
-                    created_at, updated_at
-                ) VALUES ('traselveloreal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?, ?, ?)
-                """,
-                (
-                    shortcode,
-                    now_iso,
-                    likes,
-                    max(1, likes // 20),
-                    f"[TEST DUMMY -- safe to delete] {note}. Rate multiplier {multiplier}x.",
-                    "Image",
-                    0,
-                    "",
-                    cover_source_url,
-                    cover_image_path,
-                    likes,
-                    now_iso,
-                    multiplier,
-                    now_iso,
-                    now_iso,
-                ),
-            )
-            created.append({"shortcode": shortcode, "multiplier": multiplier, "likes": likes})
-
-    return {"created": created}
-
-
-@app.post("/api/admin/delete-test-hot-posts")
-def delete_test_hot_posts(password: Annotated[str, Form()]) -> dict[str, Any]:
-    """Removes the dummy posts created by /api/admin/create-test-hot-posts."""
-    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
-        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
-    ):
-        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
-    with connect() as conn:
-        cursor = conn.execute(
-            "DELETE FROM dashboard_posts WHERE shortcode LIKE ?",
-            (f"{_TEST_HOT_SHORTCODE_PREFIX}%",),
-        )
-        deleted = cursor.rowcount
-    return {"deleted": deleted}
 
 
 @app.get("/api/calibration")

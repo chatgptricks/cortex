@@ -1380,7 +1380,13 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
             "directUrls": batch,
             "resultsType": "details",
         }
-        items.extend(_fetch_apify_items(payload, timeout=300.0))
+        # Start-and-poll, never the sync endpoint: per-URL detail scrapes run at
+        # ~0.17 posts/sec, so a batch anywhere near the 200 cap takes ~20 min --
+        # far past the sync endpoint's limit. It survives today only because
+        # batches are per-account (~23 URLs); one prolific account would tip it
+        # back into the 408-but-still-billed failure this project already paid
+        # for twice.
+        items.extend(_run_apify_actor_and_fetch(payload, max_wait_seconds=2400.0))
 
     items_by_shortcode = {it.get("shortCode"): it for it in items if it.get("shortCode")}
     now_iso = utc_now()
