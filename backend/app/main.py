@@ -881,17 +881,16 @@ def temp_ocr_status() -> dict[str, Any]:
     """progress of the background OCR sweep."""
     with connect() as conn:
         # Mirrors run_ocr_sweep's own queue: rows with no local cover file are
-        # no longer excluded (the sweep re-downloads them), and the canonical
-        # posts table counts too.
+        # no longer excluded (the sweep re-downloads them). Scoped to
+        # dashboard_posts, matching the sweep: the frozen `posts` table is not
+        # processed, so counting it would show a backlog that never drains.
         remaining = conn.execute(
-            "SELECT (SELECT COUNT(*) FROM dashboard_posts "
-            "        WHERE TRIM(COALESCE(hook_text,''))='' AND ocr_checked=0) "
-            "     + (SELECT COUNT(*) FROM posts "
-            "        WHERE TRIM(COALESCE(hook_text,''))='' AND image_path IS NOT NULL AND image_path != '') AS c"
+            "SELECT COUNT(*) AS c FROM dashboard_posts "
+            "WHERE TRIM(COALESCE(hook_text,''))='' AND ocr_checked=0"
         ).fetchone()["c"]
         done = conn.execute(
-            "SELECT (SELECT COUNT(*) FROM dashboard_posts WHERE TRIM(COALESCE(hook_text,'')) NOT IN ('','-')) "
-            "     + (SELECT COUNT(*) FROM posts WHERE TRIM(COALESCE(hook_text,'')) NOT IN ('','-')) AS c"
+            "SELECT COUNT(*) AS c FROM dashboard_posts "
+            "WHERE TRIM(COALESCE(hook_text,'')) NOT IN ('','-','~')"
         ).fetchone()["c"]
     return {"remaining": remaining, "with_text_total": done, **_OCR_RUN}
 

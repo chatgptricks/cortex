@@ -229,13 +229,15 @@ def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> Path | N
 
 
 def run_ocr_sweep(limit: int = 30, crop_region: str = "full") -> dict[str, Any]:
-    """Fills in cover OCR text (hook_text) for any post still missing it, across
-    BOTH tables -- dashboard_posts and the canonical posts table. Downloads the
-    cover first when it was never cached locally.
+    """Fills in cover OCR text (hook_text) for posts that don't have it yet.
 
-    Sized for the scheduler: processes at most `limit` covers per call so a
-    single tick stays bounded, and marks every row it touches as checked so
-    blank/failed ones are never retried (and re-billed) on the next pass.
+    Scoped to dashboard_posts only. The canonical `posts` table is frozen -- it
+    belongs to Predict now and no longer receives Instagram posts -- so scanning
+    it on every tick was work on rows the dashboard never reads.
+
+    Newest first, so freshly-arrived posts become text-searchable right away.
+    Every row touched is marked checked, including blank results, so a cover with
+    genuinely no text is never re-sent (and re-billed) on a later pass.
     """
     from .db import connect, utc_now
 
@@ -260,27 +262,16 @@ def run_ocr_sweep(limit: int = 30, crop_region: str = "full") -> dict[str, Any]:
                     "UPDATE dashboard_posts SET ocr_checked = 2 WHERE id = ?",
                     [(int(r["id"]),) for r in dash],
                 )
-            canon = []
-            if len(dash) < limit:
-                canon = conn.execute(
-                    "SELECT id, shortcode, image_path FROM posts "
-                    "WHERE TRIM(COALESCE(hook_text, '')) = '' AND image_path IS NOT NULL AND image_path != '' "
-                    "ORDER BY id DESC LIMIT ?",
-                    (limit - len(dash),),
-                ).fetchall()
-                if canon:
-                    # posts has no ocr_checked column; the in-flight marker is
-                    # a placeholder hook_text that _clean_ocr_text hides.
-                    conn.executemany(
-                        "UPDATE posts SET hook_text = '~' WHERE id = ?", [(int(r["id"]),) for r in canon]
-                    )
+            # The frozen `posts` table is intentionally not scanned here.
+            canon: list = []
 
     with connect() as conn:
         summary["remaining"] = conn.execute(
-            "SELECT (SELECT COUNT(*) FROM dashboard_posts "
-            "        WHERE TRIM(COALESCE(hook_text,''))='' AND ocr_checked=0) "
-            "     + (SELECT COUNT(*) FROM posts "
-            "        WHERE TRIM(COALESCE(hook_text,''))='' AND image_path IS NOT NULL AND image_path != '') AS c"
+            # Counts only what this sweep will actually work on -- the frozen
+            # `posts` table is out of scope, so including it would report a
+            # backlog that never drains.
+            "SELECT COUNT(*) AS c FROM dashboard_posts "
+            "WHERE TRIM(COALESCE(hook_text,''))='' AND ocr_checked=0"
         ).fetchone()["c"]
 
     jobs: list[tuple[str, int, Path]] = []
@@ -1093,6 +1084,12 @@ def _insert_new_posts(account: str, cfg: dict[str, Any], new_items: list[dict[st
 # only delays surfacing a post that's already taking off.
 _HOT_MIN_AGE_HOURS = 0.5
 
+# How far back the short cycle looks, and how many posts it pulls per account.
+# 20 comfortably covers a day's output for every tracked account (the busiest
+# post ~5-10/day), so a lower cap just stops paying to re-fetch old posts.
+_SHORT_LOOKBACK_HOURS = 24
+_SHORT_RESULTS_LIMIT = 20
+
 # Short-term cycle: every 30min during posting hours, hourly overnight -- posts <=24h old
 # ---------------------------------------------------------------------------
 
@@ -1107,7 +1104,11 @@ def _short_term_payload(handles: list[str], results_limit: int, now: datetime) -
         # across accounts.
         "resultsLimit": results_limit,
         "skipPinnedPosts": True,
-        "onlyPostsNewerThan": (now - timedelta(hours=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # 24h lookback. Running every 30 min during posting hours, that's ~48
+        # cycles of tolerance before anything could slip past -- and the daily
+        # cycle catches stragglers anyway. The old 30h window meant re-scraping
+        # (and re-paying for) the same posts on every single cycle.
+        "onlyPostsNewerThan": (now - timedelta(hours=_SHORT_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 
@@ -1241,7 +1242,7 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
     return {"new_posts": insert_summary, "engagement": engagement_summary}
 
 
-def run_short_term_cycle(account: str, results_limit: int = 80) -> dict[str, Any]:
+def run_short_term_cycle(account: str, results_limit: int = _SHORT_RESULTS_LIMIT) -> dict[str, Any]:
     """Single-account entry point: (1) pulls the last ~30h of posts and
     inserts any brand-new ones, and (2) refreshes likes/comments on all
     existing posts <=24h old, doing a one-time "first hour" HOT check the
@@ -1260,7 +1261,7 @@ def run_short_term_cycle(account: str, results_limit: int = 80) -> dict[str, Any
     return _process_short_term_items(account, cfg, items, now)
 
 
-def run_short_term_cycle_batch(accounts: list[str], results_limit: int = 80) -> dict[str, dict[str, Any]]:
+def run_short_term_cycle_batch(accounts: list[str], results_limit: int = _SHORT_RESULTS_LIMIT) -> dict[str, dict[str, Any]]:
     """Same job as run_short_term_cycle, but for every account in one Apify
     call: a single actor run scrapes all accounts' profile URLs at once
     (resultsLimit is documented as "per URL", so each account still gets up
