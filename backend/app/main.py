@@ -246,6 +246,12 @@ def insights_posts() -> dict[str, Any]:
     for row in rows:
         p = dict(row)
         hook = _clean_ocr_text(p.get("hook_text"))
+        # post_type_label carries a productType suffix for some rows
+        # ("Carousel (carousel_container)"), which would split the same format
+        # into several buckets and quietly halve every per-format average.
+        # The suffix is preserved separately in `pt`.
+        raw_label = p.get("post_type_label") or "Image"
+        base_type = raw_label.split(" (")[0].strip() or "Image"
         posts.append(
             {
                 "a": p["account"],
@@ -254,7 +260,7 @@ def insights_posts() -> dict[str, Any]:
                 "d": p["published_at"],
                 "l": _likes_or_null(p.get("likes")),
                 "c": p.get("comments") or 0,
-                "t": p.get("post_type_label") or "Image",
+                "t": base_type,
                 "pt": p.get("product_type"),
                 "v": p.get("video_views"),
                 "pl": p.get("video_plays"),
