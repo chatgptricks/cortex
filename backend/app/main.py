@@ -575,10 +575,13 @@ def admin_migrate_canonical(
     dashboard_posts, so the dashboard reads from ONE table for every account
     and every account gets the same columns (raw_json, reel views, slides...).
 
-    `posts` is left completely untouched -- it stays Predict's table, keeping
-    its historical/analysis rows. Only Instagram-sourced rows (section='single'
-    with a real shortcode) are copied; Predict's curated 'historical'/'ab' rows
-    are not dashboard content and stay behind.
+    `posts` is left completely untouched -- it stays Predict's table with all of
+    its analysis columns and training rows. This COPIES every row that has a real
+    shortcode, regardless of section: 2,361 of them are section='historical'
+    (Predict's curated training set) and the dashboard has always displayed them,
+    so excluding them would silently drop 2,361 posts from the UI. Rows whose
+    shortcode is a synthetic 'post-N' placeholder are skipped -- they have no
+    Instagram identity to dedupe or refresh against.
 
     Idempotent: dashboard_posts has UNIQUE(account, shortcode), so re-running
     skips anything already copied. Defaults to dry_run.
@@ -593,8 +596,7 @@ def admin_migrate_canonical(
                    is_hot, likes_at_1h, hot_checked, hot_marked_at, hot_rate_multiplier,
                    refreshed_30d, refreshed_120d, created_at, updated_at
             FROM posts
-            WHERE section = 'single'
-              AND shortcode IS NOT NULL AND TRIM(shortcode) != ''
+            WHERE shortcode IS NOT NULL AND TRIM(shortcode) != ''
               AND shortcode NOT LIKE 'post-%'
             """
         ).fetchall()
