@@ -712,6 +712,57 @@ def admin_enrich_from_run(run_id: str, password: Annotated[str, Form()]) -> dict
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.get("/api/admin/sample-enriched")
+def admin_sample_enriched(
+    password: str,
+    limit: int = 10,
+    account: str | None = None,
+    only_video: bool = False,
+    include_raw: bool = False,
+) -> dict[str, Any]:
+    """Inspection helper: returns fully-enriched rows so the captured data can be
+    reviewed without a DB client. raw_json is omitted by default (it's several KB
+    per post) but its key list is summarised so you can see everything retained.
+    """
+    _require_admin(password)
+
+    where = "raw_json IS NOT NULL"
+    params: list[Any] = []
+    if account:
+        where += " AND account = ?"
+        params.append(account)
+    if only_video:
+        where += " AND video_views IS NOT NULL"
+
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM dashboard_posts WHERE {where} ORDER BY published_at DESC LIMIT ?",
+            (*params, max(1, min(limit, 50))),
+        ).fetchall()
+
+    import json as _json
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        post = dict(row)
+        raw = post.pop("raw_json", None)
+        try:
+            parsed = _json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            parsed = {}
+        post["_raw_json_keys"] = sorted(parsed)
+        post["_raw_json_bytes"] = len(raw or "")
+        if include_raw:
+            post["_raw_json"] = parsed
+        # Long text would drown the output; the point here is field coverage.
+        for key in ("caption", "hook_text", "alt_text", "first_comment"):
+            if isinstance(post.get(key), str) and len(post[key]) > 160:
+                post[key] = post[key][:160] + "…"
+        out.append(post)
+
+    return {"count": len(out), "posts": out}
+
+
 @app.get("/api/admin/apify/missing")
 def admin_missing_enrichment() -> dict[str, Any]:
     """What still lacks the full Apify payload, and what it would cost to fill."""
