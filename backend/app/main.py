@@ -896,6 +896,18 @@ def temp_ocr_status() -> dict[str, Any]:
     return {"remaining": remaining, "with_text_total": done, **_OCR_RUN}
 
 
+# The preview endpoint is deliberately unauthenticated -- the add-account wizard
+# shows a live profile picture in step 1, before the user has entered the refresh
+# password. But every call spends Apify credits, so without a throttle it's an
+# open tap anyone with the URL could run up. Cache repeat lookups of the same
+# handle and cap the global rate.
+_PREVIEW_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_PREVIEW_CACHE_TTL = 600.0  # seconds
+_PREVIEW_CALLS: list[float] = []
+_PREVIEW_MAX_PER_MIN = 10
+_PREVIEW_LOCK = threading.Lock()
+
+
 @app.get("/api/admin/accounts/preview")
 def admin_preview_account(handle: str) -> dict[str, Any]:
     """Read-only lookup used by the add-account wizard's first step to show
