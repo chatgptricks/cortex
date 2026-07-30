@@ -678,49 +678,6 @@ def admin_enrich_profile_status() -> dict[str, Any]:
     return dict(_PROFILE_ENRICH)
 
 
-@app.post("/api/admin/_temp-purge-unrecoverable")
-def temp_purge_unrecoverable(password: Annotated[str, Form()], dry_run: bool = True) -> dict[str, Any]:
-    """TEMPORARY -- removes the posts whose Apify payload could not be recovered
-    after two paid attempts (deleted/archived on Instagram, or legacy shortcodes
-    that never mapped to real posts). Deletes their cached cover files too so no
-    orphans stay on the 2GB disk. Dry-run by default. Remove after use."""
-    _require_admin(password)
-
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT id, account, shortcode, published_at, likes, cover_image_path "
-            "FROM dashboard_posts WHERE raw_json IS NULL "
-            "AND shortcode IS NOT NULL AND shortcode NOT LIKE 'post-%'"
-        ).fetchall()
-
-    targets = [dict(r) for r in rows]
-    if dry_run:
-        return {
-            "dry_run": True,
-            "would_delete": len(targets),
-            "by_account": {a: sum(1 for t in targets if t["account"] == a) for a in {t["account"] for t in targets}},
-            "sample": [
-                {"shortcode": t["shortcode"], "published_at": t["published_at"], "likes": t["likes"]}
-                for t in targets[:5]
-            ],
-        }
-
-    deleted = covers_removed = 0
-    for t in targets:
-        path = Path(str(t["cover_image_path"])) if t["cover_image_path"] else None
-        if path and path.is_file():
-            try:
-                path.unlink()
-                covers_removed += 1
-            except OSError:
-                pass
-        with connect() as conn:
-            conn.execute("DELETE FROM dashboard_posts WHERE id = ?", (t["id"],))
-        deleted += 1
-
-    return {"dry_run": False, "deleted": deleted, "covers_removed": covers_removed}
-
-
 @app.get("/api/admin/apify/missing")
 def admin_missing_enrichment() -> dict[str, Any]:
     """What still lacks the full Apify payload, and what it would cost to fill."""
