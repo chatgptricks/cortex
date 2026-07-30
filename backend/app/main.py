@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .apify_sync import (
+    VALID_GROUPS,
     ApifySyncError,
     create_account,
     fetch_and_store_avatar,
@@ -831,6 +832,56 @@ def admin_create_account(
     except ApifySyncError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"account": account}
+
+
+@app.post("/api/admin/accounts/{handle}/settings")
+def admin_update_account_settings(
+    handle: str,
+    password: Annotated[str, Form()],
+    hot_threshold: Annotated[int | None, Form()] = None,
+    label: Annotated[str | None, Form()] = None,
+    group: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Edit an account's tunables from the dashboard's Settings panel. Only the
+    fields actually supplied are changed, so the panel can PATCH one value at a
+    time without having to resend the whole account.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+
+    try:
+        get_account_config(handle)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    updates: list[str] = []
+    params: list[Any] = []
+    if hot_threshold is not None:
+        if hot_threshold < 1:
+            raise HTTPException(status_code=400, detail="hot_threshold must be at least 1.")
+        updates.append("hot_threshold = ?")
+        params.append(int(hot_threshold))
+    if label is not None and label.strip():
+        updates.append("label = ?")
+        params.append(label.strip())
+    if group is not None:
+        if group not in VALID_GROUPS:
+            raise HTTPException(status_code=400, detail=f"group must be one of {VALID_GROUPS}.")
+        updates.append("group_name = ?")
+        params.append(group)
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+
+    updates.append("updated_at = ?")
+    params.append(utc_now())
+    params.append(handle)
+    with connect() as conn:
+        conn.execute(f"UPDATE accounts SET {', '.join(updates)} WHERE handle = ?", params)
+
+    return {"ok": True, "account": get_account_config(handle)}
 
 
 @app.post("/api/admin/accounts/{handle}/deactivate")
