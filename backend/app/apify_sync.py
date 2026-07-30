@@ -598,6 +598,81 @@ def enrich_from_run(run_id: str) -> dict[str, Any]:
     return {"run_status": data.get("status"), "dataset_items": len(items), "updated": updated}
 
 
+def enrich_account_via_profile(account: str, results_limit: int = 3000) -> dict[str, Any]:
+    """Enriches an account's existing posts with ONE profile scrape.
+
+    Much faster than hitting each missing post's URL individually: a profile
+    scrape pages the feed (~12 posts per request), while resultsType='details'
+    navigates to every post separately. Measured ~1.9 posts/sec vs ~0.17 --
+    roughly 11x. So for a large gap concentrated in one account this is the right
+    tool; the per-URL scrape is only worth it for a handful scattered across
+    accounts.
+
+    Updates rows that already exist (matched on shortcode) and inserts any post
+    the scrape found that we didn't have yet.
+    """
+    from .db import connect, utc_now
+
+    cfg = get_account_config(account)
+    payload: dict[str, Any] = {
+        "directUrls": [f"https://www.instagram.com/{cfg['handle']}/"],
+        "resultsType": "posts",
+        "resultsLimit": results_limit,
+    }
+    items = _run_apify_actor_and_fetch(payload, max_wait_seconds=2400.0)
+
+    assignments = ", ".join(f"{col} = ?" for col in _EXTRACT_COLUMNS)
+    now_iso = utc_now()
+    updated = 0
+    seen: set[str] = set()
+
+    with connect() as conn:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            shortcode = item.get("shortCode")
+            if not shortcode:
+                continue
+            seen.add(shortcode)
+            extracted = extract_apify_fields(item)
+            # Refresh engagement at the same time -- we're already holding the
+            # freshest numbers Apify just returned, so not writing them would
+            # waste the call.
+            cursor = conn.execute(
+                f"UPDATE dashboard_posts SET {assignments}, likes = COALESCE(?, likes), "
+                f"comments = COALESCE(?, comments), enriched_at = ?, updated_at = ? "
+                f"WHERE account = ? AND shortcode = ?",
+                (
+                    *(extracted[col] for col in _EXTRACT_COLUMNS),
+                    _likes_or_none(item.get("likesCount")),
+                    item.get("commentsCount"),
+                    now_iso,
+                    now_iso,
+                    account,
+                    shortcode,
+                ),
+            )
+            updated += cursor.rowcount or 0
+
+    # Anything the scrape returned that we had no row for gets inserted through
+    # the normal path, so covers are downloaded and compressed as usual.
+    with connect() as conn:
+        existing = {
+            r["shortcode"]
+            for r in conn.execute(
+                "SELECT shortcode FROM dashboard_posts WHERE account = ?", (account,)
+            ).fetchall()
+        }
+    new_items = [i for i in items if i.get("shortCode") and i["shortCode"] not in existing]
+    inserted = _insert_new_posts(account, cfg, new_items) if new_items else {"added": 0}
+
+    return {
+        "scraped": len(items),
+        "updated_existing": updated,
+        "inserted_new": inserted.get("added", 0),
+    }
+
+
 def missing_enrichment_breakdown() -> dict[str, Any]:
     """Which posts still lack the full Apify payload, grouped by account, so the
     cost of filling them can be judged before spending anything."""

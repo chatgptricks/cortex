@@ -566,128 +566,6 @@ def _enrich_worker(max_runs: int, per_run_limit: int) -> None:
         _ENRICH_RUN["running"] = False
 
 
-@app.post("/api/admin/migrate-canonical")
-def admin_migrate_canonical(
-    password: Annotated[str, Form()],
-    dry_run: bool = True,
-) -> dict[str, Any]:
-    """Moves chatgptricks off the canonical `posts` table and into
-    dashboard_posts, so the dashboard reads from ONE table for every account
-    and every account gets the same columns (raw_json, reel views, slides...).
-
-    `posts` is left completely untouched -- it stays Predict's table with all of
-    its analysis columns and training rows. This COPIES every row that has a real
-    shortcode, regardless of section: 2,361 of them are section='historical'
-    (Predict's curated training set) and the dashboard has always displayed them,
-    so excluding them would silently drop 2,361 posts from the UI. Rows whose
-    shortcode is a synthetic 'post-N' placeholder are skipped -- they have no
-    Instagram identity to dedupe or refresh against.
-
-    Idempotent: dashboard_posts has UNIQUE(account, shortcode), so re-running
-    skips anything already copied. Defaults to dry_run.
-    """
-    _require_admin(password)
-
-    with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, title, caption, hook_text, published_at, likes, comments,
-                   post_type_label, shortcode, image_path, is_animated,
-                   is_hot, likes_at_1h, hot_checked, hot_marked_at, hot_rate_multiplier,
-                   refreshed_30d, refreshed_120d, created_at, updated_at
-            FROM posts
-            WHERE shortcode IS NOT NULL AND TRIM(shortcode) != ''
-              AND shortcode NOT LIKE 'post-%'
-            """
-        ).fetchall()
-        existing = {
-            r["shortcode"]
-            for r in conn.execute(
-                "SELECT shortcode FROM dashboard_posts WHERE account = 'chatgptricks'"
-            ).fetchall()
-        }
-
-    candidates = [dict(r) for r in rows]
-    to_copy = [r for r in candidates if r["shortcode"] not in existing]
-
-    if dry_run:
-        return {
-            "dry_run": True,
-            "eligible_in_posts": len(candidates),
-            "already_in_dashboard": len(candidates) - len(to_copy),
-            "would_copy": len(to_copy),
-            "with_ocr": sum(1 for r in to_copy if (r.get("hook_text") or "").strip() not in ("", "-", "~")),
-            "with_hot": sum(1 for r in to_copy if r.get("is_hot")),
-            "sample": [
-                {"shortcode": r["shortcode"], "published_at": r["published_at"], "likes": r["likes"]}
-                for r in to_copy[:3]
-            ],
-        }
-
-    copied = failed = 0
-    now_iso = utc_now()
-    for row in to_copy:
-        try:
-            with connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO dashboard_posts (
-                        account, shortcode, published_at, likes, comments, caption,
-                        post_type_label, is_animated, permalink,
-                        cover_image_path, hook_text, ocr_checked,
-                        is_hot, likes_at_1h, hot_checked, hot_marked_at, hot_rate_multiplier,
-                        refreshed_30d, refreshed_120d, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        "chatgptricks",
-                        row["shortcode"],
-                        row["published_at"],
-                        row["likes"],
-                        row["comments"],
-                        row["caption"] or row["title"],
-                        row["post_type_label"],
-                        row["is_animated"] or 0,
-                        f"https://www.instagram.com/p/{row['shortcode']}/",
-                        row["image_path"],
-                        row["hook_text"],
-                        # Preserve the OCR work already done: mark as checked so
-                        # the sweep doesn't re-run (and re-bill) these covers.
-                        1 if (row.get("hook_text") or "").strip() else 0,
-                        row["is_hot"] or 0,
-                        row["likes_at_1h"],
-                        row["hot_checked"] or 0,
-                        row["hot_marked_at"],
-                        row["hot_rate_multiplier"],
-                        row["refreshed_30d"] or 0,
-                        row["refreshed_120d"] or 0,
-                        row["created_at"] or now_iso,
-                        now_iso,
-                    ),
-                )
-            copied += 1
-        except Exception:
-            failed += 1
-
-    # Flip the account non-canonical so every downstream path -- sync, cover
-    # serving, OCR sweep, engagement cycles -- resolves to dashboard_posts and
-    # chatgptricks behaves exactly like the other accounts. `posts` keeps its
-    # rows and stays Predict's alone.
-    with connect() as conn:
-        conn.execute(
-            "UPDATE accounts SET is_canonical = 0, updated_at = ? WHERE handle = 'chatgptricks'",
-            (now_iso,),
-        )
-
-    return {
-        "dry_run": False,
-        "copied": copied,
-        "failed": failed,
-        "total_candidates": len(to_copy),
-        "canonical_flag_cleared": True,
-    }
-
-
 @app.post("/api/admin/apify/enrich")
 def temp_enrich(password: Annotated[str, Form()], max_runs: int = 40, per_run_limit: int = 5000) -> dict[str, Any]:
     """backfill the new columns from already-paid Apify datasets.
@@ -761,6 +639,43 @@ def admin_sample_enriched(
         out.append(post)
 
     return {"count": len(out), "posts": out}
+
+
+_PROFILE_ENRICH: dict[str, Any] = {"running": False, "account": None, "result": None, "error": None}
+
+
+def _profile_enrich_worker(account: str, results_limit: int) -> None:
+    from .apify_sync import enrich_account_via_profile
+
+    try:
+        _PROFILE_ENRICH["result"] = enrich_account_via_profile(account, results_limit=results_limit)
+    except Exception as exc:
+        _PROFILE_ENRICH["error"] = str(exc)
+    finally:
+        _PROFILE_ENRICH["running"] = False
+
+
+@app.post("/api/admin/apify/enrich-profile/{handle}")
+def admin_enrich_profile(
+    handle: str,
+    password: Annotated[str, Form()],
+    results_limit: int = 3000,
+) -> dict[str, Any]:
+    """Enriches one account's back catalogue with a single profile scrape --
+    ~11x faster per post than scraping each missing URL individually."""
+    _require_admin(password)
+    if _PROFILE_ENRICH["running"]:
+        return {"already_running": True, **_PROFILE_ENRICH}
+    _PROFILE_ENRICH.update({"running": True, "account": handle, "result": None, "error": None})
+    threading.Thread(
+        target=_profile_enrich_worker, args=(handle, results_limit), daemon=True, name=f"enrich-profile-{handle}"
+    ).start()
+    return {"started": True, "account": handle, "results_limit": results_limit}
+
+
+@app.get("/api/admin/apify/enrich-profile-status")
+def admin_enrich_profile_status() -> dict[str, Any]:
+    return dict(_PROFILE_ENRICH)
 
 
 @app.get("/api/admin/apify/missing")
