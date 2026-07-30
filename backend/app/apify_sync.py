@@ -518,17 +518,18 @@ def enrich_from_existing_runs(max_runs: int = 40, per_run_limit: int = 5000) -> 
                     if not isinstance(item, dict):
                         continue
                     shortcode = item.get("shortCode")
-                    owner = str(item.get("ownerUsername") or "").strip().lower()
-                    if not shortcode or not owner:
+                    if not shortcode:
                         continue
                     extracted = extract_apify_fields(item)
                     assignments = ", ".join(f"{col} = ?" for col in _EXTRACT_COLUMNS)
-                    # Only fills rows that were never enriched, so re-running is
-                    # cheap and never clobbers fresher data.
+                    # Matched on shortcode only -- accounts repost each other, so
+                    # the payload's ownerUsername is often the original author,
+                    # not the account we filed the post under. Only fills rows
+                    # never enriched, so re-running is cheap and non-destructive.
                     cursor = conn.execute(
                         f"UPDATE dashboard_posts SET {assignments}, enriched_at = ? "
-                        f"WHERE account = ? AND shortcode = ? AND enriched_at IS NULL",
-                        (*(extracted[col] for col in _EXTRACT_COLUMNS), utc_now(), owner, shortcode),
+                        f"WHERE shortcode = ? AND raw_json IS NULL",
+                        (*(extracted[col] for col in _EXTRACT_COLUMNS), utc_now(), shortcode),
                     )
                     updated_here += cursor.rowcount or 0
 
@@ -579,14 +580,18 @@ def enrich_from_run(run_id: str) -> dict[str, Any]:
             if not isinstance(item, dict):
                 continue
             shortcode = item.get("shortCode")
-            owner = str(item.get("ownerUsername") or "").strip().lower()
-            if not shortcode or not owner:
+            if not shortcode:
                 continue
+            # Matched by shortcode alone, NOT by ownerUsername: several tracked
+            # accounts repost each other, so the payload's owner is the original
+            # author rather than the account we filed it under (costarica reposts
+            # traselveloreal, for instance). The payload describes one real
+            # Instagram post, so every row holding that shortcode deserves it.
             extracted = extract_apify_fields(item)
             cursor = conn.execute(
                 f"UPDATE dashboard_posts SET {assignments}, enriched_at = ? "
-                f"WHERE account = ? AND shortcode = ? AND raw_json IS NULL",
-                (*(extracted[col] for col in _EXTRACT_COLUMNS), now_iso, owner, shortcode),
+                f"WHERE shortcode = ? AND raw_json IS NULL",
+                (*(extracted[col] for col in _EXTRACT_COLUMNS), now_iso, shortcode),
             )
             updated += cursor.rowcount or 0
 
