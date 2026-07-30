@@ -566,6 +566,110 @@ def _enrich_worker(max_runs: int, per_run_limit: int) -> None:
         _ENRICH_RUN["running"] = False
 
 
+@app.post("/api/admin/migrate-canonical")
+def admin_migrate_canonical(
+    password: Annotated[str, Form()],
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Moves chatgptricks off the canonical `posts` table and into
+    dashboard_posts, so the dashboard reads from ONE table for every account
+    and every account gets the same columns (raw_json, reel views, slides...).
+
+    `posts` is left completely untouched -- it stays Predict's table, keeping
+    its historical/analysis rows. Only Instagram-sourced rows (section='single'
+    with a real shortcode) are copied; Predict's curated 'historical'/'ab' rows
+    are not dashboard content and stay behind.
+
+    Idempotent: dashboard_posts has UNIQUE(account, shortcode), so re-running
+    skips anything already copied. Defaults to dry_run.
+    """
+    _require_admin(password)
+
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, title, caption, hook_text, published_at, likes, comments,
+                   post_type_label, shortcode, image_path, is_animated,
+                   is_hot, likes_at_1h, hot_checked, hot_marked_at, hot_rate_multiplier,
+                   refreshed_30d, refreshed_120d, created_at, updated_at
+            FROM posts
+            WHERE section = 'single'
+              AND shortcode IS NOT NULL AND TRIM(shortcode) != ''
+              AND shortcode NOT LIKE 'post-%'
+            """
+        ).fetchall()
+        existing = {
+            r["shortcode"]
+            for r in conn.execute(
+                "SELECT shortcode FROM dashboard_posts WHERE account = 'chatgptricks'"
+            ).fetchall()
+        }
+
+    candidates = [dict(r) for r in rows]
+    to_copy = [r for r in candidates if r["shortcode"] not in existing]
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "eligible_in_posts": len(candidates),
+            "already_in_dashboard": len(candidates) - len(to_copy),
+            "would_copy": len(to_copy),
+            "with_ocr": sum(1 for r in to_copy if (r.get("hook_text") or "").strip() not in ("", "-", "~")),
+            "with_hot": sum(1 for r in to_copy if r.get("is_hot")),
+            "sample": [
+                {"shortcode": r["shortcode"], "published_at": r["published_at"], "likes": r["likes"]}
+                for r in to_copy[:3]
+            ],
+        }
+
+    copied = failed = 0
+    now_iso = utc_now()
+    for row in to_copy:
+        try:
+            with connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO dashboard_posts (
+                        account, shortcode, published_at, likes, comments, caption,
+                        post_type_label, is_animated, permalink,
+                        cover_image_path, hook_text, ocr_checked,
+                        is_hot, likes_at_1h, hot_checked, hot_marked_at, hot_rate_multiplier,
+                        refreshed_30d, refreshed_120d, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "chatgptricks",
+                        row["shortcode"],
+                        row["published_at"],
+                        row["likes"],
+                        row["comments"],
+                        row["caption"] or row["title"],
+                        row["post_type_label"],
+                        row["is_animated"] or 0,
+                        f"https://www.instagram.com/p/{row['shortcode']}/",
+                        row["image_path"],
+                        row["hook_text"],
+                        # Preserve the OCR work already done: mark as checked so
+                        # the sweep doesn't re-run (and re-bill) these covers.
+                        1 if (row.get("hook_text") or "").strip() else 0,
+                        row["is_hot"] or 0,
+                        row["likes_at_1h"],
+                        row["hot_checked"] or 0,
+                        row["hot_marked_at"],
+                        row["hot_rate_multiplier"],
+                        row["refreshed_30d"] or 0,
+                        row["refreshed_120d"] or 0,
+                        row["created_at"] or now_iso,
+                        now_iso,
+                    ),
+                )
+            copied += 1
+        except Exception:
+            failed += 1
+
+    return {"dry_run": False, "copied": copied, "failed": failed, "total_candidates": len(to_copy)}
+
+
 @app.post("/api/admin/apify/enrich")
 def temp_enrich(password: Annotated[str, Form()], max_runs: int = 40, per_run_limit: int = 5000) -> dict[str, Any]:
     """backfill the new columns from already-paid Apify datasets.
