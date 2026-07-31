@@ -188,6 +188,36 @@ def admin_diag(password: str) -> dict[str, Any]:
     except Exception as exc:
         out["query"] = {"ok": False, "error": repr(exc), "trace": traceback.format_exc()[-900:]}
 
+    # Which directories actually hold the space -- the point is to find out
+    # whether the disk filled with data we need or with stale caches/uploads.
+    def _dir_stats(path: Path) -> dict[str, Any]:
+        total = count = 0
+        for f in path.rglob("*"):
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+                    count += 1
+            except OSError:
+                continue
+        return {"mb": round(total / 1e6, 1), "files": count}
+
+    try:
+        root = Path(DATA_DIR)
+        breakdown = {}
+        for child in sorted(root.iterdir()):
+            try:
+                if child.is_dir():
+                    breakdown[child.name + "/"] = _dir_stats(child)
+                else:
+                    breakdown[child.name] = {"mb": round(child.stat().st_size / 1e6, 2), "files": 1}
+            except OSError as exc:
+                breakdown[child.name] = {"error": repr(exc)}
+        out["breakdown"] = dict(
+            sorted(breakdown.items(), key=lambda kv: kv[1].get("mb", 0), reverse=True)
+        )
+    except Exception as exc:
+        out["breakdown"] = {"error": repr(exc)}
+
     return out
 
 
