@@ -294,24 +294,41 @@ def temp_recompress(password: Annotated[str, Form()], limit: int = 20,
 def temp_purge_orphans(password: Annotated[str, Form()], dry_run: bool = True) -> dict[str, Any]:
     """TEMPORARY. Deletes upload files that no row in either table points at.
 
-    Builds the referenced set from both dashboard_posts and posts before
-    deleting anything -- checking only one table would wipe the other's covers.
-    Leaves avatars alone: those are referenced by handle, not by a DB path."""
+    Checks EVERY path-bearing column in the schema, not just cover_image_path.
+    posts.image_path/video_path/analysis_path belong to Predict, and the big
+    hash-named PNGs on disk are Predict source images -- scanning only the
+    dashboard's cover column would have classified them as orphans and deleted
+    working Predict data. Avatars are excluded too: they're resolved by handle.
+    """
     _require_admin(password)
 
     from .config import UPLOAD_DIR
 
+    # (table, column) pairs; missing tables/columns are skipped, not fatal.
+    path_columns = [
+        ("dashboard_posts", "cover_image_path"),
+        ("posts", "cover_image_path"),
+        ("posts", "image_path"),
+        ("posts", "video_path"),
+        ("posts", "analysis_path"),
+        ("traselveloreal_posts", "cover_image_path"),
+        ("accounts", "avatar_path"),
+    ]
+
     referenced: set[str] = set()
-    with connect() as conn:
-        for table in ("dashboard_posts", "posts"):
-            try:
-                for row in conn.execute(
-                    f"SELECT cover_image_path FROM {table} WHERE cover_image_path IS NOT NULL"
-                ):
-                    if row["cover_image_path"]:
-                        referenced.add(str(row["cover_image_path"]))
-            except Exception:
-                continue
+    scanned: list[str] = []
+    for table, column in path_columns:
+        try:
+            with connect() as conn:
+                rows = conn.execute(
+                    f"SELECT {column} AS p FROM {table} WHERE {column} IS NOT NULL"
+                ).fetchall()
+            for row in rows:
+                if row["p"]:
+                    referenced.add(str(row["p"]))
+            scanned.append(f"{table}.{column}={len(rows)}")
+        except Exception as exc:
+            scanned.append(f"{table}.{column}=SKIPPED({type(exc).__name__})")
 
     orphans = []
     for f in Path(UPLOAD_DIR).rglob("*"):
@@ -334,7 +351,13 @@ def temp_purge_orphans(password: Annotated[str, Form()], dry_run: bool = True) -
             "would_delete": len(orphans),
             "mb": round(total / 1e6, 1),
             "by_ext": by_ext,
+            "columns_scanned": scanned,
+            "referenced_paths": len(referenced),
             "sample": [f.name for f, _ in orphans[:10]],
+            "largest": [
+                {"name": f.name, "kb": round(sz / 1e3, 1)}
+                for f, sz in sorted(orphans, key=lambda kv: kv[1], reverse=True)[:8]
+            ],
         }
 
     deleted = freed = 0
