@@ -145,6 +145,80 @@ _MODEL_LOG = logging.getLogger("uvicorn.error")
 _FIT_LOCK = threading.Lock()
 
 
+@app.get("/api/admin/_temp-storage-audit")
+def temp_storage_audit(password: str) -> dict[str, Any]:
+    """TEMPORARY, read-only. uploads/ holds 1.6GB across ~15k files (~108KB
+    each) even though covers are compressed to WebP on ingest, so something
+    doesn't add up. Reports what's actually on disk by format, how much is
+    still referenced by a live row, and how fast it's growing. Remove after use."""
+    _require_admin(password)
+
+    from .config import UPLOAD_DIR
+
+    by_ext: dict[str, dict[str, Any]] = {}
+    by_prefix: dict[str, dict[str, Any]] = {}
+    by_month: dict[str, int] = {}
+    on_disk: dict[str, int] = {}
+    total = count = 0
+
+    for f in Path(UPLOAD_DIR).rglob("*"):
+        try:
+            if not f.is_file():
+                continue
+            size = f.stat().st_size
+        except OSError:
+            continue
+        total += size
+        count += 1
+        on_disk[str(f)] = size
+
+        ext = f.suffix.lower() or "(none)"
+        e = by_ext.setdefault(ext, {"files": 0, "mb": 0.0})
+        e["files"] += 1
+        e["mb"] = round(e["mb"] + size / 1e6, 1)
+
+        prefix = f.name.split("-")[0] if "-" in f.name else "(other)"
+        p = by_prefix.setdefault(prefix, {"files": 0, "mb": 0.0})
+        p["files"] += 1
+        p["mb"] = round(p["mb"] + size / 1e6, 1)
+
+        try:
+            by_month[datetime.fromtimestamp(f.stat().st_mtime, UTC).strftime("%Y-%m")] = (
+                by_month.get(datetime.fromtimestamp(f.stat().st_mtime, UTC).strftime("%Y-%m"), 0) + 1
+            )
+        except OSError:
+            pass
+
+    # Anything on disk that no live row points at is dead weight.
+    referenced: set[str] = set()
+    with connect() as conn:
+        for table in ("dashboard_posts", "posts"):
+            try:
+                for row in conn.execute(
+                    f"SELECT cover_image_path FROM {table} WHERE cover_image_path IS NOT NULL"
+                ):
+                    if row["cover_image_path"]:
+                        referenced.add(str(row["cover_image_path"]))
+            except Exception:
+                continue
+
+    orphan_bytes = sum(sz for path, sz in on_disk.items() if path not in referenced)
+    orphans = sum(1 for path in on_disk if path not in referenced)
+
+    big = sorted(on_disk.items(), key=lambda kv: kv[1], reverse=True)[:10]
+
+    return {
+        "total": {"files": count, "mb": round(total / 1e6, 1),
+                  "avg_kb": round(total / count / 1e3, 1) if count else 0},
+        "by_ext": dict(sorted(by_ext.items(), key=lambda kv: kv[1]["mb"], reverse=True)),
+        "by_prefix": dict(sorted(by_prefix.items(), key=lambda kv: kv[1]["mb"], reverse=True)),
+        "referenced_rows": len(referenced),
+        "orphans": {"files": orphans, "mb": round(orphan_bytes / 1e6, 1)},
+        "files_by_month": dict(sorted(by_month.items())),
+        "largest": [{"name": Path(p).name, "kb": round(s / 1e3, 1)} for p, s in big],
+    }
+
+
 @app.get("/api/auth/check")
 def auth_check(request: Request) -> dict[str, Any]:
     if not PREDICT_API_KEY:
