@@ -219,6 +219,135 @@ def temp_storage_audit(password: str) -> dict[str, Any]:
     }
 
 
+@app.post("/api/admin/_temp-recompress")
+def temp_recompress(password: Annotated[str, Form()], limit: int = 20,
+                    dry_run: bool = True) -> dict[str, Any]:
+    """TEMPORARY. Re-encodes leftover .jpg covers to WebP -- they predate the
+    compression step and average 217KB against 81KB for the WebP ones.
+
+    Rewrites the DB path in the same pass, and only deletes the original after
+    the new file is on disk and the row points at it: a crash mid-run then
+    leaves a harmless duplicate rather than a post with no cover. Skips any
+    image that doesn't actually get smaller."""
+    _require_admin(password)
+
+    from .apify_sync import _compress_cover
+
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, cover_image_path FROM dashboard_posts "
+            "WHERE cover_image_path LIKE '%.jpg' ORDER BY id LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    before = after = converted = skipped = missing = 0
+    errors: list[str] = []
+
+    for row in rows:
+        src = Path(str(row["cover_image_path"]))
+        if not src.is_file():
+            missing += 1
+            continue
+        try:
+            raw = src.read_bytes()
+            data, suffix = _compress_cover(raw)
+            if suffix != ".webp" or len(data) >= len(raw):
+                skipped += 1
+                continue
+            before += len(raw)
+            after += len(data)
+            converted += 1
+            if dry_run:
+                continue
+            dest = src.with_suffix(".webp")
+            dest.write_bytes(data)
+            with connect() as conn:
+                conn.execute(
+                    "UPDATE dashboard_posts SET cover_image_path = ? WHERE id = ?",
+                    (str(dest), int(row["id"])),
+                )
+            src.unlink()  # only after the row already points at the new file
+        except Exception as exc:
+            errors.append(f"{src.name}: {exc!r}")
+
+    with connect() as conn:
+        remaining = conn.execute(
+            "SELECT COUNT(*) c FROM dashboard_posts WHERE cover_image_path LIKE '%.jpg'"
+        ).fetchone()["c"]
+
+    return {
+        "dry_run": dry_run,
+        "examined": len(rows),
+        "converted": converted,
+        "skipped_no_gain": skipped,
+        "missing_file": missing,
+        "mb_before": round(before / 1e6, 2),
+        "mb_after": round(after / 1e6, 2),
+        "mb_saved": round((before - after) / 1e6, 2),
+        "avg_reduction_pct": round((1 - after / before) * 100, 1) if before else None,
+        "jpg_rows_remaining": remaining,
+        "errors": errors[:5],
+    }
+
+
+@app.post("/api/admin/_temp-purge-orphans")
+def temp_purge_orphans(password: Annotated[str, Form()], dry_run: bool = True) -> dict[str, Any]:
+    """TEMPORARY. Deletes upload files that no row in either table points at.
+
+    Builds the referenced set from both dashboard_posts and posts before
+    deleting anything -- checking only one table would wipe the other's covers.
+    Leaves avatars alone: those are referenced by handle, not by a DB path."""
+    _require_admin(password)
+
+    from .config import UPLOAD_DIR
+
+    referenced: set[str] = set()
+    with connect() as conn:
+        for table in ("dashboard_posts", "posts"):
+            try:
+                for row in conn.execute(
+                    f"SELECT cover_image_path FROM {table} WHERE cover_image_path IS NOT NULL"
+                ):
+                    if row["cover_image_path"]:
+                        referenced.add(str(row["cover_image_path"]))
+            except Exception:
+                continue
+
+    orphans = []
+    for f in Path(UPLOAD_DIR).rglob("*"):
+        try:
+            if not f.is_file() or str(f) in referenced:
+                continue
+            if f.name.startswith("avatar"):
+                continue  # served by handle, never stored as a row path
+            orphans.append((f, f.stat().st_size))
+        except OSError:
+            continue
+
+    total = sum(s for _, s in orphans)
+    if dry_run:
+        by_ext: dict[str, int] = {}
+        for f, _ in orphans:
+            by_ext[f.suffix.lower()] = by_ext.get(f.suffix.lower(), 0) + 1
+        return {
+            "dry_run": True,
+            "would_delete": len(orphans),
+            "mb": round(total / 1e6, 1),
+            "by_ext": by_ext,
+            "sample": [f.name for f, _ in orphans[:10]],
+        }
+
+    deleted = freed = 0
+    for f, size in orphans:
+        try:
+            f.unlink()
+            deleted += 1
+            freed += size
+        except OSError:
+            continue
+    return {"dry_run": False, "deleted": deleted, "mb_freed": round(freed / 1e6, 1)}
+
+
 @app.get("/api/auth/check")
 def auth_check(request: Request) -> dict[str, Any]:
     if not PREDICT_API_KEY:

@@ -99,3 +99,60 @@ def notify_hot_post(post: dict[str, Any]) -> bool:
 
 def cover_url_for(account: str, post_id: int) -> str:
     return f"{_PUBLIC_API}/api/dashboard/covers/{account}/{post_id}"
+
+
+def notify_disk_warning(pct: float, used_mb: float, total_mb: float, threshold: int) -> bool:
+    """Posts one disk-space warning. Same never-raises contract as the HOT
+    alert: this is a safety net, and a safety net that can crash the scheduler
+    is worse than none.
+
+    Exists because the disk filling up is not a gradual degradation -- SQLite
+    can't open its write-ahead log, every DB-backed route 500s, and the service
+    stops booting entirely. There is no partial failure to notice first, so the
+    only useful warning is one that arrives while there's still room.
+    """
+    webhook = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return False
+    critical = threshold >= 85
+    free_mb = max(total_mb - used_mb, 0)
+    try:
+        import httpx
+
+        payload = {
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": ("Disk critical" if critical else "Disk filling up"),
+                        "emoji": False,
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*cortex-api* disk is at *{pct:.1f}%* "
+                            f"({used_mb / 1024:.2f} GB of {total_mb / 1024:.2f} GB, "
+                            f"{free_mb / 1024:.2f} GB free).\n"
+                            + (
+                                "At 100% SQLite stops working and the API goes down completely. "
+                                "Free space or resize the disk in Render now."
+                                if critical
+                                else "Not urgent yet, but worth clearing space or planning a resize."
+                            )
+                        ),
+                    },
+                },
+            ]
+        }
+        response = httpx.post(webhook, json=payload, timeout=15.0)
+        if response.status_code >= 300:
+            logger.error("Slack disk alert rejected (%s): %s", response.status_code, response.text[:200])
+            return False
+        return True
+    except Exception:
+        logger.exception("Slack disk alert failed")
+        return False

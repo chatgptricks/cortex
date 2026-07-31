@@ -146,6 +146,50 @@ def _run_ocr_job() -> None:
         logger.exception("Cover OCR sweep crashed")
 
 
+_DISK_THRESHOLDS = (85, 70)  # checked high-to-low; only the highest crossed one fires
+_DISK_STATE_KEY = "disk_alert_level"
+
+
+def _check_disk() -> None:
+    """Warns once per threshold crossed, and re-arms when usage drops back below.
+
+    Written after the disk filled at 2GB and took the whole API down: SQLite
+    couldn't open its WAL, every DB-backed route returned 500, and the service
+    stopped booting. That failure has no gradual phase to catch -- it goes from
+    fine to fully down -- so the alert has to fire while space still remains.
+
+    The last-alerted level is persisted like the other scheduler markers, so a
+    Render restart doesn't re-send an alert that already went out.
+    """
+    import shutil
+
+    from .config import DATA_DIR
+    from .slack_alerts import notify_disk_warning, slack_configured
+
+    try:
+        usage = shutil.disk_usage(str(DATA_DIR))
+    except Exception:
+        logger.exception("Disk usage check failed")
+        return
+
+    pct = usage.used / usage.total * 100
+    crossed = next((t for t in _DISK_THRESHOLDS if pct >= t), 0)
+
+    try:
+        last = int(_state_get(_DISK_STATE_KEY) or 0)
+    except ValueError:
+        last = 0
+
+    if crossed > last:
+        logger.warning("Disk at %.1f%% -- crossed the %d%% threshold", pct, crossed)
+        if slack_configured():
+            notify_disk_warning(pct, usage.used / 1e6, usage.total / 1e6, crossed)
+        _state_set(_DISK_STATE_KEY, str(crossed))
+    elif crossed < last:
+        # Dropped back down (space was freed): re-arm so the next crossing alerts again.
+        _state_set(_DISK_STATE_KEY, str(crossed))
+
+
 def _tick() -> None:
     now_cst = datetime.now(_CST)
 
@@ -156,6 +200,7 @@ def _tick() -> None:
         # Claim the bucket *before* running so a crash mid-job doesn't leave
         # it unclaimed and re-fire on the next 30s tick.
         _state_set(_SHORT_BUCKET_KEY, bucket)
+        _check_disk()  # cheap (one statvfs) and runs before the jobs that write
         _run_short_term_jobs()
         _run_ocr_job()
 
