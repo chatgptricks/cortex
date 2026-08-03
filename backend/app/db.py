@@ -221,7 +221,21 @@ def init_db() -> None:
         _ensure_column(conn, "dashboard_posts", "slide_count", "slide_count INTEGER")
         _ensure_column(conn, "dashboard_posts", "music_song", "music_song TEXT")
         _ensure_column(conn, "dashboard_posts", "music_artist", "music_artist TEXT")
+        _ensure_column(conn, "dashboard_posts", "music_audio_id", "music_audio_id TEXT")
         _ensure_column(conn, "dashboard_posts", "uses_original_audio", "uses_original_audio INTEGER")
+        # audio_id was added to extract_apify_fields after ~5.5k posts already had
+        # raw_json captured -- backfill it from the payload we already paid for
+        # instead of waiting for those rows to be re-scraped. Cheap once caught up:
+        # the WHERE clause only ever matches rows that still need it.
+        conn.execute(
+            """
+            UPDATE dashboard_posts
+            SET music_audio_id = json_extract(raw_json, '$.musicInfo.audio_id')
+            WHERE raw_json IS NOT NULL
+              AND music_audio_id IS NULL
+              AND json_extract(raw_json, '$.musicInfo.audio_id') IS NOT NULL
+            """
+        )
         _ensure_column(conn, "dashboard_posts", "paid_partnership", "paid_partnership INTEGER")
         _ensure_column(conn, "dashboard_posts", "alt_text", "alt_text TEXT")
         _ensure_column(conn, "dashboard_posts", "first_comment", "first_comment TEXT")

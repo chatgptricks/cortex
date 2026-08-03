@@ -313,7 +313,7 @@ def dashboard_posts() -> dict[str, Any]:
             """
             SELECT id, account, shortcode, published_at, likes, comments, caption,
                    post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
-                   hook_text, music_song, music_artist, uses_original_audio
+                   hook_text, music_song, music_artist, music_audio_id, uses_original_audio
             FROM dashboard_posts
             """
         ).fetchall()
@@ -353,6 +353,7 @@ def dashboard_posts() -> dict[str, Any]:
                     "musicSong": None,
                     "musicArtist": None,
                     "usesOriginalAudio": None,
+                    "musicUrl": None,
                 }
             )
 
@@ -384,6 +385,14 @@ def dashboard_posts() -> dict[str, Any]:
                 "musicSong": post.get("music_song"),
                 "musicArtist": post.get("music_artist"),
                 "usesOriginalAudio": bool(post.get("uses_original_audio")),
+                # Instagram's own sound page -- not Spotify/Apple Music, Apify
+                # doesn't supply a link to those. Links to every reel that used
+                # this exact audio, including original-audio "songs".
+                "musicUrl": (
+                    f"https://www.instagram.com/reels/audio/{post['music_audio_id']}/"
+                    if post.get("music_audio_id")
+                    else None
+                ),
             }
         )
 

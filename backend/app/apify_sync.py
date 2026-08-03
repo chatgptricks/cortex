@@ -369,6 +369,7 @@ _EXTRACT_COLUMNS = (
     "slide_count",
     "music_song",
     "music_artist",
+    "music_audio_id",
     "uses_original_audio",
     "paid_partnership",
     "alt_text",
@@ -440,6 +441,9 @@ def extract_apify_fields(item: dict[str, Any]) -> dict[str, Any]:
         "slide_count": slide_count,
         "music_song": music.get("song_name") or None,
         "music_artist": music.get("artist_name") or None,
+        # Instagram's own sound page (every reel that used this exact audio),
+        # not a Spotify/Apple Music link -- Apify doesn't give us one of those.
+        "music_audio_id": str(music.get("audio_id")) if music.get("audio_id") else None,
         "uses_original_audio": int(bool(original_audio)) if original_audio is not None else None,
         "paid_partnership": int(bool(paid)) if paid is not None else None,
         "alt_text": _clean_text(item.get("alt")) or None,
