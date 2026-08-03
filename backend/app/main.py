@@ -1110,6 +1110,44 @@ def admin_deactivate_account(handle: str, password: Annotated[str, Form()]) -> d
     return {"ok": True, "handle": handle, "deactivated": True}
 
 
+@app.post("/api/admin/accounts/{handle}/activate")
+def admin_activate_account(handle: str, password: Annotated[str, Form()]) -> dict[str, Any]:
+    """Symmetric to /deactivate: brings a soft-disabled account back into the
+    scheduler and the public roster. Post history was never touched by
+    deactivation, so there's nothing to restore -- just the flag.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    with connect() as conn:
+        cursor = conn.execute(
+            "UPDATE accounts SET is_active = 1, updated_at = ? WHERE handle = ?",
+            (utc_now(), handle),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Unknown account.")
+    return {"ok": True, "handle": handle, "activated": True}
+
+
+@app.get("/api/admin/disk-status")
+def admin_disk_status() -> dict[str, Any]:
+    """Current usage of the persistent data volume -- the same numbers the
+    Slack disk-warning alert (scheduler.py) is based on, surfaced here so the
+    admin panel can show the picture without waiting for a threshold crossing.
+    """
+    import shutil
+
+    usage = shutil.disk_usage(str(DATA_DIR))
+    pct = (usage.used / usage.total * 100) if usage.total else 0.0
+    return {
+        "used_mb": round(usage.used / 1e6, 1),
+        "total_mb": round(usage.total / 1e6, 1),
+        "free_mb": round(usage.free / 1e6, 1),
+        "pct_used": round(pct, 1),
+    }
+
+
 @app.post("/api/admin/accounts/{handle}/backfill")
 def admin_backfill_account(
     handle: str,
