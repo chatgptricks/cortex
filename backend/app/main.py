@@ -313,7 +313,7 @@ def dashboard_posts() -> dict[str, Any]:
             """
             SELECT id, account, shortcode, published_at, likes, comments, caption,
                    post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
-                   hook_text
+                   hook_text, music_song, music_artist, uses_original_audio
             FROM dashboard_posts
             """
         ).fetchall()
@@ -346,6 +346,13 @@ def dashboard_posts() -> dict[str, Any]:
                     "hotMultiplier": post.get("hot_rate_multiplier"),
                     "account": handle,
                     "group": group_by_handle.get(handle, "sentient"),
+                    # The canonical `posts` table predates the music columns
+                    # (they were added to dashboard_posts only) -- always null
+                    # here rather than missing, so the frontend can treat the
+                    # two account types the same way.
+                    "musicSong": None,
+                    "musicArtist": None,
+                    "usesOriginalAudio": None,
                 }
             )
 
@@ -374,6 +381,9 @@ def dashboard_posts() -> dict[str, Any]:
                 "hotMultiplier": post.get("hot_rate_multiplier"),
                 "account": account,
                 "group": group_by_handle.get(account, "competitors"),
+                "musicSong": post.get("music_song"),
+                "musicArtist": post.get("music_artist"),
+                "usesOriginalAudio": bool(post.get("uses_original_audio")),
             }
         )
 
