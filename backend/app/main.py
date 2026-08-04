@@ -1167,35 +1167,6 @@ def admin_disk_status() -> dict[str, Any]:
     }
 
 
-@app.get("/api/admin/_temp-music-test")
-def temp_music_test(password: str, shortcode: str) -> dict[str, Any]:
-    """One-off, read-only: re-scrapes a single already-known post via
-    resultsType='details' (the expensive per-URL mode) to check whether it
-    returns musicInfo for carousels, which resultsType='posts' (what the
-    scheduler/backfills actually use) never does. Writes nothing to the DB.
-    Remove after use.
-    """
-    _require_admin(password)
-    from .apify_sync import _run_apify_actor_and_fetch
-
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT permalink, post_type_label FROM dashboard_posts WHERE shortcode = ?", (shortcode,)
-        ).fetchone()
-    if not row or not row["permalink"]:
-        raise HTTPException(status_code=404, detail="Post not found or has no permalink.")
-
-    payload = {"directUrls": [row["permalink"]], "resultsType": "details"}
-    items = _run_apify_actor_and_fetch(payload, max_wait_seconds=180.0)
-    item = items[0] if items else {}
-    return {
-        "shortcode": shortcode,
-        "post_type_label": row["post_type_label"],
-        "musicInfo": item.get("musicInfo"),
-        "keys": sorted(item.keys()) if item else [],
-    }
-
-
 @app.post("/api/admin/accounts/{handle}/backfill")
 def admin_backfill_account(
     handle: str,
