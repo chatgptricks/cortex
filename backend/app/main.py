@@ -734,6 +734,50 @@ def admin_sample_enriched(
     return {"count": len(out), "posts": out}
 
 
+@app.get("/api/admin/_temp-shortcode-lookup")
+def temp_shortcode_lookup(password: str, shortcodes: str) -> dict[str, Any]:
+    """One-off inspection helper: given a comma-separated list of shortcodes,
+    returns every column we have for each one across both `posts` (canonical
+    chatgptricks) and `dashboard_posts` (everyone else, but chatgptricks also
+    gets an enriched row here via the profile-enrich pass), so a specific
+    batch of posts can be audited field-by-field without a DB client. Remove
+    after use -- this is not meant to become a permanent endpoint.
+    """
+    _require_admin(password)
+    codes = [s.strip() for s in shortcodes.split(",") if s.strip()]
+    if not codes:
+        raise HTTPException(status_code=400, detail="Provide at least one shortcode.")
+
+    placeholders = ",".join("?" for _ in codes)
+    out: dict[str, list[dict[str, Any]]] = {c: [] for c in codes}
+
+    with connect() as conn:
+        for row in conn.execute(
+            f"SELECT * FROM posts WHERE shortcode IN ({placeholders})", codes
+        ).fetchall():
+            d = dict(row)
+            d["_source_table"] = "posts"
+            out.setdefault(d.get("shortcode"), []).append(d)
+
+        for row in conn.execute(
+            f"SELECT * FROM dashboard_posts WHERE shortcode IN ({placeholders})", codes
+        ).fetchall():
+            d = dict(row)
+            d["_source_table"] = "dashboard_posts"
+            raw = d.pop("raw_json", None)
+            import json as _json
+
+            try:
+                parsed = _json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                parsed = {}
+            d["_raw_json_keys"] = sorted(parsed)
+            d["_raw_json"] = parsed
+            out.setdefault(d.get("shortcode"), []).append(d)
+
+    return {"requested": codes, "results": out}
+
+
 _PROFILE_ENRICH: dict[str, Any] = {"running": False, "account": None, "result": None, "error": None}
 
 
