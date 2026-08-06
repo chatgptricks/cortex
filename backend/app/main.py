@@ -212,6 +212,10 @@ async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
             # credentials -- strictly the numbers already visible on the
             # public dashboard, reshaped for analysis.
             and not path.startswith("/api/insights/")
+            # Same read-only, Firebase-gated surface as /api/insights/ above
+            # -- the Tracker page authenticates with a Firebase Bearer token,
+            # never this legacy key, so it needs the same carve-out.
+            and not path.startswith("/api/tracker/")
             # /api/admin/* routes are individually password-gated inside
             # their own handlers (TRICKS_DASH_REFRESH_PASSWORD), same as
             # tricks-dash/traselveloreal -- no need to also require the
