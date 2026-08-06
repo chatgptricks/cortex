@@ -381,7 +381,16 @@ def insights_posts() -> dict[str, Any]:
         )
 
     return {"posts": posts, "accounts": [
-        {"handle": a["handle"], "group": a["group"], "threshold": thresholds.get(a["handle"])}
+        {
+            "handle": a["handle"],
+            "group": a["group"],
+            "threshold": thresholds.get(a["handle"]),
+            # Insights' word cloud mines OCR'd cover text; without the label a
+            # page's own name/watermark (e.g. "Get Into AI") shows up as its
+            # own top "topic" on every one of its posts. Sent so the frontend
+            # can strip both the handle and each word of the label.
+            "label": a.get("label"),
+        }
         for a in accounts
     ]}
 
