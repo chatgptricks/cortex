@@ -123,6 +123,18 @@ for _cred_path in (
 
 ALLOWED_EMAILS = {e.strip().lower() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip()}
 
+# Two-tier roles: everyone on ALLOWED_EMAILS gets the read-only dashboard;
+# only ADMIN_EMAILS (a subset) can reach the Settings/admin panel and its
+# backend routes. Checked server-side below -- hiding the Settings button in
+# the UI is not itself a security boundary, so /api/admin/* is rejected for
+# non-admins regardless of what the frontend shows.
+ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+
+# Cover/avatar images load via plain <img src="..."> tags, which can't carry
+# an Authorization header -- excluded here for that technical reason only,
+# not because they're meant to stay public by design. Everything else (post
+# data, search, every admin action) requires a signed-in, allowlisted
+# Google account once FIREBASE_APP is configured.
 _FIREBASE_OPEN_PREFIXES = ("/api/dashboard/covers/", "/api/dashboard/avatar/")
 _FIREBASE_OPEN_PATHS = {"/api/health", "/", "/docs", "/openapi.json", "/redoc"}
 
@@ -130,6 +142,8 @@ _FIREBASE_OPEN_PATHS = {"/api/health", "/", "/docs", "/openapi.json", "/redoc"}
 @app.middleware("http")
 async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped-def]
     if FIREBASE_APP is None:
+        # No credentials configured (e.g. local dev without the secret
+        # file) -- stay open rather than lock everyone out.
         return await call_next(request)
     path = request.url.path
     if request.method == "OPTIONS" or path in _FIREBASE_OPEN_PATHS or path.startswith(_FIREBASE_OPEN_PREFIXES):
@@ -150,7 +164,11 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         return JSONResponse(
             {"detail": "This Google account is not authorized for Sentient Dash."}, status_code=403
         )
+    is_admin = (not ADMIN_EMAILS) or email in ADMIN_EMAILS
+    if path.startswith("/api/admin/") and not is_admin:
+        return JSONResponse({"detail": "Admin access required."}, status_code=403)
     request.state.user_email = email
+    request.state.is_admin = is_admin
     return await call_next(request)
 
 
@@ -239,6 +257,19 @@ def health() -> dict[str, Any]:
         "llm_report": llm_report_status(),
         "remote_tribe": remote_tribe_status(),
         "remote_ocr": remote_ocr_status(),
+    }
+
+
+@app.get("/api/dashboard/me")
+def dashboard_me(request: Request) -> dict[str, Any]:
+    """Tells the frontend who's signed in and whether they can see Settings.
+    Purely informational -- /api/admin/* is what actually enforces the
+    admin-only boundary, this just lets the UI hide the button for everyone
+    else instead of showing it and then bouncing them with a 403.
+    """
+    return {
+        "email": getattr(request.state, "user_email", None),
+        "is_admin": bool(getattr(request.state, "is_admin", False)),
     }
 
 
