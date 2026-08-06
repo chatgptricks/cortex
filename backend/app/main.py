@@ -49,7 +49,18 @@ from .config import (
     VIDEO_DIR,
     ensure_directories,
 )
-from .db import connect, init_db, row_to_post, utc_now
+from .db import (
+    connect,
+    count_dashboard_admins,
+    get_dashboard_user_role,
+    init_db,
+    list_dashboard_users,
+    remove_dashboard_user,
+    row_to_post,
+    seed_dashboard_users_from_env,
+    upsert_dashboard_user,
+    utc_now,
+)
 from .instagram_import import (
     InstagramImportError,
     fetch_instagram_post,
@@ -98,8 +109,8 @@ app.add_middleware(
 # --- Google login (Firebase Auth) -----------------------------------------
 # Sentient Dash used to be public-read with a single shared password gating
 # admin writes. That's replaced entirely by Google sign-in: every request
-# now needs a valid Firebase ID token for a Google account on ALLOWED_EMAILS,
-# checked by the middleware below. The old per-endpoint
+# now needs a valid Firebase ID token for a Google account in the
+# dashboard_users table, checked by the middleware below. The old per-endpoint
 # TRICKS_DASH_REFRESH_PASSWORD checks scattered through this file are left
 # untouched (the frontend still sends that same fixed value automatically,
 # with no UI for it anymore) -- they're redundant now that this middleware
@@ -121,14 +132,13 @@ for _cred_path in (
             FIREBASE_APP = firebase_admin.get_app()
         break
 
-ALLOWED_EMAILS = {e.strip().lower() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip()}
-
-# Two-tier roles: everyone on ALLOWED_EMAILS gets the read-only dashboard;
-# only ADMIN_EMAILS (a subset) can reach the Settings/admin panel and its
-# backend routes. Checked server-side below -- hiding the Settings button in
-# the UI is not itself a security boundary, so /api/admin/* is rejected for
-# non-admins regardless of what the frontend shows.
-ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+# ALLOWED_EMAILS/ADMIN_EMAILS are now only a one-time seed for the
+# dashboard_users table (see seed_dashboard_users_from_env at startup) --
+# the table itself is the live source of truth, editable from the Users tab
+# in Settings without touching Render. Kept here so a from-scratch deploy
+# with an empty DB still boots with the right people able to sign in.
+_SEED_ALLOWED_EMAILS = {e.strip().lower() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip()}
+_SEED_ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
 
 # Cover/avatar images load via plain <img src="..."> tags, which can't carry
 # an Authorization header -- excluded here for that technical reason only,
@@ -160,11 +170,12 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     except Exception:
         return JSONResponse({"detail": "Your session expired -- please sign in again."}, status_code=401)
     email = (decoded.get("email") or "").strip().lower()
-    if ALLOWED_EMAILS and email not in ALLOWED_EMAILS:
+    role = get_dashboard_user_role(email)
+    if role is None:
         return JSONResponse(
             {"detail": "This Google account is not authorized for Sentient Dash."}, status_code=403
         )
-    is_admin = (not ADMIN_EMAILS) or email in ADMIN_EMAILS
+    is_admin = role == "admin"
     if path.startswith("/api/admin/") and not is_admin:
         return JSONResponse({"detail": "Admin access required."}, status_code=403)
     request.state.user_email = email
@@ -208,6 +219,7 @@ async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    seed_dashboard_users_from_env(_SEED_ALLOWED_EMAILS, _SEED_ADMIN_EMAILS)
     _seed_default_metadata_options()
     start_scheduler()
 
@@ -633,6 +645,49 @@ def admin_slack_status() -> dict[str, Any]:
 def admin_list_accounts() -> dict[str, Any]:
     """Full roster including inactive accounts, for the admin UI."""
     return {"accounts": list_accounts(active_only=False)}
+
+
+@app.get("/api/admin/users")
+def admin_list_users() -> dict[str, Any]:
+    """Who can sign in to Sentient Dash and who's an admin. Backs the Users
+    tab in Settings -- this table is the live source of truth (see
+    seed_dashboard_users_from_env for the one-time env-var migration)."""
+    return {"users": list_dashboard_users()}
+
+
+@app.post("/api/admin/users")
+def admin_upsert_user(
+    request: Request,
+    email: Annotated[str, Form()],
+    role: Annotated[str, Form()] = "viewer",
+) -> dict[str, Any]:
+    """Add a new allowed email, or change an existing one's role. Admins can
+    add other admins or plain viewers; there's no further gate here because
+    /api/admin/* already requires an admin session to reach this at all."""
+    clean_email = email.strip().lower()
+    if not clean_email or "@" not in clean_email:
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+    if role not in ("admin", "viewer"):
+        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'viewer'.")
+    upsert_dashboard_user(clean_email, role)
+    return {"ok": True, "users": list_dashboard_users()}
+
+
+@app.post("/api/admin/users/remove")
+def admin_remove_user(request: Request, email: Annotated[str, Form()]) -> dict[str, Any]:
+    """Revoke someone's access entirely. Guarded against two lockout
+    scenarios: removing your own session's admin account, and removing the
+    last remaining admin -- either would leave nobody able to manage users or
+    accounts, with no way back in short of hand-editing the database."""
+    clean_email = email.strip().lower()
+    current_email = getattr(request.state, "user_email", None)
+    if current_email and clean_email == current_email:
+        raise HTTPException(status_code=400, detail="You can't remove your own access.")
+    role = get_dashboard_user_role(clean_email)
+    if role == "admin" and count_dashboard_admins() <= 1:
+        raise HTTPException(status_code=400, detail="Can't remove the last remaining admin.")
+    remove_dashboard_user(clean_email)
+    return {"ok": True, "users": list_dashboard_users()}
 
 
 _OCR_RUN: dict[str, Any] = {"running": False, "done": 0, "with_text": 0, "batches": 0, "error": None, "started": None}

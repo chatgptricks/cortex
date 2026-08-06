@@ -192,6 +192,18 @@ def init_db() -> None:
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            -- Sentient Dash's Google-sign-in allowlist + roles. Replaces the
+            -- old ALLOWED_EMAILS/ADMIN_EMAILS env vars as the live source of
+            -- truth once seeded (see seed_dashboard_users_from_env) -- an
+            -- admin can add/remove people and promote/demote roles from the
+            -- Users tab in Settings without touching Render at all.
+            CREATE TABLE IF NOT EXISTS dashboard_users (
+                email TEXT PRIMARY KEY,
+                role TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('admin', 'viewer')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         _ensure_column(conn, "traselveloreal_posts", "hot_rate_multiplier", "hot_rate_multiplier REAL")
@@ -386,6 +398,74 @@ def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: 
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if name not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+
+# --- Sentient Dash users (Google sign-in allowlist + roles) ----------------
+
+def list_dashboard_users() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT email, role, created_at, updated_at FROM dashboard_users ORDER BY role DESC, email ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_dashboard_user_role(email: str) -> str | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT role FROM dashboard_users WHERE email = ?", (email.strip().lower(),)
+        ).fetchone()
+        return row["role"] if row else None
+
+
+def count_dashboard_admins() -> int:
+    with connect() as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM dashboard_users WHERE role = 'admin'").fetchone()
+        return int(row["c"]) if row else 0
+
+
+def upsert_dashboard_user(email: str, role: str) -> None:
+    if role not in ("admin", "viewer"):
+        raise ValueError(f"Invalid role: {role!r}")
+    email = email.strip().lower()
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO dashboard_users (email, role, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at
+            """,
+            (email, role, now, now),
+        )
+
+
+def remove_dashboard_user(email: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM dashboard_users WHERE email = ?", (email.strip().lower(),))
+
+
+def seed_dashboard_users_from_env(allowed_emails: set[str], admin_emails: set[str]) -> None:
+    """One-time migration path: the allowlist used to live entirely in the
+    ALLOWED_EMAILS/ADMIN_EMAILS env vars. On first startup after this table
+    existed, copy anyone from those env vars who isn't already in the table
+    yet, so nobody's access silently disappears the moment this shipped.
+    Emails already in the table (added/edited via the Users tab) are left
+    alone -- this only fills in gaps, never overwrites.
+    """
+    if not allowed_emails:
+        return
+    now = utc_now()
+    with connect() as conn:
+        existing = {row["email"] for row in conn.execute("SELECT email FROM dashboard_users").fetchall()}
+        for email in allowed_emails:
+            if email in existing:
+                continue
+            role = "admin" if email in admin_emails else "viewer"
+            conn.execute(
+                "INSERT INTO dashboard_users (email, role, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (email, role, now, now),
+            )
 
 
 def decode_summary(value: str | None) -> dict[str, Any] | None:
