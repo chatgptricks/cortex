@@ -520,7 +520,13 @@ def get_usage_summary(days: int = 30) -> dict[str, Any]:
     in the browser.
     """
     now = datetime.now(UTC)
-    since_dt = now - timedelta(days=days)
+    # Window is `days` calendar days ending TODAY, inclusive -- days=30 means
+    # today and the 29 before it. (An off-by-one here silently dropped today
+    # from the heatmap: since_dt = now - timedelta(days=days) puts the last
+    # bucket at "yesterday", so a person active moments ago showed up in
+    # total_all_time/last_seen but not in last_7d/last_30d or today's cell.)
+    since_date = now.date() - timedelta(days=days - 1)
+    since_dt = datetime(since_date.year, since_date.month, since_date.day, tzinfo=UTC)
     since = since_dt.isoformat(timespec="seconds")
 
     roster = list_dashboard_users()  # [{email, role, created_at, updated_at}]
@@ -536,7 +542,7 @@ def get_usage_summary(days: int = 30) -> dict[str, Any]:
         ).fetchall()
     totals_by_email = {row["email"]: row for row in totals}
 
-    day_keys = [(since_dt + timedelta(days=d)).strftime("%Y-%m-%d") for d in range(days)]
+    day_keys = [(since_date + timedelta(days=d)).isoformat() for d in range(days)]
     DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
     per_user: dict[str, dict[str, Any]] = {
