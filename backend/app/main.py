@@ -95,6 +95,65 @@ app.add_middleware(
 )
 
 
+# --- Google login (Firebase Auth) -----------------------------------------
+# Sentient Dash used to be public-read with a single shared password gating
+# admin writes. That's replaced entirely by Google sign-in: every request
+# now needs a valid Firebase ID token for a Google account on ALLOWED_EMAILS,
+# checked by the middleware below. The old per-endpoint
+# TRICKS_DASH_REFRESH_PASSWORD checks scattered through this file are left
+# untouched (the frontend still sends that same fixed value automatically,
+# with no UI for it anymore) -- they're redundant now that this middleware
+# is the real gate, since nobody without a valid, allowlisted Google session
+# can reach those endpoints to submit that password in the first place.
+import firebase_admin
+from firebase_admin import auth as firebase_auth
+from firebase_admin import credentials as firebase_credentials
+
+FIREBASE_APP = None
+for _cred_path in (
+    "/etc/secrets/firebase-adminsdk.json",
+    str(Path(__file__).resolve().parent.parent / "firebase-adminsdk.json"),
+):
+    if os.path.exists(_cred_path):
+        try:
+            FIREBASE_APP = firebase_admin.initialize_app(firebase_credentials.Certificate(_cred_path))
+        except ValueError:
+            FIREBASE_APP = firebase_admin.get_app()
+        break
+
+ALLOWED_EMAILS = {e.strip().lower() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip()}
+
+_FIREBASE_OPEN_PREFIXES = ("/api/dashboard/covers/", "/api/dashboard/avatar/")
+_FIREBASE_OPEN_PATHS = {"/api/health", "/", "/docs", "/openapi.json", "/redoc"}
+
+
+@app.middleware("http")
+async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped-def]
+    if FIREBASE_APP is None:
+        return await call_next(request)
+    path = request.url.path
+    if request.method == "OPTIONS" or path in _FIREBASE_OPEN_PATHS or path.startswith(_FIREBASE_OPEN_PREFIXES):
+        return await call_next(request)
+
+    from fastapi.responses import JSONResponse
+
+    header = request.headers.get("authorization") or ""
+    if not header.startswith("Bearer "):
+        return JSONResponse({"detail": "Sign in required."}, status_code=401)
+    token = header[len("Bearer ") :].strip()
+    try:
+        decoded = firebase_auth.verify_id_token(token)
+    except Exception:
+        return JSONResponse({"detail": "Your session expired -- please sign in again."}, status_code=401)
+    email = (decoded.get("email") or "").strip().lower()
+    if ALLOWED_EMAILS and email not in ALLOWED_EMAILS:
+        return JSONResponse(
+            {"detail": "This Google account is not authorized for Sentient Dash."}, status_code=403
+        )
+    request.state.user_email = email
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
     if PREDICT_API_KEY and request.method != "OPTIONS":
