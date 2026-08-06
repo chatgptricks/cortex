@@ -484,7 +484,9 @@ def tracker_summary() -> dict[str, Any]:
                 "followers": latest.get("followers_count") if latest else None,
                 "posts_count": latest.get("posts_count") if latest else None,
                 "captured_at": latest.get("captured_at") if latest else None,
+                "full_name": latest.get("full_name") if latest else None,
                 "verified": bool(latest.get("verified")) if latest else False,
+                "private": bool(latest.get("private")) if latest else False,
                 "history_days": len(snaps),
                 "delta_1d": _tracker_delta(snaps, latest, 1),
                 "delta_7d": _tracker_delta(snaps, latest, 7),
@@ -569,7 +571,14 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
         "label": account.get("label"),
         "group": account.get("group"),
         "followers_history": [
-            {"date": s["captured_at"], "followers": s["followers_count"], "posts_count": s["posts_count"]}
+            {
+                "date": s["captured_at"],
+                "followers": s["followers_count"],
+                "posts_count": s["posts_count"],
+                "full_name": s["full_name"],
+                "verified": bool(s["verified"]),
+                "private": bool(s["private"]),
+            }
             for s in snapshots
         ],
         "engagement_weekly": engagement_weekly,
