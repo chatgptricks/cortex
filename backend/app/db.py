@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -204,6 +204,21 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            -- One row per authenticated request, logged from the Firebase
+            -- middleware. Feeds the Users tab's usage heatmap (who's active,
+            -- when, and in which part of the app) -- there was previously no
+            -- record at all of who actually opens the dashboard vs. just
+            -- having access to it.
+            CREATE TABLE IF NOT EXISTS usage_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                path TEXT NOT NULL,
+                method TEXT NOT NULL,
+                ts TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_log_email ON usage_log(email);
+            CREATE INDEX IF NOT EXISTS idx_usage_log_ts ON usage_log(ts);
             """
         )
         _ensure_column(conn, "traselveloreal_posts", "hot_rate_multiplier", "hot_rate_multiplier REAL")
@@ -466,6 +481,137 @@ def seed_dashboard_users_from_env(allowed_emails: set[str], admin_emails: set[st
                 "INSERT INTO dashboard_users (email, role, created_at, updated_at) VALUES (?, ?, ?, ?)",
                 (email, role, now, now),
             )
+
+
+def log_usage_event(email: str, path: str, method: str) -> None:
+    """Called from the Firebase middleware on every authenticated request.
+    Best-effort by design (the caller swallows any exception) -- a missed
+    usage row is a cosmetic gap in a heatmap, not worth risking the request
+    it's piggybacking on.
+    """
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO usage_log (email, path, method, ts) VALUES (?, ?, ?, ?)",
+            (email.strip().lower(), path, method, utc_now()),
+        )
+
+
+def _usage_section(path: str) -> str:
+    if path.startswith("/api/admin/"):
+        return "admin"
+    if path.startswith("/api/insights/"):
+        return "insights"
+    if path.startswith("/api/dashboard/"):
+        return "dashboard"
+    return "other"
+
+
+def get_usage_summary(days: int = 30) -> dict[str, Any]:
+    """Aggregated usage analytics for the admin Users tab' heatmap.
+
+    Every registered user gets a row (even one who has never signed in --
+    that's exactly the kind of thing this is meant to surface), zero-filled
+    for the requested window so the frontend can render a fixed-width grid
+    without caring which days actually had events. Per user: a day-by-day
+    count (the heatmap's main grid), an hour-of-day and day-of-week
+    breakdown (when they're actually online), and a dashboard/insights/admin
+    split (what they use). A team-wide day x hour grid is included
+    separately so "when is anyone online" doesn't require summing 12 rows
+    in the browser.
+    """
+    now = datetime.now(UTC)
+    since_dt = now - timedelta(days=days)
+    since = since_dt.isoformat(timespec="seconds")
+
+    roster = list_dashboard_users()  # [{email, role, created_at, updated_at}]
+
+    with connect() as conn:
+        window_rows = conn.execute(
+            "SELECT email, path, ts FROM usage_log WHERE ts >= ? ORDER BY ts ASC",
+            (since,),
+        ).fetchall()
+        totals = conn.execute(
+            "SELECT email, COUNT(*) AS total, MIN(ts) AS first_seen, MAX(ts) AS last_seen "
+            "FROM usage_log GROUP BY email"
+        ).fetchall()
+    totals_by_email = {row["email"]: row for row in totals}
+
+    day_keys = [(since_dt + timedelta(days=d)).strftime("%Y-%m-%d") for d in range(days)]
+    DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    per_user: dict[str, dict[str, Any]] = {
+        row["email"]: {
+            "daily": dict.fromkeys(day_keys, 0),
+            "hourly": [0] * 24,
+            "dow": [0] * 7,
+            "sections": {"dashboard": 0, "insights": 0, "admin": 0, "other": 0},
+        }
+        for row in roster
+    }
+    global_dow_hour = [[0] * 24 for _ in range(7)]
+
+    for row in window_rows:
+        email = row["email"]
+        # A usage row can outlive the person's access (removed from the
+        # roster after being active) -- still count it in the global grid,
+        # just don't manufacture a per-user row for someone no longer listed.
+        ts = row["ts"]
+        day = ts[:10]
+        try:
+            when = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        hour = when.hour
+        dow = when.weekday()  # Monday=0 .. Sunday=6
+        global_dow_hour[dow][hour] += 1
+
+        u = per_user.get(email)
+        if u is None:
+            continue
+        if day in u["daily"]:
+            u["daily"][day] += 1
+        u["hourly"][hour] += 1
+        u["dow"][dow] += 1
+        section = _usage_section(row["path"])
+        u["sections"][section] = u["sections"].get(section, 0) + 1
+
+    users_out = []
+    for row in roster:
+        email = row["email"]
+        u = per_user[email]
+        daily_list = [{"date": k, "count": u["daily"][k]} for k in day_keys]
+        t = totals_by_email.get(email)
+        users_out.append(
+            {
+                "email": email,
+                "role": row["role"],
+                "total_all_time": int(t["total"]) if t else 0,
+                "first_seen": t["first_seen"] if t else None,
+                "last_seen": t["last_seen"] if t else None,
+                "active_days": sum(1 for d in daily_list if d["count"] > 0),
+                "last_7d": sum(d["count"] for d in daily_list[-7:]),
+                "last_30d": sum(d["count"] for d in daily_list),
+                "daily": daily_list,
+                "hourly": u["hourly"],
+                "dow": u["dow"],
+                "sections": u["sections"],
+            }
+        )
+    # Most recently active first; never-active users (last_seen None) sink
+    # to the bottom, which is exactly who this feature exists to surface.
+    users_out.sort(key=lambda u: u["last_seen"] or "", reverse=True)
+
+    return {
+        "days": days,
+        "day_keys": day_keys,
+        "dow_labels": DOW,
+        "users": users_out,
+        "global_dow_hour": global_dow_hour,
+        "total_events_in_range": len(window_rows),
+        "active_users_7d": sum(1 for u in users_out if u["last_7d"] > 0),
+        "active_users_30d": sum(1 for u in users_out if u["last_30d"] > 0),
+        "total_users": len(users_out),
+    }
 
 
 def decode_summary(value: str | None) -> dict[str, Any] | None:

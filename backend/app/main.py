@@ -53,8 +53,10 @@ from .db import (
     connect,
     count_dashboard_admins,
     get_dashboard_user_role,
+    get_usage_summary,
     init_db,
     list_dashboard_users,
+    log_usage_event,
     remove_dashboard_user,
     row_to_post,
     seed_dashboard_users_from_env,
@@ -180,6 +182,12 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         return JSONResponse({"detail": "Admin access required."}, status_code=403)
     request.state.user_email = email
     request.state.is_admin = is_admin
+    try:
+        # Feeds the Users tab's usage heatmap. Best-effort: a failed insert
+        # here should never turn into a failed request for the user.
+        log_usage_event(email, path, request.method)
+    except Exception:
+        logging.getLogger(__name__).warning("usage log insert failed", exc_info=True)
     return await call_next(request)
 
 
@@ -697,6 +705,15 @@ def admin_remove_user(request: Request, email: Annotated[str, Form()]) -> dict[s
         raise HTTPException(status_code=400, detail="Can't remove the last remaining admin.")
     remove_dashboard_user(clean_email)
     return {"ok": True, "users": list_dashboard_users()}
+
+
+@app.get("/api/admin/usage")
+def admin_usage(days: Annotated[int, Query(ge=1, le=90)] = 30) -> dict[str, Any]:
+    """Usage analytics behind the Users tab's heatmap: who actually opens
+    Sentient Dash, how often, when, and in which section (dashboard vs.
+    insights vs. this admin panel). Sourced from usage_log, populated by the
+    Firebase auth middleware on every authenticated request."""
+    return get_usage_summary(days=days)
 
 
 _OCR_RUN: dict[str, Any] = {"running": False, "done": 0, "with_text": 0, "batches": 0, "error": None, "started": None}
