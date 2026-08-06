@@ -219,6 +219,26 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_usage_log_email ON usage_log(email);
             CREATE INDEX IF NOT EXISTS idx_usage_log_ts ON usage_log(ts);
+
+            -- One row per account per day (see the scheduler's daily
+            -- account-snapshot job), capturing Instagram's profile-level
+            -- stats -- follower count above all, the one number a
+            -- Social-Blade-style Tracker page is built around. This can
+            -- only ever grow forward from whenever it started being
+            -- written; there is no way to backfill Instagram's past
+            -- follower counts for a newly tracked account.
+            CREATE TABLE IF NOT EXISTS account_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                handle TEXT NOT NULL,
+                followers_count INTEGER,
+                posts_count INTEGER,
+                full_name TEXT,
+                verified INTEGER NOT NULL DEFAULT 0,
+                private INTEGER NOT NULL DEFAULT 0,
+                captured_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_account_snapshots_handle ON account_snapshots(handle);
+            CREATE INDEX IF NOT EXISTS idx_account_snapshots_captured_at ON account_snapshots(captured_at);
             """
         )
         _ensure_column(conn, "traselveloreal_posts", "hot_rate_multiplier", "hot_rate_multiplier REAL")
@@ -618,6 +638,54 @@ def get_usage_summary(days: int = 30) -> dict[str, Any]:
         "active_users_30d": sum(1 for u in users_out if u["last_30d"] > 0),
         "total_users": len(users_out),
     }
+
+
+# --- Account snapshots (Tracker page) --------------------------------------
+
+def insert_account_snapshot(
+    handle: str,
+    followers_count: int | None,
+    posts_count: int | None,
+    full_name: str | None,
+    verified: bool,
+    private: bool,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO account_snapshots
+                (handle, followers_count, posts_count, full_name, verified, private, captured_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (handle.strip().lower(), followers_count, posts_count, full_name, int(bool(verified)), int(bool(private)), utc_now()),
+        )
+
+
+def list_account_snapshots(handle: str) -> list[dict[str, Any]]:
+    """Full history for one account, oldest first -- the Tracker detail
+    page's follower-growth line is drawn directly from this."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT handle, followers_count, posts_count, full_name, verified, private, captured_at "
+            "FROM account_snapshots WHERE handle = ? ORDER BY captured_at ASC",
+            (handle.strip().lower(),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def all_account_snapshots() -> dict[str, list[dict[str, Any]]]:
+    """Every snapshot for every account, oldest first, grouped by handle.
+    Used to build the Tracker leaderboard's 1d/7d/30d deltas -- one query
+    instead of one round trip per tracked account."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT handle, followers_count, posts_count, full_name, verified, private, captured_at "
+            "FROM account_snapshots ORDER BY handle ASC, captured_at ASC"
+        ).fetchall()
+    by_handle: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_handle.setdefault(row["handle"], []).append(dict(row))
+    return by_handle
 
 
 def decode_summary(value: str | None) -> dict[str, Any] | None:

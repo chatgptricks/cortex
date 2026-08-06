@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from bisect import bisect_right
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -50,11 +50,13 @@ from .config import (
     ensure_directories,
 )
 from .db import (
+    all_account_snapshots,
     connect,
     count_dashboard_admins,
     get_dashboard_user_role,
     get_usage_summary,
     init_db,
+    list_account_snapshots,
     list_dashboard_users,
     log_usage_event,
     remove_dashboard_user,
@@ -403,6 +405,173 @@ def insights_posts() -> dict[str, Any]:
     ]}
 
 
+def _closest_snapshot_at_or_before(snapshots: list[dict[str, Any]], cutoff: str) -> dict[str, Any] | None:
+    """`snapshots` must be sorted oldest -> newest (captured_at ascending).
+    Returns the most recent one at or before `cutoff`, or None if the
+    account's recorded history doesn't reach back that far yet."""
+    candidate = None
+    for snap in snapshots:
+        if snap["captured_at"] <= cutoff:
+            candidate = snap
+        else:
+            break
+    return candidate
+
+
+def _tracker_delta(snapshots: list[dict[str, Any]], latest: dict[str, Any] | None, days: int) -> dict[str, Any] | None:
+    if not latest or latest.get("followers_count") is None:
+        return None
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
+    baseline = _closest_snapshot_at_or_before(snapshots, cutoff)
+    if not baseline or baseline is latest or baseline.get("followers_count") is None:
+        return None
+    delta = latest["followers_count"] - baseline["followers_count"]
+    pct = (delta / baseline["followers_count"] * 100) if baseline["followers_count"] else None
+    return {"delta": delta, "pct": pct, "from": baseline["captured_at"]}
+
+
+@app.get("/api/tracker/summary")
+def tracker_summary() -> dict[str, Any]:
+    """Social-Blade-style leaderboard: every tracked account's current
+    follower count, 1d/7d/30d growth (grows more meaningful as
+    account_snapshots accumulates day over day -- there's no way to
+    backfill Instagram's past follower counts), and an engagement trend
+    pulled from the post history already on hand, which goes back months
+    rather than starting from zero today. Open to any signed-in user, not
+    admin-gated -- same tier as /api/insights/*.
+    """
+    accounts = list_accounts(active_only=True)
+    snapshots_by_handle = all_account_snapshots()
+
+    now = datetime.now(UTC)
+    cutoff_30 = (now - timedelta(days=30)).isoformat(timespec="seconds")
+    cutoff_60 = (now - timedelta(days=60)).isoformat(timespec="seconds")
+
+    with connect() as conn:
+        engagement_rows = conn.execute(
+            """
+            SELECT account,
+                   AVG(CASE WHEN published_at >= ? THEN likes END) AS avg_likes_30d,
+                   COUNT(CASE WHEN published_at >= ? THEN 1 END) AS n_30d,
+                   AVG(CASE WHEN published_at >= ? AND published_at < ? THEN likes END) AS avg_likes_prev_30d
+            FROM dashboard_posts
+            WHERE published_at IS NOT NULL AND published_at != ''
+            GROUP BY account
+            """,
+            (cutoff_30, cutoff_30, cutoff_60, cutoff_30),
+        ).fetchall()
+    engagement_by_account = {row["account"]: dict(row) for row in engagement_rows}
+
+    rows: list[dict[str, Any]] = []
+    for account in accounts:
+        handle = account["handle"]
+        snaps = snapshots_by_handle.get(handle, [])
+        latest = snaps[-1] if snaps else None
+        eng = engagement_by_account.get(handle, {})
+        avg30 = eng.get("avg_likes_30d")
+        avgprev = eng.get("avg_likes_prev_30d")
+        engagement_trend_pct = (avg30 - avgprev) / avgprev * 100 if avg30 is not None and avgprev else None
+
+        rows.append(
+            {
+                "handle": handle,
+                "label": account.get("label"),
+                "group": account.get("group"),
+                "followers": latest.get("followers_count") if latest else None,
+                "posts_count": latest.get("posts_count") if latest else None,
+                "captured_at": latest.get("captured_at") if latest else None,
+                "verified": bool(latest.get("verified")) if latest else False,
+                "history_days": len(snaps),
+                "delta_1d": _tracker_delta(snaps, latest, 1),
+                "delta_7d": _tracker_delta(snaps, latest, 7),
+                "delta_30d": _tracker_delta(snaps, latest, 30),
+                "avg_likes_30d": avg30,
+                "posts_30d": eng.get("n_30d") or 0,
+                "engagement_trend_pct": engagement_trend_pct,
+            }
+        )
+
+    # Followers is the primary Social-Blade-style ranking. Growth is ranked
+    # separately (by 7d delta, the shortest window likely to be populated
+    # soon after this ships) and only among accounts that actually have
+    # one yet, so a brand-new snapshot history doesn't rank via a missing
+    # value sorting first or last by accident.
+    by_followers = sorted((r for r in rows if r["followers"] is not None), key=lambda r: r["followers"], reverse=True)
+    for i, r in enumerate(by_followers, start=1):
+        r["rank_by_followers"] = i
+    by_growth = sorted(
+        (r for r in rows if r["delta_7d"] is not None), key=lambda r: r["delta_7d"]["delta"], reverse=True
+    )
+    for i, r in enumerate(by_growth, start=1):
+        r["rank_by_growth_7d"] = i
+    for r in rows:
+        r.setdefault("rank_by_followers", None)
+        r.setdefault("rank_by_growth_7d", None)
+
+    rows.sort(key=lambda r: (r["followers"] is None, -(r["followers"] or 0)))
+
+    earliest = min((snaps[0]["captured_at"] for snaps in snapshots_by_handle.values() if snaps), default=None)
+    return {"accounts": rows, "tracking_since": earliest, "generated_at": utc_now()}
+
+
+@app.get("/api/tracker/accounts/{handle}")
+def tracker_account_detail(handle: str) -> dict[str, Any]:
+    """Growth history for one account: the full follower/posts_count
+    snapshot series recorded so far, plus a weekly engagement trend computed
+    from the post history we already have (months of real data, unlike the
+    follower series which starts from whenever tracking began)."""
+    clean = handle.strip().lstrip("@").lower()
+    accounts = {a["handle"]: a for a in list_accounts(active_only=False)}
+    account = accounts.get(clean)
+    if not account:
+        raise HTTPException(status_code=404, detail="Unknown account.")
+
+    snapshots = list_account_snapshots(clean)
+
+    with connect() as conn:
+        post_rows = conn.execute(
+            "SELECT published_at, likes, video_views FROM dashboard_posts "
+            "WHERE account = ? AND published_at IS NOT NULL AND published_at != ''",
+            (clean,),
+        ).fetchall()
+
+    weekly: dict[str, dict[str, Any]] = {}
+    for row in post_rows:
+        try:
+            dt = datetime.fromisoformat(row["published_at"])
+        except ValueError:
+            continue
+        # ISO week start (Monday) as a stable bucket key -- the chart plots
+        # calendar weeks, not an exact rolling 7-day window.
+        week_start = (dt - timedelta(days=dt.weekday())).date().isoformat()
+        bucket = weekly.setdefault(week_start, {"likes": [], "views": [], "count": 0})
+        bucket["likes"].append(row["likes"] or 0)
+        if row["video_views"] is not None:
+            bucket["views"].append(row["video_views"])
+        bucket["count"] += 1
+
+    engagement_weekly = [
+        {
+            "week_start": week,
+            "post_count": b["count"],
+            "avg_likes": sum(b["likes"]) / len(b["likes"]) if b["likes"] else None,
+            "avg_views": sum(b["views"]) / len(b["views"]) if b["views"] else None,
+        }
+        for week, b in sorted(weekly.items())
+    ]
+
+    return {
+        "handle": clean,
+        "label": account.get("label"),
+        "group": account.get("group"),
+        "followers_history": [
+            {"date": s["captured_at"], "followers": s["followers_count"], "posts_count": s["posts_count"]}
+            for s in snapshots
+        ],
+        "engagement_weekly": engagement_weekly,
+    }
+
+
 @app.get("/api/dashboard/posts")
 def dashboard_posts() -> dict[str, Any]:
     """Unified, public, read-only projection across every account. Each
@@ -714,6 +883,19 @@ def admin_usage(days: Annotated[int, Query(ge=1, le=90)] = 30) -> dict[str, Any]
     insights vs. this admin panel). Sourced from usage_log, populated by the
     Firebase auth middleware on every authenticated request."""
     return get_usage_summary(days=days)
+
+
+@app.post("/api/admin/tracker/snapshot-now")
+def admin_tracker_snapshot_now() -> dict[str, Any]:
+    """Manually runs the same per-account Apify profile scrape the daily
+    7am CST job runs (see scheduler._run_account_snapshot_job), so day-one
+    -- or re-adding an account -- doesn't have to wait for the next
+    scheduled tick to show up on the Tracker page. Costs one lightweight
+    Apify call per active account."""
+    from .apify_sync import snapshot_all_accounts
+
+    result = snapshot_all_accounts()
+    return {"ok": True, **result}
 
 
 _OCR_RUN: dict[str, Any] = {"running": False, "done": 0, "with_text": 0, "batches": 0, "error": None, "started": None}

@@ -131,6 +131,26 @@ def _run_daily_jobs() -> None:
             logger.exception("Daily engagement cycle (%s) crashed", account)
 
 
+def _run_account_snapshot_job() -> None:
+    """One row per active account per day into account_snapshots -- the
+    Tracker page's entire follower-growth chart is built from this. A
+    separate lightweight Apify 'details' scrape per account (the same call
+    fetch_profile_preview already makes for the add-account wizard), not
+    bundled into run_daily_cycle above since that scrapes individual posts
+    and never touches the profile-level follower count.
+    """
+    from .apify_sync import snapshot_all_accounts
+
+    try:
+        result = snapshot_all_accounts()
+        if result["failed"]:
+            logger.error("Account snapshot job: %d ok, failed: %s", len(result["snapshotted"]), result["failed"])
+        else:
+            logger.info("Account snapshot job: %d accounts snapshotted", len(result["snapshotted"]))
+    except Exception:
+        logger.exception("Account snapshot job crashed")
+
+
 def _run_ocr_job() -> None:
     """Keeps cover OCR current without anyone running it by hand: each hourly
     tick tops up a bounded number of covers still missing hook_text, so posts
@@ -209,6 +229,7 @@ def _tick() -> None:
     if now_cst >= daily_trigger and _state_get(_DAILY_DATE_KEY) != today:
         _state_set(_DAILY_DATE_KEY, today)
         _run_daily_jobs()
+        _run_account_snapshot_job()
 
 
 def _loop() -> None:

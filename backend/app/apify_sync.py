@@ -1571,6 +1571,37 @@ def store_avatar_from_url(handle: str, image_url: str) -> str:
     return str(avatar_path)
 
 
+def snapshot_all_accounts() -> dict[str, Any]:
+    """Takes one Tracker-page snapshot (followers/posts count) per active
+    account and records it. Shared by the scheduler's daily job and the
+    admin "snapshot now" button so a fresh install (or someone impatient for
+    day-one data) doesn't have to wait for 7am CST to see the leaderboard
+    populate.
+    """
+    from .db import insert_account_snapshot
+
+    ok: list[str] = []
+    failed: dict[str, str] = {}
+    for account in list_accounts(active_only=True):
+        handle = account["handle"]
+        try:
+            preview = fetch_profile_preview(handle)
+            insert_account_snapshot(
+                handle=handle,
+                followers_count=preview.get("followers_count"),
+                posts_count=preview.get("posts_count"),
+                full_name=preview.get("full_name"),
+                verified=bool(preview.get("verified")),
+                private=bool(preview.get("private")),
+            )
+            ok.append(handle)
+        except ApifySyncError as exc:
+            failed[handle] = str(exc)
+        except Exception as exc:  # noqa: BLE001 -- reported back, not raised
+            failed[handle] = str(exc)
+    return {"snapshotted": ok, "failed": failed}
+
+
 def fetch_and_store_avatar(handle: str) -> str:
     """Looks up the account's current profile picture via Apify (one
     lightweight 'details' scrape) and caches it locally. Use
