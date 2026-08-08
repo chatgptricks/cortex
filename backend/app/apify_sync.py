@@ -1529,6 +1529,7 @@ def fetch_profile_preview(handle: str) -> dict[str, Any]:
         "full_name": item.get("fullName"),
         "profile_pic_url": item.get("profilePicUrlHD") or item.get("profilePicUrl"),
         "followers_count": item.get("followersCount"),
+        "following_count": item.get("followsCount"),
         "posts_count": item.get("postsCount"),
         "verified": bool(item.get("verified")),
         "private": bool(item.get("private")),
@@ -1593,6 +1594,7 @@ def snapshot_all_accounts() -> dict[str, Any]:
                 full_name=preview.get("full_name"),
                 verified=bool(preview.get("verified")),
                 private=bool(preview.get("private")),
+                following_count=preview.get("following_count"),
             )
             ok.append(handle)
         except ApifySyncError as exc:

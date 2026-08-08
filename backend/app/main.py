@@ -542,6 +542,7 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
         ).fetchall()
 
     weekly: dict[str, dict[str, Any]] = {}
+    daily: dict[str, list[int]] = {}
     for row in post_rows:
         try:
             dt = datetime.fromisoformat(row["published_at"])
@@ -555,6 +556,10 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
         if row["video_views"] is not None:
             bucket["views"].append(row["video_views"])
         bucket["count"] += 1
+        # Per calendar day too -- feeds the historical-stats table's
+        # "engagement rate" column (that day's avg likes / that day's
+        # follower count), independent of the weekly chart above.
+        daily.setdefault(dt.date().isoformat(), []).append(row["likes"] or 0)
 
     engagement_weekly = [
         {
@@ -566,6 +571,13 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
         for week, b in sorted(weekly.items())
     ]
 
+    def _day_likes(captured_at: str) -> list[int]:
+        try:
+            day = datetime.fromisoformat(captured_at).date().isoformat()
+        except ValueError:
+            return []
+        return daily.get(day, [])
+
     return {
         "handle": clean,
         "label": account.get("label"),
@@ -575,9 +587,15 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
                 "date": s["captured_at"],
                 "followers": s["followers_count"],
                 "posts_count": s["posts_count"],
+                "following_count": s["following_count"],
                 "full_name": s["full_name"],
                 "verified": bool(s["verified"]),
                 "private": bool(s["private"]),
+                # That calendar day's posts (if any), for the historical-stats
+                # table's engagement-rate column -- independent of the weekly
+                # chart, which buckets by ISO week instead.
+                "avg_likes_that_day": (lambda vals: sum(vals) / len(vals) if vals else None)(_day_likes(s["captured_at"])),
+                "posts_that_day": len(_day_likes(s["captured_at"])),
             }
             for s in snapshots
         ],

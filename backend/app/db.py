@@ -242,6 +242,10 @@ def init_db() -> None:
             """
         )
         _ensure_column(conn, "traselveloreal_posts", "hot_rate_multiplier", "hot_rate_multiplier REAL")
+        # Following count -- added after account_snapshots shipped, so older
+        # snapshots have NULL here; the Tracker's historical-stats table just
+        # shows "--" for those rows instead of a delta.
+        _ensure_column(conn, "account_snapshots", "following_count", "following_count INTEGER")
         # Locally-cached profile picture path for each account -- Instagram's
         # own CDN URLs (via Apify) are signed and expire, so we download once
         # and serve our own copy instead of persisting the raw CDN URL.
@@ -649,15 +653,25 @@ def insert_account_snapshot(
     full_name: str | None,
     verified: bool,
     private: bool,
+    following_count: int | None = None,
 ) -> None:
     with connect() as conn:
         conn.execute(
             """
             INSERT INTO account_snapshots
-                (handle, followers_count, posts_count, full_name, verified, private, captured_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (handle, followers_count, posts_count, full_name, verified, private, following_count, captured_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (handle.strip().lower(), followers_count, posts_count, full_name, int(bool(verified)), int(bool(private)), utc_now()),
+            (
+                handle.strip().lower(),
+                followers_count,
+                posts_count,
+                full_name,
+                int(bool(verified)),
+                int(bool(private)),
+                following_count,
+                utc_now(),
+            ),
         )
 
 
@@ -666,7 +680,7 @@ def list_account_snapshots(handle: str) -> list[dict[str, Any]]:
     page's follower-growth line is drawn directly from this."""
     with connect() as conn:
         rows = conn.execute(
-            "SELECT handle, followers_count, posts_count, full_name, verified, private, captured_at "
+            "SELECT handle, followers_count, posts_count, full_name, verified, private, following_count, captured_at "
             "FROM account_snapshots WHERE handle = ? ORDER BY captured_at ASC",
             (handle.strip().lower(),),
         ).fetchall()
@@ -679,7 +693,7 @@ def all_account_snapshots() -> dict[str, list[dict[str, Any]]]:
     instead of one round trip per tracked account."""
     with connect() as conn:
         rows = conn.execute(
-            "SELECT handle, followers_count, posts_count, full_name, verified, private, captured_at "
+            "SELECT handle, followers_count, posts_count, full_name, verified, private, following_count, captured_at "
             "FROM account_snapshots ORDER BY handle ASC, captured_at ASC"
         ).fetchall()
     by_handle: dict[str, list[dict[str, Any]]] = {}
