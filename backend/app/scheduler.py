@@ -140,15 +140,23 @@ def _run_account_snapshot_job() -> None:
     and never touches the profile-level follower count.
     """
     from .apify_sync import snapshot_all_accounts
+    from .slack_alerts import notify_snapshot_failure, slack_configured
 
     try:
         result = snapshot_all_accounts()
         if result["failed"]:
             logger.error("Account snapshot job: %d ok, failed: %s", len(result["snapshotted"]), result["failed"])
+            # This job runs once a day and is the Tracker's only data source,
+            # so a silent failure costs a full day of follower history that
+            # cannot be recovered afterwards. Always shout about it.
+            if slack_configured():
+                notify_snapshot_failure(len(result["snapshotted"]), result["failed"])
         else:
             logger.info("Account snapshot job: %d accounts snapshotted", len(result["snapshotted"]))
     except Exception:
         logger.exception("Account snapshot job crashed")
+        if slack_configured():
+            notify_snapshot_failure(0, {"*": "snapshot job crashed before it could run -- see Render logs"})
 
 
 def _run_ocr_job() -> None:

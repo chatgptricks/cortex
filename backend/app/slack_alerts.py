@@ -156,3 +156,73 @@ def notify_disk_warning(pct: float, used_mb: float, total_mb: float, threshold: 
     except Exception:
         logger.exception("Slack disk alert failed")
         return False
+
+
+def notify_snapshot_failure(ok_count: int, failed: dict[str, str]) -> bool:
+    """Posts one alert when the daily Tracker snapshot job couldn't record
+    some (or any) accounts. Same never-raises contract as the alerts above.
+
+    Exists because this job is the Tracker's only data source and it fires
+    once a day, so a failure is invisible until someone notices the chart has
+    stopped moving. In Aug 2026 an Apify usage limit was hit, every run was
+    aborted with a 403, and two days of follower history were lost before
+    anyone looked -- and follower counts can't be backfilled after the fact.
+
+    The first failure reason is included verbatim: the useful signal is
+    usually the upstream status (403 = usage limit/permissions, 401 = bad
+    token), which tells you where to look without opening the logs.
+    """
+    webhook = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return False
+
+    total = ok_count + len(failed)
+    total_down = ok_count == 0
+    sample = next(iter(failed.values()), "")
+    # Reasons embed the Apify request URL, which carries the API token as a
+    # query param -- never put that in a Slack message.
+    sample = sample.split("for url", 1)[0].strip() or "see logs"
+
+    try:
+        import httpx
+
+        payload = {
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": ("Tracker snapshot failed" if total_down else "Tracker snapshot incomplete"),
+                        "emoji": False,
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            (
+                                f"*No accounts were recorded* (0 of {total}).\n"
+                                if total_down
+                                else f"Recorded *{ok_count} of {total}* accounts; "
+                                f"*{len(failed)}* failed.\n"
+                            )
+                            + f"First error: `{sample}`\n"
+                            + (
+                                "Today's follower history is missing and cannot be backfilled later. "
+                                "Check Apify (usage limit / token) then re-run *Snapshot now* in the "
+                                "admin panel to capture today before the day rolls over."
+                            )
+                        ),
+                    },
+                },
+            ]
+        }
+        response = httpx.post(webhook, json=payload, timeout=15.0)
+        if response.status_code >= 300:
+            logger.error("Slack snapshot alert rejected (%s): %s", response.status_code, response.text[:200])
+            return False
+        return True
+    except Exception:
+        logger.exception("Slack snapshot alert failed")
+        return False
