@@ -12,14 +12,22 @@ logger = logging.getLogger("uvicorn.error")
 # year-round rather than shifting with daylight saving.
 _CST = timezone(timedelta(hours=-6))
 
-# The short-term job (new posts + <=24h engagement + the one-time HOT check)
-# runs around the clock, but at two cadences: every 30 minutes during posting
-# hours, and hourly overnight. Detection speed matters most right after a post
-# goes up, and almost nothing is published between midnight and dawn -- so
-# paying for 30-min checks then would be spending without upside. Measured at
-# ~$0.079/cycle: 40 cycles/day here vs 48 if it were 30-min around the clock.
-_ACTIVE_START_HOUR = 7  # 7:00am CST
-_ACTIVE_END_HOUR = 23  # 11:00pm CST (exclusive -- 23:xx is already overnight)
+# The short-term job (new posts + recent-post engagement + the one-time HOT
+# check) runs hourly, around the clock.
+#
+# It used to run every 30 minutes during posting hours (40 cycles/day). That
+# was the entire Apify bill: apify/instagram-scraper is billed per result at
+# $1.90/1,000, and every cycle re-fetches all posts inside the lookback window
+# for all 21 accounts -- so a single post was paid for on every cycle of its
+# lifetime in that window. Measured Aug 2026: ~73 results/cycle at ~$0.14, 40
+# cycles/day, ~$165/month -- which is what pushed the account past its usage
+# limit and silently killed two days of Tracker history.
+#
+# Halving the cadence halves that, and costs little: the HOT check is one-time
+# and fires as soon as a post is >= _HOT_MIN_AGE_HOURS (0.5h) old, so the only
+# effect is that a HOT post is flagged up to ~1.5h after publishing instead of
+# ~1h. The rate itself stays exact -- it is computed from the post's real age,
+# not from an assumed cycle interval.
 _DAILY_JOB_AT = (7, 0)  # 7:00am CST
 
 _started = False
@@ -69,19 +77,18 @@ def _state_set(key: str, value: str) -> None:
 
 def _bucket_key(now_cst: datetime) -> str:
     """Identifier for the current slot, so a tick loop that wakes every ~30s only
-    fires the job once per slot.
+    fires the job once per slot. One hourly slot ('2026-07-27T03'), around the
+    clock.
 
-    During posting hours the slot is half-hourly ('2026-07-27T14:30'); overnight
-    it's hourly ('2026-07-27T03'). The two formats can't collide, so switching
-    cadence across the boundary never re-fires or skips a slot.
+    Previously this returned a half-hourly key during posting hours. Slots are
+    only ever compared against the last one stored, so shortening the format is
+    safe across the switchover: the first hourly key simply differs from
+    whatever half-hourly key was saved, and the job fires once.
 
-    HOT detection is unaffected by the cadence: the "first hour" check computes a
-    real likes/hour rate from the post's actual age rather than assuming exactly
+    HOT detection is unaffected by the cadence: the check computes a real
+    likes/hour rate from the post's actual age rather than assuming exactly
     1.0h, so it stays accurate wherever the tick lands.
     """
-    if _ACTIVE_START_HOUR <= now_cst.hour < _ACTIVE_END_HOUR:
-        half = 0 if now_cst.minute < 30 else 30
-        return now_cst.strftime("%Y-%m-%dT%H:") + f"{half:02d}"
     return now_cst.strftime("%Y-%m-%dT%H")
 
 

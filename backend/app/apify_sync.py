@@ -1091,7 +1091,7 @@ _HOT_MIN_AGE_HOURS = 0.5
 # How far back the short cycle looks, and how many posts it pulls per account.
 # 20 comfortably covers a day's output for every tracked account (the busiest
 # post ~5-10/day), so a lower cap just stops paying to re-fetch old posts.
-_SHORT_LOOKBACK_HOURS = 24
+_SHORT_LOOKBACK_HOURS = 12
 _SHORT_RESULTS_LIMIT = 20
 
 # Short-term cycle: every 30min during posting hours, hourly overnight -- posts <=24h old
@@ -1108,10 +1108,18 @@ def _short_term_payload(handles: list[str], results_limit: int, now: datetime) -
         # across accounts.
         "resultsLimit": results_limit,
         "skipPinnedPosts": True,
-        # 24h lookback. Running every 30 min during posting hours, that's ~48
-        # cycles of tolerance before anything could slip past -- and the daily
-        # cycle catches stragglers anyway. The old 30h window meant re-scraping
-        # (and re-paying for) the same posts on every single cycle.
+        # 12h lookback, and this window is the single biggest driver of the
+        # Apify bill: the actor is billed per result, and every cycle re-fetches
+        # (and re-pays for) every post still inside the window. Widening it by
+        # an hour costs an hour's worth of posts on every cycle, forever.
+        #
+        # 12h is chosen because the two things this window feeds have very
+        # different needs: the one-time HOT check only needs a post to be seen
+        # once after it turns 0.5h old, and new-post discovery only needs the
+        # window to exceed the cycle interval. Both are satisfied many times
+        # over -- hourly cycles give 12 chances to catch anything. Only the
+        # like/comment refresh wants a long tail, and the daily cycle already
+        # records final numbers for posts older than this.
         "onlyPostsNewerThan": (now - timedelta(hours=_SHORT_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
@@ -1151,7 +1159,11 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
         if not shortcode or shortcode.startswith("post-"):
             continue
         age_hours = _post_age_hours(row["published_at"], now)
-        if age_hours is None or age_hours > 24:
+        # Tied to the scrape window rather than a fixed 24h: a post older than
+        # the lookback can't be in `items`, so counting it as eligible would
+        # only inflate the "unmatched" tally and make a healthy cycle look
+        # broken. Keep the two in lockstep.
+        if age_hours is None or age_hours > _SHORT_LOOKBACK_HOURS:
             continue
         eligible[shortcode] = {"id": row["id"], "hot_checked": bool(row["hot_checked"]), "age_hours": age_hours}
 
