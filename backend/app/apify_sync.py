@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1091,7 +1093,14 @@ _HOT_MIN_AGE_HOURS = 0.5
 # How far back the short cycle looks, and how many posts it pulls per account.
 # 20 comfortably covers a day's output for every tracked account (the busiest
 # post ~5-10/day), so a lower cap just stops paying to re-fetch old posts.
+logger = logging.getLogger(__name__)
+
 _SHORT_LOOKBACK_HOURS = 12
+# Per-account retries in the daily snapshot job. The job fires once a day and
+# its data can't be backfilled, so a transient Apify timeout on one profile
+# would otherwise cost that account a permanent hole in its history.
+_SNAPSHOT_ATTEMPTS = 3
+_SNAPSHOT_RETRY_DELAY_SECONDS = 5.0
 _SHORT_RESULTS_LIMIT = 20
 
 # Short-term cycle: every 30min during posting hours, hourly overnight -- posts <=24h old
@@ -1597,22 +1606,42 @@ def snapshot_all_accounts() -> dict[str, Any]:
     failed: dict[str, str] = {}
     for account in list_accounts(active_only=True):
         handle = account["handle"]
-        try:
-            preview = fetch_profile_preview(handle)
-            insert_account_snapshot(
-                handle=handle,
-                followers_count=preview.get("followers_count"),
-                posts_count=preview.get("posts_count"),
-                full_name=preview.get("full_name"),
-                verified=bool(preview.get("verified")),
-                private=bool(preview.get("private")),
-                following_count=preview.get("following_count"),
-            )
-            ok.append(handle)
-        except ApifySyncError as exc:
-            failed[handle] = str(exc)
-        except Exception as exc:  # noqa: BLE001 -- reported back, not raised
-            failed[handle] = str(exc)
+        # Retry transient failures. This job runs once a day, so a single
+        # flaky request costs that account a full day of follower history
+        # that can never be recovered -- and Apify read timeouts on
+        # individual profiles do happen (observed 2026-08-14 on one of 22
+        # accounts). Retrying one profile costs ~$0.002, so it is always
+        # cheaper than losing the day.
+        last_error: Exception | None = None
+        for attempt in range(_SNAPSHOT_ATTEMPTS):
+            try:
+                preview = fetch_profile_preview(handle)
+                insert_account_snapshot(
+                    handle=handle,
+                    followers_count=preview.get("followers_count"),
+                    posts_count=preview.get("posts_count"),
+                    full_name=preview.get("full_name"),
+                    verified=bool(preview.get("verified")),
+                    private=bool(preview.get("private")),
+                    following_count=preview.get("following_count"),
+                )
+                ok.append(handle)
+                last_error = None
+                break
+            except Exception as exc:  # noqa: BLE001 -- reported back, not raised
+                last_error = exc
+                # A missing/renamed account fails identically on every
+                # attempt, so don't burn retries (or money) on it.
+                if isinstance(exc, ApifySyncError) and "Could not find" in str(exc):
+                    break
+                if attempt + 1 < _SNAPSHOT_ATTEMPTS:
+                    logger.warning(
+                        "Snapshot for %s failed (attempt %d/%d): %s -- retrying",
+                        handle, attempt + 1, _SNAPSHOT_ATTEMPTS, exc,
+                    )
+                    time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS)
+        if last_error is not None:
+            failed[handle] = str(last_error)
     return {"snapshotted": ok, "failed": failed}
 
 

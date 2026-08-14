@@ -183,6 +183,32 @@ def notify_snapshot_failure(ok_count: int, failed: dict[str, str]) -> bool:
     # query param -- never put that in a Slack message.
     sample = sample.split("for url", 1)[0].strip() or "see logs"
 
+    # Name the accounts that actually failed. The first version of this alert
+    # only gave counts, which made a 1-of-22 timeout read like a total outage.
+    handles = ", ".join(f"`{h}`" for h in list(failed)[:8])
+    if len(failed) > 8:
+        handles += f" +{len(failed) - 8} more"
+
+    # Route the advice off the actual error. Telling someone to check their
+    # usage limit when the real problem was a one-off socket timeout sends
+    # them to the wrong place entirely.
+    low = sample.lower()
+    if "403" in low or "usage" in low or "limit" in low:
+        advice = (
+            "Looks like an Apify usage limit -- runs get aborted platform-wide when it's "
+            "hit. Check Billing > Limits, then re-run *Snapshot now*."
+        )
+    elif "401" in low or "token" in low or "forbidden" in low:
+        advice = "Looks like an Apify auth problem -- check the API token, then re-run *Snapshot now*."
+    elif "timed out" in low or "timeout" in low or "connection" in low:
+        advice = (
+            "Transient network error -- this is retried automatically, so if you're seeing "
+            "this the retries were also exhausted. Re-run *Snapshot now* to capture the "
+            "missing accounts before the day rolls over."
+        )
+    else:
+        advice = "Re-run *Snapshot now* in the admin panel to capture the missing accounts before the day rolls over."
+
     try:
         import httpx
 
@@ -202,17 +228,15 @@ def notify_snapshot_failure(ok_count: int, failed: dict[str, str]) -> bool:
                         "type": "mrkdwn",
                         "text": (
                             (
-                                f"*No accounts were recorded* (0 of {total}).\n"
+                                f"*No accounts were recorded* (0 of {total}). "
+                                "Today's follower history is missing for every account "
+                                "and cannot be backfilled later.\n"
                                 if total_down
-                                else f"Recorded *{ok_count} of {total}* accounts; "
-                                f"*{len(failed)}* failed.\n"
+                                else f"Recorded *{ok_count} of {total}* accounts. "
+                                f"Missing today: {handles}\n"
                             )
-                            + f"First error: `{sample}`\n"
-                            + (
-                                "Today's follower history is missing and cannot be backfilled later. "
-                                "Check Apify (usage limit / token) then re-run *Snapshot now* in the "
-                                "admin panel to capture today before the day rolls over."
-                            )
+                            + f"Error: `{sample}`\n"
+                            + advice
                         ),
                     },
                 },
