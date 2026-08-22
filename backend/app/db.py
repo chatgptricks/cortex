@@ -274,6 +274,17 @@ def init_db() -> None:
         _ensure_column(conn, "dashboard_posts", "music_artist", "music_artist TEXT")
         _ensure_column(conn, "dashboard_posts", "music_audio_id", "music_audio_id TEXT")
         _ensure_column(conn, "dashboard_posts", "uses_original_audio", "uses_original_audio INTEGER")
+        # Curation flags set from the dashboard card menu. Both tables get
+        # them: `posts` holds the canonical account and `dashboard_posts`
+        # everything else, and the card menu has to work on either.
+        #   is_promo -- paid placement. Also inferred from the #aitoolsentient
+        #     hashtag on the frontend; this column is the manual override for
+        #     placements that didn't use the tag.
+        #   hidden   -- excluded from the dashboard grid but NOT deleted, so
+        #     it still counts in totals and can be brought back.
+        for _post_table in ("posts", "dashboard_posts"):
+            _ensure_column(conn, _post_table, "is_promo", "is_promo INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, _post_table, "hidden", "hidden INTEGER NOT NULL DEFAULT 0")
         # audio_id was added to extract_apify_fields after ~5.5k posts already had
         # raw_json captured -- backfill it from the payload we already paid for
         # instead of waiting for those rows to be re-scraped. Cheap once caught up:

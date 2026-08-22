@@ -1593,6 +1593,73 @@ def store_avatar_from_url(handle: str, image_url: str) -> str:
     return str(avatar_path)
 
 
+def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
+    """Re-scrapes one post and updates its like/comment counts.
+
+    The scheduled cycle only touches posts inside its 12h lookback, so an
+    older post's numbers stay frozen at whatever they were when it aged out.
+    This is the manual escape hatch behind the card's "Reload" action.
+
+    Scrapes the post URL directly rather than the profile: one result instead
+    of a page of them (~$0.002), and it works no matter how old the post is.
+    Deliberately does NOT touch is_hot -- that's a one-time judgement made
+    from the post's first-hour velocity, and recomputing it from a like count
+    weeks later would be meaningless.
+    """
+    from .db import connect
+
+    cfg = _account_config(handle)
+    table = cfg["table"]
+    clean = shortcode.strip()
+    if not clean:
+        raise ApifySyncError("A shortcode is required.")
+
+    where = "shortcode = ?" if table == "posts" else "account = ? AND shortcode = ?"
+    where_params: list[Any] = [clean] if table == "posts" else [handle, clean]
+
+    with connect() as conn:
+        row = conn.execute(
+            f"SELECT id, likes, comments, permalink FROM {table} WHERE {where}"
+            if table != "posts"
+            else f"SELECT id, likes, comments FROM {table} WHERE {where}",
+            where_params,
+        ).fetchone()
+    if row is None:
+        raise ApifySyncError("Post not found.")
+
+    url = (dict(row).get("permalink") or "").strip() or f"https://www.instagram.com/p/{clean}/"
+    items = _fetch_apify_items(
+        {"directUrls": [url], "resultsType": "posts", "resultsLimit": 1},
+        timeout=90.0,
+    )
+    item = next((it for it in items if (it.get("shortCode") or "") == clean), items[0] if items else None)
+    if not item:
+        raise ApifySyncError("Instagram returned nothing for that post -- it may have been deleted.")
+
+    likes = _likes_or_none(item.get("likesCount"))
+    comments = item.get("commentsCount")
+    comments = comments if isinstance(comments, int) and comments >= 0 else None
+
+    set_clauses = ["likes = ?", "updated_at = ?"]
+    params: list[Any] = [likes, utc_now()]
+    if comments is not None:
+        set_clauses.append("comments = ?")
+        params.append(comments)
+
+    with connect() as conn:
+        conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE {where}", [*params, *where_params])
+
+    before = dict(row)
+    return {
+        "account": handle,
+        "shortcode": clean,
+        "likes": likes,
+        "comments": comments if comments is not None else before.get("comments"),
+        "likes_before": before.get("likes"),
+        "comments_before": before.get("comments"),
+    }
+
+
 def snapshot_all_accounts() -> dict[str, Any]:
     """Takes one Tracker-page snapshot (followers/posts count) per active
     account and records it. Shared by the scheduler's daily job and the

@@ -27,6 +27,7 @@ from .apify_sync import (
     fetch_profile_preview,
     get_account_config,
     list_accounts,
+    refresh_single_post,
     run_backfill,
     run_manual_refresh,
     store_avatar_from_url,
@@ -622,7 +623,8 @@ def dashboard_posts() -> dict[str, Any]:
                 """
                 SELECT id, title, caption, hook_text, published_at, likes, comments,
                        post_type_label, shortcode, image_path, is_animated,
-                       source_row_number, created_at, section, is_hot, hot_rate_multiplier
+                       source_row_number, created_at, section, is_hot, hot_rate_multiplier,
+                       is_promo, hidden
                 FROM posts
                 """
             ).fetchall()
@@ -632,7 +634,8 @@ def dashboard_posts() -> dict[str, Any]:
             """
             SELECT id, account, shortcode, published_at, likes, comments, caption,
                    post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
-                   hook_text, music_song, music_artist, music_audio_id, uses_original_audio
+                   hook_text, music_song, music_artist, music_audio_id, uses_original_audio,
+                   is_promo, hidden
             FROM dashboard_posts
             """
         ).fetchall()
@@ -663,6 +666,8 @@ def dashboard_posts() -> dict[str, Any]:
                     "coverUrl": f"/api/dashboard/covers/{handle}/{post['id']}",
                     "isHot": bool(post.get("is_hot")),
                     "hotMultiplier": post.get("hot_rate_multiplier"),
+                    "isPromo": bool(post.get("is_promo")),
+                    "hidden": bool(post.get("hidden")),
                     "account": handle,
                     "group": group_by_handle.get(handle, "sentient"),
                     # The canonical `posts` table predates the music columns
@@ -699,6 +704,8 @@ def dashboard_posts() -> dict[str, Any]:
                 "coverUrl": f"/api/dashboard/covers/{account}/{post['id']}",
                 "isHot": bool(post.get("is_hot")),
                 "hotMultiplier": post.get("hot_rate_multiplier"),
+                "isPromo": bool(post.get("is_promo")),
+                "hidden": bool(post.get("hidden")),
                 "account": account,
                 "group": group_by_handle.get(account, "competitors"),
                 "musicSong": post.get("music_song"),
@@ -794,6 +801,81 @@ def dashboard_cover(account: str, post_id: int) -> FileResponse:
         )
 
     return FileResponse(new_path)
+
+
+def _resolve_post_table(account: str) -> str:
+    """Which table holds this account's posts. The canonical account lives in
+    the legacy `posts` table and everyone else in `dashboard_posts`; the card
+    menu has to work on either, so every post-level write goes through here.
+    """
+    row = next((a for a in list_accounts(active_only=False) if a["handle"] == account), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Unknown account: {account}")
+    return "posts" if row["is_canonical"] else "dashboard_posts"
+
+
+@app.post("/api/dashboard/posts/flags")
+def dashboard_post_flags(
+    account: Annotated[str, Form()],
+    shortcode: Annotated[str, Form()],
+    is_promo: Annotated[bool | None, Form()] = None,
+    hidden: Annotated[bool | None, Form()] = None,
+) -> dict[str, Any]:
+    """Sets curation flags from the post card's ... menu.
+
+    Both flags are optional so the caller can toggle one without having to
+    know (or accidentally overwrite) the other. Neither destroys anything:
+    `hidden` filters the post out of the grid but leaves the row, its cover
+    and its numbers intact, so it still counts in totals and can be undone.
+    Deliberately not a delete -- an irreversible action on a single click,
+    against data that costs money to re-scrape, isn't worth the convenience.
+    """
+    table = _resolve_post_table(account)
+    updates: list[str] = []
+    params: list[Any] = []
+    if is_promo is not None:
+        updates.append("is_promo = ?")
+        params.append(1 if is_promo else 0)
+    if hidden is not None:
+        updates.append("hidden = ?")
+        params.append(1 if hidden else 0)
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+
+    updates.append("updated_at = ?")
+    params.append(utc_now())
+
+    # The canonical `posts` table has no `account` column (it only ever holds
+    # the one account), so scope by shortcode alone there.
+    where = "shortcode = ?" if table == "posts" else "account = ? AND shortcode = ?"
+    where_params: list[Any] = [shortcode] if table == "posts" else [account, shortcode]
+
+    with connect() as conn:
+        cursor = conn.execute(
+            f"UPDATE {table} SET {', '.join(updates)} WHERE {where}", [*params, *where_params]
+        )
+        if not cursor.rowcount:
+            raise HTTPException(status_code=404, detail="Post not found.")
+        row = conn.execute(f"SELECT is_promo, hidden FROM {table} WHERE {where}", where_params).fetchone()
+
+    return {"account": account, "shortcode": shortcode, "is_promo": bool(row["is_promo"]), "hidden": bool(row["hidden"])}
+
+
+@app.post("/api/dashboard/posts/reload")
+def dashboard_post_reload(
+    account: Annotated[str, Form()],
+    shortcode: Annotated[str, Form()],
+) -> dict[str, Any]:
+    """Re-scrapes one post's like/comment counts on demand.
+
+    The scheduled cycle only looks at posts inside its 12h window, so an older
+    post's numbers are frozen at whatever they were when it aged out. This is
+    the escape hatch for "that count looks stale". One Apify result, ~$0.002.
+    """
+    try:
+        return refresh_single_post(account, shortcode)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/dashboard/refresh")
