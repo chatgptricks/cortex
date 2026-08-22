@@ -187,6 +187,26 @@ def init_db() -> None:
                the jobs re-fired immediately -- including the full daily
                engagement cycle, which costs real Apify credits on every
                restart. Persisting them here makes restarts free. */
+            /* User-defined account lists, surfaced as extra tabs next to
+               All/Sentient/Competitors/HOT. Owned by the Google account that
+               created them and private by default; `is_shared` exists so a
+               "share with the team" toggle can be added later without a
+               migration. handles is a JSON array rather than a join table --
+               a list is always read and written whole, and the roster is ~30
+               accounts, so a second table would buy nothing. */
+            CREATE TABLE IF NOT EXISTS account_lists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_email TEXT NOT NULL,
+                name TEXT NOT NULL,
+                handles TEXT NOT NULL,
+                is_shared INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_email, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_account_lists_owner
+                ON account_lists(owner_email);
+
             CREATE TABLE IF NOT EXISTS scheduler_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -740,3 +760,86 @@ def row_to_post(row: sqlite3.Row) -> dict[str, Any]:
 
 def make_relative(path: str | Path) -> str:
     return str(Path(path))
+
+
+# --- User-defined account lists (custom dashboard tabs) --------------------
+
+def _account_list_row(row: Any) -> dict[str, Any]:
+    data = dict(row)
+    try:
+        handles = json.loads(data.get("handles") or "[]")
+    except (TypeError, ValueError):
+        handles = []
+    return {
+        "id": data["id"],
+        "name": data["name"],
+        "handles": [h for h in handles if isinstance(h, str)],
+        "owner_email": data["owner_email"],
+        "is_shared": bool(data.get("is_shared")),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+def list_account_lists(email: str) -> list[dict[str, Any]]:
+    """Lists this user can see: their own, plus anything explicitly shared.
+
+    Ordered by name so the extra tabs don't reshuffle between page loads.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM account_lists
+            WHERE owner_email = ? OR is_shared = 1
+            ORDER BY name COLLATE NOCASE
+            """,
+            (email.strip().lower(),),
+        ).fetchall()
+    return [_account_list_row(row) for row in rows]
+
+
+def upsert_account_list(email: str, name: str, handles: list[str], list_id: int | None = None) -> dict[str, Any]:
+    """Creates a list, or renames/re-scopes one the caller owns.
+
+    Scoped by owner_email on update so a crafted id can't edit someone
+    else's list -- ownership is enforced here rather than trusted from the
+    client.
+    """
+    owner = email.strip().lower()
+    # Lowercase to match how handles are stored, so a list saved with mixed
+    # case still matches posts when the frontend filters by handle.
+    payload = json.dumps([h.strip().lstrip("@").lower() for h in handles if h and h.strip()])
+    now = utc_now()
+    with connect() as conn:
+        if list_id is not None:
+            cursor = conn.execute(
+                """
+                UPDATE account_lists SET name = ?, handles = ?, updated_at = ?
+                WHERE id = ? AND owner_email = ?
+                """,
+                (name.strip(), payload, now, list_id, owner),
+            )
+            if not cursor.rowcount:
+                raise ValueError("List not found.")
+            row = conn.execute("SELECT * FROM account_lists WHERE id = ?", (list_id,)).fetchone()
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO account_lists (owner_email, name, handles, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(owner_email, name)
+                DO UPDATE SET handles = excluded.handles, updated_at = excluded.updated_at
+                """,
+                (owner, name.strip(), payload, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM account_lists WHERE owner_email = ? AND name = ?", (owner, name.strip())
+            ).fetchone()
+    return _account_list_row(row)
+
+
+def delete_account_list(email: str, list_id: int) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM account_lists WHERE id = ? AND owner_email = ?", (list_id, email.strip().lower())
+        )
+    return bool(cursor.rowcount)

@@ -51,6 +51,7 @@ from .config import (
     ensure_directories,
 )
 from .db import (
+    delete_account_list,
     all_account_snapshots,
     connect,
     count_dashboard_admins,
@@ -59,12 +60,14 @@ from .db import (
     init_db,
     list_account_snapshots,
     list_dashboard_users,
+    list_account_lists,
     log_usage_event,
     remove_dashboard_user,
     row_to_post,
     seed_dashboard_users_from_env,
     upsert_dashboard_user,
     utc_now,
+    upsert_account_list,
 )
 from .instagram_import import (
     InstagramImportError,
@@ -801,6 +804,66 @@ def dashboard_cover(account: str, post_id: int) -> FileResponse:
         )
 
     return FileResponse(new_path)
+
+
+def _caller_email(request: Request) -> str:
+    """Email of the signed-in user, set by the Firebase middleware.
+
+    Falls back to a sentinel when Firebase isn't configured (local dev runs
+    with the gate open) so lists still work there instead of crashing.
+    """
+    return (getattr(request.state, "user_email", "") or "local@dev").strip().lower()
+
+
+@app.get("/api/dashboard/lists")
+def dashboard_lists(request: Request) -> dict[str, Any]:
+    """Custom account lists this user can see: their own plus shared ones."""
+    return {"lists": list_account_lists(_caller_email(request))}
+
+
+@app.post("/api/dashboard/lists")
+def dashboard_lists_save(
+    request: Request,
+    name: Annotated[str, Form()],
+    handles: Annotated[str, Form()],
+    list_id: Annotated[int | None, Form()] = None,
+) -> dict[str, Any]:
+    """Creates or updates one of the caller's lists.
+
+    `handles` is a comma-separated string rather than a repeated field so the
+    frontend can send it from a plain FormData without special-casing arrays.
+    Ownership is enforced in the DB layer, so passing someone else's list_id
+    fails rather than editing their list.
+    """
+    clean_name = name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="A list needs a name.")
+    # Lowercased because handles are stored that way: Instagram treats them
+    # case-insensitively, so "@ChatGPTricks" must resolve to the same account
+    # as "chatgptricks" rather than being rejected as unknown.
+    wanted = [h.strip().lstrip("@").lower() for h in handles.split(",") if h.strip()]
+    if not wanted:
+        raise HTTPException(status_code=400, detail="Pick at least one account.")
+
+    # Drop handles that aren't real accounts: a list pointing at a deleted or
+    # mistyped handle would silently render an empty tab.
+    known = {a["handle"] for a in list_accounts(active_only=False)}
+    unknown = [h for h in wanted if h not in known]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown account(s): {', '.join(unknown)}")
+
+    try:
+        saved = upsert_account_list(_caller_email(request), clean_name, wanted, list_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"list": saved}
+
+
+@app.post("/api/dashboard/lists/delete")
+def dashboard_lists_delete(request: Request, list_id: Annotated[int, Form()]) -> dict[str, Any]:
+    if not delete_account_list(_caller_email(request), list_id):
+        raise HTTPException(status_code=404, detail="List not found.")
+    return {"deleted": list_id}
 
 
 def _resolve_post_table(account: str) -> str:
