@@ -58,12 +58,23 @@ TRICKS_DASH_REFRESH_PASSWORD = os.getenv("TRICKS_DASH_REFRESH_PASSWORD", "").str
 PREDICT_USERNAME = os.getenv("PREDICT_USERNAME", "admin").strip()
 PREDICT_PASSWORD = os.getenv("PREDICT_PASSWORD", "").strip() or PREDICT_API_KEY
 
-# Comma-separated extra CORS origins for deployed frontends
-# (e.g. "https://user.github.io").
-EXTRA_CORS_ORIGINS = [
+# Origins the deployed frontends are served from. These are baked in rather
+# than left to an env var because they're a property of where this app lives,
+# not of a particular deployment -- and a missing env var silently breaks
+# every API call from the dashboard with an opaque CORS error.
+# PREDICT_ALLOWED_ORIGINS still adds more at runtime (previews, local hosts).
+_DEFAULT_CORS_ORIGINS = [
+    "https://sentientdash.app",
+    "https://www.sentientdash.app",
+    # Kept alongside the custom domain: GitHub Pages keeps serving this URL
+    # (it 301s to the custom domain), and links to it exist in Slack history.
+    "https://chatgptricks.github.io",
+]
+
+EXTRA_CORS_ORIGINS = _DEFAULT_CORS_ORIGINS + [
     origin.strip()
     for origin in os.getenv("PREDICT_ALLOWED_ORIGINS", "").split(",")
-    if origin.strip()
+    if origin.strip() and origin.strip() not in _DEFAULT_CORS_ORIGINS
 ]
 
 ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
