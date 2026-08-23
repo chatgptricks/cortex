@@ -102,16 +102,6 @@ DEFAULT_COMPANY_OPTIONS = [
 ]
 DEFAULT_POST_TYPE_OPTIONS = ["Tricks", "News", "Promo", "Reel", "Meme"]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", *EXTRA_CORS_ORIGINS],
-    # Local Vite projects in this workspace use different ports (including the
-    # standalone Tricks Dash on 4175). Production origins remain explicit.
-    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 # --- Google login (Firebase Auth) -----------------------------------------
@@ -196,6 +186,27 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         logging.getLogger(__name__).warning("usage log insert failed", exc_info=True)
     return await call_next(request)
 
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", *EXTRA_CORS_ORIGINS],
+    # Local Vite projects in this workspace use different ports (including the
+    # standalone Tricks Dash on 4175). Production origins remain explicit.
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Registered last on purpose. Starlette runs the most recently added
+# middleware outermost, so this wraps the two auth middlewares below rather
+# than sitting inside them. When an auth middleware short-circuits with a 401
+# or 403 it returns a response directly -- if CORS were inner, that response
+# would carry no Access-Control-Allow-Origin, the browser would refuse to let
+# the page read it, and a simple "your session expired" would surface as an
+# opaque network failure. That is exactly what made a signed-out visit to the
+# dashboard show "Could not load the shared Post DB" instead of the sign-in
+# gate.
 
 @app.middleware("http")
 async def _require_api_key(request, call_next):  # type: ignore[no-untyped-def]
