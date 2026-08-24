@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -33,6 +33,7 @@ from .apify_sync import (
     store_avatar_from_url,
 )
 from .calibration import fit_calibration, predict_likes
+from .post_media import PostMediaError, build_zip
 from .config import (
     ALLOWED_IMAGE_SUFFIXES,
     ANALYSIS_DIR,
@@ -950,6 +951,40 @@ def dashboard_post_reload(
         return refresh_single_post(account, shortcode)
     except ApifySyncError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/dashboard/posts/media")
+def dashboard_post_media(
+    account: Annotated[str, Query()],
+    shortcode: Annotated[str, Query()],
+) -> Response:
+    """Returns every image in a post as a ZIP.
+
+    Replaces the manual DevTools routine for pulling carousel slides. Tries
+    Instagram's public page first (free) and falls back to Apify (~$0.002).
+
+    A GET rather than a POST because the browser has to treat the response as a
+    file download, and because it is a read: nothing in our data changes.
+    """
+    _resolve_post_table(account)  # 404s on an unknown account before any scraping
+    try:
+        payload, filename, meta = build_zip(account, shortcode)
+    except PostMediaError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # A browser can only read custom headers it is told to expose, and
+            # this is a cross-origin request -- without this the slide count
+            # never reaches the UI.
+            "Access-Control-Expose-Headers": "X-Slide-Count, X-Media-Source",
+            "X-Slide-Count": str(meta["slides"]),
+            "X-Media-Source": str(meta["source"]),
+        },
+    )
 
 
 @app.post("/api/dashboard/refresh")
