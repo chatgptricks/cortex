@@ -54,7 +54,6 @@ def build_hot_message(post: dict[str, Any]) -> dict[str, Any]:
     likes = _fmt_int(post.get("likes"))
     rate = _fmt_int(post.get("rate_per_hour"))
     threshold = _fmt_int(post.get("threshold"))
-    permalink = post.get("permalink") or ""
     age = post.get("age_hours")
     age_txt = f"{age:.1f}h" if isinstance(age, (int, float)) else "—"
     mult_txt = f"{multiplier:.2f}x" if isinstance(multiplier, (int, float)) else "—"
@@ -77,27 +76,24 @@ def build_hot_message(post: dict[str, Any]) -> dict[str, Any]:
     cover_url = post.get("cover_url")
     if cover_url:
         blocks.append({"type": "image", "image_url": cover_url, "alt_text": f"Cover for @{account}"})
-    buttons: list[dict[str, Any]] = []
+    # Only the dashboard link -- that's where you'd actually act on a HOT
+    # post (mark it promo, pull the media, read the numbers), so the
+    # Instagram permalink button was just a second click with nowhere to go.
     shortcode = post.get("shortcode")
     if shortcode:
-        buttons.append(
+        blocks.append(
             {
-                "type": "button",
-                "style": "primary",
-                "text": {"type": "plain_text", "text": "Open in Dashboard", "emoji": True},
-                "url": dashboard_url_for(account, str(shortcode)),
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "style": "primary",
+                        "text": {"type": "plain_text", "text": "Open post", "emoji": True},
+                        "url": dashboard_url_for(account, str(shortcode)),
+                    }
+                ],
             }
         )
-    if permalink:
-        buttons.append(
-            {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "Instagram", "emoji": True},
-                "url": permalink,
-            }
-        )
-    if buttons:
-        blocks.append({"type": "actions", "elements": buttons})
 
     return {"text": f"🔥 HOT — @{account} ({mult_txt}, {likes} likes)", "blocks": blocks}
 
