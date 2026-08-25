@@ -74,8 +74,8 @@ def _dedupe(urls: list[str]) -> list[str]:
     return out
 
 
-def _slides_from_instagram(shortcode: str) -> list[str]:
-    """Pulls slide URLs straight out of the post page's embedded JSON."""
+def _slides_from_instagram(shortcode: str) -> list[dict[str, Any]]:
+    """Pulls media straight out of the post page's embedded JSON."""
     url = f"https://www.instagram.com/p/{shortcode}/"
     with httpx.Client(timeout=_TIMEOUT, follow_redirects=True, headers=_BROWSER_HEADERS) as client:
         response = client.get(url)
@@ -101,23 +101,28 @@ def _slides_from_instagram(shortcode: str) -> list[str]:
                 continue
         return out
 
-    videos = _decode(re.findall(r'"video_url":"(https:\\?/\\?/[^"]+)"', html))
-    images = _decode(re.findall(r'"display_url":"(https:\\?/\\?/[^"]+)"', html))
+    videos = _dedupe(_decode(re.findall(r'"video_url":"(https:\\?/\\?/[^"]+)"', html)))
+    images = _dedupe(_decode(re.findall(r'"display_url":"(https:\\?/\\?/[^"]+)"', html)))
 
-    # Videos first, then any image slides. A video slide also carries a
-    # display_url -- its poster frame -- so on a reel the two lists describe
-    # the same slide and the poster would just be a duplicate of the cover.
-    urls = _dedupe(videos) + _dedupe(images)
-    if not urls:
+    # A video slide also carries a display_url -- its poster frame. The video
+    # is the media; the still is only useful as a thumbnail for the picker, so
+    # it rides along on the entry rather than counting as its own item.
+    items: list[dict[str, Any]] = []
+    for i, url in enumerate(videos):
+        items.append({"kind": "video", "url": url, "poster": images[i] if i < len(images) else None})
+    for url in images[len(videos):]:
+        items.append({"kind": "image", "url": url, "poster": url})
+
+    if not items:
         raise PostMediaError("No media found in the Instagram page")
-    return urls
+    return items
 
 
 # ---------------------------------------------------------------------------
 # Source 2: Apify
 # ---------------------------------------------------------------------------
 
-def _slides_from_apify(shortcode: str) -> list[str]:
+def _slides_from_apify(shortcode: str) -> list[dict[str, Any]]:
     from .apify_sync import _run_apify_actor_and_fetch
 
     payload = {
@@ -129,53 +134,67 @@ def _slides_from_apify(shortcode: str) -> list[str]:
     if not item:
         raise PostMediaError("Apify returned no result for this post")
 
-    urls: list[str] = []
+    items: list[dict[str, Any]] = []
 
     # A carousel arrives as childPosts, one entry per slide, in order. Each
-    # slide is either a video or an image, so take its videoUrl when it has
-    # one and fall back to the still -- a video slide also carries a
-    # displayUrl, which is only its poster frame.
-    children = item.get("childPosts") or []
-    for child in children:
+    # slide is either a video or an image; the video is the media and its
+    # displayUrl is only the poster frame, so it travels as a thumbnail.
+    for child in item.get("childPosts") or []:
         if not isinstance(child, dict):
             continue
-        pick = child.get("videoUrl") or child.get("displayUrl")
-        if isinstance(pick, str):
-            urls.append(pick)
+        video, still = child.get("videoUrl"), child.get("displayUrl")
+        if isinstance(video, str):
+            items.append({"kind": "video", "url": video, "poster": still if isinstance(still, str) else None})
+        elif isinstance(still, str):
+            items.append({"kind": "image", "url": still, "poster": still})
 
-    if not urls:
-        # Single post. Same rule: the video is the media, the still is a poster.
-        if isinstance(item.get("videoUrl"), str):
-            urls.append(item["videoUrl"])
+    if not items:
+        video, still = item.get("videoUrl"), item.get("displayUrl")
+        if isinstance(video, str):
+            items.append({"kind": "video", "url": video, "poster": still if isinstance(still, str) else None})
         else:
             for value in item.get("images") or []:
                 if isinstance(value, str):
-                    urls.append(value)
-            if isinstance(item.get("displayUrl"), str):
-                urls.append(item["displayUrl"])
+                    items.append({"kind": "image", "url": value, "poster": value})
+            if not items and isinstance(still, str):
+                items.append({"kind": "image", "url": still, "poster": still})
 
-    urls = _dedupe(urls)
-    if not urls:
+    seen, out = set(), []
+    for it in items:
+        key = urlparse(it["url"]).path
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    if not out:
         raise PostMediaError("Apify result carried no media URLs")
-    return urls
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def collect_slide_urls(shortcode: str) -> tuple[list[str], str]:
-    """Returns (urls, source) for a post, trying the free path first."""
+def collect_media(shortcode: str) -> tuple[list[dict[str, Any]], str]:
+    """Returns (items, source) for a post, trying the free path first.
+
+    Each item is {kind, url, poster, index, filename}: everything the picker
+    needs to show a thumbnail and everything the ZIP needs to name a file.
+    """
     try:
-        urls = _slides_from_instagram(shortcode)
-        logger.info("post_media: %s resolved %d slide(s) from instagram", shortcode, len(urls))
-        return urls, "instagram"
+        items = _slides_from_instagram(shortcode)
+        source = "instagram"
+        logger.info("post_media: %s resolved %d item(s) from instagram", shortcode, len(items))
     except Exception as exc:  # noqa: BLE001 -- any failure here just means "fall back"
         logger.info("post_media: instagram path failed for %s (%s); falling back to Apify", shortcode, exc)
+        items = _slides_from_apify(shortcode)
+        source = "apify"
+        logger.info("post_media: %s resolved %d item(s) from apify", shortcode, len(items))
 
-    urls = _slides_from_apify(shortcode)
-    logger.info("post_media: %s resolved %d slide(s) from apify", shortcode, len(urls))
-    return urls, "apify"
+    for i, it in enumerate(items, start=1):
+        it["index"] = i
+        it["filename"] = f"{i:02d}{_suffix_for(it['url'], None)}"
+    return items, source
 
 
 def _suffix_for(url: str, content_type: str | None) -> str:
@@ -193,35 +212,51 @@ def _suffix_for(url: str, content_type: str | None) -> str:
     return ".jpg"
 
 
-def build_zip(account: str, shortcode: str) -> tuple[bytes, str, dict[str, Any]]:
-    """Downloads every slide and packs them into an in-memory ZIP.
+def fetch_one(url: str) -> tuple[bytes, str]:
+    """Downloads a single item. Used when the picker asks for just one file --
+    a lone item in a ZIP is a wrapper the person then has to undo."""
+    with httpx.Client(timeout=_TIMEOUT, follow_redirects=True, headers=_BROWSER_HEADERS) as client:
+        response = client.get(url)
+        response.raise_for_status()
+        return response.content, _suffix_for(url, response.headers.get("content-type"))
+
+
+def build_zip(
+    account: str, shortcode: str, only: set[int] | None = None
+) -> tuple[bytes, str, dict[str, Any]]:
+    """Downloads the requested items and packs them into an in-memory ZIP.
 
     Downloading server-side rather than from the browser sidesteps the CDN's
     cross-origin rules entirely, and means the client gets one file instead of
     n downloads that Chrome would prompt about.
+
+    `only` keeps the original numbering: picking slides 2 and 5 gives you
+    02 and 05, not 01 and 02, so a filename still says where it sat in the post.
     """
-    urls, source = collect_slide_urls(shortcode)
+    items, source = collect_media(shortcode)
+    wanted = [it for it in items if not only or it["index"] in only]
+    if not wanted:
+        raise PostMediaError("None of the requested items exist in this post")
 
     buffer = io.BytesIO()
-    failed: list[str] = []
+    failed = 0
     written = 0
     with httpx.Client(timeout=_TIMEOUT, follow_redirects=True, headers=_BROWSER_HEADERS) as client:
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-            for index, url in enumerate(urls, start=1):
+            for it in wanted:
                 try:
-                    media = client.get(url)
+                    media = client.get(it["url"])
                     media.raise_for_status()
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("post_media: slide %d of %s failed: %s", index, shortcode, exc)
-                    failed.append(url)
+                    logger.warning("post_media: item %s of %s failed: %s", it["index"], shortcode, exc)
+                    failed += 1
                     continue
-                suffix = _suffix_for(url, media.headers.get("content-type"))
-                archive.writestr(f"{index:02d}{suffix}", media.content)
+                suffix = _suffix_for(it["url"], media.headers.get("content-type"))
+                archive.writestr(f"{it['index']:02d}{suffix}", media.content)
                 written += 1
 
     if not written:
-        raise PostMediaError("Every slide failed to download")
+        raise PostMediaError("Every item failed to download")
 
     filename = f"{account}-{shortcode}.zip"
-    meta = {"slides": written, "failed": len(failed), "source": source}
-    return buffer.getvalue(), filename, meta
+    return buffer.getvalue(), filename, {"slides": written, "failed": failed, "source": source}

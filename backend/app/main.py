@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -33,7 +33,7 @@ from .apify_sync import (
     store_avatar_from_url,
 )
 from .calibration import fit_calibration, predict_likes
-from .post_media import PostMediaError, build_zip
+from .post_media import PostMediaError, build_zip, collect_media, fetch_one
 from .config import (
     ALLOWED_IMAGE_SUFFIXES,
     ANALYSIS_DIR,
@@ -957,18 +957,74 @@ def dashboard_post_reload(
 def dashboard_post_media(
     account: Annotated[str, Query()],
     shortcode: Annotated[str, Query()],
+    list_only: Annotated[bool, Query(alias="list")] = False,
+    only: Annotated[str | None, Query()] = None,
 ) -> Response:
-    """Returns every image in a post as a ZIP.
+    """Lists a post's media, or returns some of it as a download.
 
-    Replaces the manual DevTools routine for pulling carousel slides. Tries
-    Instagram's public page first (free) and falls back to Apify (~$0.002).
+    Three shapes, one resolve step:
+      ?list=1        -> JSON, one entry per item, for the picker
+      (no args)      -> ZIP of everything
+      ?only=2,5      -> ZIP of just those, keeping their original numbering
+      ?only=3        -> that single file, unzipped
 
-    A GET rather than a POST because the browser has to treat the response as a
-    file download, and because it is a read: nothing in our data changes.
+    A lone file in a ZIP is a wrapper the person then has to undo, so one
+    requested item comes back as itself.
     """
     _resolve_post_table(account)  # 404s on an unknown account before any scraping
+
+    wanted: set[int] | None = None
+    if only:
+        try:
+            wanted = {int(part) for part in only.split(",") if part.strip()}
+        except ValueError:
+            raise HTTPException(status_code=400, detail="`only` must be comma-separated numbers.") from None
+        if not wanted:
+            raise HTTPException(status_code=400, detail="`only` was empty.")
+
     try:
-        payload, filename, meta = build_zip(account, shortcode)
+        if list_only:
+            items, source = collect_media(shortcode)
+            return JSONResponse(
+                {
+                    "source": source,
+                    # The signed CDN url is deliberately not echoed back: the
+                    # browser never fetches the media itself, the server does.
+                    # `poster` is returned because the picker has to show a
+                    # thumbnail, and for an image it is the image.
+                    "items": [
+                        {
+                            "index": it["index"],
+                            "kind": it["kind"],
+                            "filename": it["filename"],
+                            "poster": it.get("poster"),
+                        }
+                        for it in items
+                    ],
+                }
+            )
+
+        if wanted and len(wanted) == 1:
+            items, _ = collect_media(shortcode)
+            index = next(iter(wanted))
+            item = next((i for i in items if i["index"] == index), None)
+            if item is None:
+                raise HTTPException(status_code=404, detail=f"This post has no item {index}.")
+            payload, suffix = fetch_one(item["url"])
+            name = f"{account}-{shortcode}-{index:02d}{suffix}"
+            media_type = "video/mp4" if suffix == ".mp4" else f"image/{suffix.lstrip('.')}"
+            return Response(
+                content=payload,
+                media_type=media_type,
+                headers={
+                    "Content-Disposition": f'attachment; filename="{name}"',
+                    "Access-Control-Expose-Headers": "X-Slide-Count, X-Media-Source",
+                    "X-Slide-Count": "1",
+                    "X-Media-Source": "direct",
+                },
+            )
+
+        payload, filename, meta = build_zip(account, shortcode, wanted)
     except PostMediaError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -978,8 +1034,8 @@ def dashboard_post_media(
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             # A browser can only read custom headers it is told to expose, and
-            # this is a cross-origin request -- without this the slide count
-            # never reaches the UI.
+            # this is a cross-origin request -- without this the count never
+            # reaches the UI.
             "Access-Control-Expose-Headers": "X-Slide-Count, X-Media-Source",
             "X-Slide-Count": str(meta["slides"]),
             "X-Media-Source": str(meta["source"]),
