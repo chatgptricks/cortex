@@ -25,6 +25,7 @@ import io
 import json
 import logging
 import re
+import time
 import zipfile
 from typing import Any
 from urllib.parse import urlparse
@@ -175,12 +176,50 @@ def _slides_from_apify(shortcode: str) -> list[dict[str, Any]]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def collect_media(shortcode: str) -> tuple[list[dict[str, Any]], str]:
+# Resolving a post costs an Apify run (~$0.0023) and ~10-20s, and a single
+# session hits it repeatedly: open the picker, then download all, then grab one
+# more file. Without this, the picker turned one paid lookup into four.
+#
+# The TTL is short because the CDN urls are signed and expire; 15 minutes
+# comfortably covers picking through a post while staying well inside that.
+_CACHE: dict[str, tuple[float, list[dict[str, Any]], str]] = {}
+_CACHE_TTL_SECONDS = 900.0
+_CACHE_MAX = 200
+
+
+def _cache_get(shortcode: str) -> tuple[list[dict[str, Any]], str] | None:
+    hit = _CACHE.get(shortcode)
+    if not hit:
+        return None
+    stored_at, items, source = hit
+    if time.monotonic() - stored_at > _CACHE_TTL_SECONDS:
+        _CACHE.pop(shortcode, None)
+        return None
+    # Copied on the way out so a caller stamping index/filename onto the dicts
+    # can't mutate what the next caller receives.
+    return [dict(it) for it in items], source
+
+
+def _cache_put(shortcode: str, items: list[dict[str, Any]], source: str) -> None:
+    if len(_CACHE) >= _CACHE_MAX:
+        oldest = min(_CACHE, key=lambda k: _CACHE[k][0])
+        _CACHE.pop(oldest, None)
+    _CACHE[shortcode] = (time.monotonic(), [dict(it) for it in items], source)
+
+
+def collect_media(shortcode: str, *, use_cache: bool = True) -> tuple[list[dict[str, Any]], str]:
     """Returns (items, source) for a post, trying the free path first.
 
     Each item is {kind, url, poster, index, filename}: everything the picker
     needs to show a thumbnail and everything the ZIP needs to name a file.
     """
+    if use_cache:
+        cached = _cache_get(shortcode)
+        if cached:
+            items, source = cached
+            logger.info("post_media: %s served %d item(s) from cache", shortcode, len(items))
+            return items, source
+
     try:
         items = _slides_from_instagram(shortcode)
         source = "instagram"
@@ -194,6 +233,7 @@ def collect_media(shortcode: str) -> tuple[list[dict[str, Any]], str]:
     for i, it in enumerate(items, start=1):
         it["index"] = i
         it["filename"] = f"{i:02d}{_suffix_for(it['url'], None)}"
+    _cache_put(shortcode, items, source)
     return items, source
 
 
