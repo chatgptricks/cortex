@@ -1637,7 +1637,11 @@ def temp_ocr_status() -> dict[str, Any]:
 _PREVIEW_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _PREVIEW_CACHE_TTL = 600.0  # seconds
 _PREVIEW_CALLS: list[float] = []
-_PREVIEW_MAX_PER_MIN = 10
+# The wizard fires one lookup per debounced pause while you type, and a couple
+# of retries after a miss burns through a tight budget fast -- at which point
+# the 429 was surfaced as "couldn't find that account". Twenty a minute is
+# still bounded (~$0.046/min worst case) and no longer trips during normal use.
+_PREVIEW_MAX_PER_MIN = 20
 _PREVIEW_LOCK = threading.Lock()
 
 
