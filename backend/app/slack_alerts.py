@@ -12,11 +12,28 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any
+from urllib.parse import quote
 
 logger = logging.getLogger("uvicorn.error")
 
 # Public base used to build links back into the dashboard/cover images.
 _PUBLIC_API = os.getenv("PUBLIC_API_BASE", "https://cortex-api-db2e.onrender.com").rstrip("/")
+# Where the alert should take you. Overridable so a staging deploy doesn't
+# send everyone to production.
+_DASHBOARD = os.getenv("DASHBOARD_BASE", "https://sentientdash.app").rstrip("/")
+
+
+def dashboard_url_for(account: str, shortcode: str) -> str:
+    """Deep link that opens this post in the dashboard's detail rail.
+
+    The dashboard keys a post by "account:shortcode" and reads ?post= on load,
+    so this lands on the post itself rather than on the grid. Preferred over
+    the Instagram permalink because the alert is a prompt to *do* something --
+    mark it promo, read the numbers, pull the media -- and all of that lives in
+    the dashboard.
+    """
+    key = quote(f"{account}:{shortcode}", safe="")
+    return f"{_DASHBOARD}/?post={key}"
 
 
 def slack_configured() -> bool:
@@ -60,19 +77,27 @@ def build_hot_message(post: dict[str, Any]) -> dict[str, Any]:
     cover_url = post.get("cover_url")
     if cover_url:
         blocks.append({"type": "image", "image_url": cover_url, "alt_text": f"Cover for @{account}"})
-    if permalink:
-        blocks.append(
+    buttons: list[dict[str, Any]] = []
+    shortcode = post.get("shortcode")
+    if shortcode:
+        buttons.append(
             {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Open on Instagram", "emoji": True},
-                        "url": permalink,
-                    }
-                ],
+                "type": "button",
+                "style": "primary",
+                "text": {"type": "plain_text", "text": "Open in Dashboard", "emoji": True},
+                "url": dashboard_url_for(account, str(shortcode)),
             }
         )
+    if permalink:
+        buttons.append(
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Instagram", "emoji": True},
+                "url": permalink,
+            }
+        )
+    if buttons:
+        blocks.append({"type": "actions", "elements": buttons})
 
     return {"text": f"🔥 HOT — @{account} ({mult_txt}, {likes} likes)", "blocks": blocks}
 

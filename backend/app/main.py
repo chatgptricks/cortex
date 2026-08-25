@@ -1032,6 +1032,7 @@ def admin_slack_test(password: Annotated[str, Form()]) -> dict[str, Any]:
             "threshold": 600,
             "age_hours": 3.0,
             "permalink": "https://www.instagram.com/chatgptricks/",
+            "shortcode": "DcXEyj_nZud",
             "caption": "Test alert from Sentient Dash — if you can read this, HOT alerts are wired up.",
         }
     )

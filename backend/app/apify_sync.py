@@ -1245,6 +1245,9 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
                             "threshold": threshold,
                             "age_hours": info["age_hours"],
                             "permalink": item.get("url") or f"https://www.instagram.com/p/{shortcode}/",
+                            # Needed to build the dashboard deep link; the
+                            # dashboard keys a post by account + shortcode.
+                            "shortcode": shortcode,
                             "caption": _clean_text(item.get("caption")),
                         }
                     )
