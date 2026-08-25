@@ -1,4 +1,4 @@
-"""Collects every image in a post and hands it back as a ZIP.
+"""Collects every piece of media in a post and hands it back as a ZIP.
 
 Replaces the manual DevTools routine: open the post, dig the slide URLs out of
 the embedded JSON, save each one by hand.
@@ -12,7 +12,8 @@ Two sources, in order:
 2. The Apify actor already used elsewhere in this project, with
    resultsType='details'. Reliable, ~$0.002 per post.
 
-Images are passed through byte-for-byte. Instagram serves JPEG; re-encoding to
+Video is preferred over the still whenever a slide has one -- the
+poster frame is not the media. Files are passed through byte-for-byte. Instagram serves JPEG; re-encoding to
 PNG would inflate each file 3-5x and recover exactly none of the quality the
 original JPEG already discarded.
 """
@@ -85,24 +86,30 @@ def _slides_from_instagram(shortcode: str) -> list[str]:
     if "loginForm" in html or '"is_logged_in":false' in html and "display_url" not in html:
         raise PostMediaError("Instagram served a login wall")
 
-    # display_url is the full-resolution slide. Two layers of escaping sit
-    # between the page source and a fetchable URL, and both have to come off:
-    # JSON escaping (\/ for /) because the value lives in a <script> blob, and
-    # HTML entities (&amp; for &) because that blob is inside markup. Leaving
-    # the entities in place yields URLs the CDN rejects -- the signature is
-    # part of the query string, so a literal "&amp;" corrupts it.
-    raw = re.findall(r'"display_url":"(https:\\?/\\?/[^"]+)"', html)
-    urls = []
-    for candidate in raw:
-        try:
-            decoded = json.loads(f'"{candidate}"')
-        except json.JSONDecodeError:
-            continue
-        urls.append(html_module.unescape(decoded))
+    # Two layers of escaping sit between the page source and a fetchable URL,
+    # and both have to come off: JSON escaping (\/ for /) because the value
+    # lives in a <script> blob, and HTML entities (&amp; for &) because that
+    # blob is inside markup. Leaving the entities in place yields URLs the CDN
+    # rejects -- the signature is part of the query string, so a literal
+    # "&amp;" corrupts it.
+    def _decode(matches: list[str]) -> list[str]:
+        out = []
+        for candidate in matches:
+            try:
+                out.append(html_module.unescape(json.loads(f'"{candidate}"')))
+            except json.JSONDecodeError:
+                continue
+        return out
 
-    urls = _dedupe(urls)
+    videos = _decode(re.findall(r'"video_url":"(https:\\?/\\?/[^"]+)"', html))
+    images = _decode(re.findall(r'"display_url":"(https:\\?/\\?/[^"]+)"', html))
+
+    # Videos first, then any image slides. A video slide also carries a
+    # display_url -- its poster frame -- so on a reel the two lists describe
+    # the same slide and the poster would just be a duplicate of the cover.
+    urls = _dedupe(videos) + _dedupe(images)
     if not urls:
-        raise PostMediaError("No images found in the Instagram page")
+        raise PostMediaError("No media found in the Instagram page")
     return urls
 
 
@@ -123,20 +130,33 @@ def _slides_from_apify(shortcode: str) -> list[str]:
         raise PostMediaError("Apify returned no result for this post")
 
     urls: list[str] = []
-    # `images` is the carousel in order. childPosts covers the actors/versions
-    # that nest slides instead, and displayUrl is the single-image case.
-    for value in item.get("images") or []:
-        if isinstance(value, str):
-            urls.append(value)
-    for child in item.get("childPosts") or []:
-        if isinstance(child, dict) and isinstance(child.get("displayUrl"), str):
-            urls.append(child["displayUrl"])
-    if isinstance(item.get("displayUrl"), str):
-        urls.append(item["displayUrl"])
+
+    # A carousel arrives as childPosts, one entry per slide, in order. Each
+    # slide is either a video or an image, so take its videoUrl when it has
+    # one and fall back to the still -- a video slide also carries a
+    # displayUrl, which is only its poster frame.
+    children = item.get("childPosts") or []
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        pick = child.get("videoUrl") or child.get("displayUrl")
+        if isinstance(pick, str):
+            urls.append(pick)
+
+    if not urls:
+        # Single post. Same rule: the video is the media, the still is a poster.
+        if isinstance(item.get("videoUrl"), str):
+            urls.append(item["videoUrl"])
+        else:
+            for value in item.get("images") or []:
+                if isinstance(value, str):
+                    urls.append(value)
+            if isinstance(item.get("displayUrl"), str):
+                urls.append(item["displayUrl"])
 
     urls = _dedupe(urls)
     if not urls:
-        raise PostMediaError("Apify result carried no image URLs")
+        raise PostMediaError("Apify result carried no media URLs")
     return urls
 
 
