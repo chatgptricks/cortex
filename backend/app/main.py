@@ -1220,9 +1220,13 @@ def _ocr_worker(crop_region: str, batch_size: int, max_batches: int) -> None:
 _BACKFILL_RUN: dict[str, Any] = {"running": False, "handle": None, "result": None, "error": None}
 
 
-def _backfill_worker(handle: str, results_limit: int) -> None:
+def _backfill_worker(
+    handle: str, results_limit: int, date_from: str | None = None, date_to: str | None = None
+) -> None:
     try:
-        _BACKFILL_RUN["result"] = run_backfill(handle, results_limit=results_limit)
+        _BACKFILL_RUN["result"] = run_backfill(
+            handle, results_limit=results_limit, date_from=date_from, date_to=date_to
+        )
     except Exception as exc:
         _BACKFILL_RUN["error"] = str(exc)
     finally:
@@ -1551,15 +1555,35 @@ def temp_import_run(handle: str, run_id: str, password: Annotated[str, Form()]) 
 
 
 @app.post("/api/admin/accounts/backfill-bg/{handle}")
-def temp_backfill_bg(handle: str, password: Annotated[str, Form()], results_limit: int = 2000) -> dict[str, Any]:
-    """runs a backfill in a background thread so a client
-    disconnect (or a slow scrape) can't abort it."""
+def temp_backfill_bg(
+    handle: str,
+    password: Annotated[str, Form()],
+    results_limit: Annotated[int, Form()] = 2000,
+    date_from: Annotated[str | None, Form()] = None,
+    date_to: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Runs a backfill in a background thread so a client disconnect (or a slow
+    scrape) can't abort it.
+
+    This is the endpoint the add-account wizard uses. The synchronous one
+    cannot survive a full history import: the scrape routinely runs for
+    minutes, far longer than the proxy in front of this service will hold an
+    idle connection open, so the request dies and the account is left sitting
+    at zero posts with nothing to explain why.
+
+    Takes the same date_from/date_to as the synchronous route, otherwise a
+    date-ranged import would silently widen to everything once the wizard
+    switched over.
+    """
     _require_admin(password)
     if _BACKFILL_RUN["running"]:
         return {"already_running": True, **_BACKFILL_RUN}
     _BACKFILL_RUN.update({"running": True, "handle": handle, "result": None, "error": None})
     threading.Thread(
-        target=_backfill_worker, args=(handle, results_limit), daemon=True, name=f"backfill-{handle}"
+        target=_backfill_worker,
+        args=(handle, results_limit, date_from or None, date_to or None),
+        daemon=True,
+        name=f"backfill-{handle}",
     ).start()
     return {"started": True, "handle": handle, "results_limit": results_limit}
 
