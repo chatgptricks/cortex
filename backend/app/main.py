@@ -1012,13 +1012,21 @@ def dashboard_post_media(
                 raise HTTPException(status_code=404, detail=f"This post has no item {index}.")
             payload, suffix = fetch_one(item["url"])
             name = f"{account}-{shortcode}-{index:02d}{suffix}"
-            media_type = "video/mp4" if suffix == ".mp4" else f"image/{suffix.lstrip('.')}"
+            # "image/jpg" isn't a registered type -- browsers tolerate it, but
+            # the correct one is image/jpeg.
+            media_type = {
+                ".mp4": "video/mp4",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".png": "image/png",
+                ".webp": "image/webp",
+            }.get(suffix, "application/octet-stream")
             return Response(
                 content=payload,
                 media_type=media_type,
                 headers={
                     "Content-Disposition": f'attachment; filename="{name}"',
-                    "Access-Control-Expose-Headers": "X-Slide-Count, X-Media-Source",
+                    "Access-Control-Expose-Headers": "Content-Disposition, X-Slide-Count, X-Media-Source",
                     "X-Slide-Count": "1",
                     "X-Media-Source": "direct",
                 },
@@ -1033,10 +1041,11 @@ def dashboard_post_media(
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
-            # A browser can only read custom headers it is told to expose, and
-            # this is a cross-origin request -- without this the count never
-            # reaches the UI.
-            "Access-Control-Expose-Headers": "X-Slide-Count, X-Media-Source",
+            # A browser can only read headers it is told to expose, and this
+            # is a cross-origin request. Content-Disposition matters as much as
+            # the counts: the client names the saved file from it, so without
+            # it a single JPEG gets saved with the ZIP's name and extension.
+            "Access-Control-Expose-Headers": "Content-Disposition, X-Slide-Count, X-Media-Source",
             "X-Slide-Count": str(meta["slides"]),
             "X-Media-Source": str(meta["source"]),
         },
