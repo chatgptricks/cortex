@@ -1121,23 +1121,29 @@ def admin_list_accounts() -> dict[str, Any]:
 
     Enriched with each account's all-time average likes and a suggested
     HOT threshold derived from it (rounded up to the nearest hundred --
-    1,047 avg likes suggests a 1,100/hr threshold), plus current follower
-    count from the tracker snapshots, so the admin table has something to
-    sort/scan by instead of just names.
+    1,047 avg likes suggests a 1,100/hr threshold), current follower count
+    from the tracker snapshots, and the published date of the oldest post
+    we have on file -- that last one is how far back a "extract history"
+    backfill has actually reached, which otherwise isn't visible anywhere.
     """
     accounts = list_accounts(active_only=False)
 
     with connect() as conn:
         dash_rows = conn.execute(
             """
-            SELECT account, AVG(likes) AS avg_likes, COUNT(*) AS n_posts
+            SELECT account, AVG(likes) AS avg_likes, COUNT(*) AS n_posts,
+                   MIN(published_at) AS oldest_post_at
             FROM dashboard_posts
             WHERE likes IS NOT NULL
             GROUP BY account
             """
         ).fetchall()
         canonical_row = conn.execute(
-            "SELECT AVG(likes) AS avg_likes, COUNT(*) AS n_posts FROM posts WHERE likes IS NOT NULL"
+            """
+            SELECT AVG(likes) AS avg_likes, COUNT(*) AS n_posts,
+                   MIN(published_at) AS oldest_post_at
+            FROM posts WHERE likes IS NOT NULL
+            """
         ).fetchone()
 
     stats_by_handle = {row["account"]: dict(row) for row in dash_rows}
@@ -1157,6 +1163,7 @@ def admin_list_accounts() -> dict[str, Any]:
         snaps = snapshots_by_handle.get(account["handle"]) or []
         latest = snaps[-1] if snaps else None
         account["followers"] = latest.get("followers_count") if latest else None
+        account["oldest_post_at"] = stat["oldest_post_at"] if stat else None
 
     return {"accounts": accounts}
 
