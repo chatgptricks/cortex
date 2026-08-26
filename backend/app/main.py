@@ -1117,8 +1117,48 @@ def admin_slack_status() -> dict[str, Any]:
 
 @app.get("/api/admin/accounts")
 def admin_list_accounts() -> dict[str, Any]:
-    """Full roster including inactive accounts, for the admin UI."""
-    return {"accounts": list_accounts(active_only=False)}
+    """Full roster including inactive accounts, for the admin UI.
+
+    Enriched with each account's all-time average likes and a suggested
+    HOT threshold derived from it (rounded up to the nearest hundred --
+    1,047 avg likes suggests a 1,100/hr threshold), plus current follower
+    count from the tracker snapshots, so the admin table has something to
+    sort/scan by instead of just names.
+    """
+    accounts = list_accounts(active_only=False)
+
+    with connect() as conn:
+        dash_rows = conn.execute(
+            """
+            SELECT account, AVG(likes) AS avg_likes, COUNT(*) AS n_posts
+            FROM dashboard_posts
+            WHERE likes IS NOT NULL
+            GROUP BY account
+            """
+        ).fetchall()
+        canonical_row = conn.execute(
+            "SELECT AVG(likes) AS avg_likes, COUNT(*) AS n_posts FROM posts WHERE likes IS NOT NULL"
+        ).fetchone()
+
+    stats_by_handle = {row["account"]: dict(row) for row in dash_rows}
+    snapshots_by_handle = all_account_snapshots()
+
+    for account in accounts:
+        stat = dict(canonical_row) if account["is_canonical"] and canonical_row else stats_by_handle.get(account["handle"])
+        avg_likes = stat["avg_likes"] if stat else None
+        n_posts = stat["n_posts"] if stat else 0
+        account["avg_likes"] = round(avg_likes) if avg_likes is not None else None
+        account["avg_likes_sample_size"] = n_posts
+        # New accounts with no post history yet fall back to the same 600
+        # default the add-account wizard already uses.
+        account["suggested_hot_threshold"] = (
+            int((avg_likes + 99) // 100 * 100) if avg_likes else 600
+        )
+        snaps = snapshots_by_handle.get(account["handle"]) or []
+        latest = snaps[-1] if snaps else None
+        account["followers"] = latest.get("followers_count") if latest else None
+
+    return {"accounts": accounts}
 
 
 @app.get("/api/admin/users")
