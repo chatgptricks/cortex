@@ -230,7 +230,7 @@ def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> Path | N
     return path
 
 
-def run_ocr_sweep(limit: int = 30, crop_region: str = "full") -> dict[str, Any]:
+def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
     """Fills in cover OCR text (hook_text) for posts that don't have it yet.
 
     Scoped to dashboard_posts only. The canonical `posts` table is frozen -- it
@@ -240,10 +240,17 @@ def run_ocr_sweep(limit: int = 30, crop_region: str = "full") -> dict[str, Any]:
     Newest first, so freshly-arrived posts become text-searchable right away.
     Every row touched is marked checked, including blank results, so a cover with
     genuinely no text is never re-sent (and re-billed) on a later pass.
+
+    Runs through Sentient Dash's own standalone OCR worker (sentient_ocr.py /
+    workers/modal_ocr_worker.py) -- always the full cover image, no crop, no
+    GPU, and no dependency on Predict's shared tribev2 worker. See that
+    worker's module docstring for why (it replaced a setup that paid for an
+    L40S GPU it never used, and a fixed crop that missed text sitting outside
+    it on some accounts' cover templates).
     """
     from .db import connect, utc_now
 
-    from .remote_ocr import extract_images_text_remote
+    from .sentient_ocr import extract_images_text_sentient
 
     summary: dict[str, Any] = {"sent": 0, "with_text": 0, "skipped": 0, "remaining": 0}
 
@@ -316,7 +323,7 @@ def run_ocr_sweep(limit: int = 30, crop_region: str = "full") -> dict[str, Any]:
         return summary
 
     try:
-        results = extract_images_text_remote([p for _, _, p in jobs], crop_region=crop_region)
+        results = extract_images_text_sentient([p for _, _, p in jobs])
     except Exception:
         # Release the claims so a later pass retries these instead of leaving
         # them stranded in the in-flight state.

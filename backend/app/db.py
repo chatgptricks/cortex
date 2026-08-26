@@ -733,35 +733,6 @@ def all_account_snapshots() -> dict[str, list[dict[str, Any]]]:
     return by_handle
 
 
-def decode_summary(value: str | None) -> dict[str, Any] | None:
-    if not value:
-        return None
-    return json.loads(value)
-
-
-def row_to_post(row: sqlite3.Row) -> dict[str, Any]:
-    data = dict(row)
-    data["analysis_summary"] = decode_summary(data.get("analysis_summary"))
-    data["llm_report"] = decode_summary(data.get("llm_report"))
-    data["tags"] = decode_summary(data.get("tags")) if data.get("tags") else []
-
-    for field in ["person_label", "company_label"]:
-        val = data.get(field)
-        if val:
-            try:
-                parsed = json.loads(val)
-                if isinstance(parsed, list):
-                    data[field] = ", ".join(str(i) for i in parsed)
-            except Exception:
-                pass
-
-    return data
-
-
-def make_relative(path: str | Path) -> str:
-    return str(Path(path))
-
-
 # --- User-defined account lists (custom dashboard tabs) --------------------
 
 def _account_list_row(row: Any) -> dict[str, Any]:

@@ -13,17 +13,11 @@ services:
     envVars:
       - key: PREDICT_DATA_DIR
         value: /var/data
-      - key: PREDICT_API_KEY
-        sync: false
       - key: PREDICT_ALLOWED_ORIGINS
-        sync: false # e.g. https://YOUR_USER.github.io
-      - key: HF_TOKEN
+        sync: false # extra CORS origins, comma-separated
+      - key: TRICKS_DASH_REFRESH_PASSWORD
         sync: false
-      - key: REMOTE_TRIBE_URL
+      - key: SENTIENT_OCR_URL
         sync: false
-      - key: REMOTE_TRIBE_TOKEN
+      - key: SENTIENT_OCR_TOKEN
         sync: false
-      - key: REMOTE_OCR_URL
-        sync: false
-      - key: MIN_CALIBRATION_SAMPLES
-        value: "3"

@@ -14,55 +14,33 @@ def _path_from_env(name: str, default: Path) -> Path:
     return Path(value).expanduser().resolve()
 
 
+# PREDICT_DATA_DIR / predict.sqlite3 are legacy names from when this backend
+# was Predict's -- Predict is archived, but this is still the live Sentient
+# Dash database file (dashboard_posts, accounts, dashboard_users,
+# account_snapshots, account_lists all live here). Renaming it would be a
+# real migration with downtime risk for zero functional benefit, so it's left
+# as-is on purpose.
 DATA_DIR = _path_from_env("PREDICT_DATA_DIR", PROJECT_ROOT / "data")
 UPLOAD_DIR = DATA_DIR / "uploads"
-VIDEO_DIR = DATA_DIR / "videos"
-ANALYSIS_DIR = DATA_DIR / "analyses"
 DB_PATH = DATA_DIR / "predict.sqlite3"
 
-TRIBEV2_MODEL_ID = os.getenv("TRIBEV2_MODEL_ID", "facebook/tribev2")
-TRIBEV2_DEVICE = os.getenv("TRIBEV2_DEVICE", "auto")
-TRIBEV2_CACHE_DIR = _path_from_env("TRIBEV2_CACHE_DIR", DATA_DIR / "tribev2-cache")
-
-LLM_REPORT_MODEL_ID = os.getenv("LLM_REPORT_MODEL_ID", "meta-llama/Meta-Llama-3.1-8B-Instruct")
-LLM_REPORT_PROVIDER = os.getenv("LLM_REPORT_PROVIDER", "featherless-ai")
-LLM_REPORT_MAX_TOKENS = int(os.getenv("LLM_REPORT_MAX_TOKENS", "700"))
-LLM_REPORT_TEMPERATURE = float(os.getenv("LLM_REPORT_TEMPERATURE", "0.15"))
-LLM_REPORT_TIMEOUT = float(os.getenv("LLM_REPORT_TIMEOUT", "90"))
-
-REMOTE_TRIBE_URL = os.getenv("REMOTE_TRIBE_URL")
-REMOTE_TRIBE_TOKEN = os.getenv("REMOTE_TRIBE_TOKEN")
-REMOTE_TRIBE_TIMEOUT = float(os.getenv("REMOTE_TRIBE_TIMEOUT", "1200"))
-
-REMOTE_OCR_URL = os.getenv("REMOTE_OCR_URL")
-REMOTE_OCR_TOKEN = os.getenv("REMOTE_OCR_TOKEN") or REMOTE_TRIBE_TOKEN
-REMOTE_OCR_TIMEOUT = float(os.getenv("REMOTE_OCR_TIMEOUT", "1800"))
-OCR_BATCH_MIN_READY = int(os.getenv("OCR_BATCH_MIN_READY", "100"))
-OCR_BATCH_SIZE = int(os.getenv("OCR_BATCH_SIZE", "100"))
-OCR_CROP_REGION = os.getenv("OCR_CROP_REGION", "lower_half")
-
-MIN_CALIBRATION_SAMPLES = int(os.getenv("MIN_CALIBRATION_SAMPLES", "3"))
-
-# When set, all /api and /media requests must carry this key
-# (X-API-Key header or ?token= query param). Leave unset for local dev.
-PREDICT_API_KEY = os.getenv("PREDICT_API_KEY", "").strip() or None
-
-# Separate password gating the public Tricks Dash "Refresh" button
-# (POST /api/tricks-dash/refresh). Kept independent of PREDICT_API_KEY so it
-# can be shared with non-admins without exposing the main API key.
+# Separate password gating Sentient Dash's various admin-write endpoints
+# (backfill, refresh, account settings, etc.) inside their own handlers.
 TRICKS_DASH_REFRESH_PASSWORD = os.getenv("TRICKS_DASH_REFRESH_PASSWORD", "").strip() or None
 
-# Login credentials for the web UI. The login endpoint exchanges valid
-# credentials for the API key, so the key never ships in the frontend bundle.
-# Password defaults to the API key until PREDICT_PASSWORD is set.
-PREDICT_USERNAME = os.getenv("PREDICT_USERNAME", "admin").strip()
-PREDICT_PASSWORD = os.getenv("PREDICT_PASSWORD", "").strip() or PREDICT_API_KEY
+# Sentient Dash's own cover-image OCR worker (workers/modal_ocr_worker.py) --
+# a standalone, GPU-free Modal app with its own secret. Always OCRs the full
+# cover image; there is no crop-region setting here on purpose.
+SENTIENT_OCR_URL = os.getenv("SENTIENT_OCR_URL")
+SENTIENT_OCR_TOKEN = os.getenv("SENTIENT_OCR_TOKEN")
+SENTIENT_OCR_TIMEOUT = float(os.getenv("SENTIENT_OCR_TIMEOUT", "300"))
 
 # Origins the deployed frontends are served from. These are baked in rather
 # than left to an env var because they're a property of where this app lives,
 # not of a particular deployment -- and a missing env var silently breaks
 # every API call from the dashboard with an opaque CORS error.
-# PREDICT_ALLOWED_ORIGINS still adds more at runtime (previews, local hosts).
+# PREDICT_ALLOWED_ORIGINS still adds more at runtime (previews, local hosts) --
+# kept under its old env var name so nothing needs to change on Render.
 _DEFAULT_CORS_ORIGINS = [
     "https://sentientdash.app",
     "https://www.sentientdash.app",
@@ -77,11 +55,7 @@ EXTRA_CORS_ORIGINS = _DEFAULT_CORS_ORIGINS + [
     if origin.strip() and origin.strip() not in _DEFAULT_CORS_ORIGINS
 ]
 
-ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
-DEFAULT_VIDEO_SECONDS = 2
-DEFAULT_VIDEO_FPS = 1
-
 
 def ensure_directories() -> None:
-    for directory in [DATA_DIR, UPLOAD_DIR, VIDEO_DIR, ANALYSIS_DIR, TRIBEV2_CACHE_DIR]:
+    for directory in [DATA_DIR, UPLOAD_DIR]:
         directory.mkdir(parents=True, exist_ok=True)

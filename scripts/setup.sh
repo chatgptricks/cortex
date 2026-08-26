@@ -20,7 +20,7 @@ PY
 fi
 
 if [[ -z "$PYTHON_BIN" ]]; then
-  echo "Python 3.11 or 3.12 is required for TRIBE v2/PyTorch. Set PYTHON_BIN=/path/to/python3.12 and retry." >&2
+  echo "Python 3.11 or 3.12 is required. Set PYTHON_BIN=/path/to/python3.12 and retry." >&2
   exit 1
 fi
 
