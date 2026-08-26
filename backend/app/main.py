@@ -1278,6 +1278,30 @@ def temp_runs(password: str, limit: int = 15) -> dict[str, Any]:
     }
 
 
+@app.get("/api/admin/apify/run-log/{run_id}")
+def temp_run_log(run_id: str, password: str, tail_chars: int = 20000) -> dict[str, Any]:
+    """Raw actor log for one run, so a scrape that came back short can be
+    diagnosed (rate-limited? blocked session? actor decided it was done?)
+    instead of guessed at from the item count alone. Read-only, same admin
+    gate as the rest of this module.
+    """
+    _require_admin(password)
+    import httpx
+
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    with httpx.Client(timeout=30.0) as client:
+        r = client.get(f"https://api.apify.com/v2/actor-runs/{run_id}/log", params={"token": token})
+        if r.status_code == 404:
+            raise HTTPException(status_code=404, detail="No log for this run (too old, or bad id).")
+        r.raise_for_status()
+        text = r.text
+    return {
+        "run_id": run_id,
+        "total_chars": len(text),
+        "tail": text[-tail_chars:] if len(text) > tail_chars else text,
+    }
+
+
 @app.post("/api/admin/apify/abort-run/{run_id}")
 def temp_abort_run(run_id: str, password: Annotated[str, Form()]) -> dict[str, Any]:
     """stop an in-flight Apify run so it stops billing."""
