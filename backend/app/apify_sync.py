@@ -1482,6 +1482,15 @@ def run_backfill(
         # historical import -- we want manually pinned posts included too
         # (they still count toward the account's real post history), so
         # don't skip them here.
+        #
+        # Residential proxies, scoped to this one-time backfill only (not the
+        # hourly engagement scrape, to avoid raising the routine cost). Run
+        # logs showed the actor's default (datacenter) proxy getting BLOCKED
+        # by Instagram repeatedly on large accounts -- sometimes enough
+        # retries got through anyway (~460 posts), sometimes the actor gave
+        # up after a couple dozen (~50 posts). Residential IPs are the
+        # standard mitigation for this exact failure mode.
+        "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
     }
     if date_from:
         payload["onlyPostsNewerThan"] = date_from
