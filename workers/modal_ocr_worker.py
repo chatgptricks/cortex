@@ -46,11 +46,19 @@ OCR_MIN_CONFIDENCE = float(os.getenv("SENTIENT_OCR_MIN_CONFIDENCE", "0.35"))
 # across cold starts -- the image itself has no ML weights baked in.
 cache_volume = modal.Volume.from_name("sentient-ocr-cache", create_if_missing=True)
 
-image = modal.Image.debian_slim(python_version="3.12").pip_install(
-    "fastapi>=0.115,<1.0",
-    "python-multipart>=0.0.9,<1.0",
-    "pillow>=10,<13",
-    "rapidocr-onnxruntime>=1.3,<2.0",
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    # rapidocr-onnxruntime pulls in opencv-python, which dlopen()s libGL at
+    # import time even though nothing here ever renders anything -- without
+    # this the container crashes on the first request with "ImportError:
+    # libGL.so.1: cannot open shared object file".
+    .apt_install("libgl1", "libglib2.0-0")
+    .pip_install(
+        "fastapi>=0.115,<1.0",
+        "python-multipart>=0.0.9,<1.0",
+        "pillow>=10,<13",
+        "rapidocr-onnxruntime>=1.3,<2.0",
+    )
 )
 
 app = modal.App("sentient-cover-ocr", image=image)
