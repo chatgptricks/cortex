@@ -1483,14 +1483,12 @@ def run_backfill(
         # (they still count toward the account's real post history), so
         # don't skip them here.
         #
-        # Residential proxies, scoped to this one-time backfill only (not the
-        # hourly engagement scrape, to avoid raising the routine cost). Run
-        # logs showed the actor's default (datacenter) proxy getting BLOCKED
-        # by Instagram repeatedly on large accounts -- sometimes enough
-        # retries got through anyway (~460 posts), sometimes the actor gave
-        # up after a couple dozen (~50 posts). Residential IPs are the
-        # standard mitigation for this exact failure mode.
-        "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
+        # Tried forcing RESIDENTIAL proxies here to fight Instagram's
+        # CheerioCrawler BLOCKED responses on large accounts -- confirmed via
+        # run logs that it didn't help (still got blocked repeatedly, in one
+        # case worse than the datacenter default) and it costs more, so
+        # reverted. The block looks tied to the actor's plain-HTTP request
+        # fingerprint rather than IP reputation.
     }
     if date_from:
         payload["onlyPostsNewerThan"] = date_from
