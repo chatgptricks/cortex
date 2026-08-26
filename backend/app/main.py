@@ -1351,6 +1351,12 @@ def temp_test_alt_actor(
     _require_admin(password)
     import httpx
 
+    # Starts the run and returns immediately -- does NOT poll to completion.
+    # A 60-item Instagram scrape still takes a couple of minutes, and a
+    # client held open that long through Render's proxy is exactly the bug
+    # this whole investigation started from. The run/dataset status is
+    # publicly readable from Apify without a token, so the caller can poll
+    # it directly instead of this endpoint holding a connection open.
     token = os.getenv("APIFY_TOKEN", "").strip()
     payload = {"username": [handle], "resultsLimit": results_limit}
     with httpx.Client(timeout=30.0) as client:
@@ -1365,38 +1371,7 @@ def temp_test_alt_actor(
     if not run_id:
         raise HTTPException(status_code=502, detail="Alt actor did not return a run id.")
 
-    import time
-
-    status_url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    deadline = time.monotonic() + 180.0
-    status = run.get("status")
-    dataset_id = run.get("defaultDatasetId")
-    while status in ("READY", "RUNNING") and time.monotonic() < deadline:
-        time.sleep(6.0)
-        with httpx.Client(timeout=30.0) as client:
-            poll = client.get(status_url, params={"token": token})
-            poll.raise_for_status()
-            run = poll.json().get("data", {})
-        status = run.get("status")
-        dataset_id = run.get("defaultDatasetId") or dataset_id
-
-    items: list[dict[str, Any]] = []
-    if dataset_id:
-        with httpx.Client(timeout=30.0) as client:
-            ds = client.get(f"https://api.apify.com/v2/datasets/{dataset_id}/items", params={"token": token, "format": "json"})
-            if ds.status_code == 200:
-                parsed = ds.json()
-                if isinstance(parsed, list):
-                    items = parsed
-
-    return {
-        "run_id": run_id,
-        "status": status,
-        "usd": run.get("usageTotalUsd"),
-        "item_count": len(items),
-        "oldest": min((i.get("timestamp") for i in items if i.get("timestamp")), default=None),
-        "newest": max((i.get("timestamp") for i in items if i.get("timestamp")), default=None),
-    }
+    return {"started": True, "run_id": run_id, "status": run.get("status")}
 
 
 @app.post("/api/admin/apify/abort-run/{run_id}")
