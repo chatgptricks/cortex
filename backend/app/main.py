@@ -1181,15 +1181,33 @@ def _ocr_worker(batch_size: int, max_batches: int) -> None:
                 _OCR_RUN["running"] = False
 
 
-_BACKFILL_RUN: dict[str, Any] = {"running": False, "handle": None, "result": None, "error": None}
+_BACKFILL_RUN: dict[str, Any] = {
+    "running": False,
+    "handle": None,
+    "result": None,
+    "error": None,
+    "progress": None,
+    "started_at": None,
+}
 
 
 def _backfill_worker(
     handle: str, results_limit: int, date_from: str | None = None, date_to: str | None = None
 ) -> None:
+    # Fine-grained phase updates (starting the Apify run, waiting on it,
+    # downloading the dataset, saving each post's cover) so the admin UI can
+    # show what's actually happening during what's otherwise a multi-minute
+    # black box -- see run_backfill()'s on_progress parameter.
+    def on_progress(progress: dict[str, Any]) -> None:
+        _BACKFILL_RUN["progress"] = progress
+
     try:
         _BACKFILL_RUN["result"] = run_backfill(
-            handle, results_limit=results_limit, date_from=date_from, date_to=date_to
+            handle,
+            results_limit=results_limit,
+            date_from=date_from,
+            date_to=date_to,
+            on_progress=on_progress,
         )
     except Exception as exc:
         _BACKFILL_RUN["error"] = str(exc)
@@ -1638,7 +1656,16 @@ def temp_backfill_bg(
     _require_admin(password)
     if _BACKFILL_RUN["running"]:
         return {"already_running": True, **_BACKFILL_RUN}
-    _BACKFILL_RUN.update({"running": True, "handle": handle, "result": None, "error": None})
+    _BACKFILL_RUN.update(
+        {
+            "running": True,
+            "handle": handle,
+            "result": None,
+            "error": None,
+            "progress": {"phase": "queued"},
+            "started_at": time.time(),
+        }
+    )
     threading.Thread(
         target=_backfill_worker,
         args=(handle, results_limit, date_from or None, date_to or None),

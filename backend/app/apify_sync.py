@@ -6,9 +6,27 @@ import re
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 APIFY_ACTOR_ID = "apify~instagram-scraper"
+
+# Progress callback used by run_backfill() and everything it calls, so the
+# admin UI can show what's actually happening (starting the scrape, waiting
+# on Apify, downloading covers...) instead of a single opaque spinner for
+# what can be a many-minutes-long import. Optional everywhere and never
+# allowed to break the import itself if the callback misbehaves -- it only
+# ever updates an in-memory status dict, but a backfill that already paid
+# for an Apify run is worth far more than a progress update.
+ProgressFn = Callable[..., None] | None
+
+
+def _emit(on_progress: ProgressFn, **fields: Any) -> None:
+    if on_progress is None:
+        return
+    try:
+        on_progress(fields)
+    except Exception:
+        pass
 
 VALID_GROUPS = ("sentient", "competitors")
 
@@ -837,6 +855,7 @@ def _run_apify_actor_and_fetch(
     payload: dict[str, Any],
     max_wait_seconds: float = 1800.0,
     poll_interval: float = 8.0,
+    on_progress: ProgressFn = None,
 ) -> list[dict[str, Any]]:
     """Starts the actor run and polls for completion with short, separate
     requests instead of holding one long-lived connection open for the
@@ -860,6 +879,7 @@ def _run_apify_actor_and_fetch(
         raise ApifySyncError("httpx is not installed in the backend environment.") from exc
     import time
 
+    _emit(on_progress, phase="starting_apify_run")
     start_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs"
     try:
         with httpx.Client(timeout=30.0) as client:
@@ -873,10 +893,18 @@ def _run_apify_actor_and_fetch(
     if not run_id:
         raise ApifySyncError("Apify did not return a run id.")
 
+    poll_started_at = time.monotonic()
     status_url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    deadline = time.monotonic() + max_wait_seconds
+    deadline = poll_started_at + max_wait_seconds
     dataset_id = run.get("defaultDatasetId")
     status = run.get("status")
+    _emit(
+        on_progress,
+        phase="waiting_apify",
+        run_id=run_id,
+        run_status=status,
+        elapsed_seconds=0,
+    )
     while status in ("READY", "RUNNING") and time.monotonic() < deadline:
         time.sleep(poll_interval)
         try:
@@ -888,12 +916,20 @@ def _run_apify_actor_and_fetch(
             raise ApifySyncError(f"Failed to poll Apify run status: {exc}") from exc
         status = run.get("status")
         dataset_id = run.get("defaultDatasetId") or dataset_id
+        _emit(
+            on_progress,
+            phase="waiting_apify",
+            run_id=run_id,
+            run_status=status,
+            elapsed_seconds=round(time.monotonic() - poll_started_at),
+        )
 
     if status != "SUCCEEDED":
         raise ApifySyncError(f"Apify run did not finish successfully (status={status}).")
     if not dataset_id:
         raise ApifySyncError("Apify run succeeded but returned no dataset id.")
 
+    _emit(on_progress, phase="fetching_dataset")
     items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
     try:
         with httpx.Client(timeout=60.0) as client:
@@ -904,6 +940,7 @@ def _run_apify_actor_and_fetch(
         raise ApifySyncError(f"Failed to fetch Apify dataset items: {exc}") from exc
     if not isinstance(items, list):
         raise ApifySyncError("Apify dataset returned an unexpected response shape.")
+    _emit(on_progress, phase="dataset_ready", fetched=len(items))
     return items
 
 
@@ -912,7 +949,9 @@ def _run_apify_actor_and_fetch(
 # ---------------------------------------------------------------------------
 
 
-def _insert_new_chatgptricks_posts(new_items: list[dict[str, Any]]) -> dict[str, Any]:
+def _insert_new_chatgptricks_posts(
+    new_items: list[dict[str, Any]], on_progress: ProgressFn = None
+) -> dict[str, Any]:
     """Mirrors the insert shape sync_instagram_profile_posts() uses for
     IG-sourced posts (section="single", source_ref="instagram:<shortcode>",
     shortcode set), so these stay properly deduplicated against any future
@@ -928,15 +967,28 @@ def _insert_new_chatgptricks_posts(new_items: list[dict[str, Any]]) -> dict[str,
         return summary
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    total = len(new_items)
+
+    def _tick(index: int, shortcode: str) -> None:
+        _emit(
+            on_progress,
+            phase="inserting",
+            done=index + 1,
+            total=total,
+            added=summary["added"],
+            failed=summary["failed"],
+            shortcode=shortcode,
+        )
 
     with httpx.Client(timeout=60.0, headers={"User-Agent": "Mozilla/5.0"}) as image_client:
-        for item in new_items:
+        for index, item in enumerate(new_items):
             shortcode = str(item["shortCode"]).strip()
             source_ref = f"instagram:{shortcode}"
             image_url = item.get("displayUrl") or next(iter(item.get("images") or []), None)
             if not image_url:
                 summary["failed"] += 1
                 summary["items"].append({"shortcode": shortcode, "status": "failed", "error": "no cover image"})
+                _tick(index, shortcode)
                 continue
 
             try:
@@ -946,6 +998,7 @@ def _insert_new_chatgptricks_posts(new_items: list[dict[str, Any]]) -> dict[str,
             except httpx.HTTPError as exc:
                 summary["failed"] += 1
                 summary["items"].append({"shortcode": shortcode, "status": "failed", "error": str(exc)})
+                _tick(index, shortcode)
                 continue
 
             image_bytes, suffix = _compress_cover(image_bytes)
@@ -995,11 +1048,14 @@ def _insert_new_chatgptricks_posts(new_items: list[dict[str, Any]]) -> dict[str,
 
             summary["added"] += 1
             summary["items"].append({"shortcode": shortcode, "status": "added", "published_at": _published_at(item)})
+            _tick(index, shortcode)
 
     return summary
 
 
-def _insert_new_dashboard_posts(account: str, new_items: list[dict[str, Any]]) -> dict[str, Any]:
+def _insert_new_dashboard_posts(
+    account: str, new_items: list[dict[str, Any]], on_progress: ProgressFn = None
+) -> dict[str, Any]:
     """Generic insert used by every non-canonical account (Sentient or
     Competitors) into the shared dashboard_posts table, scoped by `account`.
     """
@@ -1013,9 +1069,10 @@ def _insert_new_dashboard_posts(account: str, new_items: list[dict[str, Any]]) -
         return summary
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    total = len(new_items)
 
     with httpx.Client(timeout=60.0, headers={"User-Agent": "Mozilla/5.0"}) as image_client:
-        for item in new_items:
+        for index, item in enumerate(new_items):
             shortcode = str(item["shortCode"]).strip()
             image_url = item.get("displayUrl") or next(iter(item.get("images") or []), None)
             cover_path: str | None = None
@@ -1076,18 +1133,38 @@ def _insert_new_dashboard_posts(account: str, new_items: list[dict[str, Any]]) -
             except Exception as exc:  # e.g. UNIQUE constraint on a race re-add
                 summary["failed"] += 1
                 summary["items"].append({"shortcode": shortcode, "status": "failed", "error": str(exc)})
+                _emit(
+                    on_progress,
+                    phase="inserting",
+                    done=index + 1,
+                    total=total,
+                    added=summary["added"],
+                    failed=summary["failed"],
+                    shortcode=shortcode,
+                )
                 continue
 
             summary["added"] += 1
             summary["items"].append({"shortcode": shortcode, "status": "added", "published_at": _published_at(item)})
+            _emit(
+                on_progress,
+                phase="inserting",
+                done=index + 1,
+                total=total,
+                added=summary["added"],
+                failed=summary["failed"],
+                shortcode=shortcode,
+            )
 
     return summary
 
 
-def _insert_new_posts(account: str, cfg: dict[str, Any], new_items: list[dict[str, Any]]) -> dict[str, Any]:
+def _insert_new_posts(
+    account: str, cfg: dict[str, Any], new_items: list[dict[str, Any]], on_progress: ProgressFn = None
+) -> dict[str, Any]:
     if cfg["is_canonical"]:
-        return _insert_new_chatgptricks_posts(new_items)
-    return _insert_new_dashboard_posts(account, new_items)
+        return _insert_new_chatgptricks_posts(new_items, on_progress=on_progress)
+    return _insert_new_dashboard_posts(account, new_items, on_progress=on_progress)
 
 
 # ---------------------------------------------------------------------------
@@ -1464,6 +1541,7 @@ def run_backfill(
     results_limit: int = 2000,
     date_from: str | None = None,
     date_to: str | None = None,
+    on_progress: ProgressFn = None,
 ) -> dict[str, Any]:
     """One-time initial history import for a freshly self-serve-added
     account: pulls up to `results_limit` recent posts and inserts any not
@@ -1506,7 +1584,8 @@ def run_backfill(
     # Render<->Apify path on longer scrapes -- the run still SUCCEEDS and
     # gets billed, but we never receive the response. Start-and-poll instead
     # so no single connection needs to stay open for more than ~30s.
-    items = _run_apify_actor_and_fetch(payload, max_wait_seconds=1800.0)
+    _emit(on_progress, phase="preparing", account=account)
+    items = _run_apify_actor_and_fetch(payload, max_wait_seconds=1800.0, on_progress=on_progress)
 
     if date_to:
         try:
@@ -1526,6 +1605,7 @@ def run_backfill(
 
             items = [it for it in items if _within_upper_bound(it)]
 
+    _emit(on_progress, phase="matching", fetched=len(items))
     from .db import connect
 
     with connect() as conn:
@@ -1536,7 +1616,15 @@ def run_backfill(
 
     new_items = [it for it in items if it.get("shortCode") and it["shortCode"] not in existing_shortcodes]
     new_items.sort(key=lambda it: it.get("timestamp") or "")
-    return _insert_new_posts(account, cfg, new_items)
+    _emit(
+        on_progress,
+        phase="inserting",
+        done=0,
+        total=len(new_items),
+        already_had=len(existing_shortcodes),
+        fetched=len(items),
+    )
+    return _insert_new_posts(account, cfg, new_items, on_progress=on_progress)
 
 
 def fetch_profile_preview(handle: str) -> dict[str, Any]:
