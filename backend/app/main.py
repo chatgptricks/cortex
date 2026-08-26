@@ -1119,30 +1119,42 @@ def admin_slack_status() -> dict[str, Any]:
 def admin_list_accounts() -> dict[str, Any]:
     """Full roster including inactive accounts, for the admin UI.
 
-    Enriched with each account's all-time average likes and a suggested
-    HOT threshold derived from it (rounded up to the nearest hundred --
-    1,047 avg likes suggests a 1,100/hr threshold), current follower count
-    from the tracker snapshots, and the published date of the oldest post
-    we have on file -- that last one is how far back a "extract history"
-    backfill has actually reached, which otherwise isn't visible anywhere.
+    Enriched with a suggested HOT threshold, current follower count from the
+    tracker snapshots, and the published date of the oldest post we have on
+    file (how far back a "extract history" backfill has actually reached,
+    which otherwise isn't visible anywhere).
+
+    The suggestion is built from `likes_at_1h` -- the like count the
+    engagement pass actually captured around the ~1h mark for each post it
+    ran the one-time HOT check against (see the `is_hot` calc further down
+    this file: `rate_per_hour = likes / age_hours`, compared to
+    `hot_threshold`). That's a materially different number from a post's
+    lifetime `likes`, which keeps climbing for days after the HOT check has
+    already happened -- averaging final totals would suggest a threshold
+    calibrated to multi-day likes, not the first-hour pace HOT is actually
+    measuring. Backfilled posts never went through that live check (no
+    `likes_at_1h`), so they're correctly excluded rather than diluting the
+    average with stale totals.
     """
     accounts = list_accounts(active_only=False)
 
     with connect() as conn:
         dash_rows = conn.execute(
             """
-            SELECT account, AVG(likes) AS avg_likes, COUNT(*) AS n_posts,
+            SELECT account,
+                   AVG(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS avg_likes,
+                   COUNT(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS n_posts,
                    MIN(published_at) AS oldest_post_at
             FROM dashboard_posts
-            WHERE likes IS NOT NULL
             GROUP BY account
             """
         ).fetchall()
         canonical_row = conn.execute(
             """
-            SELECT AVG(likes) AS avg_likes, COUNT(*) AS n_posts,
+            SELECT AVG(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS avg_likes,
+                   COUNT(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS n_posts,
                    MIN(published_at) AS oldest_post_at
-            FROM posts WHERE likes IS NOT NULL
+            FROM posts
             """
         ).fetchone()
 
