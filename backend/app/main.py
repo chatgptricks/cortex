@@ -1278,14 +1278,16 @@ def temp_runs(password: str, limit: int = 15) -> dict[str, Any]:
     }
 
 
-@app.get("/api/admin/apify/run-log/{run_id}")
-def temp_run_log(run_id: str, password: str, tail_chars: int = 20000) -> dict[str, Any]:
-    """Raw actor log for one run, so a scrape that came back short can be
-    diagnosed (rate-limited? blocked session? actor decided it was done?)
-    instead of guessed at from the item count alone. Read-only, same admin
-    gate as the rest of this module.
+@app.get("/api/admin/apify/run-log-summary/{run_id}")
+def temp_run_log_summary(run_id: str, password: str) -> dict[str, Any]:
+    """Diagnoses why a scrape came back short (rate-limited? blocked
+    session? actor decided it was done?) without handing back the raw log,
+    which routinely contains request URLs/cookies from the actor's own HTTP
+    calls that shouldn't leave this server. Read-only, same admin gate as
+    the rest of this module.
     """
     _require_admin(password)
+    import re
     import httpx
 
     token = os.getenv("APIFY_TOKEN", "").strip()
@@ -1295,10 +1297,41 @@ def temp_run_log(run_id: str, password: str, tail_chars: int = 20000) -> dict[st
             raise HTTPException(status_code=404, detail="No log for this run (too old, or bad id).")
         r.raise_for_status()
         text = r.text
+
+    # Strip anything cookie/token/session-shaped before a single character of
+    # this leaves the server -- the actor's own log lines routinely embed its
+    # HTTP request headers verbatim.
+    def _redact(line: str) -> str:
+        line = re.sub(r"(?i)(cookie|set-cookie|authorization|sessionid|csrftoken|ds_user_id)\s*[:=]\s*\S+", r"\1=[redacted]", line)
+        line = re.sub(r"token=\S+", "token=[redacted]", line)
+        return line
+
+    lines = text.splitlines()
+    keywords = [
+        "rate limit", "rate-limit", "429", "checkpoint", "challenge_required",
+        "temporarily blocked", "please wait", "login_required", "captcha",
+        "not authorized", "403", "please try again", "unusual activity",
+        "no more items", "reached the end", "finished", "session pool",
+        "retiring session", "blocked", "error", "warn",
+    ]
+    hits: dict[str, int] = {}
+    samples: list[str] = []
+    for line in lines:
+        low = line.lower()
+        for kw in keywords:
+            if kw in low:
+                hits[kw] = hits.get(kw, 0) + 1
+                if len(samples) < 25:
+                    samples.append(_redact(line)[:300])
+                break
+
     return {
         "run_id": run_id,
-        "total_chars": len(text),
-        "tail": text[-tail_chars:] if len(text) > tail_chars else text,
+        "total_lines": len(lines),
+        "keyword_counts": hits,
+        "sample_lines": samples,
+        "first_line": _redact(lines[0])[:300] if lines else None,
+        "last_line": _redact(lines[-1])[:300] if lines else None,
     }
 
 
