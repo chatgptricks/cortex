@@ -1049,6 +1049,7 @@ def admin_list_accounts() -> dict[str, Any]:
             SELECT account,
                    AVG(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS avg_likes,
                    COUNT(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS n_posts,
+                   COUNT(*) AS total_posts,
                    MIN(published_at) AS oldest_post_at
             FROM dashboard_posts
             GROUP BY account
@@ -1058,6 +1059,7 @@ def admin_list_accounts() -> dict[str, Any]:
             """
             SELECT AVG(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS avg_likes,
                    COUNT(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS n_posts,
+                   COUNT(*) AS total_posts,
                    MIN(published_at) AS oldest_post_at
             FROM posts
             """
@@ -1072,6 +1074,11 @@ def admin_list_accounts() -> dict[str, Any]:
         n_posts = stat["n_posts"] if stat else 0
         account["avg_likes"] = round(avg_likes) if avg_likes is not None else None
         account["avg_likes_sample_size"] = n_posts
+        # Real post count on file, unlike n_posts above (which is scoped to
+        # hot_checked rows for the avg-likes sample) -- this is what the
+        # admin table shows so it's actually meaningful for backfilled
+        # accounts too, which never go through the HOT check at all.
+        account["total_posts"] = stat["total_posts"] if stat else 0
         # New accounts with no post history yet fall back to the same 600
         # default the add-account wizard already uses.
         account["suggested_hot_threshold"] = (
