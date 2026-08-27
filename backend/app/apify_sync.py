@@ -1765,55 +1765,69 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
     }
 
 
-def snapshot_all_accounts() -> dict[str, Any]:
-    """Takes one Tracker-page snapshot (followers/posts count) per active
-    account and records it. Shared by the scheduler's daily job and the
-    admin "snapshot now" button so a fresh install (or someone impatient for
-    day-one data) doesn't have to wait for 7am CST to see the leaderboard
-    populate.
+def snapshot_one_account(handle: str) -> dict[str, Any]:
+    """Snapshots a single account right now and records it -- the manual
+    "refresh" action behind the Tracker page's per-account button, and the
+    building block snapshot_all_accounts loops over for the batch version.
+
+    Retries transient failures (Apify read timeouts on individual profiles
+    do happen) since a flaky request otherwise costs a full day of follower
+    history that can never be recovered. Retrying one profile costs
+    ~$0.002, always cheaper than losing the data point.
     """
     from .db import insert_account_snapshot
 
+    clean = handle.strip().lstrip("@").lower()
+    if not clean:
+        raise ApifySyncError("Handle is required.")
+
+    last_error: Exception | None = None
+    for attempt in range(_SNAPSHOT_ATTEMPTS):
+        try:
+            preview = fetch_profile_preview(clean)
+            insert_account_snapshot(
+                handle=clean,
+                followers_count=preview.get("followers_count"),
+                posts_count=preview.get("posts_count"),
+                full_name=preview.get("full_name"),
+                verified=bool(preview.get("verified")),
+                private=bool(preview.get("private")),
+                following_count=preview.get("following_count"),
+            )
+            return preview
+        except Exception as exc:  # noqa: BLE001 -- reported back, not raised
+            last_error = exc
+            # A missing/renamed account fails identically on every attempt,
+            # so don't burn retries (or money) on it.
+            if isinstance(exc, ApifySyncError) and "Could not find" in str(exc):
+                break
+            if attempt + 1 < _SNAPSHOT_ATTEMPTS:
+                logger.warning(
+                    "Snapshot for %s failed (attempt %d/%d): %s -- retrying",
+                    clean, attempt + 1, _SNAPSHOT_ATTEMPTS, exc,
+                )
+                time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS)
+    if isinstance(last_error, ApifySyncError):
+        raise last_error
+    raise ApifySyncError(str(last_error) if last_error else "Snapshot failed.")
+
+
+def snapshot_all_accounts() -> dict[str, Any]:
+    """Takes one Tracker-page snapshot (followers/posts count) per active
+    account and records it. Shared by the scheduler's daily job, the admin
+    "snapshot now" button, and the Tracker page's own overview "refresh all"
+    action, so a fresh install (or someone impatient for day-one data)
+    doesn't have to wait for 7am CST to see the leaderboard populate.
+    """
     ok: list[str] = []
     failed: dict[str, str] = {}
     for account in list_accounts(active_only=True):
         handle = account["handle"]
-        # Retry transient failures. This job runs once a day, so a single
-        # flaky request costs that account a full day of follower history
-        # that can never be recovered -- and Apify read timeouts on
-        # individual profiles do happen (observed 2026-08-14 on one of 22
-        # accounts). Retrying one profile costs ~$0.002, so it is always
-        # cheaper than losing the day.
-        last_error: Exception | None = None
-        for attempt in range(_SNAPSHOT_ATTEMPTS):
-            try:
-                preview = fetch_profile_preview(handle)
-                insert_account_snapshot(
-                    handle=handle,
-                    followers_count=preview.get("followers_count"),
-                    posts_count=preview.get("posts_count"),
-                    full_name=preview.get("full_name"),
-                    verified=bool(preview.get("verified")),
-                    private=bool(preview.get("private")),
-                    following_count=preview.get("following_count"),
-                )
-                ok.append(handle)
-                last_error = None
-                break
-            except Exception as exc:  # noqa: BLE001 -- reported back, not raised
-                last_error = exc
-                # A missing/renamed account fails identically on every
-                # attempt, so don't burn retries (or money) on it.
-                if isinstance(exc, ApifySyncError) and "Could not find" in str(exc):
-                    break
-                if attempt + 1 < _SNAPSHOT_ATTEMPTS:
-                    logger.warning(
-                        "Snapshot for %s failed (attempt %d/%d): %s -- retrying",
-                        handle, attempt + 1, _SNAPSHOT_ATTEMPTS, exc,
-                    )
-                    time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS)
-        if last_error is not None:
-            failed[handle] = str(last_error)
+        try:
+            snapshot_one_account(handle)
+            ok.append(handle)
+        except Exception as exc:  # noqa: BLE001 -- reported back, not raised
+            failed[handle] = str(exc)
     return {"snapshotted": ok, "failed": failed}
 
 

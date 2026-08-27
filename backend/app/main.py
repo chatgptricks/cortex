@@ -555,6 +555,49 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
     }
 
 
+@app.post("/api/tracker/accounts/{handle}/refresh")
+def tracker_account_refresh(handle: str) -> dict[str, Any]:
+    """Manually re-scrapes one account's Instagram profile right now, for
+    the Tracker page's per-account refresh button. Open to any signed-in
+    user, same tier as the rest of /api/tracker/* -- one lightweight Apify
+    call (~$0.002), so there's no reason to gate it behind admin."""
+    from .apify_sync import ApifySyncError, snapshot_one_account
+
+    clean = handle.strip().lstrip("@").lower()
+    known = {a["handle"] for a in list_accounts(active_only=True)}
+    if clean not in known:
+        raise HTTPException(status_code=404, detail=f"Unknown or inactive account '{clean}'.")
+    try:
+        preview = snapshot_one_account(clean)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "handle": clean,
+        "followers": preview.get("followers_count"),
+        "posts_count": preview.get("posts_count"),
+        "following_count": preview.get("following_count"),
+        "full_name": preview.get("full_name"),
+        "verified": bool(preview.get("verified")),
+        "private": bool(preview.get("private")),
+        "captured_at": utc_now(),
+    }
+
+
+@app.post("/api/tracker/snapshot-now")
+def tracker_snapshot_now() -> dict[str, Any]:
+    """Manually runs the same per-account Apify profile scrape the daily 7am
+    CST job runs, for the Tracker page's own overview "refresh all" button.
+    Open to any signed-in user, same tier as the rest of /api/tracker/*.
+    Mirrors /api/admin/tracker/snapshot-now (kept as-is for the admin panel's
+    System tab) rather than reusing it, so this one stays reachable without
+    admin rights. Costs one lightweight Apify call per active account."""
+    from .apify_sync import snapshot_all_accounts
+
+    result = snapshot_all_accounts()
+    return {"ok": True, **result}
+
+
 @app.get("/api/dashboard/posts")
 def dashboard_posts() -> dict[str, Any]:
     """Unified, public, read-only projection across every account. Each
