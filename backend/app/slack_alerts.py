@@ -122,12 +122,23 @@ def cover_url_for(account: str, post_id: int) -> str:
     return f"{_PUBLIC_API}/api/dashboard/covers/{account}/{post_id}"
 
 
-def notify_custom(message: str, title: str | None = None) -> bool:
+def alert_image_url_for(filename: str) -> str:
+    """Public URL for an image attached to a custom alert (see
+    /api/admin/alert-image/{filename} in main.py) -- Slack fetches this
+    itself to render the image inline, so it has to be a URL its servers
+    can reach, not a data: URI or anything auth-gated."""
+    return f"{_PUBLIC_API}/api/admin/alert-image/{filename}"
+
+
+def notify_custom(message: str, title: str | None = None, image_url: str | None = None) -> bool:
     """Posts a free-form alert typed in by hand from the admin panel's
     System tab -- for anything worth pinging Slack about that doesn't fit
     one of the purpose-built alerts above (a heads-up, a reminder, a note
     to the team). Same never-raises contract: a bad webhook here shouldn't
     surface as a 500 for what's already a manual, low-stakes action.
+
+    image_url is optional -- a screenshot pasted or uploaded alongside the
+    message, already saved server-side and passed in as a public URL.
     """
     webhook = os.getenv("SLACK_WEBHOOK_URL", "").strip()
     if not webhook:
@@ -136,12 +147,15 @@ def notify_custom(message: str, title: str | None = None) -> bool:
     if not clean:
         return False
     heading = (title or "").strip() or "📣 Custom alert"
+    blocks: list[dict[str, Any]] = [
+        {"type": "header", "text": {"type": "plain_text", "text": heading, "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": clean[:2900]}},
+    ]
+    if image_url:
+        blocks.append({"type": "image", "image_url": image_url, "alt_text": "Attached image"})
     payload = {
         "text": f"{heading}: {clean[:150]}",
-        "blocks": [
-            {"type": "header", "text": {"type": "plain_text", "text": heading, "emoji": True}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": clean[:2900]}},
-        ],
+        "blocks": blocks,
     }
     try:
         import httpx

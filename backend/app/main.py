@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Form, HTTPException, Query, Request
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -117,7 +117,7 @@ _SEED_ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").s
 # not because they're meant to stay public by design. Everything else (post
 # data, search, every admin action) requires a signed-in, allowlisted
 # Google account once FIREBASE_APP is configured.
-_FIREBASE_OPEN_PREFIXES = ("/api/dashboard/covers/", "/api/dashboard/avatar/")
+_FIREBASE_OPEN_PREFIXES = ("/api/dashboard/covers/", "/api/dashboard/avatar/", "/api/admin/alert-image/")
 _FIREBASE_OPEN_PATHS = {"/api/health", "/", "/docs", "/openapi.json", "/redoc"}
 
 
@@ -1009,21 +1009,37 @@ def admin_slack_test(password: Annotated[str, Form()]) -> dict[str, Any]:
     return {"sent": sent}
 
 
+_ALERT_IMAGE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+# Screenshots and phone photos land well under this; the real limit is
+# httpx's own request timeout on the Slack post, not disk space.
+_ALERT_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+_ALERT_IMAGE_NAME_RE = re.compile(r"^alert-[0-9a-f]{32}\.(jpg|png|gif|webp)$")
+
+
 @app.post("/api/admin/slack-custom")
 def admin_slack_custom(
     password: Annotated[str, Form()],
     message: Annotated[str, Form()],
     title: Annotated[str | None, Form()] = None,
+    image: Annotated[UploadFile | None, File()] = None,
 ) -> dict[str, Any]:
     """Free-form Slack alert typed in from the admin panel's System tab --
     for anything worth flagging that doesn't have its own purpose-built
-    alert (HOT posts, disk, snapshot failures)."""
+    alert (HOT posts, disk, snapshot failures). image is optional: a
+    screenshot pasted or uploaded alongside the message, saved here and
+    referenced by URL in the Slack message (Slack's Block Kit image block
+    needs a URL it can fetch, not raw bytes)."""
     if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
         password.strip(), TRICKS_DASH_REFRESH_PASSWORD
     ):
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
 
-    from .slack_alerts import notify_custom, slack_configured
+    from .slack_alerts import alert_image_url_for, notify_custom, slack_configured
 
     if not slack_configured():
         raise HTTPException(status_code=503, detail="SLACK_WEBHOOK_URL is not set on the server.")
@@ -1032,8 +1048,37 @@ def admin_slack_custom(
     if not clean_message:
         raise HTTPException(status_code=400, detail="Message is required.")
 
-    sent = notify_custom(clean_message, title=(title or "").strip() or None)
+    image_url: str | None = None
+    if image is not None and image.filename:
+        suffix = _ALERT_IMAGE_EXTENSIONS.get((image.content_type or "").lower())
+        if not suffix:
+            raise HTTPException(status_code=400, detail="Only JPEG, PNG, GIF, or WebP images are supported.")
+        data = image.file.read(_ALERT_IMAGE_MAX_BYTES + 1)
+        if len(data) > _ALERT_IMAGE_MAX_BYTES:
+            raise HTTPException(status_code=400, detail="Image is too large (8 MB max).")
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        filename = f"alert-{secrets.token_hex(16)}{suffix}"
+        (UPLOAD_DIR / filename).write_bytes(data)
+        image_url = alert_image_url_for(filename)
+
+    sent = notify_custom(clean_message, title=(title or "").strip() or None, image_url=image_url)
     return {"sent": sent}
+
+
+@app.get("/api/admin/alert-image/{filename}")
+def admin_alert_image(filename: str) -> FileResponse:
+    """Serves an image attached to a custom alert. Unauthenticated on
+    purpose -- Slack's own servers fetch this URL to render the image
+    inline in the message, and can't send a Bearer token when they do.
+    Filenames are a random 32-hex-char token generated server-side (see
+    admin_slack_custom above), not user input, so the regex here is just a
+    path-traversal guard, not a real access check."""
+    if not _ALERT_IMAGE_NAME_RE.match(filename):
+        raise HTTPException(status_code=404, detail="Not found.")
+    path = UPLOAD_DIR / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Not found.")
+    return FileResponse(path)
 
 
 @app.get("/api/admin/slack-status")
