@@ -1009,6 +1009,33 @@ def admin_slack_test(password: Annotated[str, Form()]) -> dict[str, Any]:
     return {"sent": sent}
 
 
+@app.post("/api/admin/slack-custom")
+def admin_slack_custom(
+    password: Annotated[str, Form()],
+    message: Annotated[str, Form()],
+    title: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Free-form Slack alert typed in from the admin panel's System tab --
+    for anything worth flagging that doesn't have its own purpose-built
+    alert (HOT posts, disk, snapshot failures)."""
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+
+    from .slack_alerts import notify_custom, slack_configured
+
+    if not slack_configured():
+        raise HTTPException(status_code=503, detail="SLACK_WEBHOOK_URL is not set on the server.")
+
+    clean_message = message.strip()
+    if not clean_message:
+        raise HTTPException(status_code=400, detail="Message is required.")
+
+    sent = notify_custom(clean_message, title=(title or "").strip() or None)
+    return {"sent": sent}
+
+
 @app.get("/api/admin/slack-status")
 def admin_slack_status() -> dict[str, Any]:
     """Whether the server has a Slack webhook configured (never exposes it)."""

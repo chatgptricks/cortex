@@ -122,6 +122,40 @@ def cover_url_for(account: str, post_id: int) -> str:
     return f"{_PUBLIC_API}/api/dashboard/covers/{account}/{post_id}"
 
 
+def notify_custom(message: str, title: str | None = None) -> bool:
+    """Posts a free-form alert typed in by hand from the admin panel's
+    System tab -- for anything worth pinging Slack about that doesn't fit
+    one of the purpose-built alerts above (a heads-up, a reminder, a note
+    to the team). Same never-raises contract: a bad webhook here shouldn't
+    surface as a 500 for what's already a manual, low-stakes action.
+    """
+    webhook = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return False
+    clean = (message or "").strip()
+    if not clean:
+        return False
+    heading = (title or "").strip() or "📣 Custom alert"
+    payload = {
+        "text": f"{heading}: {clean[:150]}",
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": heading, "emoji": True}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": clean[:2900]}},
+        ],
+    }
+    try:
+        import httpx
+
+        response = httpx.post(webhook, json=payload, timeout=15.0)
+        if response.status_code >= 300:
+            logger.error("Slack custom alert rejected (%s): %s", response.status_code, response.text[:200])
+            return False
+        return True
+    except Exception:
+        logger.exception("Slack custom alert failed")
+        return False
+
+
 def notify_disk_warning(pct: float, used_mb: float, total_mb: float, threshold: int) -> bool:
     """Posts one disk-space warning. Same never-raises contract as the HOT
     alert: this is a safety net, and a safety net that can crash the scheduler
