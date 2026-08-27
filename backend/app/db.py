@@ -225,6 +225,39 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            -- A queue row belongs to one person, not just one Instagram post:
+            -- the same post can be meaningful work for several teammates, and
+            -- each person must be able to progress it independently.  The
+            -- post is identified by account + shortcode because canonical
+            -- posts and every dynamically-added dashboard account live in
+            -- different source tables.
+            --
+            -- There deliberately are no foreign keys to dashboard_users or
+            -- the post tables. Removing a person's dashboard access or
+            -- hiding/removing a post must preserve the assignment as history.
+            CREATE TABLE IF NOT EXISTS post_assignments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_account TEXT NOT NULL,
+                post_shortcode TEXT NOT NULL,
+                assignee_email TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queue'
+                    CHECK(status IN ('queue', 'in_progress', 'posted')),
+                note TEXT NOT NULL DEFAULT '',
+                priority TEXT
+                    CHECK(priority IS NULL OR priority IN ('low', 'medium', 'high', 'urgent')),
+                due_date TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                position INTEGER NOT NULL DEFAULT 0,
+                created_by_email TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(post_account, post_shortcode, assignee_email)
+            );
+            CREATE INDEX IF NOT EXISTS idx_post_assignments_assignee_status
+                ON post_assignments(assignee_email, status, position, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_post_assignments_post
+                ON post_assignments(post_account, post_shortcode);
+
             -- One row per authenticated request, logged from the Firebase
             -- middleware. Feeds the Users tab's usage heatmap (who's active,
             -- when, and in which part of the app) -- there was previously no

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -730,6 +731,395 @@ def _caller_email(request: Request) -> str:
     with the gate open) so lists still work there instead of crashing.
     """
     return (getattr(request.state, "user_email", "") or "local@dev").strip().lower()
+
+
+# --- Sentient Queue --------------------------------------------------------
+#
+# A post can be assigned to many people, so a Queue task is an *assignment*,
+# not a property of the post itself.  Every task carries its own state and
+# metadata; moving Ana's task to Posted must never close Luis's task for the
+# same Instagram post.
+QUEUE_STATUSES = {"queue", "in_progress", "posted"}
+QUEUE_PRIORITIES = {"low", "medium", "high", "urgent"}
+QUEUE_TAGS = {"content", "design", "copy", "research", "review", "repurpose"}
+
+
+def _queue_status(value: str) -> str:
+    clean = value.strip().lower()
+    if clean not in QUEUE_STATUSES:
+        raise HTTPException(status_code=400, detail="Status must be queue, in_progress, or posted.")
+    return clean
+
+
+def _queue_priority(value: str | None) -> str | None:
+    clean = (value or "").strip().lower()
+    if not clean:
+        return None
+    if clean not in QUEUE_PRIORITIES:
+        raise HTTPException(status_code=400, detail="Invalid queue priority.")
+    return clean
+
+
+def _queue_due_date(value: str | None) -> str | None:
+    clean = (value or "").strip()
+    if not clean:
+        return None
+    try:
+        datetime.strptime(clean, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Due date must use YYYY-MM-DD.") from exc
+    return clean
+
+
+def _queue_tags(value: str | None) -> list[str]:
+    # The dashboard posts a compact comma-separated FormData value.  Tags are
+    # deliberately a fixed vocabulary in v1 so board filters remain useful
+    # instead of turning into dozens of almost-identical spellings.
+    raw = (value or "").split(",")
+    tags = list(dict.fromkeys(tag.strip().lower() for tag in raw if tag.strip()))
+    invalid = [tag for tag in tags if tag not in QUEUE_TAGS]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unknown queue tag(s): {', '.join(invalid)}")
+    return tags
+
+
+def _queue_assignee_emails(value: str) -> list[str]:
+    emails = list(dict.fromkeys(email.strip().lower() for email in value.split(",") if email.strip()))
+    if not emails:
+        raise HTTPException(status_code=400, detail="Choose at least one person.")
+    known = {user["email"] for user in list_dashboard_users()}
+    unknown = [email for email in emails if email not in known]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown queue user(s): {', '.join(unknown)}")
+    return emails
+
+
+def _queue_post_exists(account: str, shortcode: str) -> tuple[str, str]:
+    clean_account = account.strip().lstrip("@").lower()
+    clean_shortcode = shortcode.strip()
+    if not clean_shortcode:
+        raise HTTPException(status_code=400, detail="Post shortcode is required.")
+    table = _resolve_post_table(clean_account)
+    with connect() as conn:
+        if table == "posts":
+            row = conn.execute("SELECT id FROM posts WHERE shortcode = ?", (clean_shortcode,)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM dashboard_posts WHERE account = ? AND shortcode = ?",
+                (clean_account, clean_shortcode),
+            ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Post not found.")
+    return clean_account, clean_shortcode
+
+
+def _queue_rows(assignee: str | None, include_posted: bool) -> list[dict[str, Any]]:
+    """Returns assignments with a lightweight current post projection.
+
+    The joins are intentionally left joins: an assignment remains useful as
+    history even if a post was subsequently removed from the live dashboard.
+    """
+    canonical = next((a for a in list_accounts(active_only=False) if a["is_canonical"]), None)
+    canonical_handle = canonical["handle"] if canonical else ""
+    clauses: list[str] = []
+    params: list[Any] = [canonical_handle]
+    if assignee:
+        clauses.append("q.assignee_email = ?")
+        params.append(assignee)
+    if not include_posted:
+        clauses.append("q.status != 'posted'")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT q.*, u.role AS assignee_role,
+                   dp.id AS dashboard_post_id, dp.caption AS dashboard_caption,
+                   dp.permalink AS dashboard_permalink, dp.published_at AS dashboard_published_at,
+                   dp.likes AS dashboard_likes, dp.comments AS dashboard_comments,
+                   dp.post_type_label AS dashboard_post_type,
+                   p.id AS canonical_post_id, p.caption AS canonical_caption,
+                   p.title AS canonical_title, p.published_at AS canonical_published_at,
+                   p.likes AS canonical_likes, p.comments AS canonical_comments,
+                   p.post_type_label AS canonical_post_type
+            FROM post_assignments q
+            LEFT JOIN dashboard_users u ON u.email = q.assignee_email
+            LEFT JOIN dashboard_posts dp
+              ON dp.account = q.post_account AND dp.shortcode = q.post_shortcode
+            LEFT JOIN posts p
+              ON q.post_account = ? AND p.shortcode = q.post_shortcode
+            {where}
+            ORDER BY
+              CASE q.status WHEN 'queue' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
+              q.position ASC,
+              q.updated_at DESC
+            """,
+            params,
+        ).fetchall()
+
+    assignments: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        tags_raw = row.get("tags") or "[]"
+        try:
+            tags = json.loads(tags_raw)
+            tags = tags if isinstance(tags, list) else []
+        except json.JSONDecodeError:
+            tags = []
+        dashboard_id = row.get("dashboard_post_id")
+        canonical_id = row.get("canonical_post_id")
+        post_id = dashboard_id if dashboard_id is not None else canonical_id
+        caption = row.get("dashboard_caption") if dashboard_id is not None else (row.get("canonical_caption") or row.get("canonical_title"))
+        permalink = row.get("dashboard_permalink") or f"https://www.instagram.com/p/{row['post_shortcode']}/"
+        assignments.append(
+            {
+                "id": row["id"],
+                "assigneeEmail": row["assignee_email"],
+                "assigneeRole": row.get("assignee_role"),
+                "status": row["status"],
+                "note": row["note"],
+                "priority": row["priority"],
+                "dueDate": row["due_date"],
+                "tags": tags,
+                "position": row["position"],
+                "createdByEmail": row["created_by_email"],
+                "createdAt": row["created_at"],
+                "updatedAt": row["updated_at"],
+                "post": {
+                    "account": row["post_account"],
+                    "shortcode": row["post_shortcode"],
+                    "caption": caption or "",
+                    "permalink": permalink,
+                    "publishedAt": row.get("dashboard_published_at") if dashboard_id is not None else row.get("canonical_published_at"),
+                    "likes": row.get("dashboard_likes") if dashboard_id is not None else row.get("canonical_likes"),
+                    "comments": row.get("dashboard_comments") if dashboard_id is not None else row.get("canonical_comments"),
+                    "type": row.get("dashboard_post_type") if dashboard_id is not None else row.get("canonical_post_type"),
+                    "coverUrl": (
+                        f"/api/dashboard/covers/{row['post_account']}/{post_id}" if post_id is not None else None
+                    ),
+                    "missing": post_id is None,
+                },
+            }
+        )
+    return assignments
+
+
+def _queue_metrics(assignments: list[dict[str, Any]]) -> dict[str, Any]:
+    by_status = {status: 0 for status in QUEUE_STATUSES}
+    by_user: dict[str, dict[str, Any]] = {}
+    for assignment in assignments:
+        by_status[assignment["status"]] += 1
+        email = assignment["assigneeEmail"]
+        row = by_user.setdefault(email, {"email": email, "queue": 0, "inProgress": 0, "posted": 0, "pending": 0})
+        if assignment["status"] == "queue":
+            row["queue"] += 1
+            row["pending"] += 1
+        elif assignment["status"] == "in_progress":
+            row["inProgress"] += 1
+            row["pending"] += 1
+        else:
+            row["posted"] += 1
+    return {
+        "total": len(assignments),
+        "queue": by_status["queue"],
+        "inProgress": by_status["in_progress"],
+        "posted": by_status["posted"],
+        "pending": by_status["queue"] + by_status["in_progress"],
+        "byUser": sorted(by_user.values(), key=lambda row: (-row["pending"], row["email"])),
+    }
+
+
+def _queue_editable_assignment(task_id: int, caller_email: str, is_admin: bool) -> dict[str, Any]:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM post_assignments WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Queue task not found.")
+    assignment = dict(row)
+    if not is_admin and assignment["assignee_email"] != caller_email:
+        raise HTTPException(status_code=403, detail="You can only update your own Queue tasks.")
+    return assignment
+
+
+@app.get("/api/dashboard/queue")
+def dashboard_queue(
+    request: Request,
+    assignee: Annotated[str | None, Query()] = None,
+    include_posted: Annotated[bool, Query()] = False,
+) -> dict[str, Any]:
+    """Queue board data. Admins can request everyone or one person; every
+    other signed-in user is always scoped to their own independent tasks."""
+    caller = _caller_email(request)
+    is_admin = bool(getattr(request.state, "is_admin", False))
+    requested = (assignee or "").strip().lower()
+    if not requested:
+        scope = None if is_admin else caller
+    elif requested == "all":
+        if not is_admin:
+            raise HTTPException(status_code=403, detail="Only admins can view the team Queue.")
+        scope = None
+    else:
+        if not is_admin and requested != caller:
+            raise HTTPException(status_code=403, detail="You can only view your own Queue.")
+        scope = requested
+
+    assignments = _queue_rows(scope, include_posted)
+    all_assignments = _queue_rows(None if is_admin else caller, True)
+    return {
+        "viewer": {"email": caller, "isAdmin": is_admin},
+        "scope": "all" if scope is None else scope,
+        "users": list_dashboard_users(),
+        "assignments": assignments,
+        "metrics": _queue_metrics(all_assignments),
+        "tagOptions": sorted(QUEUE_TAGS),
+        "priorityOptions": ["low", "medium", "high", "urgent"],
+    }
+
+
+@app.get("/api/dashboard/queue/summary")
+def dashboard_queue_summary(request: Request) -> dict[str, Any]:
+    """Small count for the Queue badge in the main dashboard header."""
+    assignments = _queue_rows(_caller_email(request), False)
+    return _queue_metrics(assignments)
+
+
+@app.get("/api/dashboard/queue/users")
+def dashboard_queue_users(request: Request) -> dict[str, Any]:
+    """The assignment picker roster. Non-admins receive only themselves so
+    the UI never implies they can assign work to another teammate."""
+    caller = _caller_email(request)
+    is_admin = bool(getattr(request.state, "is_admin", False))
+    users = list_dashboard_users()
+    if not is_admin:
+        users = [user for user in users if user["email"] == caller]
+    return {"users": users, "viewer": {"email": caller, "isAdmin": is_admin}}
+
+
+@app.post("/api/dashboard/queue/assign")
+def dashboard_queue_assign(
+    request: Request,
+    account: Annotated[str, Form()],
+    shortcode: Annotated[str, Form()],
+    assignees: Annotated[str, Form()],
+    status: Annotated[str, Form()] = "queue",
+    note: Annotated[str | None, Form()] = None,
+    priority: Annotated[str | None, Form()] = None,
+    due_date: Annotated[str | None, Form()] = None,
+    tags: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Creates or refreshes one independent task for every chosen person."""
+    caller = _caller_email(request)
+    is_admin = bool(getattr(request.state, "is_admin", False))
+    emails = _queue_assignee_emails(assignees)
+    if not is_admin and emails != [caller]:
+        raise HTTPException(status_code=403, detail="You can only assign a post to yourself.")
+    clean_account, clean_shortcode = _queue_post_exists(account, shortcode)
+    clean_status = _queue_status(status)
+    clean_priority = _queue_priority(priority)
+    clean_due_date = _queue_due_date(due_date)
+    clean_tags = _queue_tags(tags)
+    clean_note = (note or "").strip()
+    now = utc_now()
+
+    with connect() as conn:
+        for email in emails:
+            existing = conn.execute(
+                "SELECT id, position FROM post_assignments WHERE post_account = ? AND post_shortcode = ? AND assignee_email = ?",
+                (clean_account, clean_shortcode, email),
+            ).fetchone()
+            if existing:
+                position = existing["position"]
+            else:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(position), 0) + 100 AS position FROM post_assignments WHERE assignee_email = ? AND status = ?",
+                    (email, clean_status),
+                ).fetchone()
+                position = int(row["position"])
+            conn.execute(
+                """
+                INSERT INTO post_assignments (
+                    post_account, post_shortcode, assignee_email, status, note, priority,
+                    due_date, tags, position, created_by_email, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(post_account, post_shortcode, assignee_email) DO UPDATE SET
+                    status = excluded.status,
+                    note = excluded.note,
+                    priority = excluded.priority,
+                    due_date = excluded.due_date,
+                    tags = excluded.tags,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_account, clean_shortcode, email, clean_status, clean_note, clean_priority,
+                    clean_due_date, json.dumps(clean_tags), position, caller, now, now,
+                ),
+            )
+    return {"ok": True, "assignees": emails}
+
+
+@app.post("/api/dashboard/queue/tasks/{task_id}")
+def dashboard_queue_update_task(
+    task_id: int,
+    request: Request,
+    status: Annotated[str | None, Form()] = None,
+    note: Annotated[str | None, Form()] = None,
+    priority: Annotated[str | None, Form()] = None,
+    due_date: Annotated[str | None, Form()] = None,
+    tags: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    caller = _caller_email(request)
+    _queue_editable_assignment(task_id, caller, bool(getattr(request.state, "is_admin", False)))
+    updates: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        updates.append("status = ?")
+        params.append(_queue_status(status))
+    if note is not None:
+        updates.append("note = ?")
+        params.append(note.strip())
+    if priority is not None:
+        updates.append("priority = ?")
+        params.append(_queue_priority(priority))
+    if due_date is not None:
+        updates.append("due_date = ?")
+        params.append(_queue_due_date(due_date))
+    if tags is not None:
+        updates.append("tags = ?")
+        params.append(json.dumps(_queue_tags(tags)))
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+    updates.append("updated_at = ?")
+    params.append(utc_now())
+    params.append(task_id)
+    with connect() as conn:
+        conn.execute(f"UPDATE post_assignments SET {', '.join(updates)} WHERE id = ?", params)
+    return {"ok": True, "id": task_id}
+
+
+@app.post("/api/dashboard/queue/reorder")
+def dashboard_queue_reorder(
+    request: Request,
+    status: Annotated[str, Form()],
+    task_ids: Annotated[str, Form()],
+) -> dict[str, Any]:
+    """Persists the full order of one board column after a drag-and-drop."""
+    caller = _caller_email(request)
+    is_admin = bool(getattr(request.state, "is_admin", False))
+    clean_status = _queue_status(status)
+    try:
+        ids = list(dict.fromkeys(int(value) for value in task_ids.split(",") if value.strip()))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid Queue task ids.") from exc
+    if not ids:
+        raise HTTPException(status_code=400, detail="No Queue tasks to reorder.")
+    for task_id in ids:
+        _queue_editable_assignment(task_id, caller, is_admin)
+    now = utc_now()
+    with connect() as conn:
+        for position, task_id in enumerate(ids, start=1):
+            conn.execute(
+                "UPDATE post_assignments SET status = ?, position = ?, updated_at = ? WHERE id = ?",
+                (clean_status, position * 100, now, task_id),
+            )
+    return {"ok": True, "status": clean_status, "taskIds": ids}
 
 
 @app.get("/api/dashboard/lists")
@@ -2114,5 +2504,3 @@ def reset_hot_check(password: Annotated[str, Form()], account: Annotated[str, Fo
             )
 
     return {"account": account, "reset": len(reset_ids)}
-
-
