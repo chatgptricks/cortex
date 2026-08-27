@@ -1638,29 +1638,39 @@ def admin_list_accounts() -> dict[str, Any]:
     measuring. Backfilled posts never went through that live check (no
     `likes_at_1h`), so they're correctly excluded rather than diluting the
     average with stale totals.
+
+    The average itself only looks at the last 30 days of posts, so a recent
+    slump or surge in engagement moves the suggestion instead of it being
+    dragged down by a post's whole history. An account tracked for less
+    than 30 days just averages whatever it has so far -- the window is a
+    ceiling on how far back to look, never a floor on how much data is
+    required.
     """
     accounts = list_accounts(active_only=False)
+    cutoff_30 = (datetime.now(UTC) - timedelta(days=30)).isoformat(timespec="seconds")
 
     with connect() as conn:
         dash_rows = conn.execute(
             """
             SELECT account,
-                   AVG(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS avg_likes,
-                   COUNT(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS n_posts,
+                   AVG(CASE WHEN hot_checked = 1 AND published_at >= ? THEN likes_at_1h END) AS avg_likes,
+                   COUNT(CASE WHEN hot_checked = 1 AND published_at >= ? THEN likes_at_1h END) AS n_posts,
                    COUNT(*) AS total_posts,
                    MIN(published_at) AS oldest_post_at
             FROM dashboard_posts
             GROUP BY account
-            """
+            """,
+            (cutoff_30, cutoff_30),
         ).fetchall()
         canonical_row = conn.execute(
             """
-            SELECT AVG(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS avg_likes,
-                   COUNT(CASE WHEN hot_checked = 1 THEN likes_at_1h END) AS n_posts,
+            SELECT AVG(CASE WHEN hot_checked = 1 AND published_at >= ? THEN likes_at_1h END) AS avg_likes,
+                   COUNT(CASE WHEN hot_checked = 1 AND published_at >= ? THEN likes_at_1h END) AS n_posts,
                    COUNT(*) AS total_posts,
                    MIN(published_at) AS oldest_post_at
             FROM posts
-            """
+            """,
+            (cutoff_30, cutoff_30),
         ).fetchone()
 
     stats_by_handle = {row["account"]: dict(row) for row in dash_rows}
