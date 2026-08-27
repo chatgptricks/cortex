@@ -857,7 +857,13 @@ def _queue_rows(assignee: str | None, include_posted: bool) -> list[dict[str, An
         clauses.append("q.assignee_email = ?")
         params.append(assignee)
     if not include_posted:
-        clauses.append("q.status != 'posted'")
+        # A task freshly marked "posted" is still worth seeing -- it's how
+        # you confirm the thing you just published actually shows up. It
+        # only drops out of the default view once it's been sitting there a
+        # full day; before that, both a full archive query and the default
+        # query return it.
+        clauses.append("(q.status != 'posted' OR q.updated_at >= ?)")
+        params.append((datetime.now(UTC) - timedelta(hours=24)).isoformat(timespec="seconds"))
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with connect() as conn:
         rows = conn.execute(
