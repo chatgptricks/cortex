@@ -153,6 +153,7 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         return JSONResponse({"detail": "Admin access required."}, status_code=403)
     request.state.user_email = email
     request.state.is_admin = is_admin
+    request.state.user_uid = decoded.get("uid")
     try:
         # Feeds the Users tab's usage heatmap. Best-effort: a failed insert
         # here should never turn into a failed request for the user.
@@ -206,6 +207,35 @@ def health() -> dict[str, Any]:
         # disconnected -- nothing here reports on it anymore.
         "sentient_ocr": sentient_ocr_status(),
     }
+
+
+@app.post("/api/auth/custom-token")
+def auth_custom_token(request: Request) -> dict[str, Any]:
+    """Mints a short-lived Firebase custom token for the caller's own,
+    already-verified account.
+
+    Sentient Dash is split across several real subdomains (hot.sentientdash.app,
+    tracker.sentientdash.app, this Queue page, etc.) plus tracker.html/insights.html
+    served from the root domain. Firebase's own session persistence is scoped
+    per *origin*, so signing in on one subdomain does nothing for the others --
+    hence "I have to log in again on every page." A custom token lets a page
+    that already has no local session silently re-establish one (via
+    signInWithCustomToken) for the exact same Firebase user, without a second
+    Google prompt. See src/firebase.js's SSO helpers for the client half --
+    they stash this in a `.sentientdash.app`-scoped cookie so every subdomain
+    can read it.
+
+    Requires the caller to already be signed in on *some* origin (this route
+    is not in _FIREBASE_OPEN_PATHS, so the middleware above already verified
+    their ID token and populated request.state.user_uid before this runs).
+    """
+    uid = getattr(request.state, "user_uid", None)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Sign in required.")
+    if FIREBASE_APP is None:
+        raise HTTPException(status_code=503, detail="Firebase auth is not configured on this server.")
+    token = firebase_auth.create_custom_token(uid, app=FIREBASE_APP)
+    return {"customToken": token.decode("utf-8") if isinstance(token, bytes) else token}
 
 
 @app.get("/api/dashboard/me")
@@ -837,6 +867,9 @@ def _queue_rows(assignee: str | None, include_posted: bool) -> list[dict[str, An
                    dp.permalink AS dashboard_permalink, dp.published_at AS dashboard_published_at,
                    dp.likes AS dashboard_likes, dp.comments AS dashboard_comments,
                    dp.post_type_label AS dashboard_post_type,
+                   dp.music_song AS dashboard_music_song, dp.music_artist AS dashboard_music_artist,
+                   dp.music_audio_id AS dashboard_music_audio_id,
+                   dp.uses_original_audio AS dashboard_uses_original_audio,
                    p.id AS canonical_post_id, p.caption AS canonical_caption,
                    p.title AS canonical_title, p.published_at AS canonical_published_at,
                    p.likes AS canonical_likes, p.comments AS canonical_comments,
@@ -897,6 +930,18 @@ def _queue_rows(assignee: str | None, include_posted: bool) -> list[dict[str, An
                         f"/api/dashboard/covers/{row['post_account']}/{post_id}" if post_id is not None else None
                     ),
                     "missing": post_id is None,
+                    # Music metadata only exists on dashboard_posts (canonical
+                    # posts predate that column) -- deep-diving an assignment
+                    # from before the dashboard migration just shows no song,
+                    # which matches what the main dashboard itself would show.
+                    "musicSong": row.get("dashboard_music_song") if dashboard_id is not None else None,
+                    "musicArtist": row.get("dashboard_music_artist") if dashboard_id is not None else None,
+                    "usesOriginalAudio": bool(row.get("dashboard_uses_original_audio")) if dashboard_id is not None else False,
+                    "musicUrl": (
+                        f"https://www.instagram.com/reels/audio/{row['dashboard_music_audio_id']}/"
+                        if dashboard_id is not None and row.get("dashboard_music_audio_id")
+                        else None
+                    ),
                 },
             }
         )
