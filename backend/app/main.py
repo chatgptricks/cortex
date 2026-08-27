@@ -8,7 +8,7 @@ import secrets
 import shutil
 import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -361,24 +361,54 @@ def insights_posts() -> dict[str, Any]:
     ]}
 
 
-def _closest_snapshot_at_or_before(snapshots: list[dict[str, Any]], cutoff: str) -> dict[str, Any] | None:
-    """`snapshots` must be sorted oldest -> newest (captured_at ascending).
-    Returns the most recent one at or before `cutoff`, or None if the
-    account's recorded history doesn't reach back that far yet."""
-    candidate = None
+# Same fixed offset the daily snapshot job runs on (see scheduler.py's
+# _CST) -- used purely to decide which calendar day a snapshot belongs to,
+# so "N day growth" lines up with the Historical Stats table's day rows
+# regardless of what wall-clock time a manual refresh happens to run at.
+_TRACKER_TZ = timezone(timedelta(hours=-6))
+
+
+def _snapshot_local_date(snapshot: dict[str, Any]):
+    captured_at = snapshot.get("captured_at")
+    if not captured_at:
+        return None
+    return datetime.fromisoformat(captured_at).astimezone(_TRACKER_TZ).date()
+
+
+def _collapse_to_last_per_day(snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """`snapshots` must be sorted oldest -> newest. Collapses to one entry
+    per calendar day -- that day's LAST snapshot -- oldest -> newest, the
+    same rule the Tracker page's own collapseToLastPerDay applies
+    client-side to the Historical Stats table and growth chart. Growth
+    figures below are computed from this instead of the raw per-snapshot
+    history so a manual refresh mid-day can't inflate "1 day growth" by
+    comparing against an earlier-than-final snapshot from the day before."""
+    by_day: dict[Any, dict[str, Any]] = {}
     for snap in snapshots:
-        if snap["captured_at"] <= cutoff:
-            candidate = snap
+        day = _snapshot_local_date(snap)
+        if day is None:
+            continue
+        by_day[day] = snap
+    return [by_day[day] for day in sorted(by_day)]
+
+
+def _tracker_delta(day_snapshots: list[dict[str, Any]], days: int) -> dict[str, Any] | None:
+    """Growth over `days` calendar days: latest day's snapshot vs. the
+    closest day at-or-before (latest day - `days`), both taken from the
+    already day-collapsed list. `day_snapshots` must be sorted oldest ->
+    newest (see _collapse_to_last_per_day)."""
+    if not day_snapshots:
+        return None
+    latest = day_snapshots[-1]
+    if latest.get("followers_count") is None:
+        return None
+    cutoff_date = _snapshot_local_date(latest) - timedelta(days=days)
+    baseline = None
+    for snap in day_snapshots:
+        if _snapshot_local_date(snap) <= cutoff_date:
+            baseline = snap
         else:
             break
-    return candidate
-
-
-def _tracker_delta(snapshots: list[dict[str, Any]], latest: dict[str, Any] | None, days: int) -> dict[str, Any] | None:
-    if not latest or latest.get("followers_count") is None:
-        return None
-    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
-    baseline = _closest_snapshot_at_or_before(snapshots, cutoff)
     if not baseline or baseline is latest or baseline.get("followers_count") is None:
         return None
     delta = latest["followers_count"] - baseline["followers_count"]
@@ -423,6 +453,7 @@ def tracker_summary() -> dict[str, Any]:
         handle = account["handle"]
         snaps = snapshots_by_handle.get(handle, [])
         latest = snaps[-1] if snaps else None
+        day_snaps = _collapse_to_last_per_day(snaps)
         eng = engagement_by_account.get(handle, {})
         avg30 = eng.get("avg_likes_30d")
         avgprev = eng.get("avg_likes_prev_30d")
@@ -440,9 +471,9 @@ def tracker_summary() -> dict[str, Any]:
                 "verified": bool(latest.get("verified")) if latest else False,
                 "private": bool(latest.get("private")) if latest else False,
                 "history_days": len(snaps),
-                "delta_1d": _tracker_delta(snaps, latest, 1),
-                "delta_7d": _tracker_delta(snaps, latest, 7),
-                "delta_30d": _tracker_delta(snaps, latest, 30),
+                "delta_1d": _tracker_delta(day_snaps, 1),
+                "delta_7d": _tracker_delta(day_snaps, 7),
+                "delta_30d": _tracker_delta(day_snaps, 30),
                 "avg_likes_30d": avg30,
                 "posts_30d": eng.get("n_30d") or 0,
                 "engagement_trend_pct": engagement_trend_pct,
