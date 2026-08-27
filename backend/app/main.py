@@ -1145,6 +1145,17 @@ def dashboard_queue_update_task(
     return {"ok": True, "id": task_id}
 
 
+@app.delete("/api/dashboard/queue/tasks/{task_id}")
+def dashboard_queue_delete_task(task_id: int, request: Request) -> dict[str, Any]:
+    """Permanently removes one Queue task. Same ownership rule as updating
+    it: admins can remove anyone's task, everyone else only their own."""
+    caller = _caller_email(request)
+    _queue_editable_assignment(task_id, caller, bool(getattr(request.state, "is_admin", False)))
+    with connect() as conn:
+        conn.execute("DELETE FROM post_assignments WHERE id = ?", (task_id,))
+    return {"ok": True, "id": task_id}
+
+
 @app.post("/api/dashboard/queue/reorder")
 def dashboard_queue_reorder(
     request: Request,
