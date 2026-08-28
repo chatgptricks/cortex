@@ -258,6 +258,21 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_post_assignments_post
                 ON post_assignments(post_account, post_shortcode);
 
+            -- A compact immutable audit trail for Queue work. Event rows are
+            -- intentionally kept outside the assignment row so the task view
+            -- can explain who changed what without overloading the current
+            -- task state with historical fields.
+            CREATE TABLE IF NOT EXISTS post_assignment_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assignment_id INTEGER NOT NULL,
+                actor_email TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_post_assignment_events_assignment
+                ON post_assignment_events(assignment_id, created_at DESC);
+
             -- One row per authenticated request, logged from the Firebase
             -- middleware. Feeds the Users tab's usage heatmap (who's active,
             -- when, and in which part of the app) -- there was previously no

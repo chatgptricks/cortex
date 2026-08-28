@@ -1085,6 +1085,43 @@ def _queue_editable_assignment(task_id: int, caller_email: str, is_admin: bool) 
     return assignment
 
 
+def _queue_log_event(conn: Any, assignment_id: int, actor_email: str, event_type: str, details: dict[str, Any] | None = None) -> None:
+    conn.execute(
+        """
+        INSERT INTO post_assignment_events (assignment_id, actor_email, event_type, details, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (assignment_id, actor_email, event_type, json.dumps(details or {}), utc_now()),
+    )
+
+
+def _queue_history(task_id: int) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT actor_email, event_type, details, created_at
+            FROM post_assignment_events
+            WHERE assignment_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (task_id,),
+        ).fetchall()
+    events: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        try:
+            details = json.loads(row["details"] or "{}")
+        except json.JSONDecodeError:
+            details = {}
+        events.append({
+            "actorEmail": row["actor_email"],
+            "type": row["event_type"],
+            "details": details if isinstance(details, dict) else {},
+            "createdAt": row["created_at"],
+        })
+    return events
+
+
 @app.get("/api/dashboard/queue")
 def dashboard_queue(
     request: Request,
@@ -1144,6 +1181,75 @@ def dashboard_queue_users(request: Request) -> dict[str, Any]:
     return {"users": users, "viewer": {"email": caller, "isAdmin": is_admin}}
 
 
+@app.get("/api/dashboard/queue/tasks/{task_id}/history")
+def dashboard_queue_task_history(task_id: int, request: Request) -> dict[str, Any]:
+    caller = _caller_email(request)
+    _queue_editable_assignment(task_id, caller, bool(getattr(request.state, "is_admin", False)))
+    return {"events": _queue_history(task_id)}
+
+
+@app.post("/api/dashboard/queue/bulk-update")
+def dashboard_queue_bulk_update(
+    request: Request,
+    task_ids: Annotated[str, Form()],
+    assignee: Annotated[str | None, Form()] = None,
+    priority: Annotated[str | None, Form()] = None,
+    due_date: Annotated[str | None, Form()] = None,
+    tags: Annotated[str | None, Form()] = None,
+    recommended_account: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Applies selected optional fields to many tasks. Admin-only by design."""
+    caller = _caller_email(request)
+    if not bool(getattr(request.state, "is_admin", False)):
+        raise HTTPException(status_code=403, detail="Only admins can bulk-edit Queue tasks.")
+    ids = list(dict.fromkeys(int(raw) for raw in task_ids.split(",") if raw.strip().isdigit()))
+    if not ids:
+        raise HTTPException(status_code=400, detail="Choose at least one Queue task.")
+    clean_assignee = None
+    if assignee is not None:
+        choices = _queue_assignee_emails(assignee)
+        if len(choices) != 1:
+            raise HTTPException(status_code=400, detail="Choose one assignee for a bulk update.")
+        clean_assignee = choices[0]
+
+    updates: list[str] = []
+    values: list[Any] = []
+    fields: list[str] = []
+    if clean_assignee is not None:
+        updates.append("assignee_email = ?"); values.append(clean_assignee); fields.append("assignee")
+    if priority is not None:
+        updates.append("priority = ?"); values.append(_queue_priority(priority)); fields.append("priority")
+    if due_date is not None:
+        updates.append("due_date = ?"); values.append(_queue_due_date(due_date)); fields.append("due_date")
+    if tags is not None:
+        updates.append("tags = ?"); values.append(json.dumps(_queue_tags(tags))); fields.append("tags")
+    if recommended_account is not None:
+        updates.append("recommended_account = ?"); values.append(_queue_recommended_account(recommended_account)); fields.append("recommended_account")
+    if not updates:
+        raise HTTPException(status_code=400, detail="Choose at least one field to update.")
+
+    now = utc_now()
+    with connect() as conn:
+        for task_id in ids:
+            row = conn.execute("SELECT * FROM post_assignments WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"Queue task {task_id} not found.")
+            if clean_assignee and clean_assignee != row["assignee_email"]:
+                duplicate = conn.execute(
+                    """SELECT id FROM post_assignments
+                       WHERE post_account = ? AND post_shortcode = ? AND assignee_email = ? AND id != ?""",
+                    (row["post_account"], row["post_shortcode"], clean_assignee, task_id),
+                ).fetchone()
+                if duplicate:
+                    raise HTTPException(status_code=409, detail="One selected post is already assigned to that person.")
+            conn.execute(
+                f"UPDATE post_assignments SET {', '.join(updates)}, updated_at = ? WHERE id = ?",
+                (*values, now, task_id),
+            )
+            _queue_log_event(conn, task_id, caller, "bulk_updated", {"fields": fields})
+    return {"ok": True, "taskIds": ids, "fields": fields}
+
+
 @app.post("/api/dashboard/queue/assign")
 def dashboard_queue_assign(
     request: Request,
@@ -1186,7 +1292,7 @@ def dashboard_queue_assign(
                     (email, clean_status),
                 ).fetchone()
                 position = int(row["position"])
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO post_assignments (
                     post_account, post_shortcode, assignee_email, status, note, priority,
@@ -1206,6 +1312,14 @@ def dashboard_queue_assign(
                     clean_due_date, json.dumps(clean_tags), clean_recommended_account, position, caller, now, now,
                 ),
             )
+            assignment_id = int(existing["id"]) if existing else int(cursor.lastrowid)
+            _queue_log_event(
+                conn,
+                assignment_id,
+                caller,
+                "assigned" if existing is None else "assignment_refreshed",
+                {"status": clean_status, "recommendedAccount": clean_recommended_account},
+            )
     return {"ok": True, "assignees": emails}
 
 
@@ -1224,24 +1338,31 @@ def dashboard_queue_update_task(
     _queue_editable_assignment(task_id, caller, bool(getattr(request.state, "is_admin", False)))
     updates: list[str] = []
     params: list[Any] = []
+    changed_fields: list[str] = []
     if status is not None:
         updates.append("status = ?")
         params.append(_queue_status(status))
+        changed_fields.append("status")
     if note is not None:
         updates.append("note = ?")
         params.append(note.strip())
+        changed_fields.append("note")
     if priority is not None:
         updates.append("priority = ?")
         params.append(_queue_priority(priority))
+        changed_fields.append("priority")
     if due_date is not None:
         updates.append("due_date = ?")
         params.append(_queue_due_date(due_date))
+        changed_fields.append("due_date")
     if tags is not None:
         updates.append("tags = ?")
         params.append(json.dumps(_queue_tags(tags)))
+        changed_fields.append("tags")
     if recommended_account is not None:
         updates.append("recommended_account = ?")
         params.append(_queue_recommended_account(recommended_account))
+        changed_fields.append("recommended_account")
     if not updates:
         raise HTTPException(status_code=400, detail="Nothing to update.")
     updates.append("updated_at = ?")
@@ -1249,6 +1370,7 @@ def dashboard_queue_update_task(
     params.append(task_id)
     with connect() as conn:
         conn.execute(f"UPDATE post_assignments SET {', '.join(updates)} WHERE id = ?", params)
+        _queue_log_event(conn, task_id, caller, "updated", {"fields": changed_fields})
     return {"ok": True, "id": task_id}
 
 
@@ -1284,10 +1406,13 @@ def dashboard_queue_reorder(
     now = utc_now()
     with connect() as conn:
         for position, task_id in enumerate(ids, start=1):
+            current = conn.execute("SELECT status FROM post_assignments WHERE id = ?", (task_id,)).fetchone()
             conn.execute(
                 "UPDATE post_assignments SET status = ?, position = ?, updated_at = ? WHERE id = ?",
                 (clean_status, position * 100, now, task_id),
             )
+            if current and current["status"] != clean_status:
+                _queue_log_event(conn, task_id, caller, "moved", {"status": clean_status})
     return {"ok": True, "status": clean_status, "taskIds": ids}
 
 
