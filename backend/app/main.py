@@ -156,6 +156,12 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     request.state.user_email = email
     request.state.is_admin = is_admin
     request.state.operating_role = access["operating_role"]
+    try:
+        request.state.operating_roles = json.loads(access.get("operating_roles") or "[]")
+    except json.JSONDecodeError:
+        request.state.operating_roles = []
+    if not request.state.operating_roles:
+        request.state.operating_roles = [access["operating_role"]]
     request.state.user_uid = decoded.get("uid")
     try:
         # Feeds the Users tab's usage heatmap. Best-effort: a failed insert
@@ -253,6 +259,7 @@ def dashboard_me(request: Request) -> dict[str, Any]:
         "email": getattr(request.state, "user_email", None),
         "is_admin": bool(getattr(request.state, "is_admin", False)),
         "operating_role": getattr(request.state, "operating_role", "sales"),
+        "operating_roles": getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]),
     }
 
 
@@ -1491,15 +1498,15 @@ SCHEDULER_START = 8 * 60
 SCHEDULER_END = 20 * 60
 
 
-def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[str, bool, str]:
+def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[str, bool, list[str]]:
     email = _caller_email(request)
     is_admin = bool(getattr(request.state, "is_admin", False))
-    role = str(getattr(request.state, "operating_role", "sales"))
-    if coordinator and not (is_admin or role == "vc"):
+    roles = list(getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]))
+    if coordinator and not (is_admin or "vc" in roles):
         raise HTTPException(status_code=403, detail="Queue coordination access required.")
-    if not coordinator and not (is_admin or role in {"vc", "pd"}):
+    if not coordinator and not (is_admin or any(role in {"vc", "pd"} for role in roles)):
         raise HTTPException(status_code=403, detail="Queue is available to production coordinators and designers.")
-    return email, is_admin, role
+    return email, is_admin, roles
 
 
 def _queue_v2_json(value: Any, fallback: Any) -> Any:
@@ -1568,7 +1575,7 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _queue_v2_designers() -> list[dict[str, Any]]:
-    users = [u for u in list_dashboard_users() if u.get("operating_role") == "pd"]
+    users = [u for u in list_dashboard_users() if "pd" in _queue_v2_json(u.get("operating_roles"), [u.get("operating_role")])]
     with connect() as conn:
         accounts = conn.execute("SELECT designer_email, account_handle FROM queue_designer_accounts ORDER BY account_handle").fetchall()
     by_designer: dict[str, list[str]] = {}
@@ -1595,7 +1602,7 @@ def _queue_v2_conflicts(conn: Any, designer: str, date: str, start: int, duratio
 
 @app.get("/api/dashboard/queue/v2")
 def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool = False) -> dict[str, Any]:
-    caller, is_admin, role = _queue_v2_access(request)
+    caller, is_admin, roles = _queue_v2_access(request)
     selected_date = date or datetime.now().date().isoformat()
     try:
         datetime.strptime(selected_date, "%Y-%m-%d")
@@ -1605,17 +1612,17 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
     params: list[Any] = [selected_date]
     if not archive:
         clauses.append("status != 'cancelled'")
-    if not (is_admin or role == "vc"):
+    if not (is_admin or "vc" in roles):
         clauses.append("designer_email = ?")
         params.append(caller)
     with connect() as conn:
         rows = conn.execute(f"SELECT * FROM queue_requests WHERE {' AND '.join(clauses)} ORDER BY deadline_at, id", params).fetchall()
     requests = [_queue_v2_project(dict(row)) for row in rows]
-    if not (is_admin or role == "vc"):
+    if not (is_admin or "vc" in roles):
         requests = [item for item in requests if item["status"] != "pool"]
     return {
-        "viewer": {"email": caller, "isAdmin": is_admin, "operatingRole": role},
-        "date": selected_date, "requests": requests, "designers": _queue_v2_designers() if (is_admin or role == "vc") else [d for d in _queue_v2_designers() if d["email"] == caller],
+        "viewer": {"email": caller, "isAdmin": is_admin, "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
+        "date": selected_date, "requests": requests, "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
         "tags": QUEUE_V2_TAGS, "hours": {"start": SCHEDULER_START, "end": SCHEDULER_END},
     }
 
@@ -1623,12 +1630,12 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
 @app.get("/api/dashboard/queue/v2/summary")
 def dashboard_queue_v2_summary(request: Request) -> dict[str, Any]:
     caller = _caller_email(request)
-    role = str(getattr(request.state, "operating_role", "sales"))
+    roles = list(getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]))
     is_admin = bool(getattr(request.state, "is_admin", False))
-    if not (is_admin or role in {"vc", "pd"}):
+    if not (is_admin or any(role in {"vc", "pd"} for role in roles)):
         return {"pending": 0}
     with connect() as conn:
-        if is_admin or role == "vc":
+        if is_admin or "vc" in roles:
             row = conn.execute("SELECT COUNT(*) AS c FROM queue_requests WHERE status IN ('pool','scheduled','in_progress','completed')").fetchone()
         else:
             row = conn.execute("SELECT COUNT(*) AS c FROM queue_requests WHERE designer_email = ? AND status IN ('scheduled','in_progress','completed')", (caller,)).fetchone()
@@ -1790,9 +1797,9 @@ def dashboard_queue_v2_cancel(request_id: int, request: Request, reason: Annotat
 
 @app.get("/api/dashboard/queue/v2/requests/{request_id}/history")
 def dashboard_queue_v2_history(request_id: int, request: Request) -> dict[str, Any]:
-    caller, is_admin, role = _queue_v2_access(request)
+    caller, is_admin, roles = _queue_v2_access(request)
     row = _queue_v2_request(request_id)
-    if not (is_admin or role == "vc" or row["designer_email"] == caller):
+    if not (is_admin or "vc" in roles or row["designer_email"] == caller):
         raise HTTPException(status_code=403, detail="Not allowed to view this request.")
     with connect() as conn:
         rows = conn.execute("SELECT actor_email, event_type, details, created_at FROM queue_request_events WHERE request_id = ? ORDER BY id DESC", (request_id,)).fetchall()

@@ -372,6 +372,7 @@ def init_db() -> None:
         # recommended for another active Sentient account.
         _ensure_column(conn, "post_assignments", "recommended_account", "recommended_account TEXT")
         _ensure_column(conn, "dashboard_users", "operating_role", "operating_role TEXT NOT NULL DEFAULT 'sales'")
+        _ensure_column(conn, "dashboard_users", "operating_roles", "operating_roles TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "dashboard_users", "is_admin", "is_admin INTEGER NOT NULL DEFAULT 0")
         # Following count -- added after account_snapshots shipped, so older
         # snapshots have NULL here; the Tracker's historical-stats table just
@@ -604,7 +605,7 @@ def get_dashboard_user_role(email: str) -> str | None:
 def get_dashboard_user_access(email: str) -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute(
-            "SELECT email, operating_role, is_admin, role FROM dashboard_users WHERE email = ?",
+            "SELECT email, operating_role, operating_roles, is_admin, role FROM dashboard_users WHERE email = ?",
             (email.strip().lower(),),
         ).fetchone()
         if not row:
@@ -694,7 +695,7 @@ def seed_queue_role_roster() -> None:
     }
     now = utc_now()
     with connect() as conn:
-        marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v2_seeded'").fetchone()
+        marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v3_seeded'").fetchone()
         if marker:
             return
         for email, (operating_role, is_admin) in roster.items():
@@ -704,9 +705,9 @@ def seed_queue_role_roster() -> None:
                 # Firebase allowlist. Settings can add them later if needed.
                 continue
             conn.execute(
-                """UPDATE dashboard_users SET role = ?, operating_role = ?, is_admin = ?, updated_at = ?
+                """UPDATE dashboard_users SET role = ?, operating_role = ?, operating_roles = ?, is_admin = ?, updated_at = ?
                    WHERE email = ?""",
-                ("admin" if is_admin else "viewer", operating_role, int(is_admin), now, email),
+                ("admin" if is_admin else "viewer", operating_role, json.dumps(["pd", "vc"] if email == "esteban@sentientagency.io" else [operating_role]), int(is_admin), now, email),
             )
         # Initial agreed account mapping. The Settings API owns all later
         # additions, so this is intentionally a one-time seed too.
@@ -716,7 +717,7 @@ def seed_queue_role_roster() -> None:
                 ("esteban@sentientagency.io", handle, now),
             )
         conn.execute(
-            "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v2_seeded', '1', ?)",
+            "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v3_seeded', '1', ?)",
             (now,),
         )
 
