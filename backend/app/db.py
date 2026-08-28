@@ -295,6 +295,10 @@ def init_db() -> None:
             """
         )
         _ensure_column(conn, "traselveloreal_posts", "hot_rate_multiplier", "hot_rate_multiplier REAL")
+        # Optional destination account for a Queue task. It is deliberately
+        # independent from post_account: a post found on one account can be
+        # recommended for another active Sentient account.
+        _ensure_column(conn, "post_assignments", "recommended_account", "recommended_account TEXT")
         # Following count -- added after account_snapshots shipped, so older
         # snapshots have NULL here; the Tracker's historical-stats table just
         # shows "--" for those rows instead of a delta.

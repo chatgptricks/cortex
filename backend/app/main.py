@@ -898,6 +898,26 @@ def _queue_assignee_emails(value: str) -> list[str]:
     return emails
 
 
+def _queue_recommended_account(value: str | None) -> str | None:
+    """Normalizes the optional destination account for an assignment.
+
+    Only active Sentient accounts are valid targets. The post's source account
+    is intentionally not used here: a task can recommend a post found on one
+    account for a different Sentient account.
+    """
+    clean = (value or "").strip().lstrip("@").lower()
+    if not clean:
+        return None
+    targets = {
+        account["handle"]
+        for account in list_accounts(active_only=True)
+        if account["group"] == "sentient"
+    }
+    if clean not in targets:
+        raise HTTPException(status_code=400, detail="Recommended account must be an active Sentient account.")
+    return clean
+
+
 def _queue_post_exists(account: str, shortcode: str) -> tuple[str, str]:
     clean_account = account.strip().lstrip("@").lower()
     clean_shortcode = shortcode.strip()
@@ -992,6 +1012,7 @@ def _queue_rows(assignee: str | None, include_posted: bool) -> list[dict[str, An
                 "note": row["note"],
                 "priority": row["priority"],
                 "dueDate": row["due_date"],
+                "recommendedAccount": row.get("recommended_account"),
                 "tags": tags,
                 "position": row["position"],
                 "createdByEmail": row["created_by_email"],
@@ -1096,6 +1117,11 @@ def dashboard_queue(
         "metrics": _queue_metrics(all_assignments),
         "tagOptions": sorted(QUEUE_TAGS),
         "priorityOptions": ["low", "medium", "high", "urgent"],
+        "recommendedAccounts": [
+            {"handle": account["handle"], "label": account["label"]}
+            for account in list_accounts(active_only=True)
+            if account["group"] == "sentient"
+        ],
     }
 
 
@@ -1129,6 +1155,7 @@ def dashboard_queue_assign(
     priority: Annotated[str | None, Form()] = None,
     due_date: Annotated[str | None, Form()] = None,
     tags: Annotated[str | None, Form()] = None,
+    recommended_account: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
     """Creates or refreshes one independent task for every chosen person."""
     caller = _caller_email(request)
@@ -1141,6 +1168,7 @@ def dashboard_queue_assign(
     clean_priority = _queue_priority(priority)
     clean_due_date = _queue_due_date(due_date)
     clean_tags = _queue_tags(tags)
+    clean_recommended_account = _queue_recommended_account(recommended_account)
     clean_note = (note or "").strip()
     now = utc_now()
 
@@ -1162,19 +1190,20 @@ def dashboard_queue_assign(
                 """
                 INSERT INTO post_assignments (
                     post_account, post_shortcode, assignee_email, status, note, priority,
-                    due_date, tags, position, created_by_email, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    due_date, tags, recommended_account, position, created_by_email, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(post_account, post_shortcode, assignee_email) DO UPDATE SET
                     status = excluded.status,
                     note = excluded.note,
                     priority = excluded.priority,
                     due_date = excluded.due_date,
                     tags = excluded.tags,
+                    recommended_account = excluded.recommended_account,
                     updated_at = excluded.updated_at
                 """,
                 (
                     clean_account, clean_shortcode, email, clean_status, clean_note, clean_priority,
-                    clean_due_date, json.dumps(clean_tags), position, caller, now, now,
+                    clean_due_date, json.dumps(clean_tags), clean_recommended_account, position, caller, now, now,
                 ),
             )
     return {"ok": True, "assignees": emails}
@@ -1189,6 +1218,7 @@ def dashboard_queue_update_task(
     priority: Annotated[str | None, Form()] = None,
     due_date: Annotated[str | None, Form()] = None,
     tags: Annotated[str | None, Form()] = None,
+    recommended_account: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
     caller = _caller_email(request)
     _queue_editable_assignment(task_id, caller, bool(getattr(request.state, "is_admin", False)))
@@ -1209,6 +1239,9 @@ def dashboard_queue_update_task(
     if tags is not None:
         updates.append("tags = ?")
         params.append(json.dumps(_queue_tags(tags)))
+    if recommended_account is not None:
+        updates.append("recommended_account = ?")
+        params.append(_queue_recommended_account(recommended_account))
     if not updates:
         raise HTTPException(status_code=400, detail="Nothing to update.")
     updates.append("updated_at = ?")
