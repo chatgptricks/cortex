@@ -695,7 +695,7 @@ def seed_queue_role_roster() -> None:
     }
     now = utc_now()
     with connect() as conn:
-        marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v3_seeded'").fetchone()
+        marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v4_seeded'").fetchone()
         if marker:
             return
         for email, (operating_role, is_admin) in roster.items():
@@ -707,7 +707,7 @@ def seed_queue_role_roster() -> None:
             conn.execute(
                 """UPDATE dashboard_users SET role = ?, operating_role = ?, operating_roles = ?, is_admin = ?, updated_at = ?
                    WHERE email = ?""",
-                ("admin" if is_admin else "viewer", operating_role, json.dumps(["pd", "vc"] if email == "esteban@sentientagency.io" else [operating_role]), int(is_admin), now, email),
+                ("admin" if is_admin else "viewer", operating_role, json.dumps(["pd", "vc", "dev"] if email == "esteban@sentientagency.io" else [operating_role]), int(is_admin), now, email),
             )
         # Initial agreed account mapping. The Settings API owns all later
         # additions, so this is intentionally a one-time seed too.
@@ -717,7 +717,7 @@ def seed_queue_role_roster() -> None:
                 ("esteban@sentientagency.io", handle, now),
             )
         conn.execute(
-            "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v3_seeded', '1', ?)",
+            "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v4_seeded', '1', ?)",
             (now,),
         )
 

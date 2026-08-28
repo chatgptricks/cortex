@@ -11,6 +11,7 @@ import time
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -151,8 +152,6 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
             {"detail": "This Google account is not authorized for Sentient Dash."}, status_code=403
         )
     is_admin = bool(access["is_admin"])
-    if path.startswith("/api/admin/") and not is_admin:
-        return JSONResponse({"detail": "Admin access required."}, status_code=403)
     request.state.user_email = email
     request.state.is_admin = is_admin
     request.state.operating_role = access["operating_role"]
@@ -162,6 +161,17 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         request.state.operating_roles = []
     if not request.state.operating_roles:
         request.state.operating_roles = [access["operating_role"]]
+    # Dev is a private role for Esteban. Keep this separate from the active
+    # operating role so a preview cannot make the role switcher disappear.
+    request.state.is_dev = email == "esteban@sentientagency.io" and "dev" in request.state.operating_roles
+    # Esteban's Dev role can safely preview a restricted operating role. This
+    # is deliberately a reduction of privileges, never an escalation.
+    preview_role = request.headers.get("x-queue-role-preview", "").strip().lower()
+    if request.state.is_dev and preview_role in {"sales", "pd", "vc", "admin"}:
+        request.state.operating_roles = [preview_role]
+        request.state.is_admin = preview_role == "admin"
+    if path.startswith("/api/admin/") and not request.state.is_admin:
+        return JSONResponse({"detail": "Admin access required."}, status_code=403)
     request.state.user_uid = decoded.get("uid")
     try:
         # Feeds the Users tab's usage heatmap. Best-effort: a failed insert
@@ -260,6 +270,7 @@ def dashboard_me(request: Request) -> dict[str, Any]:
         "is_admin": bool(getattr(request.state, "is_admin", False)),
         "operating_role": getattr(request.state, "operating_role", "sales"),
         "operating_roles": getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]),
+        "is_dev": bool(getattr(request.state, "is_dev", False)),
     }
 
 
@@ -1496,6 +1507,7 @@ QUEUE_V2_STATUSES = {"pool", "scheduled", "in_progress", "completed", "closed", 
 QUEUE_V2_TAGS = ["content", "design", "copy", "research", "review", "repurpose"]
 SCHEDULER_START = 8 * 60
 SCHEDULER_END = 20 * 60
+SCHEDULER_TIMEZONE = ZoneInfo("America/Costa_Rica")
 
 
 def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[str, bool, list[str]]:
@@ -1617,12 +1629,21 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         params.append(caller)
     with connect() as conn:
         rows = conn.execute(f"SELECT * FROM queue_requests WHERE {' AND '.join(clauses)} ORDER BY deadline_at, id", params).fetchall()
+        assigned_rows = []
+        if not (is_admin or "vc" in roles):
+            assigned_rows = conn.execute(
+                """SELECT * FROM queue_requests
+                   WHERE designer_email = ? AND status NOT IN ('pool', 'closed', 'cancelled')
+                   ORDER BY scheduled_date, scheduled_start_minutes, id""",
+                (caller,),
+            ).fetchall()
     requests = [_queue_v2_project(dict(row)) for row in rows]
+    assigned_requests = [_queue_v2_project(dict(row)) for row in assigned_rows]
     if not (is_admin or "vc" in roles):
         requests = [item for item in requests if item["status"] != "pool"]
     return {
-        "viewer": {"email": caller, "isAdmin": is_admin, "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
-        "date": selected_date, "requests": requests, "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
+        "viewer": {"email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)), "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
+        "date": selected_date, "requests": requests, "assignedRequests": assigned_requests, "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
         "tags": QUEUE_V2_TAGS, "hours": {"start": SCHEDULER_START, "end": SCHEDULER_END},
     }
 
@@ -1698,9 +1719,13 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
                 scheduled_day = datetime.strptime(date, "%Y-%m-%d").date()
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
-            today = datetime.now().date()
+            scheduler_now = datetime.now(SCHEDULER_TIMEZONE)
+            today = scheduler_now.date()
             if scheduled_day < today or scheduled_day > today + timedelta(days=5):
                 raise HTTPException(status_code=400, detail="Schedule requests from today through the next five days.")
+            current_slot = ((scheduler_now.hour * 60 + scheduler_now.minute + 9) // 10) * 10
+            if scheduled_day == today and start < current_slot:
+                raise HTTPException(status_code=400, detail="Today's requests cannot be scheduled before the current time.")
             designer_row = conn.execute("SELECT operating_role FROM dashboard_users WHERE email = ?", (designer,)).fetchone()
             if not designer_row or designer_row["operating_role"] != "pd":
                 raise HTTPException(status_code=400, detail="Choose a Queue designer.")
@@ -1709,6 +1734,8 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
                 raise HTTPException(status_code=404, detail="Queue request not found.")
             if row["status"] == "in_progress":
                 raise HTTPException(status_code=409, detail="An in-progress request cannot be moved.")
+            if start + int(row["production_points"]) * 10 > 24 * 60:
+                raise HTTPException(status_code=400, detail="A request must fit within a single calendar day.")
             if _queue_v2_conflicts(conn, designer, date, start, int(row["production_points"]) * 10, request_id):
                 raise HTTPException(status_code=409, detail="That time overlaps another scheduled request.")
             accounts = entry.get("recommendedAccounts", [])
