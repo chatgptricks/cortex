@@ -1663,6 +1663,29 @@ def dashboard_queue_v2_summary(request: Request) -> dict[str, Any]:
     return {"pending": int(row["c"] if row else 0)}
 
 
+@app.get("/api/dashboard/queue/v2/admin-report")
+def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
+    """Small operational snapshot for Queue admins, intentionally separate
+    from the scheduler payload so designers never receive team-wide totals."""
+    _, is_admin, _ = _queue_v2_access(request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    with connect() as conn:
+        rows = conn.execute("SELECT status, COUNT(*) AS count, COALESCE(SUM(production_points), 0) AS points FROM queue_requests GROUP BY status").fetchall()
+        designers = conn.execute(
+            """SELECT u.email, COUNT(q.id) AS active_requests, COALESCE(SUM(q.production_points), 0) AS production_points
+               FROM dashboard_users u
+               LEFT JOIN queue_requests q ON q.designer_email = u.email
+                 AND q.status IN ('scheduled', 'in_progress', 'completed')
+               WHERE u.operating_role = 'pd'
+               GROUP BY u.email ORDER BY active_requests DESC, u.email"""
+        ).fetchall()
+    totals = {status: {"count": 0, "points": 0} for status in QUEUE_V2_STATUSES}
+    for row in rows:
+        totals[row["status"]] = {"count": int(row["count"]), "points": int(row["points"])}
+    return {"totals": totals, "designers": [{"email": row["email"], "activeRequests": int(row["active_requests"]), "productionPoints": int(row["production_points"])} for row in designers]}
+
+
 @app.post("/api/dashboard/queue/v2/pool")
 def dashboard_queue_v2_pool(
     request: Request, account: Annotated[str, Form()], shortcode: Annotated[str, Form()],
