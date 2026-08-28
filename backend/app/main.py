@@ -1336,23 +1336,22 @@ def dashboard_queue_assign(
                 "assigned" if existing is None else "assignment_refreshed",
                 {"status": clean_status, "recommendedAccount": clean_recommended_account},
             )
-            # A refreshed task is intentionally quiet: the recipient already
-            # owns it, and sending the same DM on every metadata edit would
-            # make Queue notifications noisy. A newly-created task gets one
-            # direct, private message after the transaction commits.
-            if existing is None and email != caller:
-                dm_notifications.append({
-                    "task_id": assignment_id,
-                    "assignee_email": email,
-                    "assigned_by_email": caller,
-                    "account": clean_account,
-                    "post_id": post_id,
-                    "note": clean_note or None,
-                    "due_date": clean_due_date,
-                    "priority": clean_priority,
-                    "tags": clean_tags,
-                    "recommended_account": clean_recommended_account,
-                })
+            # The assignment action itself is the recipient's notification
+            # trigger, whether it creates a task or refreshes one. This also
+            # lets someone intentionally re-send a task after changing its
+            # brief, and self-assignments deserve the same private reminder.
+            dm_notifications.append({
+                "task_id": assignment_id,
+                "assignee_email": email,
+                "assigned_by_email": caller,
+                "account": clean_account,
+                "post_id": post_id,
+                "note": clean_note or None,
+                "due_date": clean_due_date,
+                "priority": clean_priority,
+                "tags": clean_tags,
+                "recommended_account": clean_recommended_account,
+            })
     if dm_notifications:
         from .slack_alerts import notify_queue_assignment
 
