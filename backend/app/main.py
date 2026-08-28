@@ -937,6 +937,20 @@ def _queue_post_exists(account: str, shortcode: str) -> tuple[str, str]:
     return clean_account, clean_shortcode
 
 
+def _queue_post_id(account: str, shortcode: str) -> int | None:
+    """Returns the ID used by the public cover route for a Queue post."""
+    table = _resolve_post_table(account)
+    with connect() as conn:
+        if table == "posts":
+            row = conn.execute("SELECT id FROM posts WHERE shortcode = ?", (shortcode,)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM dashboard_posts WHERE account = ? AND shortcode = ?",
+                (account, shortcode),
+            ).fetchone()
+    return int(row["id"]) if row else None
+
+
 def _queue_rows(assignee: str | None, include_posted: bool) -> list[dict[str, Any]]:
     """Returns assignments with a lightweight current post projection.
 
@@ -1276,7 +1290,9 @@ def dashboard_queue_assign(
     clean_tags = _queue_tags(tags)
     clean_recommended_account = _queue_recommended_account(recommended_account)
     clean_note = (note or "").strip()
+    post_id = _queue_post_id(clean_account, clean_shortcode)
     now = utc_now()
+    dm_notifications: list[dict[str, Any]] = []
 
     with connect() as conn:
         for email in emails:
@@ -1320,6 +1336,28 @@ def dashboard_queue_assign(
                 "assigned" if existing is None else "assignment_refreshed",
                 {"status": clean_status, "recommendedAccount": clean_recommended_account},
             )
+            # A refreshed task is intentionally quiet: the recipient already
+            # owns it, and sending the same DM on every metadata edit would
+            # make Queue notifications noisy. A newly-created task gets one
+            # direct, private message after the transaction commits.
+            if existing is None and email != caller:
+                dm_notifications.append({
+                    "task_id": assignment_id,
+                    "assignee_email": email,
+                    "assigned_by_email": caller,
+                    "account": clean_account,
+                    "post_id": post_id,
+                    "note": clean_note or None,
+                    "due_date": clean_due_date,
+                    "priority": clean_priority,
+                    "tags": clean_tags,
+                    "recommended_account": clean_recommended_account,
+                })
+    if dm_notifications:
+        from .slack_alerts import notify_queue_assignment
+
+        for notification in dm_notifications:
+            notify_queue_assignment(**notification)
     return {"ok": True, "assignees": emails}
 
 

@@ -22,6 +22,26 @@ _PUBLIC_API = os.getenv("PUBLIC_API_BASE", "https://cortex-api-db2e.onrender.com
 # send everyone to production.
 _DASHBOARD = os.getenv("DASHBOARD_BASE", "https://sentientdash.app").rstrip("/")
 
+# Queue users are authenticated by their dashboard email. Slack's Incoming
+# Webhook cannot deliver a message to an arbitrary person's DM, so assignment
+# alerts deliberately use a bot token and this explicit, reviewed mapping.
+# Keeping it local also avoids a users.lookupByEmail dependency and its extra
+# Slack OAuth scope every time someone assigns a post.
+_SLACK_USERS_BY_EMAIL = {
+    "esteban@sentientagency.io": "U08UYJMPJ76",
+    "louis@sentientagency.io": "U06DZPVNTBR",
+    "ivan@sentientagency.io": "U0516SU09J9",
+    "sergio@sentientagency.io": "U087U6470M6",
+    "victor@sentientagency.io": "U0BAJA1AC6P",
+    "egor@sentientagency.io": "U081LU7PVK3",
+    "santiagoflhi@gmail.com": "U0AGH0MJ3EH",
+    "dsflorezl@gmail.com": "U0BH9R6EE4Q",
+    "sara1107giraldo@gmail.com": "U0BGHD1HD0R",
+    "sebastianruizurquijo@gmail.com": "U0BG04Q4Z8F",
+    "tevi@sentientagency.io": "U05QU9WCR1N",
+    "gabo@sentientagency.io": "U0BLJHSUNJG",
+}
+
 
 def dashboard_url_for(account: str, shortcode: str) -> str:
     """Deep link that opens this post in the dashboard's detail rail.
@@ -36,8 +56,18 @@ def dashboard_url_for(account: str, shortcode: str) -> str:
     return f"{_DASHBOARD}/?post={key}"
 
 
+def queue_url_for(task_id: int) -> str:
+    """Deep link which opens exactly one Queue task's side panel."""
+    return f"{_DASHBOARD}/queue.html?task={quote(str(task_id), safe='')}"
+
+
 def slack_configured() -> bool:
     return bool(os.getenv("SLACK_WEBHOOK_URL", "").strip())
+
+
+def slack_assignment_dm_configured() -> bool:
+    """Queue DMs need a bot token; webhooks can only address their channel."""
+    return bool(os.getenv("SLACK_BOT_TOKEN", "").strip())
 
 
 def _fmt_int(value: Any) -> str:
@@ -120,6 +150,103 @@ def notify_hot_post(post: dict[str, Any]) -> bool:
 
 def cover_url_for(account: str, post_id: int) -> str:
     return f"{_PUBLIC_API}/api/dashboard/covers/{account}/{post_id}"
+
+
+def build_queue_assignment_message(
+    *,
+    task_id: int,
+    assignee_email: str,
+    assigned_by_email: str,
+    account: str,
+    post_id: int | None,
+    note: str | None = None,
+    due_date: str | None = None,
+    priority: str | None = None,
+    tags: list[str] | None = None,
+    recommended_account: str | None = None,
+) -> dict[str, Any]:
+    """A concise private assignment message with only actionable metadata."""
+    assigner_id = _SLACK_USERS_BY_EMAIL.get(assigned_by_email.strip().lower())
+    assigner = f"<@{assigner_id}>" if assigner_id else assigned_by_email.split("@", 1)[0]
+    destination = (recommended_account or account).lstrip("@") or "this account"
+    fields: list[dict[str, Any]] = [{"type": "mrkdwn", "text": f"*Source*\n@{account}"}]
+    if due_date:
+        fields.append({"type": "mrkdwn", "text": f"*Deadline*\n{due_date}"})
+    if priority:
+        fields.append({"type": "mrkdwn", "text": f"*Priority*\n{priority.replace('_', ' ').title()}"})
+    if tags:
+        fields.append({"type": "mrkdwn", "text": f"*Tags*\n{', '.join(tags)}"})
+
+    blocks: list[dict[str, Any]] = [
+        {"type": "header", "text": {"type": "plain_text", "text": "New Queue assignment", "emoji": True}},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{assigner} has assigned you this post for *@{destination}*.",
+            },
+        },
+    ]
+    if note:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Brief*\n{note.strip()[:2900]}"}})
+    if fields:
+        blocks.append({"type": "section", "fields": fields})
+    if post_id is not None:
+        blocks.append({"type": "image", "image_url": cover_url_for(account, post_id), "alt_text": f"Post from @{account}"})
+    blocks.append(
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "text": {"type": "plain_text", "text": "Open in Queue", "emoji": True},
+                    "url": queue_url_for(task_id),
+                }
+            ],
+        }
+    )
+    return {"text": f"{assigner} assigned you a post for @{destination}.", "blocks": blocks}
+
+
+def notify_queue_assignment(**assignment: Any) -> bool:
+    """Sends one *private* DM to the assignee; never falls back to a channel.
+
+    A Slack failure must never undo a successfully-created Queue assignment.
+    Required bot scopes: ``chat:write`` and ``im:write``.
+    """
+    token = os.getenv("SLACK_BOT_TOKEN", "").strip()
+    assignee_email = str(assignment.get("assignee_email") or "").strip().lower()
+    recipient = _SLACK_USERS_BY_EMAIL.get(assignee_email)
+    if not token:
+        logger.warning("Queue assignment DM skipped: SLACK_BOT_TOKEN is not configured")
+        return False
+    if not recipient:
+        logger.warning("Queue assignment DM skipped: no Slack user mapping for %s", assignee_email)
+        return False
+    try:
+        import httpx
+
+        headers = {"Authorization": f"Bearer {token}"}
+        with httpx.Client(timeout=15.0) as client:
+            opened = client.post("https://slack.com/api/conversations.open", headers=headers, json={"users": recipient})
+            opened.raise_for_status()
+            opened_data = opened.json()
+            if not opened_data.get("ok") or not opened_data.get("channel", {}).get("id"):
+                logger.error("Queue assignment DM open rejected: %s", opened_data.get("error", "unknown error"))
+                return False
+            payload = build_queue_assignment_message(**assignment)
+            payload["channel"] = opened_data["channel"]["id"]
+            sent = client.post("https://slack.com/api/chat.postMessage", headers=headers, json=payload)
+            sent.raise_for_status()
+            sent_data = sent.json()
+            if not sent_data.get("ok"):
+                logger.error("Queue assignment DM rejected: %s", sent_data.get("error", "unknown error"))
+                return False
+        return True
+    except Exception:
+        logger.exception("Queue assignment DM failed for %s", assignee_email)
+        return False
 
 
 def alert_image_url_for(filename: str) -> str:
