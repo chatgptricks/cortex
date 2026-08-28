@@ -213,7 +213,7 @@ def notify_queue_assignment(**assignment: Any) -> bool:
     """Sends one *private* DM to the assignee; never falls back to a channel.
 
     A Slack failure must never undo a successfully-created Queue assignment.
-    Required bot scopes: ``chat:write`` and ``im:write``.
+    Required bot scopes: ``chat:write``, ``im:write``, and ``im:read``.
     """
     token = os.getenv("SLACK_BOT_TOKEN", "").strip()
     assignee_email = str(assignment.get("assignee_email") or "").strip().lower()
@@ -232,11 +232,31 @@ def notify_queue_assignment(**assignment: Any) -> bool:
             opened = client.post("https://slack.com/api/conversations.open", headers=headers, json={"users": recipient})
             opened.raise_for_status()
             opened_data = opened.json()
-            if not opened_data.get("ok") or not opened_data.get("channel", {}).get("id"):
+            opened_channel = opened_data.get("channel") or {}
+            channel_id = opened_channel.get("id")
+            if not opened_data.get("ok") or not channel_id:
                 logger.error("Queue assignment DM open rejected: %s", opened_data.get("error", "unknown error"))
                 return False
+            # conversations.open returns only an ID. Verify the conversation
+            # itself before posting, so an assignment can never be delivered
+            # to a group or channel by mistake.
+            inspected = client.get(
+                "https://slack.com/api/conversations.info",
+                headers=headers,
+                params={"channel": channel_id},
+            )
+            inspected.raise_for_status()
+            inspected_data = inspected.json()
+            channel = inspected_data.get("channel") or {}
+            if (
+                not inspected_data.get("ok")
+                or not channel.get("is_im")
+                or channel.get("user") != recipient
+            ):
+                logger.error("Queue assignment DM verification rejected: %s", inspected_data.get("error", "not a one-to-one IM"))
+                return False
             payload = build_queue_assignment_message(**assignment)
-            payload["channel"] = opened_data["channel"]["id"]
+            payload["channel"] = channel_id
             sent = client.post("https://slack.com/api/chat.postMessage", headers=headers, json=payload)
             sent.raise_for_status()
             sent_data = sent.json()
