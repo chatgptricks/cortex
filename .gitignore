@@ -20,3 +20,7 @@ frontend/.vite/
 # Source data exports (not for git)
 Post DB/
 workers/__pycache__/
+
+# Local agent-handover notes -- session-to-session scratch, not project docs.
+AGENTS.md
+FOR_CODEX.md
