@@ -165,38 +165,48 @@ def build_queue_assignment_message(
     priority: str | None = None,
     tags: list[str] | None = None,
     recommended_account: str | None = None,
+    production_points: int | None = None,
+    scheduled_date: str | None = None,
+    scheduled_start_minutes: int | None = None,
+    update: bool = False,
 ) -> dict[str, Any]:
     """A concise private assignment message with only actionable metadata."""
     assigner_id = _SLACK_USERS_BY_EMAIL.get(assigned_by_email.strip().lower())
     assigner = f"<@{assigner_id}>" if assigner_id else assigned_by_email.split("@", 1)[0]
-    destination = (recommended_account or account).lstrip("@") or "this account"
+    destination = (recommended_account or "").lstrip("@")
     metadata: list[str] = []
     if due_date:
         try:
-            due = datetime.strptime(due_date, "%Y-%m-%d").strftime("%b %-d, %Y")
+            due = datetime.fromisoformat(due_date.replace("Z", "+00:00")).strftime("%b %-d, %Y · %-I:%M %p")
         except ValueError:
             due = due_date
-        metadata.append(f"*Due* {due}")
+        metadata.append(f"*Deadline*\n{due}")
     if priority:
         metadata.append(f"*Priority* {priority.replace('_', ' ').title()}")
     if tags:
-        metadata.append(f"*Tags* {', '.join(f'`{tag}`' for tag in tags)}")
+        metadata.append(f"*Tags*\n{', '.join(f'`{tag}`' for tag in tags)}")
+    if production_points:
+        metadata.append(f"*Production*\n{production_points} PP · {production_points * 10} min")
+    if scheduled_date is not None and scheduled_start_minutes is not None:
+        hours, minutes = divmod(int(scheduled_start_minutes), 60)
+        scheduled = f"{scheduled_date} · {hours % 12 or 12}:{minutes:02d} {'AM' if hours < 12 else 'PM'}"
+        metadata.append(f"*Scheduled*\n{scheduled}")
 
     blocks: list[dict[str, Any]] = [
-        {"type": "header", "text": {"type": "plain_text", "text": "New Queue assignment", "emoji": True}},
+        {"type": "header", "text": {"type": "plain_text", "text": "Queue schedule updated" if update else "New Queue assignment", "emoji": True}},
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"{assigner} has assigned you this post for *@{destination}*.",
+                "text": f"{assigner} {'updated' if update else 'assigned'} this post{' for *@' + destination + '*' if destination else ''}.",
             },
         },
     ]
     if note:
-        brief = note.strip()[:1800].replace("\n", "\n>")
+        brief = note.strip()[:1800].replace("\n", "\n> ")
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Brief*\n> {brief}"}})
     if metadata:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "  ·  ".join(metadata)}})
+        blocks.append({"type": "section", "fields": [{"type": "mrkdwn", "text": value} for value in metadata]})
     if post_id is not None:
         blocks.append({"type": "image", "image_url": cover_url_for(account, post_id), "alt_text": f"Post from @{account}"})
     blocks.append(

@@ -273,6 +273,63 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_post_assignment_events_assignment
                 ON post_assignment_events(assignment_id, created_at DESC);
 
+            -- Queue V2 is a production scheduler, deliberately separate from
+            -- the earlier thumbnail board above.  A source post can have one
+            -- active production request at a time and the request retains its
+            -- own immutable work history even when the source post changes.
+            CREATE TABLE IF NOT EXISTS queue_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_account TEXT NOT NULL,
+                post_shortcode TEXT NOT NULL,
+                post_permalink TEXT NOT NULL DEFAULT '',
+                post_caption TEXT NOT NULL DEFAULT '',
+                post_type TEXT NOT NULL DEFAULT '',
+                cover_url TEXT NOT NULL DEFAULT '',
+                production_points INTEGER NOT NULL CHECK(production_points > 0),
+                deadline_at TEXT NOT NULL,
+                tags TEXT NOT NULL DEFAULT '[]',
+                brief TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                reference_links TEXT NOT NULL DEFAULT '[]',
+                attachments TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pool'
+                    CHECK(status IN ('pool','scheduled','in_progress','completed','closed','cancelled')),
+                designer_email TEXT,
+                coordinator_email TEXT NOT NULL,
+                recommended_accounts TEXT NOT NULL DEFAULT '[]',
+                scheduled_date TEXT,
+                scheduled_start_minutes INTEGER,
+                actual_started_at TEXT,
+                completed_at TEXT,
+                closed_at TEXT,
+                final_permalink TEXT,
+                cancellation_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(post_account, post_shortcode)
+            );
+            CREATE INDEX IF NOT EXISTS idx_queue_requests_day
+                ON queue_requests(scheduled_date, designer_email, scheduled_start_minutes);
+            CREATE INDEX IF NOT EXISTS idx_queue_requests_status
+                ON queue_requests(status, deadline_at);
+            CREATE TABLE IF NOT EXISTS queue_request_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL,
+                actor_email TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(request_id) REFERENCES queue_requests(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_queue_request_events_request
+                ON queue_request_events(request_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS queue_designer_accounts (
+                designer_email TEXT NOT NULL,
+                account_handle TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(designer_email, account_handle)
+            );
+
             -- One row per authenticated request, logged from the Firebase
             -- middleware. Feeds the Users tab's usage heatmap (who's active,
             -- when, and in which part of the app) -- there was previously no
@@ -314,6 +371,8 @@ def init_db() -> None:
         # independent from post_account: a post found on one account can be
         # recommended for another active Sentient account.
         _ensure_column(conn, "post_assignments", "recommended_account", "recommended_account TEXT")
+        _ensure_column(conn, "dashboard_users", "operating_role", "operating_role TEXT NOT NULL DEFAULT 'sales'")
+        _ensure_column(conn, "dashboard_users", "is_admin", "is_admin INTEGER NOT NULL DEFAULT 0")
         # Following count -- added after account_snapshots shipped, so older
         # snapshots have NULL here; the Tracker's historical-stats table just
         # shows "--" for those rows instead of a delta.
@@ -527,7 +586,9 @@ def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: 
 def list_dashboard_users() -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
-            "SELECT email, role, created_at, updated_at FROM dashboard_users ORDER BY role DESC, email ASC"
+            """SELECT email, role, operating_role, is_admin, created_at, updated_at
+               FROM dashboard_users
+               ORDER BY is_admin DESC, operating_role ASC, email ASC"""
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -540,25 +601,48 @@ def get_dashboard_user_role(email: str) -> str | None:
         return row["role"] if row else None
 
 
+def get_dashboard_user_access(email: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT email, operating_role, is_admin, role FROM dashboard_users WHERE email = ?",
+            (email.strip().lower(),),
+        ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        # Existing databases only have the legacy role until init_db's
+        # migration has run; honour it during that tiny transition window.
+        value["is_admin"] = bool(value["is_admin"] or value["role"] == "admin")
+        value["operating_role"] = value["operating_role"] or "sales"
+        return value
+
+
 def count_dashboard_admins() -> int:
     with connect() as conn:
-        row = conn.execute("SELECT COUNT(*) AS c FROM dashboard_users WHERE role = 'admin'").fetchone()
+        row = conn.execute("SELECT COUNT(*) AS c FROM dashboard_users WHERE is_admin = 1 OR role = 'admin'").fetchone()
         return int(row["c"]) if row else 0
 
 
-def upsert_dashboard_user(email: str, role: str) -> None:
+def upsert_dashboard_user(email: str, role: str = "viewer", operating_role: str | None = None, is_admin: bool | None = None) -> None:
     if role not in ("admin", "viewer"):
-        raise ValueError(f"Invalid role: {role!r}")
+        raise ValueError(f"Invalid legacy role: {role!r}")
+    if operating_role is not None and operating_role not in ("vc", "pd", "sales"):
+        raise ValueError(f"Invalid operating role: {operating_role!r}")
     email = email.strip().lower()
+    operating_role = operating_role or "sales"
+    admin_value = bool(role == "admin") if is_admin is None else bool(is_admin)
+    legacy_role = "admin" if admin_value else "viewer"
     now = utc_now()
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO dashboard_users (email, role, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(email) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at
+            INSERT INTO dashboard_users (email, role, operating_role, is_admin, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET
+                role = excluded.role, operating_role = excluded.operating_role,
+                is_admin = excluded.is_admin, updated_at = excluded.updated_at
             """,
-            (email, role, now, now),
+            (email, legacy_role, operating_role, int(admin_value), now, now),
         )
 
 
@@ -585,9 +669,56 @@ def seed_dashboard_users_from_env(allowed_emails: set[str], admin_emails: set[st
                 continue
             role = "admin" if email in admin_emails else "viewer"
             conn.execute(
-                "INSERT INTO dashboard_users (email, role, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (email, role, now, now),
+                """INSERT INTO dashboard_users (email, role, operating_role, is_admin, created_at, updated_at)
+                   VALUES (?, ?, 'sales', ?, ?, ?)""",
+                (email, role, int(role == "admin"), now, now),
             )
+
+
+def seed_queue_role_roster() -> None:
+    """Apply the agreed initial Queue operating roles once, after env users
+    have been seeded.  Admin is independent of VC/PD/Sales."""
+    roster = {
+        "esteban@sentientagency.io": ("pd", True),
+        "louis@sentientagency.io": ("vc", True),
+        "ivan@sentientagency.io": ("vc", True),
+        "sergio@sentientagency.io": ("vc", True),
+        "victor@sentientagency.io": ("sales", False),
+        "egor@sentientagency.io": ("sales", False),
+        "santiagoflhi@gmail.com": ("pd", False),
+        "dsflorezl@gmail.com": ("pd", False),
+        "sara1107giraldo@gmail.com": ("pd", False),
+        "sebastianruizurquijo@gmail.com": ("pd", False),
+        "tevi@sentientagency.io": ("vc", False),
+        "gabo@sentientagency.io": ("pd", False),
+    }
+    now = utc_now()
+    with connect() as conn:
+        marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v2_seeded'").fetchone()
+        if marker:
+            return
+        for email, (operating_role, is_admin) in roster.items():
+            exists = conn.execute("SELECT email FROM dashboard_users WHERE email = ?", (email,)).fetchone()
+            if not exists:
+                # Do not silently grant dashboard access to emails not in the
+                # Firebase allowlist. Settings can add them later if needed.
+                continue
+            conn.execute(
+                """UPDATE dashboard_users SET role = ?, operating_role = ?, is_admin = ?, updated_at = ?
+                   WHERE email = ?""",
+                ("admin" if is_admin else "viewer", operating_role, int(is_admin), now, email),
+            )
+        # Initial agreed account mapping. The Settings API owns all later
+        # additions, so this is intentionally a one-time seed too.
+        for handle in ("chatgptricks", "costarica"):
+            conn.execute(
+                "INSERT OR IGNORE INTO queue_designer_accounts (designer_email, account_handle, created_at) VALUES (?, ?, ?)",
+                ("esteban@sentientagency.io", handle, now),
+            )
+        conn.execute(
+            "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v2_seeded', '1', ?)",
+            (now,),
+        )
 
 
 def log_usage_event(email: str, path: str, method: str) -> None:
