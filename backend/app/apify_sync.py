@@ -1711,7 +1711,7 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
     from the post's first-hour velocity, and recomputing it from a like count
     weeks later would be meaningless.
     """
-    from .db import connect
+    from .db import connect, utc_now
 
     cfg = get_account_config(handle)
     table = cfg["table"]
