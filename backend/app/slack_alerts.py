@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -169,13 +170,17 @@ def build_queue_assignment_message(
     assigner_id = _SLACK_USERS_BY_EMAIL.get(assigned_by_email.strip().lower())
     assigner = f"<@{assigner_id}>" if assigner_id else assigned_by_email.split("@", 1)[0]
     destination = (recommended_account or account).lstrip("@") or "this account"
-    fields: list[dict[str, Any]] = []
+    metadata: list[str] = []
     if due_date:
-        fields.append({"type": "mrkdwn", "text": f"*Deadline*\n{due_date}"})
+        try:
+            due = datetime.strptime(due_date, "%Y-%m-%d").strftime("%b %-d, %Y")
+        except ValueError:
+            due = due_date
+        metadata.append(f"*Due* {due}")
     if priority:
-        fields.append({"type": "mrkdwn", "text": f"*Priority*\n{priority.replace('_', ' ').title()}"})
+        metadata.append(f"*Priority* {priority.replace('_', ' ').title()}")
     if tags:
-        fields.append({"type": "mrkdwn", "text": f"*Tags*\n{', '.join(tags)}"})
+        metadata.append(f"*Tags* {', '.join(f'`{tag}`' for tag in tags)}")
 
     blocks: list[dict[str, Any]] = [
         {"type": "header", "text": {"type": "plain_text", "text": "New Queue assignment", "emoji": True}},
@@ -188,9 +193,10 @@ def build_queue_assignment_message(
         },
     ]
     if note:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Brief*\n{note.strip()[:2900]}"}})
-    if fields:
-        blocks.append({"type": "section", "fields": fields})
+        brief = note.strip()[:1800].replace("\n", "\n>")
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Brief*\n> {brief}"}})
+    if metadata:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "  ·  ".join(metadata)}})
     if post_id is not None:
         blocks.append({"type": "image", "image_url": cover_url_for(account, post_id), "alt_text": f"Post from @{account}"})
     blocks.append(
