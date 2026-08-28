@@ -169,7 +169,7 @@ def build_queue_assignment_message(
     assigner_id = _SLACK_USERS_BY_EMAIL.get(assigned_by_email.strip().lower())
     assigner = f"<@{assigner_id}>" if assigner_id else assigned_by_email.split("@", 1)[0]
     destination = (recommended_account or account).lstrip("@") or "this account"
-    fields: list[dict[str, Any]] = [{"type": "mrkdwn", "text": f"*Source*\n@{account}"}]
+    fields: list[dict[str, Any]] = []
     if due_date:
         fields.append({"type": "mrkdwn", "text": f"*Deadline*\n{due_date}"})
     if priority:
