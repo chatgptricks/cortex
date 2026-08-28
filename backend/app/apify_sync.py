@@ -1713,7 +1713,7 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
     """
     from .db import connect
 
-    cfg = _account_config(handle)
+    cfg = get_account_config(handle)
     table = cfg["table"]
     clean = shortcode.strip()
     if not clean:
