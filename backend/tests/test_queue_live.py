@@ -90,3 +90,42 @@ def test_every_dashboard_user_is_pd_capable_by_default():
         "operating_roles": json.dumps(["sales"]),
     })
     assert roles == ["sales", "pd"]
+
+
+def test_schedule_change_can_return_request_to_pool(monkeypatch, tmp_path):
+    database = tmp_path / "queue-pool-return.sqlite3"
+    conn = sqlite3.connect(database)
+    conn.executescript(
+        """
+        CREATE TABLE queue_requests (
+            id INTEGER PRIMARY KEY, production_points INTEGER, status TEXT, designer_email TEXT,
+            scheduled_date TEXT, scheduled_start_minutes INTEGER, post_account TEXT, post_shortcode TEXT,
+            coordinator_email TEXT, recommended_accounts TEXT, updated_at TEXT
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO queue_requests VALUES (1, 3, 'scheduled', 'pd@example.com', '2026-09-01', 540, 'chatgptricks', 'ONE', 'vc@example.com', '[]', '')"
+    )
+    conn.commit()
+    conn.close()
+
+    @contextmanager
+    def isolated_connect():
+        value = sqlite3.connect(database)
+        value.row_factory = sqlite3.Row
+        try:
+            yield value
+            value.commit()
+        finally:
+            value.close()
+
+    monkeypatch.setattr(main, "connect", isolated_connect)
+    with isolated_connect() as value:
+        prepared = main._queue_v2_prepare_schedule_changes(value, [{
+            "id": 1, "status": "pool", "designerEmail": None, "scheduledDate": None,
+            "scheduledStartMinutes": None, "productionPoints": 4, "recommendedAccounts": ["chatgptricks"],
+        }])
+    assert prepared[0]["pool"] is True
+    assert prepared[0]["designer"] is None
+    assert prepared[0]["duration"] == 40

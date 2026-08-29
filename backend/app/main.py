@@ -1517,6 +1517,11 @@ def dashboard_queue_reorder(
 QUEUE_V2_STATUSES = {"pool", "scheduled", "in_progress", "completed", "closed", "cancelled"}
 QUEUE_V2_TAGS = ["content", "design", "copy", "research", "review", "repurpose"]
 QUEUE_V2_PRIORITIES = ["low", "medium", "high", "urgent"]
+# queue_schedule_drafts predates pool return support and keeps its placement
+# columns NOT NULL. These private sentinels let a provisional unassignment be
+# shared live without changing the existing SQLite table shape.
+QUEUE_V2_POOL_DRAFT_DESIGNER = "__queue_pool__"
+QUEUE_V2_POOL_DRAFT_DATE = "0000-00-00"
 
 
 def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[str, bool, list[str]]:
@@ -1747,6 +1752,19 @@ def _queue_v2_project_draft(row: dict[str, Any]) -> dict[str, Any]:
     if draft_points is not None:
         item["productionPoints"] = int(draft_points)
         item["durationMinutes"] = int(draft_points) * 10
+    if row["draft_designer_email"] == QUEUE_V2_POOL_DRAFT_DESIGNER:
+        item.update({
+            "committedStatus": item["status"],
+            "status": "pool",
+            "designerEmail": None,
+            "scheduledDate": None,
+            "scheduledStartMinutes": None,
+            "recommendedAccounts": _queue_v2_json(row["draft_recommended_accounts"], []),
+            "isDraft": True,
+            "draftCoordinatorEmail": row["draft_coordinator_email"],
+            "draftUpdatedAt": row["draft_updated_at"],
+        })
+        return item
     item.update({
         "committedStatus": item["status"],
         "status": "scheduled",
@@ -1765,8 +1783,11 @@ def _queue_v2_draft_rows(conn: Any, *, designer_email: str | None = None, reques
     clauses: list[str] = []
     params: list[Any] = []
     if designer_email:
-        clauses.append("d.designer_email = ?")
-        params.append(designer_email)
+        # Pool-return drafts are visible to every Queue participant so the
+        # assigned designer immediately sees the old block disappear before
+        # the VC submits the change.
+        clauses.append("(d.designer_email = ? OR d.designer_email = ?)")
+        params.extend([designer_email, QUEUE_V2_POOL_DRAFT_DESIGNER])
     if request_ids is not None:
         if not request_ids:
             return []
@@ -1852,26 +1873,14 @@ def _queue_v2_prepare_schedule_changes(
     changed_ids: set[int] = set()
     for entry in entries:
         try:
-            request_id, designer = int(entry["id"]), str(entry["designerEmail"]).strip().lower()
-            date, start = str(entry["scheduledDate"]), int(entry["scheduledStartMinutes"])
+            request_id = int(entry["id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid schedule change.") from exc
         if request_id in changed_ids:
             raise HTTPException(status_code=400, detail="A Queue request can only appear once per change set.")
         changed_ids.add(request_id)
-        if start % 10 or start < SCHEDULER_START or start >= SCHEDULER_END:
-            raise HTTPException(status_code=400, detail="Tasks must begin in 10-minute scheduler slots.")
-        try:
-            datetime.strptime(date, "%Y-%m-%d").date()
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
-        designer_row = conn.execute(
-            "SELECT operating_role, operating_roles, slack_user_id FROM dashboard_users WHERE email = ?",
-            (designer,),
-        ).fetchone()
-        designer_roles = _queue_v2_user_roles(dict(designer_row)) if designer_row else []
-        if not designer_row or "pd" not in designer_roles:
-            raise HTTPException(status_code=400, detail="Choose a Queue designer.")
+        raw_designer = entry.get("designerEmail")
+        is_pool_return = entry.get("status") == "pool" or raw_designer in (None, "")
         row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Queue request not found.")
@@ -1886,10 +1895,36 @@ def _queue_v2_prepare_schedule_changes(
         accounts = entry.get("recommendedAccounts", [])
         if not isinstance(accounts, list):
             accounts = []
+        clean_accounts = [str(value).strip().lstrip("@").lower() for value in accounts if str(value).strip()]
+        clean_accounts = list(dict.fromkeys(clean_accounts))
+        if is_pool_return:
+            prepared.append({
+                "id": request_id, "designer": None, "date": None, "start": None,
+                "productionPoints": production_points, "duration": production_points * 10,
+                "accounts": clean_accounts, "row": dict(row), "assigneeSlackId": "", "pool": True,
+            })
+            continue
+        try:
+            designer = str(raw_designer).strip().lower()
+            date, start = str(entry["scheduledDate"]), int(entry["scheduledStartMinutes"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid schedule change.") from exc
+        if start % 10 or start < SCHEDULER_START or start >= SCHEDULER_END:
+            raise HTTPException(status_code=400, detail="Tasks must begin in 10-minute scheduler slots.")
+        try:
+            datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
+        designer_row = conn.execute(
+            "SELECT operating_role, operating_roles, slack_user_id FROM dashboard_users WHERE email = ?",
+            (designer,),
+        ).fetchone()
+        designer_roles = _queue_v2_user_roles(dict(designer_row)) if designer_row else []
+        if not designer_row or "pd" not in designer_roles:
+            raise HTTPException(status_code=400, detail="Choose a Queue designer.")
         allowed = {item["account_handle"] for item in conn.execute(
             "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ?", (designer,),
         ).fetchall()}
-        clean_accounts = [str(value).strip().lstrip("@").lower() for value in accounts if str(value).strip()]
         # A move between designers should never fail merely because the old
         # designer's recommended account is not owned by the new one. Keep
         # only accounts valid for the target; account selection is optional.
@@ -1902,7 +1937,7 @@ def _queue_v2_prepare_schedule_changes(
         })
 
     occupied_by_designer: dict[str, list[dict[str, Any]]] = {}
-    for designer in {item["designer"] for item in prepared}:
+    for designer in {item["designer"] for item in prepared if item["designer"]}:
         other_drafts = [dict(row) for row in conn.execute(
             """SELECT d.request_id, d.coordinator_email, d.scheduled_date, d.scheduled_start_minutes,
                       COALESCE(d.production_points, r.production_points) AS production_points
@@ -1926,7 +1961,7 @@ def _queue_v2_prepare_schedule_changes(
             "duration": int(row["production_points"]) * 10,
         } for row in other_drafts)
 
-    for item in sorted(prepared, key=lambda value: (value["designer"], schedule_absolute(value["date"], value["start"]), value["id"])):
+    for item in sorted((value for value in prepared if value["designer"]), key=lambda value: (value["designer"], schedule_absolute(value["date"], value["start"]), value["id"])):
         item["date"], item["start"] = next_available_slot(
             item["date"], item["start"], item["duration"], occupied_by_designer[item["designer"]],
         )
@@ -2071,7 +2106,10 @@ def dashboard_queue_v2_request_detail(request_id: int, request: Request) -> dict
     _queue_v2_require_visible(row, caller, is_admin, roles)
     with connect() as conn:
         draft_rows = _queue_v2_draft_rows(conn, request_ids={request_id})
-    if draft_rows and (is_admin or "vc" in roles or draft_rows[0]["draft_designer_email"] == caller):
+    if draft_rows and (
+        is_admin or "vc" in roles or draft_rows[0]["draft_designer_email"] == caller
+        or (draft_rows[0]["draft_designer_email"] == QUEUE_V2_POOL_DRAFT_DESIGNER and row.get("designer_email") == caller)
+    ):
         return {"request": _queue_v2_project_draft(draft_rows[0])}
     return {"request": _queue_v2_project(row)}
 
@@ -2229,7 +2267,9 @@ def dashboard_queue_v2_drafts(request: Request, changes: Annotated[str, Form()])
                      recommended_accounts = excluded.recommended_accounts,
                      production_points = excluded.production_points,
                      updated_at = excluded.updated_at""",
-                (item["id"], caller, item["designer"], item["date"], item["start"], json.dumps(item["accounts"]), item["productionPoints"], now),
+                (item["id"], caller, item["designer"] or QUEUE_V2_POOL_DRAFT_DESIGNER,
+                 item["date"] or QUEUE_V2_POOL_DRAFT_DATE, item["start"] if item["start"] is not None else 0,
+                 json.dumps(item["accounts"]), item["productionPoints"], now),
             )
         changed_ids = previous_ids | incoming_ids
         revision = _queue_v2_publish(conn, "draft_updated", caller, changed_ids)
@@ -2280,6 +2320,16 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
         assigner_slack_id = assigner_row["slack_user_id"] if assigner_row else ""
         for item in prepared:
             row = item["row"]
+            if item.get("pool"):
+                conn.execute(
+                    """UPDATE queue_requests SET designer_email = NULL, coordinator_email = ?,
+                       scheduled_date = NULL, scheduled_start_minutes = NULL,
+                       recommended_accounts = ?, production_points = ?, status = 'pool',
+                       slack_channel_id = NULL, slack_message_ts = NULL, updated_at = ? WHERE id = ?""",
+                    (caller, json.dumps(item["accounts"]), item["productionPoints"], now, item["id"]),
+                )
+                _queue_v2_log(conn, item["id"], caller, "returned_to_pool", {"productionPoints": item["productionPoints"]})
+                continue
             was_scheduled = row["status"] != "pool"
             same_assignee = str(row.get("designer_email") or "").strip().lower() == item["designer"]
             same_assignees[item["id"]] = same_assignee
@@ -2293,7 +2343,7 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
                  now, item["id"]),
             )
             _queue_v2_log(conn, item["id"], caller, "resubmitted" if was_scheduled else "scheduled", {"designer": item["designer"], "date": item["date"], "start": item["start"], "accounts": item["accounts"]})
-        for designer in {item["designer"] for item in prepared}:
+        for designer in {item["designer"] for item in prepared if item["designer"]}:
             _queue_v2_reflow_scheduled(conn, designer, caller)
         submitted_ids = {item["id"] for item in prepared}
         placeholders = ",".join("?" for _ in submitted_ids)
@@ -2301,6 +2351,9 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
         _queue_v2_publish(conn, "schedule_submitted", caller, submitted_ids)
         for item in prepared:
             row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (item["id"],)).fetchone())
+            if item.get("pool"):
+                adjustments.append({"id": item["id"], "designerEmail": None, "scheduledDate": None, "scheduledStartMinutes": None, "status": "pool"})
+                continue
             final_date, final_start = row["scheduled_date"], int(row["scheduled_start_minutes"])
             adjustments.append({"id": item["id"], "designerEmail": item["designer"], "scheduledDate": final_date, "scheduledStartMinutes": final_start})
             notifications.append({"task_id": item["id"], "assignee_email": item["designer"], "assigned_by_email": caller,
