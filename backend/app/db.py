@@ -332,6 +332,33 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(designer_email, account_handle)
             );
+            -- Scheduler placements are collaborative before Submit.  Keeping
+            -- the provisional position on the server lets the assigned PD
+            -- see a VC's drag immediately while the committed request remains
+            -- unchanged (and therefore sends no notification yet).
+            CREATE TABLE IF NOT EXISTS queue_schedule_drafts (
+                request_id INTEGER PRIMARY KEY,
+                coordinator_email TEXT NOT NULL,
+                designer_email TEXT NOT NULL,
+                scheduled_date TEXT NOT NULL,
+                scheduled_start_minutes INTEGER NOT NULL,
+                recommended_accounts TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(request_id) REFERENCES queue_requests(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_queue_schedule_drafts_designer
+                ON queue_schedule_drafts(designer_email, scheduled_date, scheduled_start_minutes);
+            -- A durable monotonic revision is the rendezvous point for the
+            -- authenticated live stream.  It works across reconnects and
+            -- process restarts instead of relying on in-memory pub/sub.
+            CREATE TABLE IF NOT EXISTS queue_live_state (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                revision INTEGER NOT NULL DEFAULT 0,
+                event_type TEXT NOT NULL DEFAULT '',
+                actor_email TEXT NOT NULL DEFAULT '',
+                request_ids TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL
+            );
 
             -- One row per authenticated request, logged from the Firebase
             -- middleware. Feeds the Users tab's usage heatmap (who's active,
@@ -381,6 +408,12 @@ def init_db() -> None:
         _ensure_column(conn, "queue_requests", "priority", "priority TEXT NOT NULL DEFAULT 'medium'")
         conn.execute("DROP INDEX IF EXISTS idx_queue_requests_status")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_requests_status_priority ON queue_requests(status, priority)")
+        conn.execute(
+            """INSERT OR IGNORE INTO queue_live_state
+               (id, revision, event_type, actor_email, request_ids, updated_at)
+               VALUES (1, 0, '', '', '[]', ?)""",
+            (utc_now(),),
+        )
         # Following count -- added after account_snapshots shipped, so older
         # snapshots have NULL here; the Tracker's historical-stats table just
         # shows "--" for those rows instead of a delta.

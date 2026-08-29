@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .apify_sync import (
@@ -1562,7 +1563,14 @@ def _queue_v2_request(request_id: int) -> dict[str, Any]:
 
 
 def _queue_v2_require_visible(row: dict[str, Any], caller: str, is_admin: bool, roles: list[str]) -> None:
-    if not (is_admin or "vc" in roles or row.get("designer_email") == caller):
+    if is_admin or "vc" in roles or row.get("designer_email") == caller:
+        return
+    with connect() as conn:
+        draft = conn.execute(
+            "SELECT 1 FROM queue_schedule_drafts WHERE request_id = ? AND designer_email = ?",
+            (row["id"], caller),
+        ).fetchone()
+    if not draft:
         raise HTTPException(status_code=403, detail="Not allowed to view this request.")
 
 
@@ -1605,6 +1613,32 @@ def _queue_v2_log(conn: Any, request_id: int, actor: str, event_type: str, detai
         "INSERT INTO queue_request_events (request_id, actor_email, event_type, details, created_at) VALUES (?, ?, ?, ?, ?)",
         (request_id, actor, event_type, json.dumps(details or {}), utc_now()),
     )
+
+
+def _queue_v2_publish(conn: Any, event_type: str, actor: str, request_ids: list[int] | set[int] | tuple[int, ...] = ()) -> int:
+    """Advance Queue's durable live revision inside the caller transaction."""
+    now = utc_now()
+    clean_ids = sorted({int(item) for item in request_ids})
+    conn.execute(
+        """UPDATE queue_live_state
+           SET revision = revision + 1, event_type = ?, actor_email = ?, request_ids = ?, updated_at = ?
+           WHERE id = 1""",
+        (event_type, actor, json.dumps(clean_ids), now),
+    )
+    row = conn.execute("SELECT revision FROM queue_live_state WHERE id = 1").fetchone()
+    return int(row["revision"] if row else 0)
+
+
+def _queue_v2_live_snapshot(conn: Any) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT revision, event_type, actor_email, request_ids, updated_at FROM queue_live_state WHERE id = 1"
+    ).fetchone()
+    if not row:
+        return {"revision": 0, "type": "", "actorEmail": "", "requestIds": [], "updatedAt": ""}
+    return {
+        "revision": int(row["revision"]), "type": row["event_type"], "actorEmail": row["actor_email"],
+        "requestIds": _queue_v2_json(row["request_ids"], []), "updatedAt": row["updated_at"],
+    }
 
 
 def _queue_v2_duration(row: dict[str, Any]) -> int:
@@ -1698,6 +1732,52 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _queue_v2_project_draft(row: dict[str, Any]) -> dict[str, Any]:
+    item = _queue_v2_project(row)
+    item.update({
+        "committedStatus": item["status"],
+        "status": "scheduled",
+        "designerEmail": row["draft_designer_email"],
+        "scheduledDate": row["draft_scheduled_date"],
+        "scheduledStartMinutes": int(row["draft_scheduled_start_minutes"]),
+        "recommendedAccounts": _queue_v2_json(row["draft_recommended_accounts"], []),
+        "isDraft": True,
+        "draftCoordinatorEmail": row["draft_coordinator_email"],
+        "draftUpdatedAt": row["draft_updated_at"],
+    })
+    return item
+
+
+def _queue_v2_draft_rows(conn: Any, *, designer_email: str | None = None, request_ids: set[int] | None = None) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if designer_email:
+        clauses.append("d.designer_email = ?")
+        params.append(designer_email)
+    if request_ids is not None:
+        if not request_ids:
+            return []
+        placeholders = ",".join("?" for _ in request_ids)
+        clauses.append(f"d.request_id IN ({placeholders})")
+        params.extend(sorted(request_ids))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        f"""SELECT r.*,
+                   d.coordinator_email AS draft_coordinator_email,
+                   d.designer_email AS draft_designer_email,
+                   d.scheduled_date AS draft_scheduled_date,
+                   d.scheduled_start_minutes AS draft_scheduled_start_minutes,
+                   d.recommended_accounts AS draft_recommended_accounts,
+                   d.updated_at AS draft_updated_at
+            FROM queue_schedule_drafts d
+            JOIN queue_requests r ON r.id = d.request_id
+            {where}
+            ORDER BY d.scheduled_date, d.scheduled_start_minutes, d.request_id""",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def _queue_v2_designers() -> list[dict[str, Any]]:
     users = [u for u in list_dashboard_users() if "pd" in _queue_v2_json(u.get("operating_roles"), [u.get("operating_role")])]
     with connect() as conn:
@@ -1706,6 +1786,124 @@ def _queue_v2_designers() -> list[dict[str, Any]]:
     for item in accounts:
         by_designer.setdefault(item["designer_email"], []).append(item["account_handle"])
     return [{"email": user["email"], "isAdmin": bool(user.get("is_admin")), "accounts": by_designer.get(user["email"], [])} for user in users]
+
+
+def _queue_v2_prepare_schedule_changes(
+    conn: Any, entries: Any, *, ignore_draft_coordinator: str | None = None,
+) -> list[dict[str, Any]]:
+    """Validate and collision-resolve provisional or committed placements."""
+    if not isinstance(entries, list) or not entries:
+        raise HTTPException(status_code=400, detail="Add at least one schedule change before submitting.")
+    prepared: list[dict[str, Any]] = []
+    changed_ids: set[int] = set()
+    for entry in entries:
+        try:
+            request_id, designer = int(entry["id"]), str(entry["designerEmail"]).strip().lower()
+            date, start = str(entry["scheduledDate"]), int(entry["scheduledStartMinutes"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid schedule change.") from exc
+        if request_id in changed_ids:
+            raise HTTPException(status_code=400, detail="A Queue request can only appear once per change set.")
+        changed_ids.add(request_id)
+        if start % 10 or start < SCHEDULER_START or start >= SCHEDULER_END:
+            raise HTTPException(status_code=400, detail="Tasks must begin in 10-minute scheduler slots.")
+        try:
+            datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
+        designer_row = conn.execute(
+            "SELECT operating_role, operating_roles, slack_user_id FROM dashboard_users WHERE email = ?",
+            (designer,),
+        ).fetchone()
+        designer_roles = _queue_v2_json(designer_row["operating_roles"], [designer_row["operating_role"]]) if designer_row else []
+        if not designer_row or "pd" not in designer_roles:
+            raise HTTPException(status_code=400, detail="Choose a Queue designer.")
+        row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Queue request not found.")
+        if row["status"] not in {"pool", "scheduled"}:
+            raise HTTPException(status_code=409, detail="Only pooled or scheduled requests can be moved.")
+        accounts = entry.get("recommendedAccounts", [])
+        if not isinstance(accounts, list):
+            accounts = []
+        allowed = {item["account_handle"] for item in conn.execute(
+            "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ?", (designer,),
+        ).fetchall()}
+        clean_accounts = [str(value).strip().lstrip("@").lower() for value in accounts if str(value).strip()]
+        if any(value not in allowed for value in clean_accounts):
+            raise HTTPException(status_code=400, detail="Recommended accounts must belong to the selected designer.")
+        prepared.append({
+            "id": request_id, "designer": designer, "date": date, "start": start,
+            "duration": int(row["production_points"]) * 10,
+            "accounts": list(dict.fromkeys(clean_accounts)), "row": dict(row),
+            "assigneeSlackId": designer_row["slack_user_id"],
+        })
+
+    occupied_by_designer: dict[str, list[dict[str, Any]]] = {}
+    for designer in {item["designer"] for item in prepared}:
+        other_drafts = [dict(row) for row in conn.execute(
+            """SELECT d.request_id, d.coordinator_email, d.scheduled_date, d.scheduled_start_minutes, r.production_points
+               FROM queue_schedule_drafts d
+               JOIN queue_requests r ON r.id = d.request_id
+               WHERE d.designer_email = ?""",
+            (designer,),
+        ).fetchall()
+            if int(row["request_id"]) not in changed_ids
+            and (not ignore_draft_coordinator or row["coordinator_email"] != ignore_draft_coordinator)]
+        drafted_ids = {int(row["request_id"]) for row in other_drafts}
+        committed = [dict(row) for row in conn.execute(
+            """SELECT * FROM queue_requests
+               WHERE designer_email = ? AND status IN ('scheduled','in_progress','completed','closed')
+                 AND scheduled_date IS NOT NULL AND scheduled_start_minutes IS NOT NULL""",
+            (designer,),
+        ).fetchall() if int(row["id"]) not in changed_ids and int(row["id"]) not in drafted_ids]
+        occupied_by_designer[designer] = [_queue_v2_occupied(row) for row in committed]
+        occupied_by_designer[designer].extend({
+            "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]),
+            "duration": int(row["production_points"]) * 10,
+        } for row in other_drafts)
+
+    for item in sorted(prepared, key=lambda value: (value["designer"], schedule_absolute(value["date"], value["start"]), value["id"])):
+        item["date"], item["start"] = next_available_slot(
+            item["date"], item["start"], item["duration"], occupied_by_designer[item["designer"]],
+        )
+        occupied_by_designer[item["designer"]].append({
+            "date": item["date"], "start": item["start"], "duration": item["duration"],
+        })
+    return prepared
+
+
+def _queue_v2_reflow_drafts(conn: Any, designer: str) -> int:
+    """Keep shared provisional placements collision-free after firm changes."""
+    drafts = [dict(row) for row in conn.execute(
+        """SELECT d.request_id, d.scheduled_date, d.scheduled_start_minutes, r.production_points
+           FROM queue_schedule_drafts d
+           JOIN queue_requests r ON r.id = d.request_id
+           WHERE d.designer_email = ?
+           ORDER BY d.scheduled_date, d.scheduled_start_minutes, d.request_id""",
+        (designer,),
+    ).fetchall()]
+    draft_ids = {int(row["request_id"]) for row in drafts}
+    committed = [dict(row) for row in conn.execute(
+        """SELECT * FROM queue_requests
+           WHERE designer_email = ? AND status IN ('scheduled','in_progress','completed','closed')
+             AND scheduled_date IS NOT NULL AND scheduled_start_minutes IS NOT NULL""",
+        (designer,),
+    ).fetchall() if int(row["id"]) not in draft_ids]
+    occupied = [_queue_v2_occupied(row) for row in committed]
+    moved = 0
+    for row in drafts:
+        resolved_date, resolved_start = next_available_slot(
+            row["scheduled_date"], int(row["scheduled_start_minutes"]), int(row["production_points"]) * 10, occupied,
+        )
+        if resolved_date != row["scheduled_date"] or resolved_start != int(row["scheduled_start_minutes"]):
+            conn.execute(
+                "UPDATE queue_schedule_drafts SET scheduled_date = ?, scheduled_start_minutes = ?, updated_at = ? WHERE request_id = ?",
+                (resolved_date, resolved_start, utc_now(), row["request_id"]),
+            )
+            moved += 1
+        occupied.append({"date": resolved_date, "start": resolved_start, "duration": int(row["production_points"]) * 10})
+    return moved
 
 
 @app.get("/api/dashboard/queue/v2")
@@ -1749,17 +1947,53 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
                    ORDER BY scheduled_date, scheduled_start_minutes, id""",
                 (caller,),
             ).fetchall()
+        draft_rows = _queue_v2_draft_rows(
+            conn,
+            designer_email=None if (is_admin or "vc" in roles) else caller,
+        )
+        live_state = _queue_v2_live_snapshot(conn)
     requests = [_queue_v2_project(dict(row)) for row in rows]
     planning_requests = [_queue_v2_project(dict(row)) for row in planning_rows]
     assigned_requests = [_queue_v2_project(dict(row)) for row in assigned_rows]
+    live_drafts = [_queue_v2_project_draft(row) for row in draft_rows]
     if not (is_admin or "vc" in roles):
         requests = [item for item in requests if item["status"] != "pool"]
     return {
         "viewer": {"email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)), "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
-        "date": selected_date, "requests": requests, "planningRequests": planning_requests, "assignedRequests": assigned_requests, "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
+        "date": selected_date, "requests": requests, "planningRequests": planning_requests,
+        "assignedRequests": assigned_requests, "liveDrafts": live_drafts, "liveRevision": live_state["revision"],
+        "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
         "tags": QUEUE_V2_TAGS, "priorities": QUEUE_V2_PRIORITIES,
         "hours": {"start": SCHEDULER_START, "end": SCHEDULER_END},
     }
+
+
+@app.get("/api/dashboard/queue/v2/live")
+async def dashboard_queue_v2_live(request: Request, after: int = 0) -> StreamingResponse:
+    """Authenticated SSE stream backed by Queue's durable SQLite revision."""
+    _queue_v2_access(request)
+    last_revision = max(0, int(after))
+
+    async def events():
+        nonlocal last_revision
+        keepalive_at = time.monotonic()
+        while not await request.is_disconnected():
+            with connect() as conn:
+                state = _queue_v2_live_snapshot(conn)
+            if state["revision"] > last_revision:
+                last_revision = state["revision"]
+                payload = json.dumps(state, separators=(",", ":"))
+                yield f"id: {last_revision}\nevent: queue\ndata: {payload}\n\n"
+                keepalive_at = time.monotonic()
+            elif time.monotonic() - keepalive_at >= 15:
+                yield ": keepalive\n\n"
+                keepalive_at = time.monotonic()
+            await asyncio.sleep(0.75)
+
+    return StreamingResponse(
+        events(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @app.get("/api/dashboard/queue/v2/requests/{request_id}")
@@ -1767,6 +2001,10 @@ def dashboard_queue_v2_request_detail(request_id: int, request: Request) -> dict
     caller, is_admin, roles = _queue_v2_access(request)
     row = _queue_v2_request(request_id)
     _queue_v2_require_visible(row, caller, is_admin, roles)
+    with connect() as conn:
+        draft_rows = _queue_v2_draft_rows(conn, request_ids={request_id})
+    if draft_rows and (is_admin or "vc" in roles or draft_rows[0]["draft_designer_email"] == caller):
+        return {"request": _queue_v2_project_draft(draft_rows[0])}
     return {"request": _queue_v2_project(row)}
 
 
@@ -1780,9 +2018,20 @@ def dashboard_queue_v2_summary(request: Request) -> dict[str, Any]:
     with connect() as conn:
         if is_admin or "vc" in roles:
             row = conn.execute("SELECT COUNT(*) AS c FROM queue_requests WHERE status IN ('pool','scheduled','in_progress','completed')").fetchone()
+            draft_count = 0
         else:
             row = conn.execute("SELECT COUNT(*) AS c FROM queue_requests WHERE designer_email = ? AND status IN ('scheduled','in_progress','completed')", (caller,)).fetchone()
-    return {"pending": int(row["c"] if row else 0)}
+            draft_count = int(conn.execute(
+                """SELECT COUNT(*) AS c FROM queue_schedule_drafts d
+                   WHERE d.designer_email = ?
+                     AND NOT EXISTS (
+                       SELECT 1 FROM queue_requests r
+                       WHERE r.id = d.request_id AND r.designer_email = ?
+                         AND r.status IN ('scheduled','in_progress','completed')
+                     )""",
+                (caller, caller),
+            ).fetchone()["c"])
+    return {"pending": int(row["c"] if row else 0) + draft_count}
 
 
 @app.get("/api/dashboard/queue/v2/admin-report")
@@ -1795,6 +2044,7 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
     with connect() as conn:
         rows = conn.execute("SELECT status, COUNT(*) AS count, COALESCE(SUM(production_points), 0) AS points FROM queue_requests GROUP BY status").fetchall()
         request_rows = [dict(row) for row in conn.execute("SELECT * FROM queue_requests").fetchall()]
+        draft_rows = _queue_v2_draft_rows(conn)
     totals = {status: {"count": 0, "points": 0} for status in QUEUE_V2_STATUSES}
     for row in rows:
         totals[row["status"]] = {"count": int(row["count"]), "points": int(row["points"])}
@@ -1825,7 +2075,10 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
     # one day, so keep this list on the report endpoint instead of forcing the
     # UI to make one request per date. Include closed/cancelled assignments as
     # historical records; unassigned pool items are the only rows omitted.
-    assigned_posts = [_queue_v2_project(row) for row in request_rows if row["designer_email"]]
+    assigned_by_id = {row["id"]: _queue_v2_project(row) for row in request_rows if row["designer_email"]}
+    for row in draft_rows:
+        assigned_by_id[row["id"]] = _queue_v2_project_draft(row)
+    assigned_posts = list(assigned_by_id.values())
     assigned_posts.sort(key=lambda item: (
         item.get("scheduledDate") or "9999-99-99",
         item.get("scheduledStartMinutes") if item.get("scheduledStartMinutes") is not None else 9999,
@@ -1872,8 +2125,74 @@ def dashboard_queue_v2_pool(
         )
         request_id = int(cursor.lastrowid)
         _queue_v2_log(conn, request_id, caller, "pooled", {"productionPoints": production_points, "priority": clean_priority})
+        _queue_v2_publish(conn, "pooled", caller, [request_id])
         row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
     return {"ok": True, "request": _queue_v2_project(row)}
+
+
+@app.post("/api/dashboard/queue/v2/drafts")
+def dashboard_queue_v2_drafts(request: Request, changes: Annotated[str, Form()]) -> dict[str, Any]:
+    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    entries = _queue_v2_json(changes, [])
+    now = utc_now()
+    with connect() as conn:
+        prepared = _queue_v2_prepare_schedule_changes(conn, entries, ignore_draft_coordinator=caller)
+        incoming_ids = {item["id"] for item in prepared}
+        previous_ids = {int(row["request_id"]) for row in conn.execute(
+            "SELECT request_id FROM queue_schedule_drafts WHERE coordinator_email = ?", (caller,),
+        ).fetchall()}
+        if incoming_ids:
+            placeholders = ",".join("?" for _ in incoming_ids)
+            conn.execute(
+                f"DELETE FROM queue_schedule_drafts WHERE coordinator_email = ? AND request_id NOT IN ({placeholders})",
+                [caller, *sorted(incoming_ids)],
+            )
+        for item in prepared:
+            conn.execute(
+                """INSERT INTO queue_schedule_drafts
+                   (request_id, coordinator_email, designer_email, scheduled_date, scheduled_start_minutes,
+                    recommended_accounts, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(request_id) DO UPDATE SET
+                     coordinator_email = excluded.coordinator_email,
+                     designer_email = excluded.designer_email,
+                     scheduled_date = excluded.scheduled_date,
+                     scheduled_start_minutes = excluded.scheduled_start_minutes,
+                     recommended_accounts = excluded.recommended_accounts,
+                     updated_at = excluded.updated_at""",
+                (item["id"], caller, item["designer"], item["date"], item["start"], json.dumps(item["accounts"]), now),
+            )
+        changed_ids = previous_ids | incoming_ids
+        revision = _queue_v2_publish(conn, "draft_updated", caller, changed_ids)
+        rows = _queue_v2_draft_rows(conn, request_ids=incoming_ids)
+    return {"ok": True, "drafts": [_queue_v2_project_draft(row) for row in rows], "liveRevision": revision}
+
+
+@app.post("/api/dashboard/queue/v2/drafts/clear")
+def dashboard_queue_v2_clear_drafts(
+    request: Request, request_ids: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    parsed = _queue_v2_json(request_ids, []) if request_ids else []
+    clean_ids = {int(value) for value in parsed if str(value).isdigit()} if isinstance(parsed, list) else set()
+    with connect() as conn:
+        if clean_ids:
+            placeholders = ",".join("?" for _ in clean_ids)
+            owned = {int(row["request_id"]) for row in conn.execute(
+                f"SELECT request_id FROM queue_schedule_drafts WHERE coordinator_email = ? AND request_id IN ({placeholders})",
+                [caller, *sorted(clean_ids)],
+            ).fetchall()}
+            conn.execute(
+                f"DELETE FROM queue_schedule_drafts WHERE coordinator_email = ? AND request_id IN ({placeholders})",
+                [caller, *sorted(clean_ids)],
+            )
+        else:
+            owned = {int(row["request_id"]) for row in conn.execute(
+                "SELECT request_id FROM queue_schedule_drafts WHERE coordinator_email = ?", (caller,),
+            ).fetchall()}
+            conn.execute("DELETE FROM queue_schedule_drafts WHERE coordinator_email = ?", (caller,))
+        revision = _queue_v2_publish(conn, "draft_cleared", caller, owned)
+    return {"ok": True, "cleared": len(owned), "liveRevision": revision}
 
 
 @app.post("/api/dashboard/queue/v2/submit")
@@ -1886,62 +2205,7 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
     adjustments: list[dict[str, Any]] = []
     now = utc_now()
     with connect() as conn:
-        prepared: list[dict[str, Any]] = []
-        changed_ids: set[int] = set()
-        for entry in entries:
-            try:
-                request_id, designer = int(entry["id"]), str(entry["designerEmail"]).strip().lower()
-                date, start = str(entry["scheduledDate"]), int(entry["scheduledStartMinutes"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail="Invalid schedule change.") from exc
-            if request_id in changed_ids:
-                raise HTTPException(status_code=400, detail="A Queue request can only appear once per submit.")
-            changed_ids.add(request_id)
-            if start % 10 or start < SCHEDULER_START or start >= SCHEDULER_END:
-                raise HTTPException(status_code=400, detail="Tasks must begin in 10-minute scheduler slots.")
-            try:
-                datetime.strptime(date, "%Y-%m-%d").date()
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
-            designer_row = conn.execute("SELECT operating_role, operating_roles, slack_user_id FROM dashboard_users WHERE email = ?", (designer,)).fetchone()
-            designer_roles = _queue_v2_json(designer_row["operating_roles"], [designer_row["operating_role"]]) if designer_row else []
-            if not designer_row or "pd" not in designer_roles:
-                raise HTTPException(status_code=400, detail="Choose a Queue designer.")
-            row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Queue request not found.")
-            if row["status"] not in {"pool", "scheduled"}:
-                raise HTTPException(status_code=409, detail="Only pooled or scheduled requests can be moved.")
-            duration = int(row["production_points"]) * 10
-            accounts = entry.get("recommendedAccounts", [])
-            if not isinstance(accounts, list):
-                accounts = []
-            allowed = {item["account_handle"] for item in conn.execute("SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ?", (designer,)).fetchall()}
-            clean_accounts = [str(a).strip().lstrip("@").lower() for a in accounts if str(a).strip()]
-            if any(a not in allowed for a in clean_accounts):
-                raise HTTPException(status_code=400, detail="Recommended accounts must belong to the selected designer.")
-            prepared.append({
-                "id": request_id, "designer": designer, "date": date, "start": start,
-                "duration": duration, "accounts": list(dict.fromkeys(clean_accounts)),
-                "row": dict(row), "assigneeSlackId": designer_row["slack_user_id"],
-            })
-
-        occupied_by_designer: dict[str, list[dict[str, Any]]] = {}
-        for designer in {item["designer"] for item in prepared}:
-            existing = [dict(row) for row in conn.execute(
-                """SELECT * FROM queue_requests
-                   WHERE designer_email = ? AND status IN ('scheduled','in_progress','completed','closed')
-                     AND scheduled_date IS NOT NULL AND scheduled_start_minutes IS NOT NULL""",
-                (designer,),
-            ).fetchall() if int(row["id"]) not in changed_ids]
-            occupied_by_designer[designer] = [_queue_v2_occupied(row) for row in existing]
-
-        for item in sorted(prepared, key=lambda entry: (entry["designer"], schedule_absolute(entry["date"], entry["start"]), entry["id"])):
-            item["date"], item["start"] = next_available_slot(
-                item["date"], item["start"], item["duration"], occupied_by_designer[item["designer"]],
-            )
-            occupied_by_designer[item["designer"]].append({"date": item["date"], "start": item["start"], "duration": item["duration"]})
-
+        prepared = _queue_v2_prepare_schedule_changes(conn, entries)
         assigner_row = conn.execute("SELECT slack_user_id FROM dashboard_users WHERE email = ?", (caller,)).fetchone()
         assigner_slack_id = assigner_row["slack_user_id"] if assigner_row else ""
         for item in prepared:
@@ -1955,6 +2219,10 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
             _queue_v2_log(conn, item["id"], caller, "resubmitted" if was_scheduled else "scheduled", {"designer": item["designer"], "date": item["date"], "start": item["start"], "accounts": item["accounts"]})
         for designer in {item["designer"] for item in prepared}:
             _queue_v2_reflow_scheduled(conn, designer, caller)
+        submitted_ids = {item["id"] for item in prepared}
+        placeholders = ",".join("?" for _ in submitted_ids)
+        conn.execute(f"DELETE FROM queue_schedule_drafts WHERE request_id IN ({placeholders})", sorted(submitted_ids))
+        _queue_v2_publish(conn, "schedule_submitted", caller, submitted_ids)
         for item in prepared:
             row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (item["id"],)).fetchone())
             final_date, final_start = row["scheduled_date"], int(row["scheduled_start_minutes"])
@@ -1973,6 +2241,7 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
         sent += int(delivered)
         with connect() as conn:
             _queue_v2_log(conn, item["task_id"], caller, "slack_sent" if delivered else "slack_failed")
+            _queue_v2_publish(conn, "notification_updated", caller, [item["task_id"]])
     return {"ok": True, "submitted": len(entries), "adjustments": adjustments, "notifications": {"sent": sent, "failed": len(notifications) - sent}}
 
 
@@ -1990,6 +2259,7 @@ def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any
     current_date = local_now.date().isoformat()
     designer = str(row["designer_email"] or "")
     with connect() as conn:
+        conn.execute("DELETE FROM queue_schedule_drafts WHERE request_id = ?", (request_id,))
         active_rows = [dict(item) for item in conn.execute(
             """SELECT * FROM queue_requests
                WHERE designer_email = ? AND status = 'in_progress' AND id != ?
@@ -2018,6 +2288,8 @@ def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any
                 "date": updated["scheduled_date"], "start": updated["scheduled_start_minutes"],
                 "activeRequestIds": [item["id"] for item in active_rows],
             })
+            _queue_v2_reflow_drafts(conn, designer)
+            _queue_v2_publish(conn, "request_deferred", caller, [request_id])
             return {"ok": True, "deferred": True, "scheduledDate": updated["scheduled_date"], "scheduledStartMinutes": updated["scheduled_start_minutes"]}
         conn.execute(
             """UPDATE queue_requests SET status = 'in_progress', scheduled_start_minutes = ?, scheduled_date = ?,
@@ -2026,6 +2298,8 @@ def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any
         )
         _queue_v2_reflow_scheduled(conn, designer, caller)
         _queue_v2_log(conn, request_id, caller, "started", {"date": current_date, "actualStartMinutes": current_slot})
+        _queue_v2_reflow_drafts(conn, designer)
+        _queue_v2_publish(conn, "request_started", caller, [request_id])
     return {"ok": True, "deferred": False, "scheduledDate": current_date, "scheduledStartMinutes": current_slot}
 
 
@@ -2065,6 +2339,12 @@ def dashboard_queue_v2_edit(
         })
         if row.get("designer_email") and row.get("status") in {"scheduled", "in_progress", "completed", "closed"}:
             _queue_v2_reflow_scheduled(conn, row["designer_email"], caller, priority_id=request_id if row["status"] == "scheduled" else None)
+        draft_designers = [item["designer_email"] for item in conn.execute(
+            "SELECT designer_email FROM queue_schedule_drafts WHERE request_id = ?", (request_id,),
+        ).fetchall()]
+        for designer in draft_designers:
+            _queue_v2_reflow_drafts(conn, designer)
+        _queue_v2_publish(conn, "request_edited", caller, [request_id])
         updated = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
     return {"ok": True, "request": _queue_v2_project(updated)}
 
@@ -2093,6 +2373,7 @@ def dashboard_queue_v2_add_attachment(request_id: int, request: Request, file: A
     with connect() as conn:
         conn.execute("UPDATE queue_requests SET attachments = ?, updated_at = ? WHERE id = ?", (json.dumps(attachments), now, request_id))
         _queue_v2_log(conn, request_id, caller, "attachment_added", {"id": attachment_id, "name": clean_name, "size": len(payload)})
+        _queue_v2_publish(conn, "attachment_added", caller, [request_id])
         updated = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
     return {"ok": True, "request": _queue_v2_project(updated)}
 
@@ -2126,6 +2407,7 @@ def dashboard_queue_v2_complete(request_id: int, request: Request) -> dict[str, 
     with connect() as conn:
         conn.execute("UPDATE queue_requests SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?", (now, now, request_id))
         _queue_v2_log(conn, request_id, caller, "completed")
+        _queue_v2_publish(conn, "request_completed", caller, [request_id])
     return {"ok": True}
 
 
@@ -2144,6 +2426,7 @@ def dashboard_queue_v2_close(request_id: int, request: Request, final_permalink:
     with connect() as conn:
         conn.execute("UPDATE queue_requests SET status = 'closed', final_permalink = ?, closed_at = ?, updated_at = ? WHERE id = ?", (link, now, now, request_id))
         _queue_v2_log(conn, request_id, caller, "closed", {"finalPermalink": link})
+        _queue_v2_publish(conn, "request_closed", caller, [request_id])
     return {"ok": True}
 
 
@@ -2153,8 +2436,10 @@ def dashboard_queue_v2_cancel(request_id: int, request: Request, reason: Annotat
     row = _queue_v2_request(request_id)
     now = utc_now()
     with connect() as conn:
+        conn.execute("DELETE FROM queue_schedule_drafts WHERE request_id = ?", (request_id,))
         conn.execute("UPDATE queue_requests SET status = 'cancelled', cancellation_reason = ?, updated_at = ? WHERE id = ?", ((reason or "").strip(), now, request_id))
         _queue_v2_log(conn, request_id, caller, "cancelled", {"reason": (reason or "").strip()})
+        _queue_v2_publish(conn, "request_cancelled", caller, [request_id])
     return {"ok": True}
 
 
@@ -2180,6 +2465,7 @@ def dashboard_queue_v2_notify(request_id: int, request: Request) -> dict[str, An
     )
     with connect() as conn:
         _queue_v2_log(conn, request_id, caller, "slack_sent" if sent else "slack_failed", {"manualRetry": True})
+        _queue_v2_publish(conn, "notification_updated", caller, [request_id])
     return {"ok": True, "sent": sent}
 
 
@@ -2187,8 +2473,7 @@ def dashboard_queue_v2_notify(request_id: int, request: Request) -> dict[str, An
 def dashboard_queue_v2_history(request_id: int, request: Request) -> dict[str, Any]:
     caller, is_admin, roles = _queue_v2_access(request)
     row = _queue_v2_request(request_id)
-    if not (is_admin or "vc" in roles or row["designer_email"] == caller):
-        raise HTTPException(status_code=403, detail="Not allowed to view this request.")
+    _queue_v2_require_visible(row, caller, is_admin, roles)
     with connect() as conn:
         rows = conn.execute("SELECT actor_email, event_type, details, created_at FROM queue_request_events WHERE request_id = ? ORDER BY id DESC", (request_id,)).fetchall()
     return {"events": [{"actorEmail": item["actor_email"], "type": item["event_type"], "details": _queue_v2_json(item["details"], {}), "createdAt": item["created_at"]} for item in rows]}
@@ -2667,6 +2952,8 @@ def admin_upsert_user(
     if clean_slack_id and not re.fullmatch(r"U[A-Z0-9]{8,20}", clean_slack_id):
         raise HTTPException(status_code=400, detail="Slack user ID must start with U.")
     upsert_dashboard_user(clean_email, role, operating_role, is_admin, clean_slack_id)
+    with connect() as conn:
+        _queue_v2_publish(conn, "roster_updated", _caller_email(request))
     return {"ok": True, "users": list_dashboard_users()}
 
 
@@ -2677,7 +2964,7 @@ def admin_queue_designer_accounts() -> dict[str, Any]:
 
 @app.post("/api/admin/queue/designer-accounts")
 def admin_queue_add_designer_account(
-    designer_email: Annotated[str, Form()], account_handle: Annotated[str, Form()]
+    request: Request, designer_email: Annotated[str, Form()], account_handle: Annotated[str, Form()]
 ) -> dict[str, Any]:
     designer = designer_email.strip().lower()
     handle = account_handle.strip().lstrip("@").lower()
@@ -2692,13 +2979,15 @@ def admin_queue_add_designer_account(
         if not account:
             raise HTTPException(status_code=400, detail="Choose an active Sentient account.")
         conn.execute("INSERT OR IGNORE INTO queue_designer_accounts (designer_email, account_handle, created_at) VALUES (?, ?, ?)", (designer, handle, utc_now()))
+        _queue_v2_publish(conn, "designer_accounts_updated", _caller_email(request))
     return {"ok": True, "designers": _queue_v2_designers()}
 
 
 @app.delete("/api/admin/queue/designer-accounts")
-def admin_queue_remove_designer_account(designer_email: Annotated[str, Query()], account_handle: Annotated[str, Query()]) -> dict[str, Any]:
+def admin_queue_remove_designer_account(request: Request, designer_email: Annotated[str, Query()], account_handle: Annotated[str, Query()]) -> dict[str, Any]:
     with connect() as conn:
         conn.execute("DELETE FROM queue_designer_accounts WHERE designer_email = ? AND account_handle = ?", (designer_email.strip().lower(), account_handle.strip().lstrip("@").lower()))
+        _queue_v2_publish(conn, "designer_accounts_updated", _caller_email(request))
     return {"ok": True, "designers": _queue_v2_designers()}
 
 
@@ -2716,6 +3005,8 @@ def admin_remove_user(request: Request, email: Annotated[str, Form()]) -> dict[s
     if role == "admin" and count_dashboard_admins() <= 1:
         raise HTTPException(status_code=400, detail="Can't remove the last remaining admin.")
     remove_dashboard_user(clean_email)
+    with connect() as conn:
+        _queue_v2_publish(conn, "roster_updated", _caller_email(request))
     return {"ok": True, "users": list_dashboard_users()}
 
 
