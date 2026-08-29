@@ -26,6 +26,12 @@ _PUBLIC_API = os.getenv("PUBLIC_API_BASE", "https://cortex-api-db2e.onrender.com
 # send everyone to production.
 _DASHBOARD = os.getenv("DASHBOARD_BASE", "https://sentientdash.app").rstrip("/")
 
+# Queue change logs intentionally go to a fixed, shared channel so VCs have a
+# durable audit trail independent of the assignment DMs. Keep the channel ID
+# here (rather than trusting a request parameter) so a Queue action can never
+# be redirected to an arbitrary Slack destination.
+SPOC_DASHBOARD_CHANNEL_ID = "C0BTMHMCYUS"
+
 # Queue users are authenticated by their dashboard email. Slack's Incoming
 # Webhook cannot deliver a message to an arbitrary person's DM, so assignment
 # alerts deliberately use a bot token and this explicit, reviewed mapping.
@@ -420,6 +426,172 @@ def notify_queue_assignment_result(**assignment: Any) -> dict[str, Any]:
 def notify_queue_assignment(**assignment: Any) -> bool:
     """Backward-compatible bool wrapper used by legacy Queue endpoints."""
     return bool(notify_queue_assignment_result(**assignment).get("sent"))
+
+
+_QUEUE_CHANGE_LABELS = {
+    "pp_revision_requested": "PP revision requested",
+    "pp_revision_approved": "PP revision approved",
+    "pp_revision_rejected": "PP revision rejected",
+    "cancellation_requested": "Cancellation requested",
+    "cancellation_approved": "Cancellation approved",
+    "cancellation_rejected": "Cancellation rejected",
+    "returned_to_pool": "Returned to pool",
+    "cancelled": "Queue post cancelled",
+    "deleted": "Queue post deleted",
+}
+
+
+def _slack_actor(email: str | None) -> str:
+    clean = str(email or "").strip().lower()
+    if not clean:
+        return "Unknown user"
+    user_id = slack_user_id_for_email(clean)
+    return f"<@{user_id}>" if user_id else clean.split("@", 1)[0]
+
+
+def _queue_change_schedule(date: str | None, start_minutes: int | None) -> str | None:
+    if not date or start_minutes is None:
+        return None
+    try:
+        hours, minutes = divmod(int(start_minutes), 60)
+        return f"{date} · {hours % 12 or 12}:{minutes:02d} {'AM' if hours < 12 else 'PM'}"
+    except (TypeError, ValueError):
+        return str(date)
+
+
+def build_queue_change_message(
+    *,
+    event_type: str,
+    task_id: int | None,
+    actor_email: str | None,
+    account: str | None,
+    shortcode: str | None,
+    designer_email: str | None = None,
+    status: str | None = None,
+    production_points: int | None = None,
+    requested_production_points: int | None = None,
+    priority: str | None = None,
+    tags: list[str] | None = None,
+    reason: str | None = None,
+    brief: str | None = None,
+    scheduled_date: str | None = None,
+    scheduled_start_minutes: int | None = None,
+    final_permalink: str | None = None,
+) -> dict[str, Any]:
+    """Build a compact Block Kit audit entry for #spoc-dashboard.
+
+    These messages are deliberately channel-safe: no private brief or
+    attachment is required to understand the event, while the Queue button
+    lands on the request's side view for the people who need to act on it.
+    """
+    label = _QUEUE_CHANGE_LABELS.get(event_type, event_type.replace("_", " ").title())
+    clean_account = str(account or "").strip().lstrip("@") or "unknown account"
+    clean_shortcode = str(shortcode or "").strip()
+    post_label = f"@{clean_account}" + (f" · `{clean_shortcode}`" if clean_shortcode else "")
+    actor = _slack_actor(actor_email)
+    designer = _slack_actor(designer_email) if designer_email else "—"
+    title = f"Queue · {label}"
+
+    summary = f"*{post_label}*\n{actor}"
+    if event_type.endswith("_requested"):
+        summary += " requested a Queue change for this post."
+    elif event_type.endswith("_approved"):
+        summary += " approved this Queue request."
+    elif event_type.endswith("_rejected"):
+        summary += " rejected this Queue request."
+    elif event_type == "returned_to_pool":
+        summary += " returned this firm assignment to the pool."
+    elif event_type == "cancelled":
+        summary += " cancelled this Queue post."
+    elif event_type == "deleted":
+        summary += " deleted this Queue post."
+    else:
+        summary += "."
+
+    fields: list[dict[str, str]] = [
+        {"type": "mrkdwn", "text": f"*Designer*\n{designer}"},
+    ]
+    if status:
+        fields.append({"type": "mrkdwn", "text": f"*Status*\n`{status.replace('_', ' ')}`"})
+    if production_points is not None:
+        pp_text = f"{production_points} PP · {int(production_points) * 10} min"
+        if requested_production_points is not None and requested_production_points != production_points:
+            pp_text += f" → {requested_production_points} PP"
+        fields.append({"type": "mrkdwn", "text": f"*Production*\n{pp_text}"})
+    if priority:
+        fields.append({"type": "mrkdwn", "text": f"*Priority*\n{str(priority).replace('_', ' ').title()}"})
+    schedule = _queue_change_schedule(scheduled_date, scheduled_start_minutes)
+    if schedule:
+        fields.append({"type": "mrkdwn", "text": f"*Scheduled*\n{schedule}"})
+    if tags:
+        clean_tags = [str(tag).strip() for tag in tags if str(tag).strip()]
+        if clean_tags:
+            fields.append({"type": "mrkdwn", "text": f"*Tags*\n{', '.join(f'`{tag}`' for tag in clean_tags)}"})
+
+    blocks: list[dict[str, Any]] = [
+        {"type": "header", "text": {"type": "plain_text", "text": title[:150], "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": summary[:2900]}},
+    ]
+    if fields:
+        blocks.append({"type": "section", "fields": fields[:10]})
+    if reason:
+        clean_reason = str(reason).strip()[:900]
+        if clean_reason:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Reason*\n> {clean_reason.replace(chr(10), chr(10) + '> ')}"}})
+    if brief and event_type.endswith("_requested"):
+        clean_brief = str(brief).strip()[:700]
+        if clean_brief:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Brief*\n> {clean_brief.replace(chr(10), chr(10) + '> ')}"}})
+    if final_permalink:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Published post*\n<{final_permalink}|Open Instagram post>"}})
+    if task_id is not None:
+        blocks.append({
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "style": "primary" if event_type.endswith("_requested") else None,
+                "text": {"type": "plain_text", "text": "Review in Queue" if event_type.endswith("_requested") else "Open in Queue", "emoji": True},
+                "url": queue_url_for(task_id),
+            }],
+        })
+        # Slack rejects a null style field even though it is optional. Keep
+        # the payload minimal for non-request audit entries.
+        if blocks[-1]["elements"][0]["style"] is None:
+            blocks[-1]["elements"][0].pop("style", None)
+    return {"text": f"{title}: {post_label}", "blocks": blocks}
+
+
+def notify_queue_change(**change: Any) -> bool:
+    """Post one Queue audit event to #spoc-dashboard using the bot token.
+
+    Slack delivery is best-effort and intentionally outside the Queue DB
+    transaction. A missing token, missing channel membership, or transient
+    Slack failure must never turn a successful Queue action into a 500.
+    """
+    token = os.getenv("SLACK_BOT_TOKEN", "").strip()
+    if not token:
+        logger.warning("Queue change log skipped: SLACK_BOT_TOKEN is not configured")
+        return False
+    try:
+        import httpx
+
+        payload = build_queue_change_message(**change)
+        payload["channel"] = SPOC_DASHBOARD_CHANNEL_ID
+        response = httpx.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}"},
+            json=payload,
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            logger.error("Queue change log rejected: %s", data.get("error", "unknown error"))
+            return False
+        return True
+    except Exception:
+        logger.exception("Queue change log failed for task %s", change.get("task_id"))
+        return False
 
 
 def alert_image_url_for(filename: str) -> str:

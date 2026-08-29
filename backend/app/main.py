@@ -1477,7 +1477,18 @@ def dashboard_queue_delete_task(task_id: int, request: Request) -> dict[str, Any
     caller = _caller_email(request)
     _queue_editable_assignment(task_id, caller, bool(getattr(request.state, "is_admin", False)))
     with connect() as conn:
+        row = conn.execute("SELECT * FROM post_assignments WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Queue task not found.")
+        deleted = dict(row)
         conn.execute("DELETE FROM post_assignments WHERE id = ?", (task_id,))
+    _queue_v2_slack_log(
+        event_type="deleted", task_id=None, actor_email=caller,
+        account=deleted.get("post_account"), shortcode=deleted.get("post_shortcode"),
+        designer_email=deleted.get("assignee_email"), status=deleted.get("status"),
+        priority=deleted.get("priority"), tags=_queue_v2_json(deleted.get("tags"), []),
+        reason="Permanently deleted from Queue.",
+    )
     return {"ok": True, "id": task_id}
 
 
@@ -1526,6 +1537,22 @@ QUEUE_V2_TIME_CATEGORIES = {"meeting", "break", "promo", "focus", "other"}
 # shared live without changing the existing SQLite table shape.
 QUEUE_V2_POOL_DRAFT_DESIGNER = "__queue_pool__"
 QUEUE_V2_POOL_DRAFT_DATE = "0000-00-00"
+
+
+def _queue_v2_slack_log(**change: Any) -> bool:
+    """Best-effort audit delivery for Queue mutations.
+
+    Keep Slack outside the database transaction and behind a tiny wrapper so
+    no missing token, channel membership issue, or transient API failure can
+    break the Queue action that was already committed.
+    """
+    try:
+        from .slack_alerts import notify_queue_change
+
+        return bool(notify_queue_change(**change))
+    except Exception:
+        logging.getLogger("uvicorn.error").exception("Queue change Slack log failed")
+        return False
 
 
 def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[str, bool, list[str]]:
@@ -1677,12 +1704,37 @@ def _queue_v2_auto_pool_hot(conn: Any) -> list[int]:
     resurrected on every refresh.
     """
     now = utc_now()
+    hot_posts = _queue_v2_hot_source_rows(conn)
+    hot_keys = {
+        (str(post.get("account") or "").strip().lower(), str(post.get("shortcode") or "").strip())
+        for post in hot_posts
+    }
+    # HOT routing is a live condition, not a permanent label. Remove only
+    # system-created HOT requests that are still waiting in the pool and have
+    # fallen back to <=3x (or are no longer marked HOT). Never touch a firm
+    # assignment, a designer's in-progress work, or a request manually pooled
+    # by a coordinator.
+    stale_ids: list[int] = []
+    for row in conn.execute(
+        """SELECT id, post_account, post_shortcode, tags FROM queue_requests
+           WHERE status = 'pool' AND coordinator_email = 'system@sentientdash.app'"""
+    ).fetchall():
+        key = (str(row["post_account"] or "").strip().lower(), str(row["post_shortcode"] or "").strip())
+        tags = _queue_v2_json(row["tags"], [])
+        if "hot" in tags and key not in hot_keys:
+            stale_ids.append(int(row["id"]))
+    if stale_ids:
+        placeholders = ",".join("?" for _ in stale_ids)
+        conn.execute(f"DELETE FROM queue_schedule_drafts WHERE request_id IN ({placeholders})", stale_ids)
+        conn.execute(f"DELETE FROM queue_requests WHERE id IN ({placeholders})", stale_ids)
+        _queue_v2_publish(conn, "hot_removed_from_pool", "system@sentientdash.app", stale_ids)
+
     existing = {
         (str(row["post_account"]), str(row["post_shortcode"])): str(row["status"])
         for row in conn.execute("SELECT post_account, post_shortcode, status FROM queue_requests").fetchall()
     }
     created: list[int] = []
-    for post in _queue_v2_hot_source_rows(conn):
+    for post in hot_posts:
         account = str(post.get("account") or "").strip().lower()
         shortcode = str(post.get("shortcode") or "").strip()
         key = (account, shortcode)
@@ -2605,6 +2657,7 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
     if not isinstance(entries, list) or not entries:
         raise HTTPException(status_code=400, detail="Add at least one schedule change before submitting.")
     notifications: list[dict[str, Any]] = []
+    channel_logs: list[dict[str, Any]] = []
     adjustments: list[dict[str, Any]] = []
     same_assignees: dict[int, bool] = {}
     now = utc_now()
@@ -2623,6 +2676,13 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
                     (caller, json.dumps(item["accounts"]), item["productionPoints"], now, item["id"]),
                 )
                 _queue_v2_log(conn, item["id"], caller, "returned_to_pool", {"productionPoints": item["productionPoints"]})
+                channel_logs.append({
+                    "event_type": "returned_to_pool", "task_id": item["id"], "actor_email": caller,
+                    "account": row["post_account"], "shortcode": row["post_shortcode"],
+                    "designer_email": row.get("designer_email"), "status": "pool",
+                    "production_points": item["productionPoints"], "priority": row.get("priority"),
+                    "tags": _queue_v2_json(row.get("tags"), []), "brief": row.get("brief"),
+                })
                 continue
             was_scheduled = row["status"] != "pool"
             same_assignee = str(row.get("designer_email") or "").strip().lower() == item["designer"]
@@ -2661,6 +2721,8 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
                                   "slack_message_ts": row.get("slack_message_ts") if same_assignees.get(item["id"], False) else "",
                                   "assignee_slack_id": item["assigneeSlackId"], "assigned_by_slack_id": assigner_slack_id})
     sent = 0
+    for change in channel_logs:
+        _queue_v2_slack_log(**change)
     for item in notifications:
         from .slack_alerts import notify_queue_assignment_result
         delivery = notify_queue_assignment_result(**item)
@@ -2761,6 +2823,15 @@ def dashboard_queue_v2_request_pp_revision(
         _queue_v2_log(conn, request_id, caller, "pp_revision_requested", {"productionPoints": production_points, "reason": (reason or "").strip()})
         _queue_v2_publish(conn, "ticket_created", caller, [request_id])
         ticket_row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    _queue_v2_slack_log(
+        event_type="pp_revision_requested", task_id=request_id, actor_email=caller,
+        account=row.get("post_account"), shortcode=row.get("post_shortcode"),
+        designer_email=row.get("designer_email"), status=row.get("status"),
+        production_points=row.get("production_points"), requested_production_points=production_points,
+        priority=row.get("priority"), tags=_queue_v2_json(row.get("tags"), []),
+        reason=(reason or "").strip(), brief=row.get("brief"),
+        scheduled_date=row.get("scheduled_date"), scheduled_start_minutes=row.get("scheduled_start_minutes"),
+    )
     return {"ok": True, "ticket": _queue_v2_ticket(ticket_row)}
 
 
@@ -2795,6 +2866,14 @@ def dashboard_queue_v2_request_cancellation(
         _queue_v2_log(conn, request_id, caller, "cancellation_requested", {"reason": clean_reason})
         _queue_v2_publish(conn, "ticket_created", caller, [request_id])
         ticket_row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    _queue_v2_slack_log(
+        event_type="cancellation_requested", task_id=request_id, actor_email=caller,
+        account=row.get("post_account"), shortcode=row.get("post_shortcode"),
+        designer_email=row.get("designer_email"), status=row.get("status"),
+        production_points=row.get("production_points"), priority=row.get("priority"),
+        tags=_queue_v2_json(row.get("tags"), []), reason=clean_reason, brief=row.get("brief"),
+        scheduled_date=row.get("scheduled_date"), scheduled_start_minutes=row.get("scheduled_start_minutes"),
+    )
     return {"ok": True, "ticket": _queue_v2_ticket(ticket_row)}
 
 
@@ -2812,6 +2891,8 @@ def dashboard_queue_v2_review_ticket(
     new_status = "approved" if clean_action == "approve" else "rejected"
     now = utc_now()
     affected_ids: set[int] = set()
+    previous_production_points: int | None = None
+    queue_change_event: str | None = None
     with connect() as conn:
         ticket_row = conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone()
         if not ticket_row:
@@ -2829,6 +2910,7 @@ def dashboard_queue_v2_review_ticket(
             if not queue_row or queue_row["status"] not in {"scheduled", "in_progress"}:
                 raise HTTPException(status_code=409, detail="The Queue request can no longer receive a PP revision.")
             queue_item = dict(queue_row)
+            previous_production_points = int(queue_item["production_points"])
             new_points = int(ticket["requested_production_points"])
             if queue_item["status"] == "in_progress":
                 conflicts = _queue_v2_time_occupied(conn, queue_item["designer_email"], queue_item["scheduled_date"])
@@ -2841,6 +2923,7 @@ def dashboard_queue_v2_review_ticket(
                     raise HTTPException(status_code=409, detail="The revised in-progress block would overlap another firm block.")
             conn.execute("UPDATE queue_requests SET production_points = ?, updated_at = ? WHERE id = ?", (new_points, now, ticket["request_id"]))
             _queue_v2_log(conn, ticket["request_id"], caller, "pp_revision_approved", {"from": queue_item["production_points"], "to": new_points})
+            queue_change_event = "pp_revision_approved"
             if queue_item.get("designer_email"):
                 _queue_v2_reflow_scheduled(conn, queue_item["designer_email"], caller, ticket["request_id"] if queue_item["status"] == "scheduled" else None)
             affected_ids.add(int(ticket["request_id"]))
@@ -2854,9 +2937,11 @@ def dashboard_queue_v2_review_ticket(
                 (ticket["reason"], now, ticket["request_id"]),
             )
             _queue_v2_log(conn, ticket["request_id"], caller, "cancellation_approved", {"reason": ticket["reason"]})
+            queue_change_event = "cancellation_approved"
             affected_ids.add(int(ticket["request_id"]))
         if ticket.get("request_id") and clean_action == "reject":
             _queue_v2_log(conn, ticket["request_id"], caller, f"{ticket['ticket_type']}_rejected", {"reviewNote": (review_note or "").strip()})
+            queue_change_event = f"{ticket['ticket_type']}_rejected"
             affected_ids.add(int(ticket["request_id"]))
         conn.execute(
             """UPDATE queue_tickets SET status = ?, reviewer_email = ?, review_note = ?, reviewed_at = ?, updated_at = ?
@@ -2870,6 +2955,34 @@ def dashboard_queue_v2_review_ticket(
                FROM queue_tickets t LEFT JOIN queue_requests r ON r.id = t.request_id WHERE t.id = ?""",
             (ticket_id,),
         ).fetchone())
+        # A few isolated Queue migration databases predate the optional
+        # metadata columns. Enrich the production response when available but
+        # keep ticket approval compatible with those older schemas/tests.
+        if reviewed.get("request_id"):
+            try:
+                extra = conn.execute(
+                    "SELECT priority, tags, scheduled_date, scheduled_start_minutes FROM queue_requests WHERE id = ?",
+                    (reviewed["request_id"],),
+                ).fetchone()
+            except Exception:
+                extra = None
+            if extra:
+                reviewed.update(dict(extra))
+    if queue_change_event and reviewed.get("request_id"):
+        requested_points = reviewed.get("requested_production_points")
+        current_points = reviewed.get("current_production_points")
+        if queue_change_event == "pp_revision_approved":
+            requested_points, current_points = current_points, previous_production_points
+        _queue_v2_slack_log(
+            event_type=queue_change_event, task_id=int(reviewed["request_id"]), actor_email=caller,
+            account=reviewed.get("post_account"), shortcode=reviewed.get("post_shortcode"),
+            designer_email=reviewed.get("designer_email"), status=reviewed.get("request_status"),
+            production_points=current_points,
+            requested_production_points=requested_points,
+            priority=reviewed.get("priority"), tags=_queue_v2_json(reviewed.get("tags"), []),
+            reason=(ticket.get("reason") or review_note or "").strip(),
+            scheduled_date=reviewed.get("scheduled_date"), scheduled_start_minutes=reviewed.get("scheduled_start_minutes"),
+        )
     return {"ok": True, "ticket": _queue_v2_ticket(reviewed)}
 
 
@@ -3075,6 +3188,15 @@ def dashboard_queue_v2_cancel(request_id: int, request: Request, reason: Annotat
         conn.execute("UPDATE queue_requests SET status = 'cancelled', cancellation_reason = ?, updated_at = ? WHERE id = ?", ((reason or "").strip(), now, request_id))
         _queue_v2_log(conn, request_id, caller, "cancelled", {"reason": (reason or "").strip()})
         _queue_v2_publish(conn, "request_cancelled", caller, [request_id])
+    _queue_v2_slack_log(
+        event_type="cancelled", task_id=request_id, actor_email=caller,
+        account=row.get("post_account"), shortcode=row.get("post_shortcode"),
+        designer_email=row.get("designer_email"), status="cancelled",
+        production_points=row.get("production_points"), priority=row.get("priority"),
+        tags=_queue_v2_json(row.get("tags"), []), reason=(reason or "").strip(),
+        brief=row.get("brief"), scheduled_date=row.get("scheduled_date"),
+        scheduled_start_minutes=row.get("scheduled_start_minutes"),
+    )
     return {"ok": True}
 
 
