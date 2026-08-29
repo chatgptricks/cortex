@@ -1516,8 +1516,9 @@ def dashboard_queue_reorder(
 # Kept alongside the original Queue endpoints so old assignments remain a
 # read-only historical record while every new request starts from a clean pool.
 QUEUE_V2_STATUSES = {"pool", "scheduled", "in_progress", "completed", "closed", "cancelled"}
-QUEUE_V2_TAGS = ["content", "design", "copy", "research", "review", "repurpose"]
+QUEUE_V2_TAGS = ["content", "design", "copy", "research", "review", "repurpose", "hot"]
 QUEUE_V2_PRIORITIES = ["low", "medium", "high", "urgent"]
+QUEUE_V2_HOT_MULTIPLIER = 3.0
 QUEUE_V2_TICKET_TYPES = {"time_block", "pp_revision", "cancellation"}
 QUEUE_V2_TIME_CATEGORIES = {"meeting", "break", "promo", "focus", "other"}
 # queue_schedule_drafts predates pool return support and keeps its placement
@@ -1596,7 +1597,8 @@ def _queue_v2_post_snapshot(account: str, shortcode: str) -> dict[str, Any]:
     with connect() as conn:
         if table == "posts":
             row = conn.execute(
-                """SELECT id, caption, title, post_type_label, published_at, likes, comments
+                """SELECT id, caption, title, post_type_label, published_at, likes, comments,
+                          is_hot, hot_rate_multiplier
                    FROM posts WHERE shortcode = ?""",
                 (shortcode,),
             ).fetchone()
@@ -1607,10 +1609,12 @@ def _queue_v2_post_snapshot(account: str, shortcode: str) -> dict[str, Any]:
                 "id": item["id"], "caption": item.get("caption") or item.get("title") or "",
                 "type": item.get("post_type_label") or "Image", "publishedAt": item.get("published_at"),
                 "likes": item.get("likes"), "comments": item.get("comments"),
+                "isHot": bool(item.get("is_hot")), "hotMultiplier": item.get("hot_rate_multiplier"),
                 "permalink": f"https://www.instagram.com/p/{shortcode}/",
             }
         row = conn.execute(
-            """SELECT id, caption, post_type_label, published_at, likes, comments, permalink
+            """SELECT id, caption, post_type_label, published_at, likes, comments, permalink,
+                      is_hot, hot_rate_multiplier
                FROM dashboard_posts WHERE account = ? AND shortcode = ?""",
             (account, shortcode),
         ).fetchone()
@@ -1621,8 +1625,96 @@ def _queue_v2_post_snapshot(account: str, shortcode: str) -> dict[str, Any]:
         "id": item["id"], "caption": item.get("caption") or "",
         "type": item.get("post_type_label") or "Image", "publishedAt": item.get("published_at"),
         "likes": item.get("likes"), "comments": item.get("comments"),
+        "isHot": bool(item.get("is_hot")), "hotMultiplier": item.get("hot_rate_multiplier"),
         "permalink": item.get("permalink") or f"https://www.instagram.com/p/{shortcode}/",
     }
+
+
+def _queue_v2_hot_source_rows(conn: Any) -> list[dict[str, Any]]:
+    """Return source posts whose measured rate is strictly above 3x.
+
+    The canonical account still lives in ``posts`` while all other accounts
+    are in ``dashboard_posts``. Keeping the source query here means HOT
+    routing works for both storage shapes and remains idempotent.
+    """
+    rows: list[dict[str, Any]] = []
+    canonical = conn.execute(
+        "SELECT handle FROM accounts WHERE is_canonical = 1 AND is_active = 1 LIMIT 1"
+    ).fetchone()
+    if canonical:
+        for row in conn.execute(
+            """SELECT id, shortcode, caption, title, post_type_label, published_at,
+                      likes, comments, is_hot, hot_rate_multiplier
+               FROM posts
+               WHERE is_hot = 1 AND hot_rate_multiplier > ?
+                 AND shortcode IS NOT NULL AND shortcode != ''""",
+            (QUEUE_V2_HOT_MULTIPLIER,),
+        ).fetchall():
+            item = dict(row)
+            item["account"] = canonical["handle"]
+            item["permalink"] = f"https://www.instagram.com/p/{item['shortcode']}/"
+            rows.append(item)
+    for row in conn.execute(
+        """SELECT dp.id, dp.account, dp.shortcode, dp.caption, dp.post_type_label,
+                  dp.published_at, dp.likes, dp.comments, dp.permalink,
+                  dp.is_hot, dp.hot_rate_multiplier
+           FROM dashboard_posts dp
+           JOIN accounts a ON a.handle = dp.account
+           WHERE a.is_active = 1 AND dp.is_hot = 1 AND dp.hot_rate_multiplier > ?
+             AND dp.shortcode IS NOT NULL AND dp.shortcode != ''""",
+        (QUEUE_V2_HOT_MULTIPLIER,),
+    ).fetchall():
+        rows.append(dict(row))
+    return sorted(rows, key=lambda item: (-float(item.get("hot_rate_multiplier") or 0), str(item.get("account") or ""), str(item.get("shortcode") or "")))
+
+
+def _queue_v2_auto_pool_hot(conn: Any) -> list[int]:
+    """Materialize every new >3x HOT post as an urgent pool request.
+
+    This is safe to call from both the engagement worker and the Queue GET
+    endpoint: the unique post key and the existing-status check make it
+    idempotent, while cancelled requests stay cancelled instead of being
+    resurrected on every refresh.
+    """
+    now = utc_now()
+    existing = {
+        (str(row["post_account"]), str(row["post_shortcode"])): str(row["status"])
+        for row in conn.execute("SELECT post_account, post_shortcode, status FROM queue_requests").fetchall()
+    }
+    created: list[int] = []
+    for post in _queue_v2_hot_source_rows(conn):
+        account = str(post.get("account") or "").strip().lower()
+        shortcode = str(post.get("shortcode") or "").strip()
+        key = (account, shortcode)
+        if not account or not shortcode or key in existing:
+            continue
+        multiplier = float(post.get("hot_rate_multiplier") or 0)
+        caption = str(post.get("caption") or post.get("title") or "").strip()
+        post_type = str(post.get("post_type_label") or "Image").strip() or "Image"
+        permalink = str(post.get("permalink") or f"https://www.instagram.com/p/{shortcode}/")
+        cover_url = f"/api/dashboard/covers/{account}/{post.get('id')}" if post.get("id") is not None else ""
+        cursor = conn.execute(
+            """INSERT INTO queue_requests (
+                   post_account, post_shortcode, post_permalink, post_caption,
+                   post_type, cover_url, production_points, priority,
+                   deadline_at, tags, brief, notes, reference_links,
+                   coordinator_email, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, 'urgent', '', ?, ?, ?, '[]', ?, ?, ?)""",
+            (
+                account, shortcode, permalink, caption, post_type, cover_url,
+                3, json.dumps(["hot"]),
+                f"HOT post · {multiplier:.2f}× rate",
+                "Automatically added to the Queue because this post exceeded 3× its account HOT threshold.",
+                "system@sentientdash.app", now, now,
+            ),
+        )
+        request_id = int(cursor.lastrowid)
+        _queue_v2_log(conn, request_id, "system@sentientdash.app", "hot_auto_pooled", {"multiplier": multiplier})
+        created.append(request_id)
+        existing[key] = "pool"
+    if created:
+        _queue_v2_publish(conn, "hot_auto_pooled", "system@sentientdash.app", created)
+    return created
 
 
 def _queue_v2_log(conn: Any, request_id: int, actor: str, event_type: str, details: dict[str, Any] | None = None) -> None:
@@ -1835,6 +1927,7 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
             "comments": snapshot.get("comments"),
         },
         "productionPoints": pp, "durationMinutes": pp * 10, "priority": row.get("priority") or "medium",
+        "isHot": bool(snapshot.get("isHot")), "hotMultiplier": snapshot.get("hotMultiplier"),
         "tags": _queue_v2_json(row["tags"], []), "brief": row["brief"], "notes": row["notes"],
         "references": _queue_v2_json(row["reference_links"], []), "attachments": _queue_v2_json(row["attachments"], []),
         "status": row["status"], "designerEmail": row["designer_email"], "coordinatorEmail": row["coordinator_email"],
@@ -2138,6 +2231,10 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         clauses.append("designer_email = ?")
         params.append(caller)
     with connect() as conn:
+        # HOT routing is idempotent and runs at read time as a safety net for
+        # posts detected before this feature was deployed (the Apify worker
+        # also calls the same helper immediately after a fresh HOT check).
+        _queue_v2_auto_pool_hot(conn)
         pool_rows = conn.execute(
             """SELECT * FROM queue_requests
                WHERE status = 'pool'
@@ -2195,6 +2292,13 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
     # separate so the existing pool visibility rules and coordinator UI remain
     # unchanged.
     pick_requests = [_queue_v2_project(dict(row)) for row in pool_rows]
+    # Keep a separately sorted HOT list so the PD picker can fall back to the
+    # highest-rate HOT posts when the ordinary pool is empty. In normal use
+    # these rows are already materialized in the pool by the helper above.
+    hot_pick_requests = sorted(
+        [task for task in pick_requests if "hot" in (task.get("tags") or []) or task.get("isHot")],
+        key=lambda task: (-float(task.get("hotMultiplier") or 0), task.get("id", 0)),
+    )
     planning_requests = [_queue_v2_project(dict(row)) for row in planning_rows]
     assigned_requests = [_queue_v2_project(dict(row)) for row in assigned_rows]
     live_drafts = [_queue_v2_project_draft(row) for row in draft_rows]
@@ -2207,6 +2311,7 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         "viewer": {"email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)), "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
         "date": selected_date, "requests": requests, "planningRequests": planning_requests,
         "pickRequests": pick_requests,
+        "hotPickRequests": hot_pick_requests,
         "assignedRequests": assigned_requests, "liveDrafts": live_drafts, "liveRevision": live_state["revision"],
         "timeBlocks": [_queue_v2_ticket(dict(row)) for row in time_block_rows], "pendingTicketCount": pending_ticket_count,
         "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],

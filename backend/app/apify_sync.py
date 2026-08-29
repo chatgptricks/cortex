@@ -1340,6 +1340,20 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
             conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE id = ?", params)
         engagement_summary["updated"] += 1
 
+    # Materialize freshly detected >3x posts immediately. The helper is
+    # imported lazily because main.py imports this module during app startup;
+    # by the time the scheduled worker reaches this point the app module is
+    # fully initialized. A Queue GET also runs the same idempotent helper as a
+    # backfill safety net, so a routing hiccup never loses a HOT request.
+    if engagement_summary["hot_marked"]:
+        try:
+            from .main import _queue_v2_auto_pool_hot
+
+            with connect() as conn:
+                _queue_v2_auto_pool_hot(conn)
+        except Exception:
+            logger.exception("Could not auto-add HOT posts to the Queue pool")
+
     if pending_alerts:
         from .slack_alerts import cover_url_for, notify_hot_post, slack_configured
 
