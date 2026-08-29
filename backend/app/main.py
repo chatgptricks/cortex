@@ -64,6 +64,8 @@ from .queue_rules import (
     SCHEDULER_END,
     SCHEDULER_START,
     SCHEDULER_TIMEZONE,
+    next_available_slot,
+    schedule_absolute,
 )
 
 
@@ -213,6 +215,9 @@ def startup() -> None:
     init_db()
     seed_dashboard_users_from_env(_SEED_ALLOWED_EMAILS, _SEED_ADMIN_EMAILS)
     seed_queue_role_roster()
+    repaired = _queue_v2_reflow_all_schedules()
+    if repaired:
+        logging.getLogger(__name__).info("Queue startup repair reflowed %s scheduled request(s)", repaired)
     start_scheduler()
 
 
@@ -1602,6 +1607,73 @@ def _queue_v2_log(conn: Any, request_id: int, actor: str, event_type: str, detai
     )
 
 
+def _queue_v2_duration(row: dict[str, Any]) -> int:
+    planned = max(10, int(row["production_points"]) * 10)
+    if row.get("status") in {"completed", "closed"} and row.get("actual_started_at") and row.get("completed_at"):
+        try:
+            actual = max(10, round((datetime.fromisoformat(row["completed_at"]) - datetime.fromisoformat(row["actual_started_at"])).total_seconds() / 60))
+            return min(planned, actual)
+        except (TypeError, ValueError):
+            pass
+    return planned
+
+
+def _queue_v2_occupied(row: dict[str, Any], duration: int | None = None) -> dict[str, Any]:
+    return {
+        "date": row.get("scheduled_date"),
+        "start": row.get("scheduled_start_minutes"),
+        "duration": duration if duration is not None else _queue_v2_duration(row),
+    }
+
+
+def _queue_v2_reflow_scheduled(conn: Any, designer: str, actor: str, priority_id: int | None = None) -> int:
+    """Remove every scheduled overlap for one designer without rejecting work.
+
+    In-progress and finished blocks stay fixed. Scheduled blocks advance across
+    midnight as needed. A priority request is used by Start so the newly
+    requested job owns the first slot after active work and later jobs cascade.
+    """
+    rows = [dict(row) for row in conn.execute(
+        """SELECT * FROM queue_requests
+           WHERE designer_email = ? AND status IN ('scheduled','in_progress','completed','closed')
+             AND scheduled_date IS NOT NULL AND scheduled_start_minutes IS NOT NULL
+           ORDER BY scheduled_date, scheduled_start_minutes, id""",
+        (designer,),
+    ).fetchall()]
+    occupied = [_queue_v2_occupied(row) for row in rows if row["status"] != "scheduled"]
+    scheduled_rows = [row for row in rows if row["status"] == "scheduled"]
+    if priority_id is not None:
+        scheduled_rows.sort(key=lambda row: (row["id"] != priority_id, row["scheduled_date"], row["scheduled_start_minutes"], row["id"]))
+    moved = 0
+    for row in scheduled_rows:
+        resolved_date, resolved_start = next_available_slot(
+            row["scheduled_date"], int(row["scheduled_start_minutes"]), _queue_v2_duration(row), occupied,
+        )
+        if resolved_date != row["scheduled_date"] or resolved_start != int(row["scheduled_start_minutes"]):
+            conn.execute(
+                "UPDATE queue_requests SET scheduled_date = ?, scheduled_start_minutes = ?, updated_at = ? WHERE id = ?",
+                (resolved_date, resolved_start, utc_now(), row["id"]),
+            )
+            _queue_v2_log(conn, row["id"], actor, "auto_reflowed", {
+                "fromDate": row["scheduled_date"], "fromStart": row["scheduled_start_minutes"],
+                "date": resolved_date, "start": resolved_start,
+            })
+            row["scheduled_date"], row["scheduled_start_minutes"] = resolved_date, resolved_start
+            moved += 1
+        occupied.append(_queue_v2_occupied(row))
+    return moved
+
+
+def _queue_v2_reflow_all_schedules() -> int:
+    """One startup pass repairs overlaps saved by older Queue releases."""
+    with connect() as conn:
+        designers = [row["designer_email"] for row in conn.execute(
+            """SELECT DISTINCT designer_email FROM queue_requests
+               WHERE designer_email IS NOT NULL AND status = 'scheduled'"""
+        ).fetchall()]
+        return sum(_queue_v2_reflow_scheduled(conn, designer, "queue-system@sentientdash.app") for designer in designers)
+
+
 def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
     pp = int(row["production_points"])
     snapshot = _queue_v2_post_snapshot(row["post_account"], row["post_shortcode"])
@@ -1657,6 +1729,18 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
                  ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, id""",
             params,
         ).fetchall()
+        planning_params: list[Any] = []
+        planning_scope = ""
+        if not (is_admin or "vc" in roles):
+            planning_scope = " AND designer_email = ?"
+            planning_params.append(caller)
+        planning_rows = conn.execute(
+            f"""SELECT * FROM queue_requests
+                WHERE status IN ('scheduled','in_progress','completed','closed')
+                  AND scheduled_date IS NOT NULL AND scheduled_start_minutes IS NOT NULL{planning_scope}
+                ORDER BY scheduled_date, scheduled_start_minutes, id""",
+            planning_params,
+        ).fetchall()
         assigned_rows = []
         if not (is_admin or "vc" in roles):
             assigned_rows = conn.execute(
@@ -1666,12 +1750,13 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
                 (caller,),
             ).fetchall()
     requests = [_queue_v2_project(dict(row)) for row in rows]
+    planning_requests = [_queue_v2_project(dict(row)) for row in planning_rows]
     assigned_requests = [_queue_v2_project(dict(row)) for row in assigned_rows]
     if not (is_admin or "vc" in roles):
         requests = [item for item in requests if item["status"] != "pool"]
     return {
         "viewer": {"email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)), "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
-        "date": selected_date, "requests": requests, "assignedRequests": assigned_requests, "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
+        "date": selected_date, "requests": requests, "planningRequests": planning_requests, "assignedRequests": assigned_requests, "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
         "tags": QUEUE_V2_TAGS, "priorities": QUEUE_V2_PRIORITIES,
         "hours": {"start": SCHEDULER_START, "end": SCHEDULER_END},
     }
@@ -1798,6 +1883,7 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
     if not isinstance(entries, list) or not entries:
         raise HTTPException(status_code=400, detail="Add at least one schedule change before submitting.")
     notifications: list[dict[str, Any]] = []
+    adjustments: list[dict[str, Any]] = []
     now = utc_now()
     with connect() as conn:
         prepared: list[dict[str, Any]] = []
@@ -1811,19 +1897,12 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
             if request_id in changed_ids:
                 raise HTTPException(status_code=400, detail="A Queue request can only appear once per submit.")
             changed_ids.add(request_id)
-            if start % 10 or start < SCHEDULER_START:
+            if start % 10 or start < SCHEDULER_START or start >= SCHEDULER_END:
                 raise HTTPException(status_code=400, detail="Tasks must begin in 10-minute scheduler slots.")
             try:
-                scheduled_day = datetime.strptime(date, "%Y-%m-%d").date()
+                datetime.strptime(date, "%Y-%m-%d").date()
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
-            scheduler_now = datetime.now(SCHEDULER_TIMEZONE)
-            today = scheduler_now.date()
-            if scheduled_day < today or scheduled_day > today + timedelta(days=5):
-                raise HTTPException(status_code=400, detail="Schedule requests from today through the next five days.")
-            current_slot = ((scheduler_now.hour * 60 + scheduler_now.minute + 9) // 10) * 10
-            if scheduled_day == today and start < current_slot:
-                raise HTTPException(status_code=400, detail="Today's requests cannot be scheduled before the current time.")
             designer_row = conn.execute("SELECT operating_role, operating_roles, slack_user_id FROM dashboard_users WHERE email = ?", (designer,)).fetchone()
             designer_roles = _queue_v2_json(designer_row["operating_roles"], [designer_row["operating_role"]]) if designer_row else []
             if not designer_row or "pd" not in designer_roles:
@@ -1847,6 +1926,22 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
                 "row": dict(row), "assigneeSlackId": designer_row["slack_user_id"],
             })
 
+        occupied_by_designer: dict[str, list[dict[str, Any]]] = {}
+        for designer in {item["designer"] for item in prepared}:
+            existing = [dict(row) for row in conn.execute(
+                """SELECT * FROM queue_requests
+                   WHERE designer_email = ? AND status IN ('scheduled','in_progress','completed','closed')
+                     AND scheduled_date IS NOT NULL AND scheduled_start_minutes IS NOT NULL""",
+                (designer,),
+            ).fetchall() if int(row["id"]) not in changed_ids]
+            occupied_by_designer[designer] = [_queue_v2_occupied(row) for row in existing]
+
+        for item in sorted(prepared, key=lambda entry: (entry["designer"], schedule_absolute(entry["date"], entry["start"]), entry["id"])):
+            item["date"], item["start"] = next_available_slot(
+                item["date"], item["start"], item["duration"], occupied_by_designer[item["designer"]],
+            )
+            occupied_by_designer[item["designer"]].append({"date": item["date"], "start": item["start"], "duration": item["duration"]})
+
         assigner_row = conn.execute("SELECT slack_user_id FROM dashboard_users WHERE email = ?", (caller,)).fetchone()
         assigner_slack_id = assigner_row["slack_user_id"] if assigner_row else ""
         for item in prepared:
@@ -1858,12 +1953,18 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
                 (item["designer"], caller, item["date"], item["start"], json.dumps(item["accounts"]), now, item["id"]),
             )
             _queue_v2_log(conn, item["id"], caller, "resubmitted" if was_scheduled else "scheduled", {"designer": item["designer"], "date": item["date"], "start": item["start"], "accounts": item["accounts"]})
+        for designer in {item["designer"] for item in prepared}:
+            _queue_v2_reflow_scheduled(conn, designer, caller)
+        for item in prepared:
+            row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (item["id"],)).fetchone())
+            final_date, final_start = row["scheduled_date"], int(row["scheduled_start_minutes"])
+            adjustments.append({"id": item["id"], "designerEmail": item["designer"], "scheduledDate": final_date, "scheduledStartMinutes": final_start})
             notifications.append({"task_id": item["id"], "assignee_email": item["designer"], "assigned_by_email": caller,
                                   "account": row["post_account"], "post_id": _queue_post_id(row["post_account"], row["post_shortcode"]),
                                   "note": row["brief"], "notes": row["notes"], "references": _queue_v2_json(row["reference_links"], []),
                                   "priority": row["priority"], "tags": _queue_v2_json(row["tags"], []),
                                   "recommended_accounts": item["accounts"], "production_points": row["production_points"],
-                                  "scheduled_date": item["date"], "scheduled_start_minutes": item["start"], "update": was_scheduled,
+                                  "scheduled_date": final_date, "scheduled_start_minutes": final_start, "update": item["row"]["status"] != "pool",
                                   "assignee_slack_id": item["assigneeSlackId"], "assigned_by_slack_id": assigner_slack_id})
     from .slack_alerts import notify_queue_assignment
     sent = 0
@@ -1872,7 +1973,7 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
         sent += int(delivered)
         with connect() as conn:
             _queue_v2_log(conn, item["task_id"], caller, "slack_sent" if delivered else "slack_failed")
-    return {"ok": True, "submitted": len(entries), "notifications": {"sent": sent, "failed": len(notifications) - sent}}
+    return {"ok": True, "submitted": len(entries), "adjustments": adjustments, "notifications": {"sent": sent, "failed": len(notifications) - sent}}
 
 
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/start")
@@ -1884,29 +1985,48 @@ def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any
     if row["status"] not in {"scheduled", "completed"}:
         raise HTTPException(status_code=409, detail="Only scheduled or completed work can be started.")
     now = utc_now()
-    schedule_updates: tuple[Any, ...] | None = None
-    if row["status"] == "scheduled" and not row["actual_started_at"]:
-        local_now = datetime.now(SCHEDULER_TIMEZONE)
-        actual_minutes = local_now.hour * 60 + local_now.minute
-        scheduled_minutes = int(row["scheduled_start_minutes"] or SCHEDULER_START)
-        if local_now.date().isoformat() != row["scheduled_date"]:
-            raise HTTPException(status_code=409, detail="This request can only be started on its scheduled day.")
-        if actual_minutes < SCHEDULER_START:
-            raise HTTPException(status_code=409, detail="Production work cannot begin before 8:00 AM.")
-        if actual_minutes > scheduled_minutes + 60:
-            raise HTTPException(status_code=409, detail="This request is more than one hour late. Ask a coordinator to reschedule it.")
-        schedule_updates = (actual_minutes, row["scheduled_date"])
+    local_now = datetime.now(SCHEDULER_TIMEZONE)
+    current_slot = (local_now.hour * 60 + local_now.minute) // 10 * 10
+    current_date = local_now.date().isoformat()
+    designer = str(row["designer_email"] or "")
     with connect() as conn:
-        if schedule_updates:
-            conn.execute(
-                """UPDATE queue_requests SET status = 'in_progress', scheduled_start_minutes = ?, scheduled_date = ?,
-                   actual_started_at = ?, completed_at = NULL, updated_at = ? WHERE id = ?""",
-                (schedule_updates[0], schedule_updates[1], now, now, request_id),
+        active_rows = [dict(item) for item in conn.execute(
+            """SELECT * FROM queue_requests
+               WHERE designer_email = ? AND status = 'in_progress' AND id != ?
+                 AND scheduled_date IS NOT NULL AND scheduled_start_minutes IS NOT NULL
+               ORDER BY scheduled_date, scheduled_start_minutes, id""",
+            (designer, request_id),
+        ).fetchall()]
+        if active_rows:
+            current_absolute = schedule_absolute(current_date, current_slot)
+            active_occupied = []
+            for active in active_rows:
+                active_absolute = schedule_absolute(active["scheduled_date"], int(active["scheduled_start_minutes"]))
+                active_duration = max(_queue_v2_duration(active), current_absolute + 10 - active_absolute)
+                active_occupied.append(_queue_v2_occupied(active, active_duration))
+            resolved_date, resolved_start = next_available_slot(
+                current_date, current_slot, _queue_v2_duration(row), active_occupied,
             )
-        else:
-            conn.execute("UPDATE queue_requests SET status = 'in_progress', completed_at = NULL, updated_at = ? WHERE id = ?", (now, request_id))
-        _queue_v2_log(conn, request_id, caller, "started", {"actualStartMinutes": schedule_updates[0] if schedule_updates else None})
-    return {"ok": True, "scheduledStartMinutes": schedule_updates[0] if schedule_updates else row["scheduled_start_minutes"]}
+            conn.execute(
+                """UPDATE queue_requests SET status = 'scheduled', scheduled_start_minutes = ?, scheduled_date = ?,
+                   actual_started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?""",
+                (resolved_start, resolved_date, now, request_id),
+            )
+            _queue_v2_reflow_scheduled(conn, designer, caller, priority_id=request_id)
+            updated = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
+            _queue_v2_log(conn, request_id, caller, "deferred_after_in_progress", {
+                "date": updated["scheduled_date"], "start": updated["scheduled_start_minutes"],
+                "activeRequestIds": [item["id"] for item in active_rows],
+            })
+            return {"ok": True, "deferred": True, "scheduledDate": updated["scheduled_date"], "scheduledStartMinutes": updated["scheduled_start_minutes"]}
+        conn.execute(
+            """UPDATE queue_requests SET status = 'in_progress', scheduled_start_minutes = ?, scheduled_date = ?,
+               actual_started_at = ?, completed_at = NULL, updated_at = ? WHERE id = ?""",
+            (current_slot, current_date, now, now, request_id),
+        )
+        _queue_v2_reflow_scheduled(conn, designer, caller)
+        _queue_v2_log(conn, request_id, caller, "started", {"date": current_date, "actualStartMinutes": current_slot})
+    return {"ok": True, "deferred": False, "scheduledDate": current_date, "scheduledStartMinutes": current_slot}
 
 
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/edit")
@@ -1919,9 +2039,8 @@ def dashboard_queue_v2_edit(
     """Coordinator-owned edits to a production request's specification.
 
     Scheduling is intentionally still controlled through Submit so assignment
-    notifications remain a deliberate action.  Changing PP here does update
-    the scheduled block's duration and is rejected when it would overlap a
-    neighboring request.
+    notifications remain a deliberate action. Changing PP immediately
+    cascades scheduled work forward when the larger block needs more room.
     """
     caller, _, _ = _queue_v2_access(request, coordinator=True)
     if production_points < 1:
@@ -1944,6 +2063,8 @@ def dashboard_queue_v2_edit(
         _queue_v2_log(conn, request_id, caller, "edited", {
             "productionPoints": production_points, "priority": clean_priority, "tags": clean_tags,
         })
+        if row.get("designer_email") and row.get("status") in {"scheduled", "in_progress", "completed", "closed"}:
+            _queue_v2_reflow_scheduled(conn, row["designer_email"], caller, priority_id=request_id if row["status"] == "scheduled" else None)
         updated = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
     return {"ok": True, "request": _queue_v2_project(updated)}
 
