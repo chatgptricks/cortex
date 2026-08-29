@@ -286,7 +286,12 @@ def init_db() -> None:
                 post_type TEXT NOT NULL DEFAULT '',
                 cover_url TEXT NOT NULL DEFAULT '',
                 production_points INTEGER NOT NULL CHECK(production_points > 0),
-                deadline_at TEXT NOT NULL,
+                priority TEXT NOT NULL DEFAULT 'medium'
+                    CHECK(priority IN ('low', 'medium', 'high', 'urgent')),
+                -- Retained as an internal compatibility column for databases
+                -- created before Queue switched from deadlines to priority.
+                -- Active Queue code never reads or exposes it.
+                deadline_at TEXT NOT NULL DEFAULT '',
                 tags TEXT NOT NULL DEFAULT '[]',
                 brief TEXT NOT NULL DEFAULT '',
                 notes TEXT NOT NULL DEFAULT '',
@@ -310,8 +315,6 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_queue_requests_day
                 ON queue_requests(scheduled_date, designer_email, scheduled_start_minutes);
-            CREATE INDEX IF NOT EXISTS idx_queue_requests_status
-                ON queue_requests(status, deadline_at);
             CREATE TABLE IF NOT EXISTS queue_request_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_id INTEGER NOT NULL,
@@ -375,6 +378,9 @@ def init_db() -> None:
         _ensure_column(conn, "dashboard_users", "operating_roles", "operating_roles TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "dashboard_users", "is_admin", "is_admin INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "dashboard_users", "slack_user_id", "slack_user_id TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "queue_requests", "priority", "priority TEXT NOT NULL DEFAULT 'medium'")
+        conn.execute("DROP INDEX IF EXISTS idx_queue_requests_status")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_requests_status_priority ON queue_requests(status, priority)")
         # Following count -- added after account_snapshots shipped, so older
         # snapshots have NULL here; the Tracker's historical-stats table just
         # shows "--" for those rows instead of a delta.
@@ -706,30 +712,56 @@ def seed_queue_role_roster() -> None:
     now = utc_now()
     with connect() as conn:
         marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v4_seeded'").fetchone()
-        if marker:
-            return
-        for email, (operating_role, is_admin) in roster.items():
-            exists = conn.execute("SELECT email FROM dashboard_users WHERE email = ?", (email,)).fetchone()
-            if not exists:
-                # Do not silently grant dashboard access to emails not in the
-                # Firebase allowlist. Settings can add them later if needed.
-                continue
+        if not marker:
+            for email, (operating_role, is_admin) in roster.items():
+                exists = conn.execute("SELECT email FROM dashboard_users WHERE email = ?", (email,)).fetchone()
+                if not exists:
+                    # Do not silently grant dashboard access to emails not in the
+                    # Firebase allowlist. Settings can add them later if needed.
+                    continue
+                operating_roles = (
+                    ["pd", "vc", "dev"] if email == "esteban@sentientagency.io"
+                    else ["vc", "pd"] if email == "ivan@sentientagency.io"
+                    else [operating_role]
+                )
+                conn.execute(
+                    """UPDATE dashboard_users SET role = ?, operating_role = ?, operating_roles = ?, is_admin = ?, updated_at = ?
+                       WHERE email = ?""",
+                    ("admin" if is_admin else "viewer", operating_role, json.dumps(operating_roles), int(is_admin), now, email),
+                )
+            # Initial agreed account mapping. The Settings API owns all later
+            # additions, so this is intentionally a one-time seed too.
+            for handle in ("chatgptricks", "costarica"):
+                conn.execute(
+                    "INSERT OR IGNORE INTO queue_designer_accounts (designer_email, account_handle, created_at) VALUES (?, ?, ?)",
+                    ("esteban@sentientagency.io", handle, now),
+                )
             conn.execute(
-                """UPDATE dashboard_users SET role = ?, operating_role = ?, operating_roles = ?, is_admin = ?, updated_at = ?
-                   WHERE email = ?""",
-                ("admin" if is_admin else "viewer", operating_role, json.dumps(["pd", "vc", "dev"] if email == "esteban@sentientagency.io" else [operating_role]), int(is_admin), now, email),
+                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v4_seeded', '1', ?)",
+                (now,),
             )
-        # Initial agreed account mapping. The Settings API owns all later
-        # additions, so this is intentionally a one-time seed too.
-        for handle in ("chatgptricks", "costarica"):
+
+        # Role additions after the initial seed need their own idempotent
+        # marker because most production databases already have v4 applied.
+        ivan_marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v5_ivan_pd'").fetchone()
+        if not ivan_marker:
+            ivan = conn.execute(
+                "SELECT operating_role, operating_roles FROM dashboard_users WHERE email = ?",
+                ("ivan@sentientagency.io",),
+            ).fetchone()
+            if ivan:
+                roles = json.loads(ivan["operating_roles"] or "[]")
+                if not roles:
+                    roles = [ivan["operating_role"]]
+                roles = list(dict.fromkeys([*roles, "vc", "pd"]))
+                conn.execute(
+                    "UPDATE dashboard_users SET operating_roles = ?, updated_at = ? WHERE email = ?",
+                    (json.dumps(roles), now, "ivan@sentientagency.io"),
+                )
             conn.execute(
-                "INSERT OR IGNORE INTO queue_designer_accounts (designer_email, account_handle, created_at) VALUES (?, ?, ?)",
-                ("esteban@sentientagency.io", handle, now),
+                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v5_ivan_pd', '1', ?)",
+                (now,),
             )
-        conn.execute(
-            "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v4_seeded', '1', ?)",
-            (now,),
-        )
 
 
 def log_usage_event(email: str, path: str, method: str) -> None:
