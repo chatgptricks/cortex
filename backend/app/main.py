@@ -1788,6 +1788,36 @@ def _queue_v2_designers() -> list[dict[str, Any]]:
     return [{"email": user["email"], "isAdmin": bool(user.get("is_admin")), "accounts": by_designer.get(user["email"], [])} for user in users]
 
 
+def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
+    """Return the complete dashboard roster for the coordinator timeline.
+
+    Queue work is still assignable only to Post Designers (the separate
+    ``designers`` collection powers account choices and server-side
+    validation), but coordinators need to see every dashboard user in the
+    scheduler for a truthful team overview. Non-production roles are marked
+    as such so the client can keep their rows visible without presenting them
+    as valid drop targets.
+    """
+    users = list_dashboard_users()
+    with connect() as conn:
+        accounts = conn.execute("SELECT designer_email, account_handle FROM queue_designer_accounts ORDER BY account_handle").fetchall()
+    by_designer: dict[str, list[str]] = {}
+    for item in accounts:
+        by_designer.setdefault(item["designer_email"], []).append(item["account_handle"])
+    result: list[dict[str, Any]] = []
+    for user in users:
+        roles = _queue_v2_json(user.get("operating_roles"), [user.get("operating_role") or "sales"])
+        roles = [str(role).strip().lower() for role in roles if str(role).strip()]
+        result.append({
+            "email": user["email"],
+            "isAdmin": bool(user.get("is_admin")),
+            "roles": roles,
+            "isQueueDesigner": "pd" in roles,
+            "accounts": by_designer.get(user["email"], []),
+        })
+    return result
+
+
 def _queue_v2_prepare_schedule_changes(
     conn: Any, entries: Any, *, ignore_draft_coordinator: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -1958,11 +1988,15 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
     live_drafts = [_queue_v2_project_draft(row) for row in draft_rows]
     if not (is_admin or "vc" in roles):
         requests = [item for item in requests if item["status"] != "pool"]
+    scheduler_users = _queue_v2_scheduler_users() if (is_admin or "vc" in roles) else [
+        user for user in _queue_v2_scheduler_users() if user["email"] == caller
+    ]
     return {
         "viewer": {"email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)), "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
         "date": selected_date, "requests": requests, "planningRequests": planning_requests,
         "assignedRequests": assigned_requests, "liveDrafts": live_drafts, "liveRevision": live_state["revision"],
         "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
+        "schedulerUsers": scheduler_users,
         "tags": QUEUE_V2_TAGS, "priorities": QUEUE_V2_PRIORITIES,
         "hours": {"start": SCHEDULER_START, "end": SCHEDULER_END},
     }
