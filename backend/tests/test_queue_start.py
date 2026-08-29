@@ -41,6 +41,7 @@ def test_starting_second_request_defers_and_cascades(monkeypatch, tmp_path) -> N
             scheduled_date TEXT NOT NULL,
             scheduled_start_minutes INTEGER NOT NULL,
             recommended_accounts TEXT NOT NULL DEFAULT '[]',
+            production_points INTEGER,
             updated_at TEXT NOT NULL
         );
         CREATE TABLE queue_live_state (

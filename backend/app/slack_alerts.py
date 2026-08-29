@@ -46,6 +46,17 @@ _SLACK_USERS_BY_EMAIL = {
     "gabo@sentientagency.io": "U0BLJHSUNJG",
 }
 
+
+def slack_user_id_for_email(email: str | None) -> str:
+    """Return the reviewed Slack ID for a dashboard user.
+
+    Dashboard rows may predate the Slack-ID field (or may have an empty value
+    after a roster migration). Keep the explicit mapping as the source of
+    truth for Queue delivery and profile lookups in those cases.
+    """
+    clean = str(email or "").strip().lower()
+    return _SLACK_USERS_BY_EMAIL.get(clean, "")
+
 _SLACK_PROFILE_CACHE: tuple[float, dict[str, str]] | None = None
 _SLACK_PROFILE_LOCK = threading.Lock()
 _SLACK_PROFILE_TTL = 6 * 60 * 60
@@ -252,13 +263,45 @@ def build_queue_assignment_message(
         scheduled = f"{scheduled_date} · {hours % 12 or 12}:{minutes:02d} {'AM' if hours < 12 else 'PM'}"
         metadata.append(f"*Scheduled*\n{scheduled}")
 
-    blocks: list[dict[str, Any]] = [
-        {"type": "header", "text": {"type": "plain_text", "text": "Queue schedule updated" if update else "New Queue assignment", "emoji": True}},
+    # Follow-up notifications are intentionally compact. The first DM is the
+    # canonical card (with media and all context); subsequent schedule changes
+    # should read as a lightweight audit entry and, when possible, live in that
+    # original message's thread.
+    if update:
+        blocks: list[dict[str, Any]] = [
+            {"type": "header", "text": {"type": "plain_text", "text": "Queue update", "emoji": True}},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"{assigner} updated this post{' for *' + destination + '*' if destination else ''}.",
+                },
+            },
+        ]
+        if metadata:
+            blocks.append({"type": "section", "fields": [{"type": "mrkdwn", "text": value} for value in metadata]})
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "style": "primary",
+                        "text": {"type": "plain_text", "text": "Open in Queue", "emoji": True},
+                        "url": queue_url_for(task_id),
+                    }
+                ],
+            }
+        )
+        return {"text": f"{assigner} updated your Queue assignment{f' for {destination}' if destination else ''}.", "blocks": blocks}
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "New Queue assignment", "emoji": True}},
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"{assigner} {'updated' if update else 'assigned'} this post{' for *' + destination + '*' if destination else ''}.",
+                "text": f"{assigner} assigned this post{' for *' + destination + '*' if destination else ''}.",
             },
         },
     ]
@@ -292,37 +335,44 @@ def build_queue_assignment_message(
     return {"text": f"{assigner} assigned you a post{f' for {destination}' if destination else ''}.", "blocks": blocks}
 
 
-def notify_queue_assignment(**assignment: Any) -> bool:
-    """Sends one *private* DM to the assignee; never falls back to a channel.
+def notify_queue_assignment_result(**assignment: Any) -> dict[str, Any]:
+    """Send a private Queue DM and return delivery metadata.
 
-    A Slack failure must never undo a successfully-created Queue assignment.
-    Required bot scopes: ``chat:write``, ``im:write``, and ``im:read``.
+    The returned Slack channel/message timestamp is persisted for Queue V2 so
+    later updates can reply in the original one-to-one DM thread. Delivery is
+    still best-effort and never raises into the assignment transaction.
     """
     token = os.getenv("SLACK_BOT_TOKEN", "").strip()
     assignee_email = str(assignment.get("assignee_email") or "").strip().lower()
-    recipient = str(assignment.pop("assignee_slack_id", "") or "").strip() or _SLACK_USERS_BY_EMAIL.get(assignee_email)
+    recipient = str(assignment.pop("assignee_slack_id", "") or "").strip() or slack_user_id_for_email(assignee_email)
+    update = bool(assignment.get("update"))
+    stored_channel = str(assignment.pop("slack_channel_id", "") or "").strip()
+    stored_thread = str(assignment.pop("slack_message_ts", "") or "").strip()
     if not token:
         logger.warning("Queue assignment DM skipped: SLACK_BOT_TOKEN is not configured")
-        return False
+        return {"sent": False}
     if not recipient:
         logger.warning("Queue assignment DM skipped: no Slack user mapping for %s", assignee_email)
-        return False
+        return {"sent": False}
     try:
         import httpx
 
         headers = {"Authorization": f"Bearer {token}"}
         with httpx.Client(timeout=15.0) as client:
-            opened = client.post("https://slack.com/api/conversations.open", headers=headers, json={"users": recipient})
-            opened.raise_for_status()
-            opened_data = opened.json()
-            opened_channel = opened_data.get("channel") or {}
-            channel_id = opened_channel.get("id")
-            if not opened_data.get("ok") or not channel_id:
-                logger.error("Queue assignment DM open rejected: %s", opened_data.get("error", "unknown error"))
-                return False
-            # conversations.open returns only an ID. Verify the conversation
-            # itself before posting, so an assignment can never be delivered
-            # to a group or channel by mistake.
+            channel_id = stored_channel
+            # Reuse the existing DM for updates when it belongs to this
+            # recipient. Otherwise open a fresh one-to-one conversation.
+            if not channel_id:
+                opened = client.post("https://slack.com/api/conversations.open", headers=headers, json={"users": recipient})
+                opened.raise_for_status()
+                opened_data = opened.json()
+                opened_channel = opened_data.get("channel") or {}
+                channel_id = opened_channel.get("id")
+                if not opened_data.get("ok") or not channel_id:
+                    logger.error("Queue assignment DM open rejected: %s", opened_data.get("error", "unknown error"))
+                    return {"sent": False}
+            # Verify the conversation before posting so an assignment can
+            # never be delivered to a group or channel by mistake.
             inspected = client.get(
                 "https://slack.com/api/conversations.info",
                 headers=headers,
@@ -337,19 +387,28 @@ def notify_queue_assignment(**assignment: Any) -> bool:
                 or channel.get("user") != recipient
             ):
                 logger.error("Queue assignment DM verification rejected: %s", inspected_data.get("error", "not a one-to-one IM"))
-                return False
+                return {"sent": False}
             payload = build_queue_assignment_message(**assignment)
             payload["channel"] = channel_id
+            if update and stored_thread:
+                payload["thread_ts"] = stored_thread
+                payload["reply_broadcast"] = False
             sent = client.post("https://slack.com/api/chat.postMessage", headers=headers, json=payload)
             sent.raise_for_status()
             sent_data = sent.json()
             if not sent_data.get("ok"):
                 logger.error("Queue assignment DM rejected: %s", sent_data.get("error", "unknown error"))
-                return False
-        return True
+                return {"sent": False}
+            message_ts = str(sent_data.get("ts") or "").strip()
+        return {"sent": True, "channelId": channel_id, "messageTs": stored_thread or message_ts}
     except Exception:
         logger.exception("Queue assignment DM failed for %s", assignee_email)
-        return False
+        return {"sent": False}
+
+
+def notify_queue_assignment(**assignment: Any) -> bool:
+    """Backward-compatible bool wrapper used by legacy Queue endpoints."""
+    return bool(notify_queue_assignment_result(**assignment).get("sent"))
 
 
 def alert_image_url_for(filename: str) -> str:

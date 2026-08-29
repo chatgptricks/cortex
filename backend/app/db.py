@@ -302,6 +302,11 @@ def init_db() -> None:
                 designer_email TEXT,
                 coordinator_email TEXT NOT NULL,
                 recommended_accounts TEXT NOT NULL DEFAULT '[]',
+                -- Slack DM metadata for compact follow-up updates. The
+                -- initial assignment stores its DM channel/message timestamp
+                -- so later changes can be threaded without repeating media.
+                slack_channel_id TEXT,
+                slack_message_ts TEXT,
                 scheduled_date TEXT,
                 scheduled_start_minutes INTEGER,
                 actual_started_at TEXT,
@@ -343,6 +348,7 @@ def init_db() -> None:
                 scheduled_date TEXT NOT NULL,
                 scheduled_start_minutes INTEGER NOT NULL,
                 recommended_accounts TEXT NOT NULL DEFAULT '[]',
+                production_points INTEGER,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(request_id) REFERENCES queue_requests(id) ON DELETE CASCADE
             );
@@ -406,6 +412,9 @@ def init_db() -> None:
         _ensure_column(conn, "dashboard_users", "is_admin", "is_admin INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "dashboard_users", "slack_user_id", "slack_user_id TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "queue_requests", "priority", "priority TEXT NOT NULL DEFAULT 'medium'")
+        _ensure_column(conn, "queue_requests", "slack_channel_id", "slack_channel_id TEXT")
+        _ensure_column(conn, "queue_requests", "slack_message_ts", "slack_message_ts TEXT")
+        _ensure_column(conn, "queue_schedule_drafts", "production_points", "production_points INTEGER")
         conn.execute("DROP INDEX IF EXISTS idx_queue_requests_status")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_requests_status_priority ON queue_requests(status, priority)")
         conn.execute(
