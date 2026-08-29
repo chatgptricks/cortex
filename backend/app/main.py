@@ -1801,6 +1801,53 @@ def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any
     return {"ok": True}
 
 
+@app.post("/api/dashboard/queue/v2/requests/{request_id}/edit")
+def dashboard_queue_v2_edit(
+    request_id: int, request: Request,
+    production_points: Annotated[int, Form()], deadline_at: Annotated[str, Form()],
+    tags: Annotated[str | None, Form()] = None, brief: Annotated[str | None, Form()] = None,
+    notes: Annotated[str | None, Form()] = None, references: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Coordinator-owned edits to a production request's specification.
+
+    Scheduling is intentionally still controlled through Submit so assignment
+    notifications remain a deliberate action.  Changing PP here does update
+    the scheduled block's duration and is rejected when it would overlap a
+    neighboring request.
+    """
+    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    if production_points < 1:
+        raise HTTPException(status_code=400, detail="Production points must be at least 1.")
+    row = _queue_v2_request(request_id)
+    deadline = _queue_v2_deadline(deadline_at)
+    clean_tags = _queue_v2_tags(tags)
+    refs = _queue_v2_json(references, [])
+    if not isinstance(refs, list):
+        raise HTTPException(status_code=400, detail="Reference links must be a list.")
+    clean_refs = [str(item).strip() for item in refs if str(item).strip()]
+    duration = production_points * 10
+    if row["scheduled_date"] and row["scheduled_start_minutes"] is not None:
+        start = int(row["scheduled_start_minutes"])
+        if start + duration > 24 * 60:
+            raise HTTPException(status_code=400, detail="The revised request must fit within a single calendar day.")
+        with connect() as conn:
+            if _queue_v2_conflicts(conn, row["designer_email"], row["scheduled_date"], start, duration, request_id):
+                raise HTTPException(status_code=409, detail="The revised duration overlaps another scheduled request.")
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """UPDATE queue_requests SET production_points = ?, deadline_at = ?, tags = ?, brief = ?, notes = ?,
+               reference_links = ?, updated_at = ? WHERE id = ?""",
+            (production_points, deadline, json.dumps(clean_tags), (brief or "").strip(), (notes or "").strip(),
+             json.dumps(clean_refs), now, request_id),
+        )
+        _queue_v2_log(conn, request_id, caller, "edited", {
+            "productionPoints": production_points, "deadlineAt": deadline, "tags": clean_tags,
+        })
+        updated = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
+    return {"ok": True, "request": _queue_v2_project(updated)}
+
+
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/complete")
 def dashboard_queue_v2_complete(request_id: int, request: Request) -> dict[str, Any]:
     caller, is_admin, _ = _queue_v2_access(request)
