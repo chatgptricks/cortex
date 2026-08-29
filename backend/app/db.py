@@ -374,6 +374,7 @@ def init_db() -> None:
         _ensure_column(conn, "dashboard_users", "operating_role", "operating_role TEXT NOT NULL DEFAULT 'sales'")
         _ensure_column(conn, "dashboard_users", "operating_roles", "operating_roles TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "dashboard_users", "is_admin", "is_admin INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "dashboard_users", "slack_user_id", "slack_user_id TEXT NOT NULL DEFAULT ''")
         # Following count -- added after account_snapshots shipped, so older
         # snapshots have NULL here; the Tracker's historical-stats table just
         # shows "--" for those rows instead of a delta.
@@ -587,7 +588,7 @@ def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: 
 def list_dashboard_users() -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
-            """SELECT email, role, operating_role, is_admin, created_at, updated_at
+            """SELECT email, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at
                FROM dashboard_users
                ORDER BY is_admin DESC, operating_role ASC, email ASC"""
         ).fetchall()
@@ -624,7 +625,10 @@ def count_dashboard_admins() -> int:
         return int(row["c"]) if row else 0
 
 
-def upsert_dashboard_user(email: str, role: str = "viewer", operating_role: str | None = None, is_admin: bool | None = None) -> None:
+def upsert_dashboard_user(
+    email: str, role: str = "viewer", operating_role: str | None = None,
+    is_admin: bool | None = None, slack_user_id: str | None = None,
+) -> None:
     if role not in ("admin", "viewer"):
         raise ValueError(f"Invalid legacy role: {role!r}")
     if operating_role is not None and operating_role not in ("vc", "pd", "sales"):
@@ -637,13 +641,19 @@ def upsert_dashboard_user(email: str, role: str = "viewer", operating_role: str 
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO dashboard_users (email, role, operating_role, is_admin, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO dashboard_users (email, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(email) DO UPDATE SET
                 role = excluded.role, operating_role = excluded.operating_role,
-                is_admin = excluded.is_admin, updated_at = excluded.updated_at
+                operating_roles = CASE
+                    WHEN dashboard_users.operating_roles LIKE '%"dev"%' THEN json_array(excluded.operating_role, 'dev')
+                    ELSE json_array(excluded.operating_role)
+                END,
+                is_admin = excluded.is_admin,
+                slack_user_id = CASE WHEN ? IS NULL THEN dashboard_users.slack_user_id ELSE excluded.slack_user_id END,
+                updated_at = excluded.updated_at
             """,
-            (email, legacy_role, operating_role, int(admin_value), now, now),
+            (email, legacy_role, operating_role, json.dumps([operating_role]), int(admin_value), (slack_user_id or "").strip(), now, now, slack_user_id),
         )
 
 

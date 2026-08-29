@@ -14,6 +14,7 @@ import os
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -161,23 +162,29 @@ def build_queue_assignment_message(
     account: str,
     post_id: int | None,
     note: str | None = None,
+    notes: str | None = None,
+    references: list[str] | None = None,
     due_date: str | None = None,
     priority: str | None = None,
     tags: list[str] | None = None,
+    recommended_accounts: list[str] | None = None,
     recommended_account: str | None = None,
     production_points: int | None = None,
     scheduled_date: str | None = None,
     scheduled_start_minutes: int | None = None,
     update: bool = False,
+    assigned_by_slack_id: str | None = None,
 ) -> dict[str, Any]:
     """A concise private assignment message with only actionable metadata."""
-    assigner_id = _SLACK_USERS_BY_EMAIL.get(assigned_by_email.strip().lower())
+    assigner_id = (assigned_by_slack_id or "").strip() or _SLACK_USERS_BY_EMAIL.get(assigned_by_email.strip().lower())
     assigner = f"<@{assigner_id}>" if assigner_id else assigned_by_email.split("@", 1)[0]
-    destination = (recommended_account or "").lstrip("@")
+    account_values = recommended_accounts if recommended_accounts is not None else ([recommended_account] if recommended_account else [])
+    destinations = [str(account).lstrip("@") for account in account_values if str(account).strip()]
+    destination = ", ".join(f"@{account}" for account in destinations)
     metadata: list[str] = []
     if due_date:
         try:
-            due = datetime.fromisoformat(due_date.replace("Z", "+00:00")).strftime("%b %-d, %Y · %-I:%M %p")
+            due = datetime.fromisoformat(due_date.replace("Z", "+00:00")).astimezone(ZoneInfo("America/Costa_Rica")).strftime("%b %-d, %Y · %-I:%M %p")
         except ValueError:
             due = due_date
         metadata.append(f"*Deadline*\n{due}")
@@ -198,13 +205,20 @@ def build_queue_assignment_message(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"{assigner} {'updated' if update else 'assigned'} this post{' for *@' + destination + '*' if destination else ''}.",
+                "text": f"{assigner} {'updated' if update else 'assigned'} this post{' for *' + destination + '*' if destination else ''}.",
             },
         },
     ]
     if note:
         brief = note.strip()[:1800].replace("\n", "\n> ")
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Brief*\n> {brief}"}})
+    if notes:
+        extra = notes.strip()[:1600].replace("\n", "\n> ")
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Notes*\n> {extra}"}})
+    if references:
+        clean_references = [str(value).strip() for value in references if str(value).strip()][:8]
+        if clean_references:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*References*\n" + "\n".join(f"• <{value}|Open reference>" for value in clean_references)}})
     if metadata:
         blocks.append({"type": "section", "fields": [{"type": "mrkdwn", "text": value} for value in metadata]})
     if post_id is not None:
@@ -222,7 +236,7 @@ def build_queue_assignment_message(
             ],
         }
     )
-    return {"text": f"{assigner} assigned you a post for @{destination}.", "blocks": blocks}
+    return {"text": f"{assigner} assigned you a post{f' for {destination}' if destination else ''}.", "blocks": blocks}
 
 
 def notify_queue_assignment(**assignment: Any) -> bool:
@@ -233,7 +247,7 @@ def notify_queue_assignment(**assignment: Any) -> bool:
     """
     token = os.getenv("SLACK_BOT_TOKEN", "").strip()
     assignee_email = str(assignment.get("assignee_email") or "").strip().lower()
-    recipient = _SLACK_USERS_BY_EMAIL.get(assignee_email)
+    recipient = str(assignment.pop("assignee_slack_id", "") or "").strip() or _SLACK_USERS_BY_EMAIL.get(assignee_email)
     if not token:
         logger.warning("Queue assignment DM skipped: SLACK_BOT_TOKEN is not configured")
         return False
