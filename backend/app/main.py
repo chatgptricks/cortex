@@ -1743,6 +1743,10 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
 
 def _queue_v2_project_draft(row: dict[str, Any]) -> dict[str, Any]:
     item = _queue_v2_project(row)
+    draft_points = row.get("draft_production_points")
+    if draft_points is not None:
+        item["productionPoints"] = int(draft_points)
+        item["durationMinutes"] = int(draft_points) * 10
     item.update({
         "committedStatus": item["status"],
         "status": "scheduled",
@@ -1777,6 +1781,7 @@ def _queue_v2_draft_rows(conn: Any, *, designer_email: str | None = None, reques
                    d.scheduled_date AS draft_scheduled_date,
                    d.scheduled_start_minutes AS draft_scheduled_start_minutes,
                    d.recommended_accounts AS draft_recommended_accounts,
+                   d.production_points AS draft_production_points,
                    d.updated_at AS draft_updated_at
             FROM queue_schedule_drafts d
             JOIN queue_requests r ON r.id = d.request_id
@@ -1805,24 +1810,34 @@ def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
     the client suppresses the implicit PD label so the roster stays concise.
     """
     users = list_dashboard_users()
-    from .slack_alerts import slack_user_profile_images
+    from .slack_alerts import slack_user_id_for_email, slack_user_profile_images
 
-    avatar_by_slack_id = slack_user_profile_images([str(user.get("slack_user_id") or "") for user in users])
+    slack_ids = [str(user.get("slack_user_id") or "").strip().upper() or slack_user_id_for_email(user.get("email")) for user in users]
+    avatar_by_slack_id = slack_user_profile_images(slack_ids)
     with connect() as conn:
         accounts = conn.execute("SELECT designer_email, account_handle FROM queue_designer_accounts ORDER BY account_handle").fetchall()
+        account_rows = conn.execute("SELECT handle, avatar_path FROM accounts WHERE is_active = 1").fetchall()
     by_designer: dict[str, list[str]] = {}
     for item in accounts:
         by_designer.setdefault(item["designer_email"], []).append(item["account_handle"])
     result: list[dict[str, Any]] = []
     for user in users:
         roles = _queue_v2_user_roles(user)
+        slack_id = str(user.get("slack_user_id") or "").strip().upper() or slack_user_id_for_email(user.get("email"))
+        managed_accounts = by_designer.get(user["email"], [])
+        account_avatars = {
+            str(item["handle"]): f"/api/dashboard/avatar/{item['handle']}"
+            for item in account_rows
+            if item["avatar_path"] and str(item["handle"]) in managed_accounts
+        }
         result.append({
             "email": user["email"],
             "isAdmin": bool(user.get("is_admin")),
             "roles": roles,
             "isQueueDesigner": "pd" in roles,
-            "avatarUrl": avatar_by_slack_id.get(str(user.get("slack_user_id") or "").strip().upper(), ""),
-            "accounts": by_designer.get(user["email"], []),
+            "avatarUrl": avatar_by_slack_id.get(slack_id, ""),
+            "accounts": managed_accounts,
+            "accountAvatars": account_avatars,
         })
     return result
 
@@ -1862,6 +1877,12 @@ def _queue_v2_prepare_schedule_changes(
             raise HTTPException(status_code=404, detail="Queue request not found.")
         if row["status"] not in {"pool", "scheduled"}:
             raise HTTPException(status_code=409, detail="Only pooled or scheduled requests can be moved.")
+        try:
+            production_points = int(entry.get("productionPoints", row["production_points"]))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Production points must be a positive integer.") from exc
+        if production_points < 1:
+            raise HTTPException(status_code=400, detail="Production points must be a positive integer.")
         accounts = entry.get("recommendedAccounts", [])
         if not isinstance(accounts, list):
             accounts = []
@@ -1869,19 +1890,22 @@ def _queue_v2_prepare_schedule_changes(
             "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ?", (designer,),
         ).fetchall()}
         clean_accounts = [str(value).strip().lstrip("@").lower() for value in accounts if str(value).strip()]
-        if any(value not in allowed for value in clean_accounts):
-            raise HTTPException(status_code=400, detail="Recommended accounts must belong to the selected designer.")
+        # A move between designers should never fail merely because the old
+        # designer's recommended account is not owned by the new one. Keep
+        # only accounts valid for the target; account selection is optional.
+        clean_accounts = [value for value in dict.fromkeys(clean_accounts) if value in allowed]
         prepared.append({
             "id": request_id, "designer": designer, "date": date, "start": start,
-            "duration": int(row["production_points"]) * 10,
-            "accounts": list(dict.fromkeys(clean_accounts)), "row": dict(row),
+            "productionPoints": production_points, "duration": production_points * 10,
+            "accounts": clean_accounts, "row": dict(row),
             "assigneeSlackId": designer_row["slack_user_id"],
         })
 
     occupied_by_designer: dict[str, list[dict[str, Any]]] = {}
     for designer in {item["designer"] for item in prepared}:
         other_drafts = [dict(row) for row in conn.execute(
-            """SELECT d.request_id, d.coordinator_email, d.scheduled_date, d.scheduled_start_minutes, r.production_points
+            """SELECT d.request_id, d.coordinator_email, d.scheduled_date, d.scheduled_start_minutes,
+                      COALESCE(d.production_points, r.production_points) AS production_points
                FROM queue_schedule_drafts d
                JOIN queue_requests r ON r.id = d.request_id
                WHERE d.designer_email = ?""",
@@ -1915,7 +1939,8 @@ def _queue_v2_prepare_schedule_changes(
 def _queue_v2_reflow_drafts(conn: Any, designer: str) -> int:
     """Keep shared provisional placements collision-free after firm changes."""
     drafts = [dict(row) for row in conn.execute(
-        """SELECT d.request_id, d.scheduled_date, d.scheduled_start_minutes, r.production_points
+            """SELECT d.request_id, d.scheduled_date, d.scheduled_start_minutes,
+                      COALESCE(d.production_points, r.production_points) AS production_points
            FROM queue_schedule_drafts d
            JOIN queue_requests r ON r.id = d.request_id
            WHERE d.designer_email = ?
@@ -2194,16 +2219,17 @@ def dashboard_queue_v2_drafts(request: Request, changes: Annotated[str, Form()])
             conn.execute(
                 """INSERT INTO queue_schedule_drafts
                    (request_id, coordinator_email, designer_email, scheduled_date, scheduled_start_minutes,
-                    recommended_accounts, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                    recommended_accounts, production_points, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(request_id) DO UPDATE SET
                      coordinator_email = excluded.coordinator_email,
                      designer_email = excluded.designer_email,
                      scheduled_date = excluded.scheduled_date,
                      scheduled_start_minutes = excluded.scheduled_start_minutes,
                      recommended_accounts = excluded.recommended_accounts,
+                     production_points = excluded.production_points,
                      updated_at = excluded.updated_at""",
-                (item["id"], caller, item["designer"], item["date"], item["start"], json.dumps(item["accounts"]), now),
+                (item["id"], caller, item["designer"], item["date"], item["start"], json.dumps(item["accounts"]), item["productionPoints"], now),
             )
         changed_ids = previous_ids | incoming_ids
         revision = _queue_v2_publish(conn, "draft_updated", caller, changed_ids)
@@ -2246,6 +2272,7 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
         raise HTTPException(status_code=400, detail="Add at least one schedule change before submitting.")
     notifications: list[dict[str, Any]] = []
     adjustments: list[dict[str, Any]] = []
+    same_assignees: dict[int, bool] = {}
     now = utc_now()
     with connect() as conn:
         prepared = _queue_v2_prepare_schedule_changes(conn, entries)
@@ -2254,10 +2281,16 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
         for item in prepared:
             row = item["row"]
             was_scheduled = row["status"] != "pool"
+            same_assignee = str(row.get("designer_email") or "").strip().lower() == item["designer"]
+            same_assignees[item["id"]] = same_assignee
             conn.execute(
                 """UPDATE queue_requests SET designer_email = ?, coordinator_email = ?, scheduled_date = ?, scheduled_start_minutes = ?,
-                   recommended_accounts = ?, status = 'scheduled', updated_at = ? WHERE id = ?""",
-                (item["designer"], caller, item["date"], item["start"], json.dumps(item["accounts"]), now, item["id"]),
+                   recommended_accounts = ?, production_points = ?, status = 'scheduled',
+                   slack_channel_id = ?, slack_message_ts = ?, updated_at = ? WHERE id = ?""",
+                (item["designer"], caller, item["date"], item["start"], json.dumps(item["accounts"]), item["productionPoints"],
+                 row.get("slack_channel_id") if same_assignee else None,
+                 row.get("slack_message_ts") if same_assignee else None,
+                 now, item["id"]),
             )
             _queue_v2_log(conn, item["id"], caller, "resubmitted" if was_scheduled else "scheduled", {"designer": item["designer"], "date": item["date"], "start": item["start"], "accounts": item["accounts"]})
         for designer in {item["designer"] for item in prepared}:
@@ -2274,15 +2307,24 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
                                   "account": row["post_account"], "post_id": _queue_post_id(row["post_account"], row["post_shortcode"]),
                                   "note": row["brief"], "notes": row["notes"], "references": _queue_v2_json(row["reference_links"], []),
                                   "priority": row["priority"], "tags": _queue_v2_json(row["tags"], []),
-                                  "recommended_accounts": item["accounts"], "production_points": row["production_points"],
-                                  "scheduled_date": final_date, "scheduled_start_minutes": final_start, "update": item["row"]["status"] != "pool",
+                                  "recommended_accounts": item["accounts"], "production_points": item["productionPoints"],
+                                  "scheduled_date": final_date, "scheduled_start_minutes": final_start,
+                                  "update": item["row"]["status"] != "pool" and same_assignees.get(item["id"], False),
+                                  "slack_channel_id": row.get("slack_channel_id") if same_assignees.get(item["id"], False) else "",
+                                  "slack_message_ts": row.get("slack_message_ts") if same_assignees.get(item["id"], False) else "",
                                   "assignee_slack_id": item["assigneeSlackId"], "assigned_by_slack_id": assigner_slack_id})
-    from .slack_alerts import notify_queue_assignment
     sent = 0
     for item in notifications:
-        delivered = notify_queue_assignment(**item)
+        from .slack_alerts import notify_queue_assignment_result
+        delivery = notify_queue_assignment_result(**item)
+        delivered = bool(delivery.get("sent"))
         sent += int(delivered)
         with connect() as conn:
+            if delivered and delivery.get("channelId") and delivery.get("messageTs"):
+                conn.execute(
+                    "UPDATE queue_requests SET slack_channel_id = ?, slack_message_ts = ?, updated_at = ? WHERE id = ?",
+                    (delivery["channelId"], delivery["messageTs"], utc_now(), item["task_id"]),
+                )
             _queue_v2_log(conn, item["task_id"], caller, "slack_sent" if delivered else "slack_failed")
             _queue_v2_publish(conn, "notification_updated", caller, [item["task_id"]])
     return {"ok": True, "submitted": len(entries), "adjustments": adjustments, "notifications": {"sent": sent, "failed": len(notifications) - sent}}
@@ -2376,6 +2418,13 @@ def dashboard_queue_v2_edit(
                reference_links = ?, updated_at = ? WHERE id = ?""",
             (production_points, clean_priority, json.dumps(clean_tags), (brief or "").strip(), (notes or "").strip(),
              json.dumps(clean_refs), now, request_id),
+        )
+        # Keep an existing collaborative placement's provisional duration in
+        # sync with the edited request so its live block and PP count change
+        # immediately, before the next Submit.
+        conn.execute(
+            "UPDATE queue_schedule_drafts SET production_points = ?, updated_at = ? WHERE request_id = ?",
+            (production_points, now, request_id),
         )
         _queue_v2_log(conn, request_id, caller, "edited", {
             "productionPoints": production_points, "priority": clean_priority, "tags": clean_tags,
@@ -2495,18 +2544,25 @@ def dashboard_queue_v2_notify(request_id: int, request: Request) -> dict[str, An
     with connect() as conn:
         recipient = conn.execute("SELECT slack_user_id FROM dashboard_users WHERE email = ?", (row["designer_email"],)).fetchone()
         assigner = conn.execute("SELECT slack_user_id FROM dashboard_users WHERE email = ?", (caller,)).fetchone()
-    from .slack_alerts import notify_queue_assignment
-    sent = notify_queue_assignment(
+    from .slack_alerts import notify_queue_assignment_result, slack_user_id_for_email
+    sent_result = notify_queue_assignment_result(
         task_id=request_id, assignee_email=row["designer_email"], assigned_by_email=caller,
-        assignee_slack_id=recipient["slack_user_id"] if recipient else "",
-        assigned_by_slack_id=assigner["slack_user_id"] if assigner else "",
+        assignee_slack_id=(recipient["slack_user_id"] if recipient else "") or slack_user_id_for_email(row["designer_email"]),
+        assigned_by_slack_id=(assigner["slack_user_id"] if assigner else "") or slack_user_id_for_email(caller),
         account=row["post_account"], post_id=_queue_post_id(row["post_account"], row["post_shortcode"]),
         note=row["brief"], notes=row["notes"], references=_queue_v2_json(row["reference_links"], []),
         priority=row["priority"], tags=_queue_v2_json(row["tags"], []),
         recommended_accounts=_queue_v2_json(row["recommended_accounts"], []), production_points=row["production_points"],
         scheduled_date=row["scheduled_date"], scheduled_start_minutes=row["scheduled_start_minutes"], update=True,
+        slack_channel_id=row.get("slack_channel_id") or "", slack_message_ts=row.get("slack_message_ts") or "",
     )
+    sent = bool(sent_result.get("sent"))
     with connect() as conn:
+        if sent and sent_result.get("channelId") and sent_result.get("messageTs"):
+            conn.execute(
+                "UPDATE queue_requests SET slack_channel_id = ?, slack_message_ts = ?, updated_at = ? WHERE id = ?",
+                (sent_result["channelId"], sent_result["messageTs"], utc_now(), request_id),
+            )
         _queue_v2_log(conn, request_id, caller, "slack_sent" if sent else "slack_failed", {"manualRetry": True})
         _queue_v2_publish(conn, "notification_updated", caller, [request_id])
     return {"ok": True, "sent": sent}

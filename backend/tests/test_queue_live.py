@@ -51,7 +51,8 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
         CREATE TABLE queue_designer_accounts (designer_email TEXT, account_handle TEXT);
         CREATE TABLE queue_schedule_drafts (
             request_id INTEGER PRIMARY KEY, coordinator_email TEXT, designer_email TEXT,
-            scheduled_date TEXT, scheduled_start_minutes INTEGER, recommended_accounts TEXT, updated_at TEXT
+            scheduled_date TEXT, scheduled_start_minutes INTEGER, recommended_accounts TEXT,
+            production_points INTEGER, updated_at TEXT
         );
         """
     )
@@ -59,7 +60,7 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
     conn.execute("INSERT INTO queue_requests VALUES (1, 3, 'pool', NULL, NULL, NULL, 'chatgptricks', 'ONE', 'vc@example.com', '')")
     conn.execute("INSERT INTO queue_requests VALUES (2, 3, 'pool', NULL, NULL, NULL, 'chatgptricks', 'TWO', 'vc@example.com', '')")
     conn.execute("INSERT INTO queue_designer_accounts VALUES ('pd@example.com', 'chatgptricks')")
-    conn.execute("INSERT INTO queue_schedule_drafts VALUES (1, 'other-vc@example.com', 'pd@example.com', '2026-09-01', 540, '[]', '')")
+    conn.execute("INSERT INTO queue_schedule_drafts VALUES (1, 'other-vc@example.com', 'pd@example.com', '2026-09-01', 540, '[]', NULL, '')")
     conn.commit()
     conn.close()
 
