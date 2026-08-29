@@ -65,6 +65,7 @@ from .queue_rules import (
     SCHEDULER_END,
     SCHEDULER_START,
     SCHEDULER_TIMEZONE,
+    intervals_conflict,
     next_available_slot,
     schedule_absolute,
 )
@@ -1517,6 +1518,8 @@ def dashboard_queue_reorder(
 QUEUE_V2_STATUSES = {"pool", "scheduled", "in_progress", "completed", "closed", "cancelled"}
 QUEUE_V2_TAGS = ["content", "design", "copy", "research", "review", "repurpose"]
 QUEUE_V2_PRIORITIES = ["low", "medium", "high", "urgent"]
+QUEUE_V2_TICKET_TYPES = {"time_block", "pp_revision", "cancellation"}
+QUEUE_V2_TIME_CATEGORIES = {"meeting", "break", "promo", "focus", "other"}
 # queue_schedule_drafts predates pool return support and keeps its placement
 # columns NOT NULL. These private sentinels let a provisional unassignment be
 # shared live without changing the existing SQLite table shape.
@@ -1530,8 +1533,8 @@ def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[st
     roles = list(getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]))
     if coordinator and not (is_admin or "vc" in roles):
         raise HTTPException(status_code=403, detail="Queue coordination access required.")
-    if not coordinator and not (is_admin or any(role in {"vc", "pd", "sales"} for role in roles)):
-        raise HTTPException(status_code=403, detail="Queue is available to production coordinators and designers.")
+    # Every authenticated dashboard user has baseline PD access. Explicit
+    # roles only add coordinator/admin capabilities; they never remove Queue.
     return email, is_admin, roles
 
 
@@ -1674,6 +1677,95 @@ def _queue_v2_occupied(row: dict[str, Any], duration: int | None = None) -> dict
     }
 
 
+def _queue_v2_ticket(row: dict[str, Any]) -> dict[str, Any]:
+    request_id = row.get("request_id")
+    request_summary = None
+    if request_id is not None:
+        request_summary = {
+            "id": int(request_id),
+            "post": {"account": row.get("post_account") or "", "shortcode": row.get("post_shortcode") or ""},
+            "designerEmail": row.get("designer_email"),
+            "status": row.get("request_status"),
+            "productionPoints": row.get("current_production_points"),
+        }
+    return {
+        "id": int(row["id"]), "type": row["ticket_type"], "status": row["status"],
+        "requesterEmail": row["requester_email"], "requestId": request_id,
+        "category": row.get("block_category") or "", "title": row.get("title") or "",
+        "scheduledDate": row.get("scheduled_date"), "scheduledStartMinutes": row.get("scheduled_start_minutes"),
+        "durationMinutes": row.get("duration_minutes"), "requestedProductionPoints": row.get("requested_production_points"),
+        "reason": row.get("reason") or "", "reviewerEmail": row.get("reviewer_email"),
+        "reviewNote": row.get("review_note") or "", "reviewedAt": row.get("reviewed_at"),
+        "createdAt": row["created_at"], "updatedAt": row["updated_at"], "request": request_summary,
+    }
+
+
+def _queue_v2_ticket_rows(conn: Any, *, requester_email: str | None = None, pending_only: bool = False) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if requester_email:
+        clauses.append("t.requester_email = ?")
+        params.append(requester_email)
+    if pending_only:
+        clauses.append("t.status = 'pending'")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        f"""SELECT t.*, r.post_account, r.post_shortcode, r.designer_email,
+                   r.status AS request_status, r.production_points AS current_production_points
+            FROM queue_tickets t
+            LEFT JOIN queue_requests r ON r.id = t.request_id
+            {where}
+            ORDER BY CASE t.status WHEN 'pending' THEN 0 ELSE 1 END, t.created_at DESC, t.id DESC
+            LIMIT 150""",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _queue_v2_time_occupied(
+    conn: Any, user_email: str, scheduled_date: str, *, exclude_ticket_id: int | None = None,
+) -> list[dict[str, Any]]:
+    drafts = [dict(row) for row in conn.execute(
+        """SELECT d.request_id, d.scheduled_date, d.scheduled_start_minutes,
+                  COALESCE(d.production_points, r.production_points) AS production_points
+           FROM queue_schedule_drafts d
+           JOIN queue_requests r ON r.id = d.request_id
+           WHERE d.designer_email = ? AND d.scheduled_date = ?""",
+        (user_email, scheduled_date),
+    ).fetchall()]
+    drafted_ids = {int(row["request_id"]) for row in drafts}
+    requests = [dict(row) for row in conn.execute(
+        """SELECT * FROM queue_requests
+           WHERE designer_email = ? AND scheduled_date = ?
+             AND status IN ('scheduled','in_progress','completed','closed')""",
+        (user_email, scheduled_date),
+    ).fetchall() if int(row["id"]) not in drafted_ids]
+    ticket_params: list[Any] = [user_email, scheduled_date]
+    ticket_scope = ""
+    if exclude_ticket_id is not None:
+        ticket_scope = " AND id != ?"
+        ticket_params.append(exclude_ticket_id)
+    blocks = [dict(row) for row in conn.execute(
+        f"""SELECT scheduled_date, scheduled_start_minutes, duration_minutes
+            FROM queue_tickets
+            WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
+              AND requester_email = ? AND scheduled_date = ?{ticket_scope}""",
+        ticket_params,
+    ).fetchall()]
+    occupied = [_queue_v2_occupied(row) for row in requests]
+    occupied.extend({"date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]), "duration": int(row["production_points"]) * 10} for row in drafts)
+    occupied.extend({"date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]), "duration": int(row["duration_minutes"])} for row in blocks)
+    return occupied
+
+
+def _queue_v2_assert_time_available(
+    conn: Any, user_email: str, scheduled_date: str, start: int, duration: int, *, exclude_ticket_id: int | None = None,
+) -> None:
+    occupied = _queue_v2_time_occupied(conn, user_email, scheduled_date, exclude_ticket_id=exclude_ticket_id)
+    if any(intervals_conflict(start, duration, int(item["start"]), int(item["duration"])) for item in occupied):
+        raise HTTPException(status_code=409, detail="That time overlaps another Queue block.")
+
+
 def _queue_v2_reflow_scheduled(conn: Any, designer: str, actor: str, priority_id: int | None = None) -> int:
     """Remove every scheduled overlap for one designer without rejecting work.
 
@@ -1689,6 +1781,14 @@ def _queue_v2_reflow_scheduled(conn: Any, designer: str, actor: str, priority_id
         (designer,),
     ).fetchall()]
     occupied = [_queue_v2_occupied(row) for row in rows if row["status"] != "scheduled"]
+    occupied.extend({
+        "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]), "duration": int(row["duration_minutes"]),
+    } for row in conn.execute(
+        """SELECT scheduled_date, scheduled_start_minutes, duration_minutes FROM queue_tickets
+           WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
+             AND requester_email = ? AND scheduled_date IS NOT NULL""",
+        (designer,),
+    ).fetchall())
     scheduled_rows = [row for row in rows if row["status"] == "scheduled"]
     if priority_id is not None:
         scheduled_rows.sort(key=lambda row: (row["id"] != priority_id, row["scheduled_date"], row["scheduled_start_minutes"], row["id"]))
@@ -1960,6 +2060,15 @@ def _queue_v2_prepare_schedule_changes(
             "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]),
             "duration": int(row["production_points"]) * 10,
         } for row in other_drafts)
+        occupied_by_designer[designer].extend({
+            "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]),
+            "duration": int(row["duration_minutes"]),
+        } for row in conn.execute(
+            """SELECT scheduled_date, scheduled_start_minutes, duration_minutes FROM queue_tickets
+               WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
+                 AND requester_email = ? AND scheduled_date IS NOT NULL""",
+            (designer,),
+        ).fetchall())
 
     for item in sorted((value for value in prepared if value["designer"]), key=lambda value: (value["designer"], schedule_absolute(value["date"], value["start"]), value["id"])):
         item["date"], item["start"] = next_available_slot(
@@ -1990,6 +2099,14 @@ def _queue_v2_reflow_drafts(conn: Any, designer: str) -> int:
         (designer,),
     ).fetchall() if int(row["id"]) not in draft_ids]
     occupied = [_queue_v2_occupied(row) for row in committed]
+    occupied.extend({
+        "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]), "duration": int(row["duration_minutes"]),
+    } for row in conn.execute(
+        """SELECT scheduled_date, scheduled_start_minutes, duration_minutes FROM queue_tickets
+           WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
+             AND requester_email = ? AND scheduled_date IS NOT NULL""",
+        (designer,),
+    ).fetchall())
     moved = 0
     for row in drafts:
         resolved_date, resolved_start = next_available_slot(
@@ -2050,6 +2167,21 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
             conn,
             designer_email=None if (is_admin or "vc" in roles) else caller,
         )
+        block_scope = "" if (is_admin or "vc" in roles) else " AND requester_email = ?"
+        block_params: list[Any] = [selected_date]
+        if block_scope:
+            block_params.append(caller)
+        time_block_rows = conn.execute(
+            f"""SELECT * FROM queue_tickets
+                WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
+                  AND scheduled_date = ?{block_scope}
+                ORDER BY scheduled_start_minutes, id""",
+            block_params,
+        ).fetchall()
+        pending_ticket_count = int(conn.execute(
+            "SELECT COUNT(*) AS c FROM queue_tickets WHERE status = 'pending'" + ("" if (is_admin or "vc" in roles) else " AND requester_email = ?"),
+            [] if (is_admin or "vc" in roles) else [caller],
+        ).fetchone()["c"])
         live_state = _queue_v2_live_snapshot(conn)
     requests = [_queue_v2_project(dict(row)) for row in rows]
     planning_requests = [_queue_v2_project(dict(row)) for row in planning_rows]
@@ -2064,6 +2196,7 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         "viewer": {"email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)), "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
         "date": selected_date, "requests": requests, "planningRequests": planning_requests,
         "assignedRequests": assigned_requests, "liveDrafts": live_drafts, "liveRevision": live_state["revision"],
+        "timeBlocks": [_queue_v2_ticket(dict(row)) for row in time_block_rows], "pendingTicketCount": pending_ticket_count,
         "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
         "schedulerUsers": scheduler_users,
         "tags": QUEUE_V2_TAGS, "priorities": QUEUE_V2_PRIORITIES,
@@ -2119,8 +2252,6 @@ def dashboard_queue_v2_summary(request: Request) -> dict[str, Any]:
     caller = _caller_email(request)
     roles = list(getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]))
     is_admin = bool(getattr(request.state, "is_admin", False))
-    if not (is_admin or any(role in {"vc", "pd"} for role in roles)):
-        return {"pending": 0}
     with connect() as conn:
         if is_admin or "vc" in roles:
             row = conn.execute("SELECT COUNT(*) AS c FROM queue_requests WHERE status IN ('pool','scheduled','in_progress','completed')").fetchone()
@@ -2381,6 +2512,202 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
             _queue_v2_log(conn, item["task_id"], caller, "slack_sent" if delivered else "slack_failed")
             _queue_v2_publish(conn, "notification_updated", caller, [item["task_id"]])
     return {"ok": True, "submitted": len(entries), "adjustments": adjustments, "notifications": {"sent": sent, "failed": len(notifications) - sent}}
+
+
+@app.get("/api/dashboard/queue/v2/tickets")
+def dashboard_queue_v2_tickets(request: Request) -> dict[str, Any]:
+    caller, is_admin, roles = _queue_v2_access(request)
+    coordinator = is_admin or "vc" in roles
+    with connect() as conn:
+        rows = _queue_v2_ticket_rows(conn, requester_email=None if coordinator else caller)
+    return {"tickets": [_queue_v2_ticket(row) for row in rows]}
+
+
+@app.post("/api/dashboard/queue/v2/tickets/time-block")
+def dashboard_queue_v2_create_time_block(
+    request: Request,
+    category: Annotated[str, Form()],
+    scheduled_date: Annotated[str, Form()],
+    scheduled_start_minutes: Annotated[int, Form()],
+    duration_minutes: Annotated[int, Form()],
+    title: Annotated[str | None, Form()] = None,
+    note: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    caller, _, _ = _queue_v2_access(request)
+    clean_category = category.strip().lower()
+    if clean_category not in QUEUE_V2_TIME_CATEGORIES:
+        raise HTTPException(status_code=400, detail="Choose meeting, break, promo, focus, or other.")
+    try:
+        datetime.strptime(scheduled_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
+    start, duration = int(scheduled_start_minutes), int(duration_minutes)
+    if start % 10 or start < SCHEDULER_START or start >= SCHEDULER_END:
+        raise HTTPException(status_code=400, detail="Time blocks must begin in 10-minute scheduler slots.")
+    if duration < 10 or duration % 10 or start + duration > SCHEDULER_END:
+        raise HTTPException(status_code=400, detail="Time blocks must use 10-minute increments and stay within one day.")
+    clean_title = (title or "").strip()[:80] or clean_category.replace("_", " ").title()
+    clean_note = (note or "").strip()[:500]
+    now = utc_now()
+    with connect() as conn:
+        _queue_v2_assert_time_available(conn, caller, scheduled_date, start, duration)
+        cursor = conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, status, block_category, title, scheduled_date,
+                scheduled_start_minutes, duration_minutes, reason, created_at, updated_at)
+               VALUES ('time_block', ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (caller, clean_category, clean_title, scheduled_date, start, duration, clean_note, now, now),
+        )
+        ticket_id = int(cursor.lastrowid)
+        _queue_v2_publish(conn, "ticket_created", caller)
+        row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    return {"ok": True, "ticket": _queue_v2_ticket(row)}
+
+
+@app.post("/api/dashboard/queue/v2/tickets/pp-revision")
+def dashboard_queue_v2_request_pp_revision(
+    request: Request,
+    request_id: Annotated[int, Form()],
+    production_points: Annotated[int, Form()],
+    reason: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    caller, _, _ = _queue_v2_access(request)
+    row = _queue_v2_request(request_id)
+    if row.get("designer_email") != caller:
+        raise HTTPException(status_code=403, detail="Only the assigned designer can request a PP revision.")
+    if row["status"] not in {"scheduled", "in_progress"}:
+        raise HTTPException(status_code=409, detail="PP revisions are available for scheduled or in-progress work.")
+    if production_points < 1 or production_points == int(row["production_points"]):
+        raise HTTPException(status_code=400, detail="Choose a different positive PP value.")
+    now = utc_now()
+    with connect() as conn:
+        pending = conn.execute(
+            "SELECT 1 FROM queue_tickets WHERE ticket_type = 'pp_revision' AND request_id = ? AND status = 'pending'",
+            (request_id,),
+        ).fetchone()
+        if pending:
+            raise HTTPException(status_code=409, detail="A PP revision is already pending for this request.")
+        cursor = conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, request_id, status, requested_production_points,
+                reason, created_at, updated_at)
+               VALUES ('pp_revision', ?, ?, 'pending', ?, ?, ?, ?)""",
+            (caller, request_id, production_points, (reason or "").strip()[:500], now, now),
+        )
+        ticket_id = int(cursor.lastrowid)
+        _queue_v2_log(conn, request_id, caller, "pp_revision_requested", {"productionPoints": production_points, "reason": (reason or "").strip()})
+        _queue_v2_publish(conn, "ticket_created", caller, [request_id])
+        ticket_row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    return {"ok": True, "ticket": _queue_v2_ticket(ticket_row)}
+
+
+@app.post("/api/dashboard/queue/v2/tickets/cancellation")
+def dashboard_queue_v2_request_cancellation(
+    request: Request,
+    request_id: Annotated[int, Form()],
+    reason: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    caller, _, _ = _queue_v2_access(request)
+    row = _queue_v2_request(request_id)
+    if row.get("designer_email") != caller:
+        raise HTTPException(status_code=403, detail="Only the assigned designer can request cancellation.")
+    if row["status"] not in {"scheduled", "in_progress", "completed"}:
+        raise HTTPException(status_code=409, detail="This request cannot be cancelled through a ticket.")
+    clean_reason = (reason or "").strip()[:500]
+    now = utc_now()
+    with connect() as conn:
+        pending = conn.execute(
+            "SELECT 1 FROM queue_tickets WHERE ticket_type = 'cancellation' AND request_id = ? AND status = 'pending'",
+            (request_id,),
+        ).fetchone()
+        if pending:
+            raise HTTPException(status_code=409, detail="A cancellation request is already pending.")
+        cursor = conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, request_id, status, reason, created_at, updated_at)
+               VALUES ('cancellation', ?, ?, 'pending', ?, ?, ?)""",
+            (caller, request_id, clean_reason, now, now),
+        )
+        ticket_id = int(cursor.lastrowid)
+        _queue_v2_log(conn, request_id, caller, "cancellation_requested", {"reason": clean_reason})
+        _queue_v2_publish(conn, "ticket_created", caller, [request_id])
+        ticket_row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    return {"ok": True, "ticket": _queue_v2_ticket(ticket_row)}
+
+
+@app.post("/api/dashboard/queue/v2/tickets/{ticket_id}/review")
+def dashboard_queue_v2_review_ticket(
+    ticket_id: int,
+    request: Request,
+    action: Annotated[str, Form()],
+    review_note: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    clean_action = action.strip().lower()
+    if clean_action not in {"approve", "reject"}:
+        raise HTTPException(status_code=400, detail="Ticket action must be approve or reject.")
+    new_status = "approved" if clean_action == "approve" else "rejected"
+    now = utc_now()
+    affected_ids: set[int] = set()
+    with connect() as conn:
+        ticket_row = conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone()
+        if not ticket_row:
+            raise HTTPException(status_code=404, detail="Queue ticket not found.")
+        ticket = dict(ticket_row)
+        if ticket["status"] != "pending":
+            raise HTTPException(status_code=409, detail="This ticket has already been reviewed.")
+        if clean_action == "approve" and ticket["ticket_type"] == "time_block":
+            _queue_v2_assert_time_available(
+                conn, ticket["requester_email"], ticket["scheduled_date"],
+                int(ticket["scheduled_start_minutes"]), int(ticket["duration_minutes"]), exclude_ticket_id=ticket_id,
+            )
+        elif clean_action == "approve" and ticket["ticket_type"] == "pp_revision":
+            queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
+            if not queue_row or queue_row["status"] not in {"scheduled", "in_progress"}:
+                raise HTTPException(status_code=409, detail="The Queue request can no longer receive a PP revision.")
+            queue_item = dict(queue_row)
+            new_points = int(ticket["requested_production_points"])
+            if queue_item["status"] == "in_progress":
+                conflicts = _queue_v2_time_occupied(conn, queue_item["designer_email"], queue_item["scheduled_date"])
+                conflicts = [item for item in conflicts if not (
+                    item["date"] == queue_item["scheduled_date"]
+                    and int(item["start"]) == int(queue_item["scheduled_start_minutes"])
+                    and int(item["duration"]) == _queue_v2_duration(queue_item)
+                )]
+                if any(intervals_conflict(int(queue_item["scheduled_start_minutes"]), new_points * 10, int(item["start"]), int(item["duration"])) for item in conflicts):
+                    raise HTTPException(status_code=409, detail="The revised in-progress block would overlap another firm block.")
+            conn.execute("UPDATE queue_requests SET production_points = ?, updated_at = ? WHERE id = ?", (new_points, now, ticket["request_id"]))
+            _queue_v2_log(conn, ticket["request_id"], caller, "pp_revision_approved", {"from": queue_item["production_points"], "to": new_points})
+            if queue_item.get("designer_email"):
+                _queue_v2_reflow_scheduled(conn, queue_item["designer_email"], caller, ticket["request_id"] if queue_item["status"] == "scheduled" else None)
+            affected_ids.add(int(ticket["request_id"]))
+        elif clean_action == "approve" and ticket["ticket_type"] == "cancellation":
+            queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
+            if not queue_row or queue_row["status"] not in {"scheduled", "in_progress", "completed"}:
+                raise HTTPException(status_code=409, detail="The Queue request can no longer be cancelled.")
+            conn.execute("DELETE FROM queue_schedule_drafts WHERE request_id = ?", (ticket["request_id"],))
+            conn.execute(
+                "UPDATE queue_requests SET status = 'cancelled', cancellation_reason = ?, updated_at = ? WHERE id = ?",
+                (ticket["reason"], now, ticket["request_id"]),
+            )
+            _queue_v2_log(conn, ticket["request_id"], caller, "cancellation_approved", {"reason": ticket["reason"]})
+            affected_ids.add(int(ticket["request_id"]))
+        if ticket.get("request_id") and clean_action == "reject":
+            _queue_v2_log(conn, ticket["request_id"], caller, f"{ticket['ticket_type']}_rejected", {"reviewNote": (review_note or "").strip()})
+            affected_ids.add(int(ticket["request_id"]))
+        conn.execute(
+            """UPDATE queue_tickets SET status = ?, reviewer_email = ?, review_note = ?, reviewed_at = ?, updated_at = ?
+               WHERE id = ?""",
+            (new_status, caller, (review_note or "").strip()[:500], now, now, ticket_id),
+        )
+        _queue_v2_publish(conn, "ticket_reviewed", caller, affected_ids)
+        reviewed = dict(conn.execute(
+            """SELECT t.*, r.post_account, r.post_shortcode, r.designer_email,
+                      r.status AS request_status, r.production_points AS current_production_points
+               FROM queue_tickets t LEFT JOIN queue_requests r ON r.id = t.request_id WHERE t.id = ?""",
+            (ticket_id,),
+        ).fetchone())
+    return {"ok": True, "ticket": _queue_v2_ticket(reviewed)}
 
 
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/start")

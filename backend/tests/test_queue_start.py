@@ -44,6 +44,10 @@ def test_starting_second_request_defers_and_cascades(monkeypatch, tmp_path) -> N
             production_points INTEGER,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE queue_tickets (
+            id INTEGER PRIMARY KEY, ticket_type TEXT, requester_email TEXT, status TEXT,
+            scheduled_date TEXT, scheduled_start_minutes INTEGER, duration_minutes INTEGER
+        );
         CREATE TABLE queue_live_state (
             id INTEGER PRIMARY KEY,
             revision INTEGER NOT NULL,
