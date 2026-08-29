@@ -189,7 +189,7 @@ def build_queue_assignment_message(
             due = due_date
         metadata.append(f"*Deadline*\n{due}")
     if priority:
-        metadata.append(f"*Priority* {priority.replace('_', ' ').title()}")
+        metadata.append(f"*Priority*\n{priority.replace('_', ' ').title()}")
     if tags:
         metadata.append(f"*Tags*\n{', '.join(f'`{tag}`' for tag in tags)}")
     if production_points:

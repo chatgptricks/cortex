@@ -65,9 +65,7 @@ from .queue_rules import (
     SCHEDULER_END,
     SCHEDULER_START,
     SCHEDULER_TIMEZONE,
-    fits_deadline,
     intervals_conflict,
-    parse_deadline,
 )
 
 
@@ -1514,6 +1512,7 @@ def dashboard_queue_reorder(
 # read-only historical record while every new request starts from a clean pool.
 QUEUE_V2_STATUSES = {"pool", "scheduled", "in_progress", "completed", "closed", "cancelled"}
 QUEUE_V2_TAGS = ["content", "design", "copy", "research", "review", "repurpose"]
+QUEUE_V2_PRIORITIES = ["low", "medium", "high", "urgent"]
 
 
 def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[str, bool, list[str]]:
@@ -1535,11 +1534,11 @@ def _queue_v2_json(value: Any, fallback: Any) -> Any:
         return fallback
 
 
-def _queue_v2_deadline(value: str) -> str:
-    try:
-        return parse_deadline(value)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Deadline must be a valid date and time.") from exc
+def _queue_v2_priority(value: str | None) -> str:
+    clean = (value or "medium").strip().lower()
+    if clean not in QUEUE_V2_PRIORITIES:
+        raise HTTPException(status_code=400, detail="Priority must be low, medium, high, or urgent.")
+    return clean
 
 
 def _queue_v2_tags(value: str | None) -> list[str]:
@@ -1617,7 +1616,7 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
             "publishedAt": snapshot.get("publishedAt"), "likes": snapshot.get("likes"),
             "comments": snapshot.get("comments"),
         },
-        "productionPoints": pp, "durationMinutes": pp * 10, "deadlineAt": row["deadline_at"],
+        "productionPoints": pp, "durationMinutes": pp * 10, "priority": row.get("priority") or "medium",
         "tags": _queue_v2_json(row["tags"], []), "brief": row["brief"], "notes": row["notes"],
         "references": _queue_v2_json(row["reference_links"], []), "attachments": _queue_v2_json(row["attachments"], []),
         "status": row["status"], "designerEmail": row["designer_email"], "coordinatorEmail": row["coordinator_email"],
@@ -1671,7 +1670,11 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         clauses.append("designer_email = ?")
         params.append(caller)
     with connect() as conn:
-        rows = conn.execute(f"SELECT * FROM queue_requests WHERE {' AND '.join(clauses)} ORDER BY deadline_at, id", params).fetchall()
+        rows = conn.execute(
+            f"""SELECT * FROM queue_requests WHERE {' AND '.join(clauses)}
+                 ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, id""",
+            params,
+        ).fetchall()
         assigned_rows = []
         if not (is_admin or "vc" in roles):
             assigned_rows = conn.execute(
@@ -1687,7 +1690,8 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
     return {
         "viewer": {"email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)), "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
         "date": selected_date, "requests": requests, "assignedRequests": assigned_requests, "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
-        "tags": QUEUE_V2_TAGS, "hours": {"start": SCHEDULER_START, "end": SCHEDULER_END},
+        "tags": QUEUE_V2_TAGS, "priorities": QUEUE_V2_PRIORITIES,
+        "hours": {"start": SCHEDULER_START, "end": SCHEDULER_END},
     }
 
 
@@ -1727,7 +1731,6 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
     totals = {status: {"count": 0, "points": 0} for status in QUEUE_V2_STATUSES}
     for row in rows:
         totals[row["status"]] = {"count": int(row["count"]), "points": int(row["points"])}
-    now = datetime.now(UTC)
     designer_reports: list[dict[str, Any]] = []
     for designer in _queue_v2_designers():
         items = [row for row in request_rows if row["designer_email"] == designer["email"]]
@@ -1737,22 +1740,19 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
             max(0, round((datetime.fromisoformat(row["completed_at"]) - datetime.fromisoformat(row["actual_started_at"])).total_seconds() / 60))
             for row in closed if row["actual_started_at"] and row["completed_at"]
         ]
-        on_time = sum(
-            1 for row in closed if row["closed_at"] and datetime.fromisoformat(row["closed_at"]) <= datetime.fromisoformat(row["deadline_at"])
-        )
-        overdue = sum(
-            1 for row in active if datetime.fromisoformat(row["deadline_at"]) < now
-        )
         designer_reports.append({
             "email": designer["email"], "activeRequests": len(active),
             "productionPoints": sum(int(row["production_points"]) for row in active),
-            "closedRequests": len(closed), "overdueRequests": overdue,
-            "onTimeRate": round(on_time / len(closed) * 100) if closed else None,
+            "closedRequests": len(closed),
+            "urgentRequests": sum(1 for row in active if (row.get("priority") or "medium") == "urgent"),
+            "highPriorityRequests": sum(1 for row in active if (row.get("priority") or "medium") == "high"),
             "averageActualMinutes": round(sum(actual_minutes) / len(actual_minutes)) if actual_minutes else None,
         })
-    closed_all = [row for row in request_rows if row["status"] == "closed"]
-    on_time_all = sum(1 for row in closed_all if row["closed_at"] and datetime.fromisoformat(row["closed_at"]) <= datetime.fromisoformat(row["deadline_at"]))
-    overdue_all = sum(1 for row in request_rows if row["status"] in {"scheduled", "in_progress", "completed"} and datetime.fromisoformat(row["deadline_at"]) < now)
+    priority_totals = {priority: {"count": 0, "points": 0} for priority in QUEUE_V2_PRIORITIES}
+    for row in request_rows:
+        priority = row.get("priority") or "medium"
+        priority_totals[priority]["count"] += 1
+        priority_totals[priority]["points"] += int(row["production_points"])
     # Admins need a durable, cross-day view of every request that has been
     # assigned to a designer. The scheduler payload is intentionally scoped to
     # one day, so keep this list on the report endpoint instead of forcing the
@@ -1766,7 +1766,7 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
     ))
     return {
         "totals": totals,
-        "performance": {"overdue": overdue_all, "onTimeRate": round(on_time_all / len(closed_all) * 100) if closed_all else None},
+        "priorities": priority_totals,
         "designers": sorted(designer_reports, key=lambda item: (-item["activeRequests"], item["email"])),
         "assignedPosts": assigned_posts,
     }
@@ -1775,7 +1775,7 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
 @app.post("/api/dashboard/queue/v2/pool")
 def dashboard_queue_v2_pool(
     request: Request, account: Annotated[str, Form()], shortcode: Annotated[str, Form()],
-    production_points: Annotated[int, Form()], deadline_at: Annotated[str, Form()],
+    production_points: Annotated[int, Form()], priority: Annotated[str, Form()] = "medium",
     tags: Annotated[str | None, Form()] = None, brief: Annotated[str | None, Form()] = None,
     notes: Annotated[str | None, Form()] = None, references: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
@@ -1785,7 +1785,7 @@ def dashboard_queue_v2_pool(
     clean_account, clean_shortcode = _queue_post_exists(account, shortcode)
     snapshot = _queue_v2_post_snapshot(clean_account, clean_shortcode)
     post_id = snapshot.get("id")
-    deadline = _queue_v2_deadline(deadline_at)
+    clean_priority = _queue_v2_priority(priority)
     refs = _queue_v2_json(references, [])
     now = utc_now()
     with connect() as conn:
@@ -1796,15 +1796,15 @@ def dashboard_queue_v2_pool(
             conn.execute("DELETE FROM queue_requests WHERE id = ?", (existing["id"],))
         cursor = conn.execute(
             """INSERT INTO queue_requests (post_account, post_shortcode, post_permalink, post_caption, post_type, cover_url,
-                production_points, deadline_at, tags, brief, notes, reference_links, coordinator_email, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                production_points, priority, deadline_at, tags, brief, notes, reference_links, coordinator_email, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (clean_account, clean_shortcode, snapshot.get("permalink") or f"https://www.instagram.com/p/{clean_shortcode}/",
              snapshot.get("caption") or "", snapshot.get("type") or "Image",
-             f"/api/dashboard/covers/{clean_account}/{post_id}" if post_id is not None else "", production_points, deadline,
+             f"/api/dashboard/covers/{clean_account}/{post_id}" if post_id is not None else "", production_points, clean_priority, now,
              json.dumps(_queue_v2_tags(tags)), (brief or "").strip(), (notes or "").strip(), json.dumps(refs if isinstance(refs, list) else []), caller, now, now),
         )
         request_id = int(cursor.lastrowid)
-        _queue_v2_log(conn, request_id, caller, "pooled", {"productionPoints": production_points, "deadlineAt": deadline})
+        _queue_v2_log(conn, request_id, caller, "pooled", {"productionPoints": production_points, "priority": clean_priority})
         row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
     return {"ok": True, "request": _queue_v2_project(row)}
 
@@ -1854,8 +1854,6 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
             duration = int(row["production_points"]) * 10
             if start + duration > 24 * 60:
                 raise HTTPException(status_code=400, detail="A request must fit within a single calendar day.")
-            if not fits_deadline(date, start, duration, row["deadline_at"]):
-                raise HTTPException(status_code=409, detail=f"@{row['post_account']} would finish after its deadline.")
             accounts = entry.get("recommendedAccounts", [])
             if not isinstance(accounts, list):
                 accounts = []
@@ -1901,7 +1899,7 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
             notifications.append({"task_id": item["id"], "assignee_email": item["designer"], "assigned_by_email": caller,
                                   "account": row["post_account"], "post_id": _queue_post_id(row["post_account"], row["post_shortcode"]),
                                   "note": row["brief"], "notes": row["notes"], "references": _queue_v2_json(row["reference_links"], []),
-                                  "due_date": row["deadline_at"], "tags": _queue_v2_json(row["tags"], []),
+                                  "priority": row["priority"], "tags": _queue_v2_json(row["tags"], []),
                                   "recommended_accounts": item["accounts"], "production_points": row["production_points"],
                                   "scheduled_date": item["date"], "scheduled_start_minutes": item["start"], "update": was_scheduled,
                                   "assignee_slack_id": item["assigneeSlackId"], "assigned_by_slack_id": assigner_slack_id})
@@ -1936,8 +1934,6 @@ def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any
         if actual_minutes > scheduled_minutes + 60:
             raise HTTPException(status_code=409, detail="This request is more than one hour late. Ask a coordinator to reschedule it.")
         duration = int(row["production_points"]) * 10
-        if not fits_deadline(row["scheduled_date"], actual_minutes, duration, row["deadline_at"]):
-            raise HTTPException(status_code=409, detail="Starting now would finish after the deadline.")
         with connect() as conn:
             if _queue_v2_conflicts(conn, row["designer_email"], row["scheduled_date"], actual_minutes, duration, request_id):
                 raise HTTPException(status_code=409, detail="Starting now would overlap another request or its buffer.")
@@ -1958,7 +1954,7 @@ def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/edit")
 def dashboard_queue_v2_edit(
     request_id: int, request: Request,
-    production_points: Annotated[int, Form()], deadline_at: Annotated[str, Form()],
+    production_points: Annotated[int, Form()], priority: Annotated[str, Form()] = "medium",
     tags: Annotated[str | None, Form()] = None, brief: Annotated[str | None, Form()] = None,
     notes: Annotated[str | None, Form()] = None, references: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
@@ -1973,7 +1969,7 @@ def dashboard_queue_v2_edit(
     if production_points < 1:
         raise HTTPException(status_code=400, detail="Production points must be at least 1.")
     row = _queue_v2_request(request_id)
-    deadline = _queue_v2_deadline(deadline_at)
+    clean_priority = _queue_v2_priority(priority)
     clean_tags = _queue_v2_tags(tags)
     refs = _queue_v2_json(references, [])
     if not isinstance(refs, list):
@@ -1984,21 +1980,19 @@ def dashboard_queue_v2_edit(
         start = int(row["scheduled_start_minutes"])
         if start + duration > 24 * 60:
             raise HTTPException(status_code=400, detail="The revised request must fit within a single calendar day.")
-        if not fits_deadline(row["scheduled_date"], start, duration, deadline):
-            raise HTTPException(status_code=409, detail="The revised request would finish after its deadline.")
         with connect() as conn:
             if _queue_v2_conflicts(conn, row["designer_email"], row["scheduled_date"], start, duration, request_id):
                 raise HTTPException(status_code=409, detail="The revised duration overlaps another scheduled request.")
     now = utc_now()
     with connect() as conn:
         conn.execute(
-            """UPDATE queue_requests SET production_points = ?, deadline_at = ?, tags = ?, brief = ?, notes = ?,
+            """UPDATE queue_requests SET production_points = ?, priority = ?, tags = ?, brief = ?, notes = ?,
                reference_links = ?, updated_at = ? WHERE id = ?""",
-            (production_points, deadline, json.dumps(clean_tags), (brief or "").strip(), (notes or "").strip(),
+            (production_points, clean_priority, json.dumps(clean_tags), (brief or "").strip(), (notes or "").strip(),
              json.dumps(clean_refs), now, request_id),
         )
         _queue_v2_log(conn, request_id, caller, "edited", {
-            "productionPoints": production_points, "deadlineAt": deadline, "tags": clean_tags,
+            "productionPoints": production_points, "priority": clean_priority, "tags": clean_tags,
         })
         updated = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
     return {"ok": True, "request": _queue_v2_project(updated)}
@@ -2109,7 +2103,7 @@ def dashboard_queue_v2_notify(request_id: int, request: Request) -> dict[str, An
         assigned_by_slack_id=assigner["slack_user_id"] if assigner else "",
         account=row["post_account"], post_id=_queue_post_id(row["post_account"], row["post_shortcode"]),
         note=row["brief"], notes=row["notes"], references=_queue_v2_json(row["reference_links"], []),
-        due_date=row["deadline_at"], tags=_queue_v2_json(row["tags"], []),
+        priority=row["priority"], tags=_queue_v2_json(row["tags"], []),
         recommended_accounts=_queue_v2_json(row["recommended_accounts"], []), production_points=row["production_points"],
         scheduled_date=row["scheduled_date"], scheduled_start_minutes=row["scheduled_start_minutes"], update=True,
     )
