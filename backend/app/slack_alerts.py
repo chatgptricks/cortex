@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
@@ -43,6 +45,57 @@ _SLACK_USERS_BY_EMAIL = {
     "tevi@sentientagency.io": "U05QU9WCR1N",
     "gabo@sentientagency.io": "U0BLJHSUNJG",
 }
+
+_SLACK_PROFILE_CACHE: tuple[float, dict[str, str]] | None = None
+_SLACK_PROFILE_LOCK = threading.Lock()
+_SLACK_PROFILE_TTL = 6 * 60 * 60
+
+
+def slack_user_profile_images(user_ids: list[str] | tuple[str, ...] | set[str]) -> dict[str, str]:
+    """Return Slack CDN avatar URLs for the requested user IDs.
+
+    The roster is tiny but this endpoint is loaded by every Queue viewer, so
+    keep a process-local six-hour cache and return stale data during a Slack
+    outage. Empty results are safe: the Queue client falls back to initials.
+    """
+    wanted = {str(value or '').strip().upper() for value in user_ids if str(value or '').strip()}
+    if not wanted:
+        return {}
+    global _SLACK_PROFILE_CACHE
+    now = time.monotonic()
+    with _SLACK_PROFILE_LOCK:
+        cached = _SLACK_PROFILE_CACHE
+        if cached and now - cached[0] < _SLACK_PROFILE_TTL:
+            return {user_id: cached[1][user_id] for user_id in wanted if user_id in cached[1]}
+        token = os.getenv("SLACK_BOT_TOKEN", "").strip()
+        if not token:
+            return {}
+        try:
+            import httpx
+
+            response = httpx.get(
+                "https://slack.com/api/users.list",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"limit": 200},
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("ok"):
+                logger.warning("Slack profile lookup rejected: %s", payload.get("error", "unknown error"))
+                return {user_id: cached[1][user_id] for user_id in wanted if cached and user_id in cached[1]}
+            profiles: dict[str, str] = {}
+            for member in payload.get("members") or []:
+                user_id = str(member.get("id") or "").strip().upper()
+                profile = member.get("profile") or {}
+                avatar = profile.get("image_48") or profile.get("image_32") or profile.get("image_24") or ""
+                if user_id and avatar:
+                    profiles[user_id] = str(avatar)
+            _SLACK_PROFILE_CACHE = (now, profiles)
+            return {user_id: profiles[user_id] for user_id in wanted if user_id in profiles}
+        except Exception:
+            logger.exception("Slack profile lookup failed")
+            return {user_id: cached[1][user_id] for user_id in wanted if cached and user_id in cached[1]}
 
 
 def dashboard_url_for(account: str, shortcode: str) -> str:
