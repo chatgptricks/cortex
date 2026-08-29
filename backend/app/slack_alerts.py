@@ -84,24 +84,35 @@ def slack_user_profile_images(user_ids: list[str] | tuple[str, ...] | set[str]) 
         try:
             import httpx
 
-            response = httpx.get(
-                "https://slack.com/api/users.list",
-                headers={"Authorization": f"Bearer {token}"},
-                params={"limit": 200},
-                timeout=10.0,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if not payload.get("ok"):
-                logger.warning("Slack profile lookup rejected: %s", payload.get("error", "unknown error"))
-                return {user_id: cached[1][user_id] for user_id in wanted if cached and user_id in cached[1]}
             profiles: dict[str, str] = {}
-            for member in payload.get("members") or []:
-                user_id = str(member.get("id") or "").strip().upper()
-                profile = member.get("profile") or {}
-                avatar = profile.get("image_48") or profile.get("image_32") or profile.get("image_24") or ""
-                if user_id and avatar:
-                    profiles[user_id] = str(avatar)
+            cursor = ""
+            while True:
+                params = {"limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+                response = httpx.get(
+                    "https://slack.com/api/users.list",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params=params,
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not payload.get("ok"):
+                    logger.warning("Slack profile lookup rejected: %s", payload.get("error", "unknown error"))
+                    return {user_id: cached[1][user_id] for user_id in wanted if cached and user_id in cached[1]}
+                for member in payload.get("members") or []:
+                    user_id = str(member.get("id") or "").strip().upper()
+                    profile = member.get("profile") or {}
+                    avatar = (
+                        profile.get("image_192") or profile.get("image_72") or profile.get("image_48")
+                        or profile.get("image_32") or profile.get("image_24") or profile.get("image_original") or ""
+                    )
+                    if user_id and avatar:
+                        profiles[user_id] = str(avatar)
+                cursor = str((payload.get("response_metadata") or {}).get("next_cursor") or "").strip()
+                if not cursor or wanted.issubset(profiles.keys()):
+                    break
             _SLACK_PROFILE_CACHE = (now, profiles)
             return {user_id: profiles[user_id] for user_id in wanted if user_id in profiles}
         except Exception:

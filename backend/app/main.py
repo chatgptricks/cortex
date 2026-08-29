@@ -2138,6 +2138,12 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         clauses.append("designer_email = ?")
         params.append(caller)
     with connect() as conn:
+        pool_rows = conn.execute(
+            """SELECT * FROM queue_requests
+               WHERE status = 'pool'
+               ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                        created_at, id"""
+        ).fetchall()
         rows = conn.execute(
             f"""SELECT * FROM queue_requests WHERE {' AND '.join(clauses)}
                  ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, id""",
@@ -2184,6 +2190,11 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         ).fetchone()["c"])
         live_state = _queue_v2_live_snapshot(conn)
     requests = [_queue_v2_project(dict(row)) for row in rows]
+    # Pool work is intentionally excluded from the designer's normal schedule
+    # response, but PDs need a safe, read-only candidate list for Pick. Keep it
+    # separate so the existing pool visibility rules and coordinator UI remain
+    # unchanged.
+    pick_requests = [_queue_v2_project(dict(row)) for row in pool_rows]
     planning_requests = [_queue_v2_project(dict(row)) for row in planning_rows]
     assigned_requests = [_queue_v2_project(dict(row)) for row in assigned_rows]
     live_drafts = [_queue_v2_project_draft(row) for row in draft_rows]
@@ -2195,6 +2206,7 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
     return {
         "viewer": {"email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)), "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
         "date": selected_date, "requests": requests, "planningRequests": planning_requests,
+        "pickRequests": pick_requests,
         "assignedRequests": assigned_requests, "liveDrafts": live_drafts, "liveRevision": live_state["revision"],
         "timeBlocks": [_queue_v2_ticket(dict(row)) for row in time_block_rows], "pendingTicketCount": pending_ticket_count,
         "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
@@ -2202,6 +2214,52 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         "tags": QUEUE_V2_TAGS, "priorities": QUEUE_V2_PRIORITIES,
         "hours": {"start": SCHEDULER_START, "end": SCHEDULER_END},
     }
+
+
+@app.post("/api/dashboard/queue/v2/pick")
+def dashboard_queue_v2_pick(
+    request: Request,
+    request_id: Annotated[int, Form()],
+    scheduled_date: Annotated[str | None, Form()] = None,
+    scheduled_start_minutes: Annotated[int | None, Form()] = None,
+) -> dict[str, Any]:
+    """Let a PD claim one pooled request for their own next available slot."""
+    caller, _, _ = _queue_v2_access(request)
+    local_now = datetime.now(SCHEDULER_TIMEZONE)
+    target_date = scheduled_date or local_now.date().isoformat()
+    target_start = scheduled_start_minutes
+    if target_start is None:
+        target_start = ((local_now.hour * 60 + local_now.minute + 9) // 10) * 10
+        if target_start >= SCHEDULER_END:
+            target_date = (local_now.date() + timedelta(days=1)).isoformat()
+            target_start = SCHEDULER_START
+    try:
+        datetime.strptime(target_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Queue request not found.")
+        if row["status"] != "pool":
+            raise HTTPException(status_code=409, detail="That request is no longer available in the pool.")
+        prepared = _queue_v2_prepare_schedule_changes(conn, [{
+            "id": request_id, "designerEmail": caller, "scheduledDate": target_date,
+            "scheduledStartMinutes": int(target_start), "productionPoints": int(row["production_points"]),
+            "recommendedAccounts": _queue_v2_json(row["recommended_accounts"], []),
+        }])
+        item = prepared[0]
+        now = utc_now()
+        conn.execute(
+            """UPDATE queue_requests SET designer_email = ?, coordinator_email = ?, scheduled_date = ?,
+               scheduled_start_minutes = ?, recommended_accounts = ?, status = 'scheduled', updated_at = ?
+               WHERE id = ?""",
+            (caller, caller, item["date"], item["start"], json.dumps(item["accounts"]), now, request_id),
+        )
+        _queue_v2_log(conn, request_id, caller, "picked", {"date": item["date"], "start": item["start"]})
+        _queue_v2_publish(conn, "request_picked", caller, [request_id])
+        result = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
+    return {"ok": True, "request": _queue_v2_project(result)}
 
 
 @app.get("/api/dashboard/queue/v2/live")
