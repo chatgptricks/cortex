@@ -34,6 +34,24 @@ def test_starting_second_request_defers_and_cascades(monkeypatch, tmp_path) -> N
             details TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE queue_schedule_drafts (
+            request_id INTEGER PRIMARY KEY,
+            coordinator_email TEXT NOT NULL,
+            designer_email TEXT NOT NULL,
+            scheduled_date TEXT NOT NULL,
+            scheduled_start_minutes INTEGER NOT NULL,
+            recommended_accounts TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE queue_live_state (
+            id INTEGER PRIMARY KEY,
+            revision INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            actor_email TEXT NOT NULL,
+            request_ids TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO queue_live_state VALUES (1, 0, '', '', '[]', '');
         """
     )
     local_now = datetime.now(SCHEDULER_TIMEZONE)
