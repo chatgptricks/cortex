@@ -1753,10 +1753,22 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
     closed_all = [row for row in request_rows if row["status"] == "closed"]
     on_time_all = sum(1 for row in closed_all if row["closed_at"] and datetime.fromisoformat(row["closed_at"]) <= datetime.fromisoformat(row["deadline_at"]))
     overdue_all = sum(1 for row in request_rows if row["status"] in {"scheduled", "in_progress", "completed"} and datetime.fromisoformat(row["deadline_at"]) < now)
+    # Admins need a durable, cross-day view of every request that has been
+    # assigned to a designer. The scheduler payload is intentionally scoped to
+    # one day, so keep this list on the report endpoint instead of forcing the
+    # UI to make one request per date. Include closed/cancelled assignments as
+    # historical records; unassigned pool items are the only rows omitted.
+    assigned_posts = [_queue_v2_project(row) for row in request_rows if row["designer_email"]]
+    assigned_posts.sort(key=lambda item: (
+        item.get("scheduledDate") or "9999-99-99",
+        item.get("scheduledStartMinutes") if item.get("scheduledStartMinutes") is not None else 9999,
+        item.get("id", 0),
+    ))
     return {
         "totals": totals,
         "performance": {"overdue": overdue_all, "onTimeRate": round(on_time_all / len(closed_all) * 100) if closed_all else None},
         "designers": sorted(designer_reports, key=lambda item: (-item["activeRequests"], item["email"])),
+        "assignedPosts": assigned_posts,
     }
 
 
