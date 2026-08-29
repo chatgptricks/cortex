@@ -61,11 +61,9 @@ from .db import (
 from .sentient_ocr import sentient_ocr_status
 from .scheduler import start_scheduler
 from .queue_rules import (
-    SCHEDULER_BUFFER_MINUTES,
     SCHEDULER_END,
     SCHEDULER_START,
     SCHEDULER_TIMEZONE,
-    intervals_conflict,
 )
 
 
@@ -1638,22 +1636,6 @@ def _queue_v2_designers() -> list[dict[str, Any]]:
     return [{"email": user["email"], "isAdmin": bool(user.get("is_admin")), "accounts": by_designer.get(user["email"], [])} for user in users]
 
 
-def _queue_v2_conflicts(conn: Any, designer: str, date: str, start: int, duration: int, exclude_id: int | None = None) -> bool:
-    end = start + duration
-    query = """SELECT id, scheduled_start_minutes, production_points FROM queue_requests
-               WHERE designer_email = ? AND scheduled_date = ?
-                 AND status IN ('scheduled', 'in_progress', 'completed', 'closed')"""
-    rows = conn.execute(query, (designer, date)).fetchall()
-    for row in rows:
-        if exclude_id and int(row["id"]) == exclude_id:
-            continue
-        other_start = int(row["scheduled_start_minutes"] or 0)
-        other_duration = int(row["production_points"]) * 10
-        if intervals_conflict(start, duration, other_start, other_duration):
-            return True
-    return False
-
-
 @app.get("/api/dashboard/queue/v2")
 def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool = False) -> dict[str, Any]:
     caller, is_admin, roles = _queue_v2_access(request)
@@ -1852,8 +1834,6 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
             if row["status"] not in {"pool", "scheduled"}:
                 raise HTTPException(status_code=409, detail="Only pooled or scheduled requests can be moved.")
             duration = int(row["production_points"]) * 10
-            if start + duration > 24 * 60:
-                raise HTTPException(status_code=400, detail="A request must fit within a single calendar day.")
             accounts = entry.get("recommendedAccounts", [])
             if not isinstance(accounts, list):
                 accounts = []
@@ -1866,24 +1846,6 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
                 "duration": duration, "accounts": list(dict.fromkeys(clean_accounts)),
                 "row": dict(row), "assigneeSlackId": designer_row["slack_user_id"],
             })
-
-        existing = conn.execute(
-            """SELECT id, designer_email, scheduled_date, scheduled_start_minutes, production_points
-               FROM queue_requests
-               WHERE status IN ('scheduled', 'in_progress', 'completed', 'closed')"""
-        ).fetchall()
-        occupied = [
-            {"id": int(item["id"]), "designer": item["designer_email"], "date": item["scheduled_date"],
-             "start": int(item["scheduled_start_minutes"] or 0), "duration": int(item["production_points"]) * 10}
-            for item in existing if int(item["id"]) not in changed_ids
-        ]
-        for item in prepared:
-            for other in occupied:
-                if item["designer"] != other["designer"] or item["date"] != other["date"]:
-                    continue
-                if intervals_conflict(item["start"], item["duration"], other["start"], other["duration"]):
-                    raise HTTPException(status_code=409, detail=f"@{item['row']['post_account']} overlaps another request or its {SCHEDULER_BUFFER_MINUTES}-minute buffer.")
-            occupied.append(item)
 
         assigner_row = conn.execute("SELECT slack_user_id FROM dashboard_users WHERE email = ?", (caller,)).fetchone()
         assigner_slack_id = assigner_row["slack_user_id"] if assigner_row else ""
@@ -1933,10 +1895,6 @@ def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any
             raise HTTPException(status_code=409, detail="Production work cannot begin before 8:00 AM.")
         if actual_minutes > scheduled_minutes + 60:
             raise HTTPException(status_code=409, detail="This request is more than one hour late. Ask a coordinator to reschedule it.")
-        duration = int(row["production_points"]) * 10
-        with connect() as conn:
-            if _queue_v2_conflicts(conn, row["designer_email"], row["scheduled_date"], actual_minutes, duration, request_id):
-                raise HTTPException(status_code=409, detail="Starting now would overlap another request or its buffer.")
         schedule_updates = (actual_minutes, row["scheduled_date"])
     with connect() as conn:
         if schedule_updates:
@@ -1975,14 +1933,6 @@ def dashboard_queue_v2_edit(
     if not isinstance(refs, list):
         raise HTTPException(status_code=400, detail="Reference links must be a list.")
     clean_refs = [str(item).strip() for item in refs if str(item).strip()]
-    duration = production_points * 10
-    if row["scheduled_date"] and row["scheduled_start_minutes"] is not None:
-        start = int(row["scheduled_start_minutes"])
-        if start + duration > 24 * 60:
-            raise HTTPException(status_code=400, detail="The revised request must fit within a single calendar day.")
-        with connect() as conn:
-            if _queue_v2_conflicts(conn, row["designer_email"], row["scheduled_date"], start, duration, request_id):
-                raise HTTPException(status_code=409, detail="The revised duration overlaps another scheduled request.")
     now = utc_now()
     with connect() as conn:
         conn.execute(
