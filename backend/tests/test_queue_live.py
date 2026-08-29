@@ -81,3 +81,11 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
         }])
     assert prepared[0]["date"] == "2026-09-01"
     assert prepared[0]["start"] == 570
+
+
+def test_every_dashboard_user_is_pd_capable_by_default():
+    roles = main._queue_v2_user_roles({
+        "operating_role": "sales",
+        "operating_roles": json.dumps(["sales"]),
+    })
+    assert roles == ["sales", "pd"]

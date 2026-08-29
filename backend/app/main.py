@@ -1525,7 +1525,7 @@ def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[st
     roles = list(getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]))
     if coordinator and not (is_admin or "vc" in roles):
         raise HTTPException(status_code=403, detail="Queue coordination access required.")
-    if not coordinator and not (is_admin or any(role in {"vc", "pd"} for role in roles)):
+    if not coordinator and not (is_admin or any(role in {"vc", "pd", "sales"} for role in roles)):
         raise HTTPException(status_code=403, detail="Queue is available to production coordinators and designers.")
     return email, is_admin, roles
 
@@ -1536,6 +1536,15 @@ def _queue_v2_json(value: Any, fallback: Any) -> Any:
         return parsed if isinstance(parsed, type(fallback)) else fallback
     except (TypeError, json.JSONDecodeError):
         return fallback
+
+
+def _queue_v2_user_roles(user: dict[str, Any] | Any) -> list[str]:
+    """Return effective Queue roles; every dashboard user is PD-capable."""
+    roles = _queue_v2_json(user.get("operating_roles"), [user.get("operating_role") or "sales"])
+    normalized = list(dict.fromkeys(str(role).strip().lower() for role in roles if str(role).strip()))
+    if "pd" not in normalized:
+        normalized.append("pd")
+    return normalized
 
 
 def _queue_v2_priority(value: str | None) -> str:
@@ -1779,7 +1788,7 @@ def _queue_v2_draft_rows(conn: Any, *, designer_email: str | None = None, reques
 
 
 def _queue_v2_designers() -> list[dict[str, Any]]:
-    users = [u for u in list_dashboard_users() if "pd" in _queue_v2_json(u.get("operating_roles"), [u.get("operating_role")])]
+    users = list_dashboard_users()
     with connect() as conn:
         accounts = conn.execute("SELECT designer_email, account_handle FROM queue_designer_accounts ORDER BY account_handle").fetchall()
     by_designer: dict[str, list[str]] = {}
@@ -1791,14 +1800,14 @@ def _queue_v2_designers() -> list[dict[str, Any]]:
 def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
     """Return the complete dashboard roster for the coordinator timeline.
 
-    Queue work is still assignable only to Post Designers (the separate
-    ``designers`` collection powers account choices and server-side
-    validation), but coordinators need to see every dashboard user in the
-    scheduler for a truthful team overview. Non-production roles are marked
-    as such so the client can keep their rows visible without presenting them
-    as valid drop targets.
+    Every dashboard user is Queue-capable as a PD by default. Their explicit
+    secondary roles (VC, Sales, or Admin) remain available to the UI, while
+    the client suppresses the implicit PD label so the roster stays concise.
     """
     users = list_dashboard_users()
+    from .slack_alerts import slack_user_profile_images
+
+    avatar_by_slack_id = slack_user_profile_images([str(user.get("slack_user_id") or "") for user in users])
     with connect() as conn:
         accounts = conn.execute("SELECT designer_email, account_handle FROM queue_designer_accounts ORDER BY account_handle").fetchall()
     by_designer: dict[str, list[str]] = {}
@@ -1806,13 +1815,13 @@ def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
         by_designer.setdefault(item["designer_email"], []).append(item["account_handle"])
     result: list[dict[str, Any]] = []
     for user in users:
-        roles = _queue_v2_json(user.get("operating_roles"), [user.get("operating_role") or "sales"])
-        roles = [str(role).strip().lower() for role in roles if str(role).strip()]
+        roles = _queue_v2_user_roles(user)
         result.append({
             "email": user["email"],
             "isAdmin": bool(user.get("is_admin")),
             "roles": roles,
             "isQueueDesigner": "pd" in roles,
+            "avatarUrl": avatar_by_slack_id.get(str(user.get("slack_user_id") or "").strip().upper(), ""),
             "accounts": by_designer.get(user["email"], []),
         })
     return result
@@ -1845,7 +1854,7 @@ def _queue_v2_prepare_schedule_changes(
             "SELECT operating_role, operating_roles, slack_user_id FROM dashboard_users WHERE email = ?",
             (designer,),
         ).fetchone()
-        designer_roles = _queue_v2_json(designer_row["operating_roles"], [designer_row["operating_role"]]) if designer_row else []
+        designer_roles = _queue_v2_user_roles(dict(designer_row)) if designer_row else []
         if not designer_row or "pd" not in designer_roles:
             raise HTTPException(status_code=400, detail="Choose a Queue designer.")
         row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone()
@@ -3006,7 +3015,7 @@ def admin_queue_add_designer_account(
         raise HTTPException(status_code=400, detail="Choose an account.")
     with connect() as conn:
         user = conn.execute("SELECT operating_role, operating_roles FROM dashboard_users WHERE email = ?", (designer,)).fetchone()
-        user_roles = _queue_v2_json(user["operating_roles"], [user["operating_role"]]) if user else []
+        user_roles = _queue_v2_user_roles(dict(user)) if user else []
         if not user or "pd" not in user_roles:
             raise HTTPException(status_code=400, detail="Choose a designer.")
         account = conn.execute("SELECT handle FROM accounts WHERE handle = ? AND group_name = 'sentient'", (handle,)).fetchone()
