@@ -354,6 +354,38 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_queue_schedule_drafts_designer
                 ON queue_schedule_drafts(designer_email, scheduled_date, scheduled_start_minutes);
+            -- Queue tickets cover personal scheduler holds plus designer
+            -- requests for PP changes and cancellations. Pending time blocks
+            -- are visible immediately, but only approved tickets are firm.
+            CREATE TABLE IF NOT EXISTS queue_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_type TEXT NOT NULL
+                    CHECK(ticket_type IN ('time_block','pp_revision','cancellation')),
+                requester_email TEXT NOT NULL,
+                request_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','approved','rejected')),
+                block_category TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                scheduled_date TEXT,
+                scheduled_start_minutes INTEGER,
+                duration_minutes INTEGER,
+                requested_production_points INTEGER,
+                reason TEXT NOT NULL DEFAULT '',
+                reviewer_email TEXT,
+                review_note TEXT NOT NULL DEFAULT '',
+                reviewed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(request_id) REFERENCES queue_requests(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_queue_tickets_status
+                ON queue_tickets(status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_queue_tickets_user_day
+                ON queue_tickets(requester_email, scheduled_date, scheduled_start_minutes);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_tickets_pending_request
+                ON queue_tickets(ticket_type, request_id)
+                WHERE status = 'pending' AND request_id IS NOT NULL;
             -- A durable monotonic revision is the rendezvous point for the
             -- authenticated live stream.  It works across reconnects and
             -- process restarts instead of relying on in-memory pub/sub.

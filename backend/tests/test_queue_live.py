@@ -54,6 +54,10 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
             scheduled_date TEXT, scheduled_start_minutes INTEGER, recommended_accounts TEXT,
             production_points INTEGER, updated_at TEXT
         );
+        CREATE TABLE queue_tickets (
+            id INTEGER PRIMARY KEY, ticket_type TEXT, requester_email TEXT, status TEXT,
+            scheduled_date TEXT, scheduled_start_minutes INTEGER, duration_minutes INTEGER
+        );
         """
     )
     conn.execute("INSERT INTO dashboard_users VALUES ('pd@example.com', 'pd', ?, '')", (json.dumps(["pd"]),))
