@@ -1530,6 +1530,10 @@ QUEUE_V2_STATUSES = {"pool", "scheduled", "in_progress", "completed", "closed", 
 QUEUE_V2_TAGS = ["content", "design", "copy", "research", "review", "repurpose", "hot"]
 QUEUE_V2_PRIORITIES = ["low", "medium", "high", "urgent"]
 QUEUE_V2_HOT_MULTIPLIER = 3.0
+# HOT routing starts at the reset moment that cleared the first batch. The
+# environment override makes a future reset explicit without another code
+# change; posts whose one-time HOT check predates this moment are ignored.
+QUEUE_V2_HOT_ROUTING_START = os.getenv("QUEUE_V2_HOT_ROUTING_START", "2026-08-29T23:47:40Z")
 QUEUE_V2_TICKET_TYPES = {"time_block", "pp_revision", "cancellation"}
 QUEUE_V2_TIME_CATEGORIES = {"meeting", "break", "promo", "focus", "other"}
 # queue_schedule_drafts predates pool return support and keeps its placement
@@ -1665,31 +1669,38 @@ def _queue_v2_hot_source_rows(conn: Any) -> list[dict[str, Any]]:
     routing works for both storage shapes and remains idempotent.
     """
     rows: list[dict[str, Any]] = []
+    # Older migration fixtures may not have the timestamp column yet. The
+    # production schema does; keeping the fallback makes the helper safe while
+    # those databases are upgraded in place.
+    post_columns = {row["name"] for row in conn.execute("PRAGMA table_info(posts)").fetchall()}
+    dashboard_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dashboard_posts)").fetchall()}
+    post_cutoff = " AND hot_marked_at >= ?" if "hot_marked_at" in post_columns else ""
+    dashboard_cutoff = " AND dp.hot_marked_at >= ?" if "hot_marked_at" in dashboard_columns else ""
     canonical = conn.execute(
         "SELECT handle FROM accounts WHERE is_canonical = 1 AND is_active = 1 LIMIT 1"
     ).fetchone()
     if canonical:
         for row in conn.execute(
-            """SELECT id, shortcode, caption, title, post_type_label, published_at,
+            f"""SELECT id, shortcode, caption, title, post_type_label, published_at,
                       likes, comments, is_hot, hot_rate_multiplier
                FROM posts
                WHERE is_hot = 1 AND hot_rate_multiplier > ?
-                 AND shortcode IS NOT NULL AND shortcode != ''""",
-            (QUEUE_V2_HOT_MULTIPLIER,),
+                 AND shortcode IS NOT NULL AND shortcode != ''{post_cutoff}""",
+            (QUEUE_V2_HOT_MULTIPLIER, QUEUE_V2_HOT_ROUTING_START) if post_cutoff else (QUEUE_V2_HOT_MULTIPLIER,),
         ).fetchall():
             item = dict(row)
             item["account"] = canonical["handle"]
             item["permalink"] = f"https://www.instagram.com/p/{item['shortcode']}/"
             rows.append(item)
     for row in conn.execute(
-        """SELECT dp.id, dp.account, dp.shortcode, dp.caption, dp.post_type_label,
+        f"""SELECT dp.id, dp.account, dp.shortcode, dp.caption, dp.post_type_label,
                   dp.published_at, dp.likes, dp.comments, dp.permalink,
                   dp.is_hot, dp.hot_rate_multiplier
            FROM dashboard_posts dp
            JOIN accounts a ON a.handle = dp.account
            WHERE a.is_active = 1 AND dp.is_hot = 1 AND dp.hot_rate_multiplier > ?
-             AND dp.shortcode IS NOT NULL AND dp.shortcode != ''""",
-        (QUEUE_V2_HOT_MULTIPLIER,),
+             AND dp.shortcode IS NOT NULL AND dp.shortcode != ''{dashboard_cutoff}""",
+        (QUEUE_V2_HOT_MULTIPLIER, QUEUE_V2_HOT_ROUTING_START) if dashboard_cutoff else (QUEUE_V2_HOT_MULTIPLIER,),
     ).fetchall():
         rows.append(dict(row))
     return sorted(rows, key=lambda item: (-float(item.get("hot_rate_multiplier") or 0), str(item.get("account") or ""), str(item.get("shortcode") or "")))
