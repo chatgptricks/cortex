@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -12,6 +14,8 @@ import time
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
+from types import SimpleNamespace
+from urllib.parse import parse_qs
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -131,7 +135,7 @@ _SEED_ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").s
 # data, search, every admin action) requires a signed-in, allowlisted
 # Google account once FIREBASE_APP is configured.
 _FIREBASE_OPEN_PREFIXES = ("/api/dashboard/covers/", "/api/dashboard/avatar/", "/api/admin/alert-image/")
-_FIREBASE_OPEN_PATHS = {"/api/health", "/", "/docs", "/openapi.json", "/redoc"}
+_FIREBASE_OPEN_PATHS = {"/api/health", "/", "/docs", "/openapi.json", "/redoc", "/api/slack/interactions"}
 
 
 @app.middleware("http")
@@ -997,6 +1001,12 @@ def _queue_post_exists(account: str, shortcode: str) -> tuple[str, str]:
 
 def _queue_post_id(account: str, shortcode: str) -> int | None:
     """Returns the ID used by the public cover route for a Queue post."""
+    # Manually-created Queue posts do not have a publishing account until a
+    # coordinator assigns them. They still need to flow through the normal
+    # scheduler and Slack notification paths, so an empty source account has
+    # no cover ID rather than being treated as an unknown account.
+    if not str(account or "").strip() or not str(shortcode or "").strip():
+        return None
     table = _resolve_post_table(account)
     with connect() as conn:
         if table == "posts":
@@ -1645,7 +1655,11 @@ def _queue_v2_require_visible(row: dict[str, Any], caller: str, is_admin: bool, 
         raise HTTPException(status_code=403, detail="Not allowed to view this request.")
 
 
-def _queue_v2_post_snapshot(account: str, shortcode: str) -> dict[str, Any]:
+def _queue_v2_post_snapshot(account: str | None, shortcode: str | None) -> dict[str, Any]:
+    # Custom Queue requests intentionally have no source account or post. Do
+    # not resolve an empty account against the dashboard account registry.
+    if not str(account or "").strip() or not str(shortcode or "").strip():
+        return {}
     table = _resolve_post_table(account)
     with connect() as conn:
         if table == "posts":
@@ -1856,6 +1870,7 @@ def _queue_v2_occupied(row: dict[str, Any], duration: int | None = None) -> dict
 
 def _queue_v2_ticket(row: dict[str, Any]) -> dict[str, Any]:
     request_id = row.get("request_id")
+    ticket_type = "move" if row.get("ticket_type") == "time_block" and row.get("block_category") == "move" and request_id is not None else row.get("ticket_type")
     request_summary = None
     if request_id is not None:
         request_summary = {
@@ -1866,7 +1881,7 @@ def _queue_v2_ticket(row: dict[str, Any]) -> dict[str, Any]:
             "productionPoints": row.get("current_production_points"),
         }
     return {
-        "id": int(row["id"]), "type": row["ticket_type"], "status": row["status"],
+        "id": int(row["id"]), "type": ticket_type, "status": row["status"],
         "requesterEmail": row["requester_email"], "requestId": request_id,
         "category": row.get("block_category") or "", "title": row.get("title") or "",
         "scheduledDate": row.get("scheduled_date"), "scheduledStartMinutes": row.get("scheduled_start_minutes"),
@@ -2365,21 +2380,45 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         time_block_rows = conn.execute(
             f"""SELECT * FROM queue_tickets
                 WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
+                  AND block_category != 'move'
                   AND scheduled_date = ?{block_scope}
                 ORDER BY scheduled_start_minutes, id""",
             block_params,
         ).fetchall()
+        pending_ticket_rows = conn.execute(
+            """SELECT id, request_id, ticket_type, block_category,
+                      requested_production_points, scheduled_date,
+                      scheduled_start_minutes, reason
+               FROM queue_tickets
+               WHERE status = 'pending' AND request_id IS NOT NULL"""
+        ).fetchall()
+        pending_tickets_by_request: dict[int, list[dict[str, Any]]] = {}
+        for ticket in pending_ticket_rows:
+            item = dict(ticket)
+            item["type"] = "move" if item["ticket_type"] == "time_block" and item["block_category"] == "move" else item["ticket_type"]
+            pending_tickets_by_request.setdefault(int(item["request_id"]), []).append({
+                "id": int(item["id"]), "type": item["type"],
+                "requestedProductionPoints": item.get("requested_production_points"),
+                "scheduledDate": item.get("scheduled_date"),
+                "scheduledStartMinutes": item.get("scheduled_start_minutes"),
+                "reason": item.get("reason") or "",
+            })
         pending_ticket_count = int(conn.execute(
             "SELECT COUNT(*) AS c FROM queue_tickets WHERE status = 'pending'" + ("" if (is_admin or "vc" in roles) else " AND requester_email = ?"),
             [] if (is_admin or "vc" in roles) else [caller],
         ).fetchone()["c"])
         live_state = _queue_v2_live_snapshot(conn)
-    requests = [_queue_v2_project(dict(row)) for row in rows]
+    def project_with_ticket_flags(row: Any) -> dict[str, Any]:
+        item = _queue_v2_project(dict(row))
+        item["pendingTickets"] = pending_tickets_by_request.get(int(item["id"]), [])
+        return item
+
+    requests = [project_with_ticket_flags(row) for row in rows]
     # Pool work is intentionally excluded from the designer's normal schedule
     # response, but PDs need a safe, read-only candidate list for Pick. Keep it
     # separate so the existing pool visibility rules and coordinator UI remain
     # unchanged.
-    pick_requests = [_queue_v2_project(dict(row)) for row in pool_rows]
+    pick_requests = [project_with_ticket_flags(row) for row in pool_rows]
     # Keep a separately sorted HOT list so the PD picker can fall back to the
     # highest-rate HOT posts when the ordinary pool is empty. In normal use
     # these rows are already materialized in the pool by the helper above.
@@ -2387,9 +2426,11 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         [task for task in pick_requests if "hot" in (task.get("tags") or []) or task.get("isHot")],
         key=lambda task: (-float(task.get("hotMultiplier") or 0), task.get("id", 0)),
     )
-    planning_requests = [_queue_v2_project(dict(row)) for row in planning_rows]
-    assigned_requests = [_queue_v2_project(dict(row)) for row in assigned_rows]
+    planning_requests = [project_with_ticket_flags(row) for row in planning_rows]
+    assigned_requests = [project_with_ticket_flags(row) for row in assigned_rows]
     live_drafts = [_queue_v2_project_draft(row) for row in draft_rows]
+    for item in live_drafts:
+        item["pendingTickets"] = pending_tickets_by_request.get(int(item["id"]), [])
     if not (is_admin or "vc" in roles):
         requests = [item for item in requests if item["status"] != "pool"]
     scheduler_users = _queue_v2_scheduler_users() if (is_admin or "vc" in roles) else [
@@ -2589,8 +2630,8 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
 @app.post("/api/dashboard/queue/v2/create")
 def dashboard_queue_v2_create(
     request: Request,
-    account: Annotated[str, Form()],
     title: Annotated[str, Form()],
+    account: Annotated[str | None, Form()] = None,
     post_type: Annotated[str, Form()] = "Image",
     production_points: Annotated[int, Form()] = 3,
     priority: Annotated[str, Form()] = "medium",
@@ -2607,7 +2648,10 @@ def dashboard_queue_v2_create(
     tables entirely.
     """
     caller, _, _ = _queue_v2_access(request, coordinator=True)
-    clean_account = _queue_v2_sentient_account(account)
+    # A manually-created request has no publishing account yet. The VC picks
+    # the designer's recommended account when scheduling it, just like any
+    # other pooled request. Validate an account only when one was supplied.
+    clean_account = _queue_v2_sentient_account(account) if str(account or "").strip() else ""
     clean_title = str(title or "").strip()
     if not clean_title:
         raise HTTPException(status_code=400, detail="Post title is required.")
@@ -2938,7 +2982,7 @@ def dashboard_queue_v2_request_pp_revision(
         _queue_v2_publish(conn, "ticket_created", caller, [request_id])
         ticket_row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
     _queue_v2_slack_log(
-        event_type="pp_revision_requested", task_id=request_id, actor_email=caller,
+        event_type="pp_revision_requested", task_id=request_id, ticket_id=ticket_id, actor_email=caller,
         account=row.get("post_account"), shortcode=row.get("post_shortcode"),
         designer_email=row.get("designer_email"), status=row.get("status"),
         production_points=row.get("production_points"), requested_production_points=production_points,
@@ -2981,7 +3025,7 @@ def dashboard_queue_v2_request_cancellation(
         _queue_v2_publish(conn, "ticket_created", caller, [request_id])
         ticket_row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
     _queue_v2_slack_log(
-        event_type="cancellation_requested", task_id=request_id, actor_email=caller,
+        event_type="cancellation_requested", task_id=request_id, ticket_id=ticket_id, actor_email=caller,
         account=row.get("post_account"), shortcode=row.get("post_shortcode"),
         designer_email=row.get("designer_email"), status=row.get("status"),
         production_points=row.get("production_points"), priority=row.get("priority"),
@@ -2991,12 +3035,170 @@ def dashboard_queue_v2_request_cancellation(
     return {"ok": True, "ticket": _queue_v2_ticket(ticket_row)}
 
 
+@app.post("/api/dashboard/queue/v2/tickets/move")
+def dashboard_queue_v2_request_move(
+    request: Request,
+    request_id: Annotated[int, Form()],
+    scheduled_date: Annotated[str, Form()],
+    scheduled_start_minutes: Annotated[int, Form()],
+    reason: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Let a designer ask to move a scheduled block earlier or later."""
+    caller, _, _ = _queue_v2_access(request)
+    row = _queue_v2_request(request_id)
+    if row.get("designer_email") != caller:
+        raise HTTPException(status_code=403, detail="Only the assigned designer can request a move.")
+    if row["status"] != "scheduled":
+        raise HTTPException(status_code=409, detail="Only scheduled work can be moved through a request.")
+    try:
+        datetime.strptime(scheduled_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
+    start = int(scheduled_start_minutes)
+    if start % 10 or start < SCHEDULER_START or start >= SCHEDULER_END:
+        raise HTTPException(status_code=400, detail="Move requests must use 10-minute scheduler slots.")
+    clean_reason = (reason or "").strip()[:500]
+    now = utc_now()
+    with connect() as conn:
+        pending = conn.execute(
+            "SELECT 1 FROM queue_tickets WHERE ticket_type = 'time_block' AND block_category = 'move' AND request_id = ? AND status = 'pending'",
+            (request_id,),
+        ).fetchone()
+        if pending:
+            raise HTTPException(status_code=409, detail="A move request is already pending for this request.")
+        cursor = conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, request_id, status, block_category, title,
+                scheduled_date, scheduled_start_minutes, duration_minutes, reason, created_at, updated_at)
+               VALUES ('time_block', ?, ?, 'pending', 'move', 'Move request', ?, ?, 0, ?, ?, ?)""",
+            (caller, request_id, scheduled_date, start, clean_reason, now, now),
+        )
+        ticket_id = int(cursor.lastrowid)
+        _queue_v2_log(conn, request_id, caller, "move_requested", {
+            "scheduledDate": scheduled_date, "scheduledStartMinutes": start, "reason": clean_reason,
+        })
+        _queue_v2_publish(conn, "ticket_created", caller, [request_id])
+        ticket_row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    _queue_v2_slack_log(
+        event_type="move_requested", task_id=request_id, ticket_id=ticket_id, actor_email=caller,
+        account=row.get("post_account"), shortcode=row.get("post_shortcode"),
+        designer_email=row.get("designer_email"), status=row.get("status"),
+        production_points=row.get("production_points"), priority=row.get("priority"),
+        tags=_queue_v2_json(row.get("tags"), []), reason=clean_reason, brief=row.get("brief"),
+        scheduled_date=scheduled_date, scheduled_start_minutes=start,
+    )
+    return {"ok": True, "ticket": _queue_v2_ticket(ticket_row)}
+
+
+def _queue_slack_reviewer(slack_user_id: str) -> dict[str, Any] | None:
+    """Resolve a Slack clicker to an allowlisted VC/admin dashboard user."""
+    clean_id = str(slack_user_id or "").strip().upper()
+    if not clean_id:
+        return None
+    try:
+        from .slack_alerts import slack_user_id_for_email
+
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT email, is_admin, operating_role, operating_roles, slack_user_id FROM dashboard_users"
+            ).fetchall()
+    except Exception:
+        logging.getLogger("uvicorn.error").exception("Slack reviewer lookup failed")
+        return None
+    for row in rows:
+        item = dict(row)
+        known_id = str(item.get("slack_user_id") or "").strip().upper() or slack_user_id_for_email(item.get("email"))
+        if known_id != clean_id:
+            continue
+        try:
+            roles = json.loads(item.get("operating_roles") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            roles = []
+        if not isinstance(roles, list) or not roles:
+            roles = [item.get("operating_role") or "sales"]
+        roles = [str(role).strip().lower() for role in roles if str(role).strip()]
+        is_admin = bool(item.get("is_admin"))
+        if not (is_admin or "vc" in roles):
+            return None
+        return {"email": str(item.get("email") or "").strip().lower(), "is_admin": is_admin, "roles": roles}
+    return None
+
+
+@app.post("/api/slack/interactions")
+async def slack_interactions(request: Request) -> Response:
+    """Handle the Approve button in Queue's #spoc-dashboard messages.
+
+    Slack sends an URL-encoded ``payload`` body. The endpoint is intentionally
+    outside Firebase middleware; authenticity comes from Slack's signing
+    secret (when configured) plus the dashboard allowlist for the clicking
+    user's Slack ID. Rejections remain a Queue-only action.
+    """
+    raw_body = await request.body()
+    signing_secret = os.getenv("SLACK_SIGNING_SECRET", "").strip()
+    if signing_secret:
+        timestamp = request.headers.get("x-slack-request-timestamp", "")
+        signature = request.headers.get("x-slack-signature", "")
+        try:
+            fresh = abs(time.time() - int(timestamp)) <= 300
+        except (TypeError, ValueError):
+            fresh = False
+        expected = "v0=" + hmac.new(
+            signing_secret.encode("utf-8"),
+            f"v0:{timestamp}:".encode("utf-8") + raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+        if not fresh or not signature or not hmac.compare_digest(expected, signature):
+            return JSONResponse({"detail": "Invalid Slack signature."}, status_code=401)
+
+    try:
+        form = parse_qs(raw_body.decode("utf-8"), keep_blank_values=True)
+        encoded_payload = (form.get("payload") or [""])[0]
+        payload = json.loads(encoded_payload or raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return JSONResponse({"response_type": "ephemeral", "text": "Queue could not read this Slack action."}, status_code=400)
+    if payload.get("type") == "url_verification":
+        return JSONResponse({"challenge": payload.get("challenge", "")})
+    action = (payload.get("actions") or [{}])[0]
+    if action.get("action_id") != "queue_approve_ticket":
+        return JSONResponse({"ok": True})
+    reviewer = _queue_slack_reviewer((payload.get("user") or {}).get("id"))
+    if not reviewer:
+        return JSONResponse({"response_type": "ephemeral", "text": "Only Queue VCs and admins can approve requests."})
+    try:
+        ticket_id = int(action.get("value"))
+    except (TypeError, ValueError):
+        return JSONResponse({"response_type": "ephemeral", "text": "This Queue approval is invalid."}, status_code=400)
+    fake_request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_email=reviewer["email"],
+            is_admin=reviewer["is_admin"],
+            operating_roles=reviewer["roles"],
+            operating_role=reviewer["roles"][0] if reviewer["roles"] else "sales",
+        )
+    )
+    try:
+        dashboard_queue_v2_review_ticket(
+            ticket_id=ticket_id,
+            request=fake_request,  # type: ignore[arg-type]
+            action="approve",
+            review_note=None,
+            _notify_slack=False,
+        )
+    except HTTPException as exc:
+        return JSONResponse({"response_type": "ephemeral", "text": str(exc.detail)}, status_code=200)
+    except Exception:
+        logging.getLogger("uvicorn.error").exception("Slack Queue approval failed")
+        return JSONResponse({"response_type": "ephemeral", "text": "Queue could not approve this request. Open Queue to review it."}, status_code=200)
+    return JSONResponse({"response_type": "ephemeral", "text": "Approved in Queue. The request is now marked approved."})
+
+
 @app.post("/api/dashboard/queue/v2/tickets/{ticket_id}/review")
 def dashboard_queue_v2_review_ticket(
     ticket_id: int,
     request: Request,
     action: Annotated[str, Form()],
     review_note: Annotated[str | None, Form()] = None,
+    _notify_slack: bool = True,
 ) -> dict[str, Any]:
     caller, _, _ = _queue_v2_access(request, coordinator=True)
     clean_action = action.strip().lower()
@@ -3014,7 +3216,32 @@ def dashboard_queue_v2_review_ticket(
         ticket = dict(ticket_row)
         if ticket["status"] != "pending":
             raise HTTPException(status_code=409, detail="This ticket has already been reviewed.")
-        if clean_action == "approve" and ticket["ticket_type"] == "time_block":
+        if clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "move":
+            queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
+            if not queue_row or queue_row["status"] != "scheduled":
+                raise HTTPException(status_code=409, detail="The Queue request can no longer be moved.")
+            queue_item = dict(queue_row)
+            occupied = _queue_v2_time_occupied(conn, queue_item["designer_email"], ticket["scheduled_date"])
+            current_start = int(queue_item["scheduled_start_minutes"])
+            current_duration = _queue_v2_duration(queue_item)
+            occupied = [item for item in occupied if not (
+                item["date"] == queue_item["scheduled_date"]
+                and int(item["start"]) == current_start
+                and int(item["duration"]) == current_duration
+            )]
+            if any(intervals_conflict(int(ticket["scheduled_start_minutes"]), current_duration, int(item["start"]), int(item["duration"])) for item in occupied):
+                raise HTTPException(status_code=409, detail="The requested move overlaps another Queue block.")
+            conn.execute(
+                "UPDATE queue_requests SET scheduled_date = ?, scheduled_start_minutes = ?, updated_at = ? WHERE id = ?",
+                (ticket["scheduled_date"], int(ticket["scheduled_start_minutes"]), now, ticket["request_id"]),
+            )
+            _queue_v2_log(conn, ticket["request_id"], caller, "move_approved", {
+                "scheduledDate": ticket["scheduled_date"], "scheduledStartMinutes": int(ticket["scheduled_start_minutes"]),
+            })
+            _queue_v2_reflow_scheduled(conn, queue_item["designer_email"], caller, ticket["request_id"])
+            queue_change_event = "move_approved"
+            affected_ids.add(int(ticket["request_id"]))
+        elif clean_action == "approve" and ticket["ticket_type"] == "time_block":
             _queue_v2_assert_time_available(
                 conn, ticket["requester_email"], ticket["scheduled_date"],
                 int(ticket["scheduled_start_minutes"]), int(ticket["duration_minutes"]), exclude_ticket_id=ticket_id,
@@ -3055,7 +3282,7 @@ def dashboard_queue_v2_review_ticket(
             affected_ids.add(int(ticket["request_id"]))
         if ticket.get("request_id") and clean_action == "reject":
             _queue_v2_log(conn, ticket["request_id"], caller, f"{ticket['ticket_type']}_rejected", {"reviewNote": (review_note or "").strip()})
-            queue_change_event = f"{ticket['ticket_type']}_rejected"
+            queue_change_event = "move_rejected" if ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "move" else f"{ticket['ticket_type']}_rejected"
             affected_ids.add(int(ticket["request_id"]))
         conn.execute(
             """UPDATE queue_tickets SET status = ?, reviewer_email = ?, review_note = ?, reviewed_at = ?, updated_at = ?
@@ -3082,13 +3309,13 @@ def dashboard_queue_v2_review_ticket(
                 extra = None
             if extra:
                 reviewed.update(dict(extra))
-    if queue_change_event and reviewed.get("request_id"):
+    if _notify_slack and queue_change_event and reviewed.get("request_id"):
         requested_points = reviewed.get("requested_production_points")
         current_points = reviewed.get("current_production_points")
         if queue_change_event == "pp_revision_approved":
             requested_points, current_points = current_points, previous_production_points
         _queue_v2_slack_log(
-            event_type=queue_change_event, task_id=int(reviewed["request_id"]), actor_email=caller,
+            event_type=queue_change_event, task_id=int(reviewed["request_id"]), ticket_id=ticket_id, actor_email=caller,
             account=reviewed.get("post_account"), shortcode=reviewed.get("post_shortcode"),
             designer_email=reviewed.get("designer_email"), status=reviewed.get("request_status"),
             production_points=current_points,

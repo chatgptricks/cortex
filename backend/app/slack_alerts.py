@@ -433,6 +433,9 @@ _QUEUE_CHANGE_LABELS = {
     "pp_revision_requested": "PP revision requested",
     "pp_revision_approved": "PP revision approved",
     "pp_revision_rejected": "PP revision rejected",
+    "move_requested": "Move requested",
+    "move_approved": "Move approved",
+    "move_rejected": "Move rejected",
     "cancellation_requested": "Cancellation requested",
     "cancellation_approved": "Cancellation approved",
     "cancellation_rejected": "Cancellation rejected",
@@ -479,6 +482,7 @@ def build_queue_change_message(
     scheduled_date: str | None = None,
     scheduled_start_minutes: int | None = None,
     final_permalink: str | None = None,
+    ticket_id: int | None = None,
 ) -> dict[str, Any]:
     """Build a compact Block Kit audit entry for #spoc-dashboard.
 
@@ -486,94 +490,79 @@ def build_queue_change_message(
     attachment is required to understand the event, while the Queue button
     lands on the request's side view for the people who need to act on it.
     """
-    label = _QUEUE_CHANGE_LABELS.get(event_type, event_type.replace("_", " ").title())
-    clean_account = str(account or "").strip().lstrip("@") or "unknown account"
+    # SPOC is a high-volume audit channel. Keep every event to one readable
+    # line and put the actionable controls in one compact button row. Slack
+    # renders user mentions as their familiar display names, while the
+    # shortcode remains the unambiguous post identifier.
+    requested = event_type.endswith("_requested")
+    approved = event_type.endswith("_approved")
+    rejected = event_type.endswith("_rejected")
+    base_type = event_type.replace("_requested", "").replace("_approved", "").replace("_rejected", "")
+    label = {
+        "pp_revision": "PP revision",
+        "cancellation": "Cancellation",
+        "move": "Move",
+        "time_block": "Time block",
+        "created": "Created",
+        "returned_to_pool": "Returned to pool",
+        "cancelled": "Cancelled",
+        "deleted": "Deleted",
+    }.get(base_type, _QUEUE_CHANGE_LABELS.get(event_type, event_type.replace("_", " ").title()))
     clean_shortcode = str(shortcode or "").strip()
-    post_label = f"@{clean_account}" + (f" · `{clean_shortcode}`" if clean_shortcode else "")
+    identifier = clean_shortcode or str(task_id or "").strip() or str(post_title or "").strip()[:80] or "unidentified"
+    subject_email = designer_email or actor_email
+    subject = _slack_actor(subject_email)
     actor = _slack_actor(actor_email)
-    designer = _slack_actor(designer_email) if designer_email else "—"
-    heading = f"Queue · {label}"
-
-    summary = f"*{post_label}*\n{actor}"
-    if event_type.endswith("_requested"):
-        summary += " requested a Queue change for this post."
-    elif event_type.endswith("_approved"):
-        summary += " approved this Queue request."
-    elif event_type.endswith("_rejected"):
-        summary += " rejected this Queue request."
-    elif event_type == "returned_to_pool":
-        summary += " returned this firm assignment to the pool."
-    elif event_type == "cancelled":
-        summary += " cancelled this Queue post."
-    elif event_type == "deleted":
-        summary += " deleted this Queue post."
-    elif event_type == "created":
-        summary += " created this Queue post directly in Queue."
+    clean_reason = " ".join(str(reason or "").strip().split())[:300]
+    if requested:
+        prefix = subject
+        verb = label
+    elif approved:
+        prefix = actor
+        verb = f"approved {label.lower()} for {subject}"
+    elif rejected:
+        prefix = actor
+        verb = f"rejected {label.lower()} for {subject}"
     else:
-        summary += "."
+        prefix = actor
+        verb = label
 
-    fields: list[dict[str, str]] = [
-        {"type": "mrkdwn", "text": f"*Designer*\n{designer}"},
-    ]
-    if status:
-        fields.append({"type": "mrkdwn", "text": f"*Status*\n`{status.replace('_', ' ')}`"})
+    parts = [prefix, verb, f"ID `{identifier}`"]
     if production_points is not None:
-        pp_text = f"{production_points} PP · {int(production_points) * 10} min"
-        if requested_production_points is not None and requested_production_points != production_points:
-            pp_text += f" → {requested_production_points} PP"
-        fields.append({"type": "mrkdwn", "text": f"*Production*\n{pp_text}"})
-    if priority:
-        fields.append({"type": "mrkdwn", "text": f"*Priority*\n{str(priority).replace('_', ' ').title()}"})
-    schedule = _queue_change_schedule(scheduled_date, scheduled_start_minutes)
-    if schedule:
-        fields.append({"type": "mrkdwn", "text": f"*Scheduled*\n{schedule}"})
-    if tags:
-        clean_tags = [str(tag).strip() for tag in tags if str(tag).strip()]
-        if clean_tags:
-            fields.append({"type": "mrkdwn", "text": f"*Tags*\n{', '.join(f'`{tag}`' for tag in clean_tags)}"})
-
-    if post_title:
-        clean_title = str(post_title).strip()[:240]
-        if clean_title:
-            blocks_title = {"type": "section", "text": {"type": "mrkdwn", "text": f"*Title*\n{clean_title}"}}
+        if requested_production_points is not None and int(requested_production_points) != int(production_points):
+            parts.append(f"{int(production_points)} PPs → {int(requested_production_points)} PPs")
         else:
-            blocks_title = None
-    else:
-        blocks_title = None
-
-    blocks: list[dict[str, Any]] = [
-        {"type": "header", "text": {"type": "plain_text", "text": heading[:150], "emoji": True}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": summary[:2900]}},
-    ]
-    if fields:
-        blocks.append({"type": "section", "fields": fields[:10]})
-    if blocks_title:
-        blocks.append(blocks_title)
-    if reason:
-        clean_reason = str(reason).strip()[:900]
-        if clean_reason:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Reason*\n> {clean_reason.replace(chr(10), chr(10) + '> ')}"}})
-    if brief and event_type.endswith("_requested"):
-        clean_brief = str(brief).strip()[:700]
-        if clean_brief:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Brief*\n> {clean_brief.replace(chr(10), chr(10) + '> ')}"}})
+            parts.append(f"{int(production_points)} PPs")
+    if base_type == "move":
+        schedule = _queue_change_schedule(scheduled_date, scheduled_start_minutes)
+        if schedule:
+            parts.append(schedule)
+    if clean_reason:
+        parts.append(f'"{clean_reason.replace(chr(34), chr(39))}"')
+    if brief and requested:
+        clean_brief = " ".join(str(brief).strip().split())[:180]
+        if clean_brief and clean_brief.lower() != clean_reason.lower():
+            parts.append(f'Brief: "{clean_brief.replace(chr(34), chr(39))}"')
     if final_permalink:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Published post*\n<{final_permalink}|Open Instagram post>"}})
+        parts.append(f"<{final_permalink}|Published post>")
+
+    line = " · ".join(part for part in parts if part)
+    blocks: list[dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": line[:2900]}}]
     if task_id is not None:
-        blocks.append({
-            "type": "actions",
-            "elements": [{
-                "type": "button",
-                "style": "primary" if event_type.endswith("_requested") else None,
-                "text": {"type": "plain_text", "text": "Review in Queue" if event_type.endswith("_requested") else "Open in Queue", "emoji": True},
-                "url": queue_url_for(task_id),
-            }],
+        elements: list[dict[str, Any]] = []
+        if requested and ticket_id is not None:
+            elements.append({
+                "type": "button", "action_id": "queue_approve_ticket", "value": str(ticket_id),
+                "style": "primary", "text": {"type": "plain_text", "text": "Approve", "emoji": True},
+                "confirm": {"title": {"type": "plain_text", "text": "Approve Queue request?"}, "text": {"type": "plain_text", "text": "This will apply the change in Queue."}, "confirm": {"type": "plain_text", "text": "Approve"}, "deny": {"type": "plain_text", "text": "Cancel"}},
+            })
+        elements.append({
+            "type": "button", "text": {"type": "plain_text", "text": "Check Post", "emoji": True},
+            "url": queue_url_for(task_id),
         })
-        # Slack rejects a null style field even though it is optional. Keep
-        # the payload minimal for non-request audit entries.
-        if blocks[-1]["elements"][0]["style"] is None:
-            blocks[-1]["elements"][0].pop("style", None)
-    return {"text": f"{heading}: {post_label}", "blocks": blocks}
+        blocks.append({"type": "actions", "elements": elements})
+    fallback = " · ".join(part.replace("`", "") for part in parts if part)
+    return {"text": fallback[:2900], "blocks": blocks}
 
 
 def notify_queue_change(**change: Any) -> bool:
