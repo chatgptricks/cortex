@@ -3177,7 +3177,7 @@ async def slack_interactions(request: Request) -> Response:
         )
     )
     try:
-        dashboard_queue_v2_review_ticket(
+        reviewed_result = dashboard_queue_v2_review_ticket(
             ticket_id=ticket_id,
             request=fake_request,  # type: ignore[arg-type]
             action="approve",
@@ -3189,6 +3189,31 @@ async def slack_interactions(request: Request) -> Response:
     except Exception:
         logging.getLogger("uvicorn.error").exception("Slack Queue approval failed")
         return JSONResponse({"response_type": "ephemeral", "text": "Queue could not approve this request. Open Queue to review it."}, status_code=200)
+    # Keep the interaction response fast while still recording the approval
+    # in the same compact SPOC audit stream used by Queue's web inbox.
+    reviewed = reviewed_result.get("ticket") or {}
+    request_info = reviewed.get("request") or {}
+    if reviewed.get("requestId"):
+        event_type = f"{reviewed.get('type')}_approved"
+        threading.Thread(
+            target=_queue_v2_slack_log,
+            kwargs={
+                "event_type": event_type,
+                "task_id": int(reviewed["requestId"]),
+                "ticket_id": int(reviewed.get("id") or ticket_id),
+                "actor_email": reviewer["email"],
+                "account": (request_info.get("post") or {}).get("account"),
+                "shortcode": (request_info.get("post") or {}).get("shortcode"),
+                "designer_email": request_info.get("designerEmail"),
+                "status": request_info.get("status"),
+                "production_points": request_info.get("productionPoints"),
+                "requested_production_points": reviewed.get("requestedProductionPoints"),
+                "reason": reviewed.get("reason") or "",
+                "scheduled_date": reviewed.get("scheduledDate"),
+                "scheduled_start_minutes": reviewed.get("scheduledStartMinutes"),
+            },
+            daemon=True,
+        ).start()
     return JSONResponse({"response_type": "ephemeral", "text": "Approved in Queue. The request is now marked approved."})
 
 
