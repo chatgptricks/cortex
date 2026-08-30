@@ -288,6 +288,7 @@ def init_db() -> None:
                 post_type TEXT NOT NULL DEFAULT '',
                 cover_url TEXT NOT NULL DEFAULT '',
                 production_points INTEGER NOT NULL CHECK(production_points > 0),
+                minutes_per_pp INTEGER NOT NULL DEFAULT 10 CHECK(minutes_per_pp > 0),
                 priority TEXT NOT NULL DEFAULT 'medium'
                     CHECK(priority IN ('low', 'medium', 'high', 'urgent')),
                 -- Retained as an internal compatibility column for databases
@@ -351,6 +352,7 @@ def init_db() -> None:
                 scheduled_start_minutes INTEGER NOT NULL,
                 recommended_accounts TEXT NOT NULL DEFAULT '[]',
                 production_points INTEGER,
+                minutes_per_pp INTEGER,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(request_id) REFERENCES queue_requests(id) ON DELETE CASCADE
             );
@@ -451,6 +453,8 @@ def init_db() -> None:
         _ensure_column(conn, "queue_requests", "slack_channel_id", "slack_channel_id TEXT")
         _ensure_column(conn, "queue_requests", "slack_message_ts", "slack_message_ts TEXT")
         _ensure_column(conn, "queue_schedule_drafts", "production_points", "production_points INTEGER")
+        _ensure_column(conn, "queue_requests", "minutes_per_pp", "minutes_per_pp INTEGER NOT NULL DEFAULT 10")
+        _ensure_column(conn, "queue_schedule_drafts", "minutes_per_pp", "minutes_per_pp INTEGER")
         conn.execute("DROP INDEX IF EXISTS idx_queue_requests_status")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_requests_status_priority ON queue_requests(status, priority)")
         conn.execute(
@@ -715,7 +719,7 @@ def upsert_dashboard_user(
 ) -> None:
     if role not in ("admin", "viewer"):
         raise ValueError(f"Invalid legacy role: {role!r}")
-    if operating_role is not None and operating_role not in ("vc", "pd", "sales"):
+    if operating_role is not None and operating_role not in ("vc", "pd", "sales", "trainee"):
         raise ValueError(f"Invalid operating role: {operating_role!r}")
     email = email.strip().lower()
     operating_role = operating_role or "sales"
@@ -838,6 +842,28 @@ def seed_queue_role_roster() -> None:
                 )
             conn.execute(
                 "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v5_ivan_pd', '1', ?)",
+                (now,),
+            )
+
+        # A real Trainee role uses longer production-point units. This seeded
+        # placeholder keeps the scheduler and assignment flow testable before
+        # the first trainee receives a company account. Notifications are
+        # routed separately so the row can keep its own neutral identity.
+        trainee_marker = conn.execute(
+            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v6_trainee_test'"
+        ).fetchone()
+        if not trainee_marker:
+            conn.execute(
+                """INSERT INTO dashboard_users
+                   (email, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at)
+                   VALUES (?, 'viewer', 'trainee', ?, 0, '', ?, ?)
+                   ON CONFLICT(email) DO UPDATE SET
+                     role = 'viewer', operating_role = 'trainee', operating_roles = excluded.operating_roles,
+                     is_admin = 0, updated_at = excluded.updated_at""",
+                ("trainee@sentientagency.io", json.dumps(["trainee"]), now, now),
+            )
+            conn.execute(
+                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v6_trainee_test', '1', ?)",
                 (now,),
             )
 

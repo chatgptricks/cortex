@@ -43,7 +43,7 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
     conn.executescript(
         """
         CREATE TABLE queue_requests (
-            id INTEGER PRIMARY KEY, production_points INTEGER, status TEXT, designer_email TEXT,
+            id INTEGER PRIMARY KEY, production_points INTEGER, minutes_per_pp INTEGER, status TEXT, designer_email TEXT,
             scheduled_date TEXT, scheduled_start_minutes INTEGER, post_account TEXT, post_shortcode TEXT,
             coordinator_email TEXT, updated_at TEXT
         );
@@ -52,7 +52,7 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
         CREATE TABLE queue_schedule_drafts (
             request_id INTEGER PRIMARY KEY, coordinator_email TEXT, designer_email TEXT,
             scheduled_date TEXT, scheduled_start_minutes INTEGER, recommended_accounts TEXT,
-            production_points INTEGER, updated_at TEXT
+            production_points INTEGER, minutes_per_pp INTEGER, updated_at TEXT
         );
         CREATE TABLE queue_tickets (
             id INTEGER PRIMARY KEY, ticket_type TEXT, requester_email TEXT, status TEXT,
@@ -61,10 +61,12 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
         """
     )
     conn.execute("INSERT INTO dashboard_users VALUES ('pd@example.com', 'pd', ?, '')", (json.dumps(["pd"]),))
-    conn.execute("INSERT INTO queue_requests VALUES (1, 3, 'pool', NULL, NULL, NULL, 'chatgptricks', 'ONE', 'vc@example.com', '')")
-    conn.execute("INSERT INTO queue_requests VALUES (2, 3, 'pool', NULL, NULL, NULL, 'chatgptricks', 'TWO', 'vc@example.com', '')")
+    conn.execute("INSERT INTO dashboard_users VALUES ('trainee@sentientagency.io', 'trainee', ?, '')", (json.dumps(["trainee"]),))
+    conn.execute("INSERT INTO queue_requests VALUES (1, 3, 10, 'pool', NULL, NULL, NULL, 'chatgptricks', 'ONE', 'vc@example.com', '')")
+    conn.execute("INSERT INTO queue_requests VALUES (2, 3, 10, 'pool', NULL, NULL, NULL, 'chatgptricks', 'TWO', 'vc@example.com', '')")
+    conn.execute("INSERT INTO queue_requests VALUES (3, 3, 10, 'pool', NULL, NULL, NULL, 'chatgptricks', 'THREE', 'vc@example.com', '')")
     conn.execute("INSERT INTO queue_designer_accounts VALUES ('pd@example.com', 'chatgptricks')")
-    conn.execute("INSERT INTO queue_schedule_drafts VALUES (1, 'other-vc@example.com', 'pd@example.com', '2026-09-01', 540, '[]', NULL, '')")
+    conn.execute("INSERT INTO queue_schedule_drafts VALUES (1, 'other-vc@example.com', 'pd@example.com', '2026-09-01', 540, '[]', NULL, 10, '')")
     conn.commit()
     conn.close()
 
@@ -84,8 +86,14 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
             "id": 2, "designerEmail": "pd@example.com", "scheduledDate": "2026-09-01",
             "scheduledStartMinutes": 540, "recommendedAccounts": [],
         }])
+        trainee = main._queue_v2_prepare_schedule_changes(value, [{
+            "id": 3, "designerEmail": "trainee@sentientagency.io", "scheduledDate": "2026-09-01",
+            "scheduledStartMinutes": 600, "recommendedAccounts": [],
+        }])
     assert prepared[0]["date"] == "2026-09-01"
     assert prepared[0]["start"] == 570
+    assert trainee[0]["minutesPerPP"] == 16
+    assert trainee[0]["duration"] == 48
 
 
 def test_every_dashboard_user_is_pd_capable_by_default():
@@ -102,14 +110,14 @@ def test_schedule_change_can_return_request_to_pool(monkeypatch, tmp_path):
     conn.executescript(
         """
         CREATE TABLE queue_requests (
-            id INTEGER PRIMARY KEY, production_points INTEGER, status TEXT, designer_email TEXT,
+            id INTEGER PRIMARY KEY, production_points INTEGER, minutes_per_pp INTEGER, status TEXT, designer_email TEXT,
             scheduled_date TEXT, scheduled_start_minutes INTEGER, post_account TEXT, post_shortcode TEXT,
             coordinator_email TEXT, recommended_accounts TEXT, updated_at TEXT
         );
         """
     )
     conn.execute(
-        "INSERT INTO queue_requests VALUES (1, 3, 'scheduled', 'pd@example.com', '2026-09-01', 540, 'chatgptricks', 'ONE', 'vc@example.com', '[]', '')"
+        "INSERT INTO queue_requests VALUES (1, 3, 10, 'scheduled', 'pd@example.com', '2026-09-01', 540, 'chatgptricks', 'ONE', 'vc@example.com', '[]', '')"
     )
     conn.commit()
     conn.close()

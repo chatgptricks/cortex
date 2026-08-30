@@ -180,7 +180,7 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     # Esteban's Dev role can safely preview a restricted operating role. This
     # is deliberately a reduction of privileges, never an escalation.
     preview_role = request.headers.get("x-queue-role-preview", "").strip().lower()
-    if request.state.is_dev and preview_role in {"sales", "pd", "vc", "admin"}:
+    if request.state.is_dev and preview_role in {"sales", "pd", "vc", "trainee", "admin"}:
         request.state.operating_roles = [preview_role]
         request.state.is_admin = preview_role == "admin"
     if path.startswith("/api/admin/") and not request.state.is_admin:
@@ -1552,6 +1552,8 @@ QUEUE_V2_TIME_CATEGORIES = {"meeting", "break", "promo", "focus", "other"}
 # shared live without changing the existing SQLite table shape.
 QUEUE_V2_POOL_DRAFT_DESIGNER = "__queue_pool__"
 QUEUE_V2_POOL_DRAFT_DATE = "0000-00-00"
+QUEUE_V2_DEFAULT_MINUTES_PER_PP = 10
+QUEUE_V2_TRAINEE_MINUTES_PER_PP = 16
 
 
 def _queue_v2_slack_log(**change: Any) -> bool:
@@ -1596,6 +1598,12 @@ def _queue_v2_user_roles(user: dict[str, Any] | Any) -> list[str]:
     if "pd" not in normalized:
         normalized.append("pd")
     return normalized
+
+
+def _queue_v2_minutes_per_pp_for_roles(roles: list[str] | tuple[str, ...] | set[str] | None) -> int:
+    """Return the PP unit for the assignee's effective Queue role."""
+    normalized = {str(role).strip().lower() for role in (roles or []) if str(role).strip()}
+    return QUEUE_V2_TRAINEE_MINUTES_PER_PP if "trainee" in normalized else QUEUE_V2_DEFAULT_MINUTES_PER_PP
 
 
 def _queue_v2_priority(value: str | None) -> str:
@@ -1850,7 +1858,8 @@ def _queue_v2_live_snapshot(conn: Any) -> dict[str, Any]:
 
 
 def _queue_v2_duration(row: dict[str, Any]) -> int:
-    planned = max(10, int(row["production_points"]) * 10)
+    minutes_per_pp = max(1, int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP))
+    planned = max(minutes_per_pp, int(row["production_points"]) * minutes_per_pp)
     if row.get("status") in {"completed", "closed"} and row.get("actual_started_at") and row.get("completed_at"):
         try:
             actual = max(10, round((datetime.fromisoformat(row["completed_at"]) - datetime.fromisoformat(row["actual_started_at"])).total_seconds() / 60))
@@ -1919,7 +1928,8 @@ def _queue_v2_time_occupied(
 ) -> list[dict[str, Any]]:
     drafts = [dict(row) for row in conn.execute(
         """SELECT d.request_id, d.scheduled_date, d.scheduled_start_minutes,
-                  COALESCE(d.production_points, r.production_points) AS production_points
+                  COALESCE(d.production_points, r.production_points) AS production_points,
+                  COALESCE(d.minutes_per_pp, r.minutes_per_pp, 10) AS minutes_per_pp
            FROM queue_schedule_drafts d
            JOIN queue_requests r ON r.id = d.request_id
            WHERE d.designer_email = ? AND d.scheduled_date = ?""",
@@ -1945,7 +1955,10 @@ def _queue_v2_time_occupied(
         ticket_params,
     ).fetchall()]
     occupied = [_queue_v2_occupied(row) for row in requests]
-    occupied.extend({"date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]), "duration": int(row["production_points"]) * 10} for row in drafts)
+    occupied.extend({
+        "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]),
+        "duration": int(row["production_points"]) * int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP),
+    } for row in drafts)
     occupied.extend({"date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]), "duration": int(row["duration_minutes"])} for row in blocks)
     return occupied
 
@@ -2016,6 +2029,7 @@ def _queue_v2_reflow_all_schedules() -> int:
 
 def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
     pp = int(row["production_points"])
+    minutes_per_pp = max(1, int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP))
     snapshot = _queue_v2_post_snapshot(row["post_account"], row["post_shortcode"])
     return {
         "id": row["id"], "post": {
@@ -2028,7 +2042,8 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
             "publishedAt": snapshot.get("publishedAt"), "likes": snapshot.get("likes"),
             "comments": snapshot.get("comments"),
         },
-        "productionPoints": pp, "durationMinutes": pp * 10, "priority": row.get("priority") or "medium",
+        "productionPoints": pp, "minutesPerPP": minutes_per_pp,
+        "durationMinutes": pp * minutes_per_pp, "priority": row.get("priority") or "medium",
         "title": row.get("post_title") or "", "isCustom": bool(row.get("is_custom")),
         "isHot": bool(snapshot.get("isHot")), "hotMultiplier": snapshot.get("hotMultiplier"),
         "tags": _queue_v2_json(row["tags"], []), "brief": row["brief"], "notes": row["notes"],
@@ -2045,9 +2060,12 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
 def _queue_v2_project_draft(row: dict[str, Any]) -> dict[str, Any]:
     item = _queue_v2_project(row)
     draft_points = row.get("draft_production_points")
+    draft_minutes_per_pp = row.get("draft_minutes_per_pp")
+    if draft_minutes_per_pp is not None:
+        item["minutesPerPP"] = max(1, int(draft_minutes_per_pp))
     if draft_points is not None:
         item["productionPoints"] = int(draft_points)
-        item["durationMinutes"] = int(draft_points) * 10
+    item["durationMinutes"] = int(item["productionPoints"]) * int(item["minutesPerPP"])
     if row["draft_designer_email"] == QUEUE_V2_POOL_DRAFT_DESIGNER:
         item.update({
             "committedStatus": item["status"],
@@ -2099,6 +2117,7 @@ def _queue_v2_draft_rows(conn: Any, *, designer_email: str | None = None, reques
                    d.scheduled_start_minutes AS draft_scheduled_start_minutes,
                    d.recommended_accounts AS draft_recommended_accounts,
                    d.production_points AS draft_production_points,
+                   d.minutes_per_pp AS draft_minutes_per_pp,
                    d.updated_at AS draft_updated_at
             FROM queue_schedule_drafts d
             JOIN queue_requests r ON r.id = d.request_id
@@ -2116,7 +2135,13 @@ def _queue_v2_designers() -> list[dict[str, Any]]:
     by_designer: dict[str, list[str]] = {}
     for item in accounts:
         by_designer.setdefault(item["designer_email"], []).append(item["account_handle"])
-    return [{"email": user["email"], "isAdmin": bool(user.get("is_admin")), "accounts": by_designer.get(user["email"], [])} for user in users]
+    return [{
+        "email": user["email"],
+        "isAdmin": bool(user.get("is_admin")),
+        "roles": _queue_v2_user_roles(user),
+        "minutesPerPP": _queue_v2_minutes_per_pp_for_roles(_queue_v2_user_roles(user)),
+        "accounts": by_designer.get(user["email"], []),
+    } for user in users]
 
 
 def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
@@ -2140,6 +2165,7 @@ def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for user in users:
         roles = _queue_v2_user_roles(user)
+        minutes_per_pp = _queue_v2_minutes_per_pp_for_roles(roles)
         slack_id = str(user.get("slack_user_id") or "").strip().upper() or slack_user_id_for_email(user.get("email"))
         managed_accounts = by_designer.get(user["email"], [])
         account_avatars = {
@@ -2151,6 +2177,7 @@ def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
             "email": user["email"],
             "isAdmin": bool(user.get("is_admin")),
             "roles": roles,
+            "minutesPerPP": minutes_per_pp,
             "isQueueDesigner": "pd" in roles,
             "avatarUrl": avatar_by_slack_id.get(slack_id, ""),
             "accounts": managed_accounts,
@@ -2196,7 +2223,8 @@ def _queue_v2_prepare_schedule_changes(
         if is_pool_return:
             prepared.append({
                 "id": request_id, "designer": None, "date": None, "start": None,
-                "productionPoints": production_points, "duration": production_points * 10,
+                "productionPoints": production_points, "minutesPerPP": QUEUE_V2_DEFAULT_MINUTES_PER_PP,
+                "duration": production_points * QUEUE_V2_DEFAULT_MINUTES_PER_PP,
                 "accounts": clean_accounts, "row": dict(row), "assigneeSlackId": "", "pool": True,
             })
             continue
@@ -2218,6 +2246,7 @@ def _queue_v2_prepare_schedule_changes(
         designer_roles = _queue_v2_user_roles(dict(designer_row)) if designer_row else []
         if not designer_row or "pd" not in designer_roles:
             raise HTTPException(status_code=400, detail="Choose a Queue designer.")
+        minutes_per_pp = _queue_v2_minutes_per_pp_for_roles(designer_roles)
         allowed = {item["account_handle"] for item in conn.execute(
             "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ?", (designer,),
         ).fetchall()}
@@ -2227,7 +2256,8 @@ def _queue_v2_prepare_schedule_changes(
         clean_accounts = [value for value in dict.fromkeys(clean_accounts) if value in allowed]
         prepared.append({
             "id": request_id, "designer": designer, "date": date, "start": start,
-            "productionPoints": production_points, "duration": production_points * 10,
+            "productionPoints": production_points, "minutesPerPP": minutes_per_pp,
+            "duration": production_points * minutes_per_pp,
             "accounts": clean_accounts, "row": dict(row),
             "assigneeSlackId": designer_row["slack_user_id"],
         })
@@ -2236,7 +2266,8 @@ def _queue_v2_prepare_schedule_changes(
     for designer in {item["designer"] for item in prepared if item["designer"]}:
         other_drafts = [dict(row) for row in conn.execute(
             """SELECT d.request_id, d.coordinator_email, d.scheduled_date, d.scheduled_start_minutes,
-                      COALESCE(d.production_points, r.production_points) AS production_points
+                      COALESCE(d.production_points, r.production_points) AS production_points,
+                      COALESCE(d.minutes_per_pp, r.minutes_per_pp, 10) AS minutes_per_pp
                FROM queue_schedule_drafts d
                JOIN queue_requests r ON r.id = d.request_id
                WHERE d.designer_email = ?""",
@@ -2254,7 +2285,7 @@ def _queue_v2_prepare_schedule_changes(
         occupied_by_designer[designer] = [_queue_v2_occupied(row) for row in committed]
         occupied_by_designer[designer].extend({
             "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]),
-            "duration": int(row["production_points"]) * 10,
+            "duration": int(row["production_points"]) * int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP),
         } for row in other_drafts)
         occupied_by_designer[designer].extend({
             "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]),
@@ -2280,7 +2311,8 @@ def _queue_v2_reflow_drafts(conn: Any, designer: str) -> int:
     """Keep shared provisional placements collision-free after firm changes."""
     drafts = [dict(row) for row in conn.execute(
             """SELECT d.request_id, d.scheduled_date, d.scheduled_start_minutes,
-                      COALESCE(d.production_points, r.production_points) AS production_points
+                      COALESCE(d.production_points, r.production_points) AS production_points,
+                      COALESCE(d.minutes_per_pp, r.minutes_per_pp, 10) AS minutes_per_pp
            FROM queue_schedule_drafts d
            JOIN queue_requests r ON r.id = d.request_id
            WHERE d.designer_email = ?
@@ -2305,8 +2337,9 @@ def _queue_v2_reflow_drafts(conn: Any, designer: str) -> int:
     ).fetchall())
     moved = 0
     for row in drafts:
+        duration = int(row["production_points"]) * int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP)
         resolved_date, resolved_start = next_available_slot(
-            row["scheduled_date"], int(row["scheduled_start_minutes"]), int(row["production_points"]) * 10, occupied,
+            row["scheduled_date"], int(row["scheduled_start_minutes"]), duration, occupied,
         )
         if resolved_date != row["scheduled_date"] or resolved_start != int(row["scheduled_start_minutes"]):
             conn.execute(
@@ -2314,7 +2347,7 @@ def _queue_v2_reflow_drafts(conn: Any, designer: str) -> int:
                 (resolved_date, resolved_start, utc_now(), row["request_id"]),
             )
             moved += 1
-        occupied.append({"date": resolved_date, "start": resolved_start, "duration": int(row["production_points"]) * 10})
+        occupied.append({"date": resolved_date, "start": resolved_start, "duration": duration})
     return moved
 
 
@@ -2442,7 +2475,11 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         if item.get("group") == "sentient"
     ]
     return {
-        "viewer": {"email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)), "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
+        "viewer": {
+            "email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)),
+            "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles,
+            "minutesPerPP": _queue_v2_minutes_per_pp_for_roles(roles),
+        },
         "date": selected_date, "requests": requests, "planningRequests": planning_requests,
         "pickRequests": pick_requests,
         "hotPickRequests": hot_pick_requests,
@@ -2492,9 +2529,9 @@ def dashboard_queue_v2_pick(
         now = utc_now()
         conn.execute(
             """UPDATE queue_requests SET designer_email = ?, coordinator_email = ?, scheduled_date = ?,
-               scheduled_start_minutes = ?, recommended_accounts = ?, status = 'scheduled', updated_at = ?
+               scheduled_start_minutes = ?, recommended_accounts = ?, minutes_per_pp = ?, status = 'scheduled', updated_at = ?
                WHERE id = ?""",
-            (caller, caller, item["date"], item["start"], json.dumps(item["accounts"]), now, request_id),
+            (caller, caller, item["date"], item["start"], json.dumps(item["accounts"]), item["minutesPerPP"], now, request_id),
         )
         _queue_v2_log(conn, request_id, caller, "picked", {"date": item["date"], "start": item["start"]})
         _queue_v2_publish(conn, "request_picked", caller, [request_id])
@@ -2761,8 +2798,8 @@ def dashboard_queue_v2_drafts(request: Request, changes: Annotated[str, Form()])
             conn.execute(
                 """INSERT INTO queue_schedule_drafts
                    (request_id, coordinator_email, designer_email, scheduled_date, scheduled_start_minutes,
-                    recommended_accounts, production_points, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    recommended_accounts, production_points, minutes_per_pp, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(request_id) DO UPDATE SET
                      coordinator_email = excluded.coordinator_email,
                      designer_email = excluded.designer_email,
@@ -2770,10 +2807,11 @@ def dashboard_queue_v2_drafts(request: Request, changes: Annotated[str, Form()])
                      scheduled_start_minutes = excluded.scheduled_start_minutes,
                      recommended_accounts = excluded.recommended_accounts,
                      production_points = excluded.production_points,
+                     minutes_per_pp = excluded.minutes_per_pp,
                      updated_at = excluded.updated_at""",
                 (item["id"], caller, item["designer"] or QUEUE_V2_POOL_DRAFT_DESIGNER,
                  item["date"] or QUEUE_V2_POOL_DRAFT_DATE, item["start"] if item["start"] is not None else 0,
-                 json.dumps(item["accounts"]), item["productionPoints"], now),
+                 json.dumps(item["accounts"]), item["productionPoints"], item["minutesPerPP"], now),
             )
         changed_ids = previous_ids | incoming_ids
         revision = _queue_v2_publish(conn, "draft_updated", caller, changed_ids)
@@ -2829,9 +2867,9 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
                 conn.execute(
                     """UPDATE queue_requests SET designer_email = NULL, coordinator_email = ?,
                        scheduled_date = NULL, scheduled_start_minutes = NULL,
-                       recommended_accounts = ?, production_points = ?, status = 'pool',
+                       recommended_accounts = ?, production_points = ?, minutes_per_pp = ?, status = 'pool',
                        slack_channel_id = NULL, slack_message_ts = NULL, updated_at = ? WHERE id = ?""",
-                    (caller, json.dumps(item["accounts"]), item["productionPoints"], now, item["id"]),
+                    (caller, json.dumps(item["accounts"]), item["productionPoints"], item["minutesPerPP"], now, item["id"]),
                 )
                 _queue_v2_log(conn, item["id"], caller, "returned_to_pool", {"productionPoints": item["productionPoints"]})
                 channel_logs.append({
@@ -2847,9 +2885,9 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
             same_assignees[item["id"]] = same_assignee
             conn.execute(
                 """UPDATE queue_requests SET designer_email = ?, coordinator_email = ?, scheduled_date = ?, scheduled_start_minutes = ?,
-                   recommended_accounts = ?, production_points = ?, status = 'scheduled',
+                   recommended_accounts = ?, production_points = ?, minutes_per_pp = ?, status = 'scheduled',
                    slack_channel_id = ?, slack_message_ts = ?, updated_at = ? WHERE id = ?""",
-                (item["designer"], caller, item["date"], item["start"], json.dumps(item["accounts"]), item["productionPoints"],
+                (item["designer"], caller, item["date"], item["start"], json.dumps(item["accounts"]), item["productionPoints"], item["minutesPerPP"],
                  row.get("slack_channel_id") if same_assignee else None,
                  row.get("slack_message_ts") if same_assignee else None,
                  now, item["id"]),
@@ -2873,6 +2911,7 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
                                   "note": row["brief"], "notes": row["notes"], "references": _queue_v2_json(row["reference_links"], []),
                                   "priority": row["priority"], "tags": _queue_v2_json(row["tags"], []),
                                   "recommended_accounts": item["accounts"], "production_points": item["productionPoints"],
+                                  "minutes_per_pp": item["minutesPerPP"],
                                   "scheduled_date": final_date, "scheduled_start_minutes": final_start,
                                   "update": item["row"]["status"] != "pool" and same_assignees.get(item["id"], False),
                                   "slack_channel_id": row.get("slack_channel_id") if same_assignees.get(item["id"], False) else "",
@@ -3285,7 +3324,8 @@ def dashboard_queue_v2_review_ticket(
                     and int(item["start"]) == int(queue_item["scheduled_start_minutes"])
                     and int(item["duration"]) == _queue_v2_duration(queue_item)
                 )]
-                if any(intervals_conflict(int(queue_item["scheduled_start_minutes"]), new_points * 10, int(item["start"]), int(item["duration"])) for item in conflicts):
+                revised_duration = new_points * int(queue_item.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP)
+                if any(intervals_conflict(int(queue_item["scheduled_start_minutes"]), revised_duration, int(item["start"]), int(item["duration"])) for item in conflicts):
                     raise HTTPException(status_code=409, detail="The revised in-progress block would overlap another firm block.")
             conn.execute("UPDATE queue_requests SET production_points = ?, updated_at = ? WHERE id = ?", (new_points, now, ticket["request_id"]))
             _queue_v2_log(conn, ticket["request_id"], caller, "pp_revision_approved", {"from": queue_item["production_points"], "to": new_points})
@@ -3584,6 +3624,7 @@ def dashboard_queue_v2_notify(request_id: int, request: Request) -> dict[str, An
         note=row["brief"], notes=row["notes"], references=_queue_v2_json(row["reference_links"], []),
         priority=row["priority"], tags=_queue_v2_json(row["tags"], []),
         recommended_accounts=_queue_v2_json(row["recommended_accounts"], []), production_points=row["production_points"],
+        minutes_per_pp=row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP,
         scheduled_date=row["scheduled_date"], scheduled_start_minutes=row["scheduled_start_minutes"], update=True,
         slack_channel_id=row.get("slack_channel_id") or "", slack_message_ts=row.get("slack_message_ts") or "",
     )
@@ -4076,8 +4117,8 @@ def admin_upsert_user(
         raise HTTPException(status_code=400, detail="Enter a valid email address.")
     if role not in ("admin", "viewer"):
         raise HTTPException(status_code=400, detail="Role must be 'admin' or 'viewer'.")
-    if operating_role is not None and operating_role not in {"vc", "pd", "sales"}:
-        raise HTTPException(status_code=400, detail="Operating role must be VC, PD, or Sales.")
+    if operating_role is not None and operating_role not in {"vc", "pd", "sales", "trainee"}:
+        raise HTTPException(status_code=400, detail="Operating role must be VC, PD, Sales, or Trainee.")
     clean_slack_id = None if slack_user_id is None else slack_user_id.strip().upper()
     if clean_slack_id and not re.fullmatch(r"U[A-Z0-9]{8,20}", clean_slack_id):
         raise HTTPException(status_code=400, detail="Slack user ID must start with U.")

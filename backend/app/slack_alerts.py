@@ -52,6 +52,13 @@ _SLACK_USERS_BY_EMAIL = {
     "gabo@sentientagency.io": "U0BLJHSUNJG",
 }
 
+# The placeholder Trainee has no Slack account yet. Assignment DMs are
+# deliberately routed to Esteban for testing, while profile/avatar lookups
+# remain empty so Queue does not present Esteban as the trainee.
+_QUEUE_NOTIFICATION_SLACK_OVERRIDES = {
+    "trainee@sentientagency.io": "U08UYJMPJ76",
+}
+
 
 def slack_user_id_for_email(email: str | None) -> str:
     """Return the reviewed Slack ID for a dashboard user.
@@ -62,6 +69,11 @@ def slack_user_id_for_email(email: str | None) -> str:
     """
     clean = str(email or "").strip().lower()
     return _SLACK_USERS_BY_EMAIL.get(clean, "")
+
+
+def queue_notification_slack_user_id(email: str | None) -> str:
+    clean = str(email or "").strip().lower()
+    return _QUEUE_NOTIFICATION_SLACK_OVERRIDES.get(clean) or slack_user_id_for_email(clean)
 
 _SLACK_PROFILE_CACHE: tuple[float, dict[str, str]] | None = None
 _SLACK_PROFILE_LOCK = threading.Lock()
@@ -251,6 +263,7 @@ def build_queue_assignment_message(
     recommended_accounts: list[str] | None = None,
     recommended_account: str | None = None,
     production_points: int | None = None,
+    minutes_per_pp: int = 10,
     scheduled_date: str | None = None,
     scheduled_start_minutes: int | None = None,
     update: bool = False,
@@ -274,7 +287,8 @@ def build_queue_assignment_message(
     if tags:
         metadata.append(f"*Tags*\n{', '.join(f'`{tag}`' for tag in tags)}")
     if production_points:
-        metadata.append(f"*Production*\n{production_points} PP · {production_points * 10} min")
+        pp_minutes = max(1, int(minutes_per_pp or 10))
+        metadata.append(f"*Production*\n{production_points} PP · {production_points * pp_minutes} min")
     if scheduled_date is not None and scheduled_start_minutes is not None:
         hours, minutes = divmod(int(scheduled_start_minutes), 60)
         scheduled = f"{scheduled_date} · {hours % 12 or 12}:{minutes:02d} {'AM' if hours < 12 else 'PM'}"
@@ -361,7 +375,7 @@ def notify_queue_assignment_result(**assignment: Any) -> dict[str, Any]:
     """
     token = os.getenv("SLACK_BOT_TOKEN", "").strip()
     assignee_email = str(assignment.get("assignee_email") or "").strip().lower()
-    recipient = str(assignment.pop("assignee_slack_id", "") or "").strip() or slack_user_id_for_email(assignee_email)
+    recipient = str(assignment.pop("assignee_slack_id", "") or "").strip() or queue_notification_slack_user_id(assignee_email)
     update = bool(assignment.get("update"))
     stored_channel = str(assignment.pop("slack_channel_id", "") or "").strip()
     stored_thread = str(assignment.pop("slack_message_ts", "") or "").strip()

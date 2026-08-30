@@ -18,6 +18,7 @@ def test_starting_second_request_defers_and_cascades(monkeypatch, tmp_path) -> N
         CREATE TABLE queue_requests (
             id INTEGER PRIMARY KEY,
             production_points INTEGER NOT NULL,
+            minutes_per_pp INTEGER NOT NULL DEFAULT 10,
             status TEXT NOT NULL,
             designer_email TEXT,
             scheduled_date TEXT,
@@ -42,6 +43,7 @@ def test_starting_second_request_defers_and_cascades(monkeypatch, tmp_path) -> N
             scheduled_start_minutes INTEGER NOT NULL,
             recommended_accounts TEXT NOT NULL DEFAULT '[]',
             production_points INTEGER,
+            minutes_per_pp INTEGER,
             updated_at TEXT NOT NULL
         );
         CREATE TABLE queue_tickets (
@@ -63,11 +65,11 @@ def test_starting_second_request_defers_and_cascades(monkeypatch, tmp_path) -> N
     current_slot = (local_now.hour * 60 + local_now.minute) // 10 * 10
     active_start = max(0, current_slot - 20)
     rows = [
-        (1, 3, "in_progress", "pd@example.com", local_now.date().isoformat(), active_start, "2026-01-01T00:00:00+00:00", None, ""),
-        (2, 3, "scheduled", "pd@example.com", local_now.date().isoformat(), current_slot, None, None, ""),
-        (3, 3, "scheduled", "pd@example.com", local_now.date().isoformat(), current_slot + 10, None, None, ""),
+        (1, 3, 10, "in_progress", "pd@example.com", local_now.date().isoformat(), active_start, "2026-01-01T00:00:00+00:00", None, ""),
+        (2, 3, 10, "scheduled", "pd@example.com", local_now.date().isoformat(), current_slot, None, None, ""),
+        (3, 3, 10, "scheduled", "pd@example.com", local_now.date().isoformat(), current_slot + 10, None, None, ""),
     ]
-    conn.executemany("INSERT INTO queue_requests VALUES (?,?,?,?,?,?,?,?,?)", rows)
+    conn.executemany("INSERT INTO queue_requests VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
     conn.commit()
     conn.close()
 
