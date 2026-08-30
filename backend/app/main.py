@@ -134,7 +134,12 @@ _SEED_ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").s
 # not because they're meant to stay public by design. Everything else (post
 # data, search, every admin action) requires a signed-in, allowlisted
 # Google account once FIREBASE_APP is configured.
-_FIREBASE_OPEN_PREFIXES = ("/api/dashboard/covers/", "/api/dashboard/avatar/", "/api/admin/alert-image/")
+_FIREBASE_OPEN_PREFIXES = (
+    "/api/dashboard/covers/",
+    "/api/dashboard/avatar/",
+    "/api/dashboard/user-avatar/",
+    "/api/admin/alert-image/",
+)
 _FIREBASE_OPEN_PATHS = {"/api/health", "/", "/docs", "/openapi.json", "/redoc", "/api/slack/interactions"}
 
 
@@ -183,8 +188,8 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     if request.state.is_dev and preview_role in {"sales", "pd", "vc", "trainee", "admin"}:
         request.state.operating_roles = [preview_role]
         request.state.is_admin = preview_role == "admin"
-    if path.startswith("/api/admin/") and not request.state.is_admin:
-        return JSONResponse({"detail": "Admin access required."}, status_code=403)
+    if path.startswith("/api/admin/") and not (request.state.is_admin or request.state.is_dev):
+        return JSONResponse({"detail": "Admin or Dev access required."}, status_code=403)
     request.state.user_uid = decoded.get("uid")
     try:
         # Feeds the Users tab's usage heatmap. Best-effort: a failed insert
@@ -2137,6 +2142,7 @@ def _queue_v2_designers() -> list[dict[str, Any]]:
         by_designer.setdefault(item["designer_email"], []).append(item["account_handle"])
     return [{
         "email": user["email"],
+        "displayName": user.get("display_name") or "",
         "isAdmin": bool(user.get("is_admin")),
         "roles": _queue_v2_user_roles(user),
         "minutesPerPP": _queue_v2_minutes_per_pp_for_roles(_queue_v2_user_roles(user)),
@@ -2152,10 +2158,9 @@ def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
     the client suppresses the implicit PD label so the roster stays concise.
     """
     users = list_dashboard_users()
-    from .slack_alerts import slack_user_id_for_email, slack_user_profile_images
+    from .slack_alerts import slack_user_id_for_email
 
     slack_ids = [str(user.get("slack_user_id") or "").strip().upper() or slack_user_id_for_email(user.get("email")) for user in users]
-    avatar_by_slack_id = slack_user_profile_images(slack_ids)
     with connect() as conn:
         accounts = conn.execute("SELECT designer_email, account_handle FROM queue_designer_accounts ORDER BY account_handle").fetchall()
         account_rows = conn.execute("SELECT handle, avatar_path FROM accounts WHERE is_active = 1").fetchall()
@@ -2175,11 +2180,20 @@ def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
         }
         result.append({
             "email": user["email"],
+            "displayName": user.get("display_name") or "",
             "isAdmin": bool(user.get("is_admin")),
             "roles": roles,
             "minutesPerPP": minutes_per_pp,
             "isQueueDesigner": "pd" in roles,
-            "avatarUrl": avatar_by_slack_id.get(slack_id, ""),
+            # Return a same-origin proxy URL rather than Slack's CDN URL.
+            # Slack image links can be signed/referrer-sensitive and fail in
+            # browsers even when users.list succeeds; the proxy downloads
+            # and caches the image server-side.
+            # Always provide the proxy when an ID is known. It can fetch the
+            # current image lazily, so a transient users.list failure during
+            # the data request does not permanently turn the roster into
+            # initials-only until the next full Queue reload.
+            "avatarUrl": f"/api/dashboard/user-avatar/{slack_id}" if slack_id else "",
             "accounts": managed_accounts,
             "accountAvatars": account_avatars,
         })
@@ -4097,7 +4111,19 @@ def admin_list_users() -> dict[str, Any]:
     """Who can sign in to Sentient Dash and who's an admin. Backs the Users
     tab in Settings -- this table is the live source of truth (see
     seed_dashboard_users_from_env for the one-time env-var migration)."""
-    return {"users": list_dashboard_users()}
+    users = list_dashboard_users()
+    # Keep the Users tab consistent with the scheduler: expose a same-origin
+    # avatar URL backed by Slack's profile image, never the fragile Slack CDN
+    # URL itself. Missing Slack IDs still fall back to initials in the UI.
+    from .slack_alerts import slack_user_id_for_email
+
+    slack_ids = [
+        str(user.get("slack_user_id") or "").strip().upper() or slack_user_id_for_email(user.get("email"))
+        for user in users
+    ]
+    for user, slack_id in zip(users, slack_ids):
+        user["avatar_url"] = f"/api/dashboard/user-avatar/{slack_id}" if slack_id else ""
+    return {"users": users}
 
 
 @app.post("/api/admin/users")
@@ -4108,6 +4134,7 @@ def admin_upsert_user(
     operating_role: Annotated[str | None, Form()] = None,
     is_admin: Annotated[bool | None, Form()] = None,
     slack_user_id: Annotated[str | None, Form()] = None,
+    display_name: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
     """Add a new allowed email, or change an existing one's role. Admins can
     add other admins or plain viewers; there's no further gate here because
@@ -4122,7 +4149,10 @@ def admin_upsert_user(
     clean_slack_id = None if slack_user_id is None else slack_user_id.strip().upper()
     if clean_slack_id and not re.fullmatch(r"U[A-Z0-9]{8,20}", clean_slack_id):
         raise HTTPException(status_code=400, detail="Slack user ID must start with U.")
-    upsert_dashboard_user(clean_email, role, operating_role, is_admin, clean_slack_id)
+    clean_display_name = None if display_name is None else display_name.strip()
+    if clean_display_name is not None and not clean_display_name:
+        raise HTTPException(status_code=400, detail="Display name cannot be blank.")
+    upsert_dashboard_user(clean_email, role, operating_role, is_admin, clean_slack_id, clean_display_name)
     with connect() as conn:
         _queue_v2_publish(conn, "roster_updated", _caller_email(request))
     return {"ok": True, "users": list_dashboard_users()}
@@ -5033,6 +5063,32 @@ def dashboard_avatar(handle: str) -> FileResponse:
     if not avatar_path.is_file():
         raise HTTPException(status_code=404, detail="Profile picture file is unavailable.")
     return FileResponse(avatar_path)
+
+
+@app.get("/api/dashboard/user-avatar/{slack_user_id}")
+def dashboard_user_avatar(slack_user_id: str) -> Response:
+    """Serve a Slack user's profile picture from the same origin as Queue.
+
+    Plain ``<img>`` tags cannot attach the Firebase bearer token, so this
+    asset route is intentionally public like the existing account-avatar
+    route. Only a Slack user ID is accepted and the server fetches the image
+    with the configured bot token; the browser never needs direct access to
+    Slack's CDN.
+    """
+    clean_id = str(slack_user_id or "").strip().upper()
+    if not re.fullmatch(r"U[A-Z0-9]{8,20}", clean_id):
+        raise HTTPException(status_code=404, detail="Invalid Slack user ID.")
+    from .slack_alerts import slack_user_avatar
+
+    image = slack_user_avatar(clean_id)
+    if not image:
+        raise HTTPException(status_code=404, detail="No Slack profile picture available.")
+    content, media_type = image
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=3600, stale-while-revalidate=86400"},
+    )
 
 
 @app.post("/api/admin/reset-hot-check")
