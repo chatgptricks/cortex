@@ -816,6 +816,7 @@ def seed_queue_role_roster() -> None:
         "dsflorezl@gmail.com": "Florez",
         "sara1107giraldo@gmail.com": "Sara",
         "sebastianruizurquijo@gmail.com": "Sebastian",
+        "sebastianruizurquillo@gmail.com": "Sebastian",
         "tevi@sentientagency.io": "Tevi",
         "gabo@sentientagency.io": "Gabo",
         "trainee@sentientagency.io": "Trainee",
@@ -831,6 +832,7 @@ def seed_queue_role_roster() -> None:
         "dsflorezl@gmail.com": "U0BH9R6EE4Q",
         "sara1107giraldo@gmail.com": "U0BGHD1HD0R",
         "sebastianruizurquijo@gmail.com": "U0BG04Q4Z8F",
+        "sebastianruizurquillo@gmail.com": "U0BG04Q4Z8F",
         "tevi@sentientagency.io": "U05QU9WCR1N",
         "gabo@sentientagency.io": "U0BLJHSUNJG",
     }

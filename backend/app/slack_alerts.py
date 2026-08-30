@@ -48,6 +48,9 @@ _SLACK_USERS_BY_EMAIL = {
     "dsflorezl@gmail.com": "U0BH9R6EE4Q",
     "sara1107giraldo@gmail.com": "U0BGHD1HD0R",
     "sebastianruizurquijo@gmail.com": "U0BG04Q4Z8F",
+    # Production was originally allowlisted with this spelling. Keep it as
+    # an alias so the existing account receives Sebastian's reviewed Slack ID.
+    "sebastianruizurquillo@gmail.com": "U0BG04Q4Z8F",
     "tevi@sentientagency.io": "U05QU9WCR1N",
     "gabo@sentientagency.io": "U0BLJHSUNJG",
 }
