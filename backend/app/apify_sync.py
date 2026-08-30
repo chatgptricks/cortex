@@ -1712,6 +1712,53 @@ def store_avatar_from_url(handle: str, image_url: str) -> str:
     return str(avatar_path)
 
 
+def _refresh_cover_from_item(table: str, handle: str, shortcode: str, row: Any, item: dict[str, Any]) -> bool:
+    """Cache the fresh cover returned by the manual post scrape.
+
+    Cover routes are deliberately lazy, so a signed Instagram URL can expire
+    while the database row still exists. Reloading counts is an explicit,
+    single-post repair action; use the same scrape result to replace the
+    stale/missing local cover instead of asking the browser to retry a dead
+    URL forever.
+    """
+    image_url = item.get("displayUrl") or next(iter(item.get("images") or []), None)
+    image_url = str(image_url or "").strip()
+    if not image_url:
+        return False
+
+    import httpx
+
+    from .config import UPLOAD_DIR
+    from .db import connect, utc_now
+
+    try:
+        with httpx.Client(timeout=60.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            response = client.get(image_url)
+            response.raise_for_status()
+        image_bytes, suffix = _compress_cover(response.content)
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        if table == "posts":
+            image_path = UPLOAD_DIR / f"cover-{shortcode}{suffix}"
+            image_path.write_bytes(image_bytes)
+            with connect() as conn:
+                conn.execute(
+                    "UPDATE posts SET image_path = ?, updated_at = ? WHERE id = ?",
+                    (str(image_path), utc_now(), int(row["id"])),
+                )
+        else:
+            image_path = UPLOAD_DIR / f"dash-{handle}-{shortcode}{suffix}"
+            image_path.write_bytes(image_bytes)
+            with connect() as conn:
+                conn.execute(
+                    "UPDATE dashboard_posts SET cover_source_url = ?, cover_image_path = ?, updated_at = ? "
+                    "WHERE id = ? AND account = ?",
+                    (image_url, str(image_path), utc_now(), int(row["id"]), handle),
+                )
+    except (httpx.HTTPError, OSError, ValueError, TypeError):
+        return False
+    return True
+
+
 def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
     """Re-scrapes one post and updates its like/comment counts.
 
@@ -1738,9 +1785,9 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
 
     with connect() as conn:
         row = conn.execute(
-            f"SELECT id, likes, comments, permalink FROM {table} WHERE {where}"
+            f"SELECT id, likes, comments, permalink, cover_image_path, cover_source_url FROM {table} WHERE {where}"
             if table != "posts"
-            else f"SELECT id, likes, comments FROM {table} WHERE {where}",
+            else f"SELECT id, likes, comments, image_path FROM {table} WHERE {where}",
             where_params,
         ).fetchone()
     if row is None:
@@ -1754,6 +1801,8 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
     item = next((it for it in items if (it.get("shortCode") or "") == clean), items[0] if items else None)
     if not item:
         raise ApifySyncError("Instagram returned nothing for that post -- it may have been deleted.")
+
+    cover_refreshed = _refresh_cover_from_item(table, handle, clean, row, item)
 
     likes = _likes_or_none(item.get("likesCount"))
     comments = item.get("commentsCount")
@@ -1776,6 +1825,7 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
         "comments": comments if comments is not None else before.get("comments"),
         "likes_before": before.get("likes"),
         "comments_before": before.get("comments"),
+        "cover_refreshed": cover_refreshed,
     }
 
 
