@@ -70,3 +70,13 @@ def test_vc_can_create_custom_queue_post(monkeypatch, tmp_path):
     assert created["status"] == "pool"
     assert created["references"] == ["https://example.com/brief"]
     assert created["post"]["shortcode"].startswith("manual-")
+
+    # The publishing account is selected later when a coordinator schedules
+    # the request for a designer; creation itself must still land in the pool.
+    unassigned = main.dashboard_queue_v2_create(
+        request=None, title="Account chosen at assignment",
+        production_points=2, priority="medium",
+    )["request"]
+    assert unassigned["post"]["account"] == ""
+    assert unassigned["post"]["title"] == "Account chosen at assignment"
+    assert unassigned["status"] == "pool"
