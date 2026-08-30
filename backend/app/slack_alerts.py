@@ -61,6 +61,20 @@ _SLACK_USERS_BY_EMAIL = {
 # depend directly on Slack's CDN behavior.
 _SLACK_PROFILE_IMAGES_BY_USER_ID = {
     "U0000000012": "https://ca.slack-edge.com/T051C9S8WF6-U0000000012-48854702e466-512",
+    "U0000000006": "",
+    "U0000000005": "",
+    "U0000000010": "",
+    "U0000000013": "",
+    "U0000000002": "",
+    "U0000000007": "",
+    "U0000000001": "",
+    "U0000000008": "",
+    "U0000000009": (
+        "https://secure.gravatar.com/avatar/e043ee897db72e2d751469166b4bd9cf.jpg"
+        "?s=512&d=https%3A%2F%2Fa.slack-edge.com%2Fdf10d%2Fimg%2Favatars%2Fava_0024-512.png"
+    ),
+    "U0000000011": "",
+    "U0000000004": "",
 }
 
 # The placeholder Trainee has no Slack account yet. Assignment DMs are
