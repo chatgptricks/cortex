@@ -820,14 +820,30 @@ def seed_queue_role_roster() -> None:
         "user04@example.com": "User 04",
         "user12@example.com": "Trainee",
     }
+    slack_user_ids = {
+        "user03@example.com": "U0000000012",
+        "user06@example.com": "U0000000006",
+        "user05@example.com": "U0000000005",
+        "user10@example.com": "U0000000010",
+        "user13@example.com": "U0000000013",
+        "user02@example.com": "U0000000002",
+        "user07@example.com": "U0000000007",
+        "user01@example.com": "U0000000001",
+        "user08@example.com": "U0000000008",
+        "user09@example.com": "U0000000009",
+        "user11@example.com": "U0000000011",
+        "user04@example.com": "U0000000004",
+    }
     now = utc_now()
     with connect() as conn:
         for email, display_name in display_names.items():
+            slack_user_id = slack_user_ids.get(email, "")
             conn.execute(
                 """UPDATE dashboard_users
-                   SET display_name = CASE WHEN TRIM(display_name) = '' THEN ? ELSE display_name END
+                   SET display_name = CASE WHEN TRIM(display_name) = '' THEN ? ELSE display_name END,
+                       slack_user_id = CASE WHEN TRIM(slack_user_id) = '' THEN ? ELSE slack_user_id END
                    WHERE email = ?""",
-                (display_name, email),
+                (display_name, slack_user_id, email),
             )
         marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v4_seeded'").fetchone()
         if not marker:
