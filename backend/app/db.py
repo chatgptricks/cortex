@@ -816,6 +816,7 @@ def seed_queue_role_roster() -> None:
         "user01@example.com": "User 07",
         "user08@example.com": "User 08",
         "user09@example.com": "User 09",
+        "user09-legacy@example.com": "User 09",
         "user11@example.com": "User 11",
         "user04@example.com": "User 04",
         "user12@example.com": "Trainee",
@@ -831,6 +832,7 @@ def seed_queue_role_roster() -> None:
         "user01@example.com": "U0000000001",
         "user08@example.com": "U0000000008",
         "user09@example.com": "U0000000009",
+        "user09-legacy@example.com": "U0000000009",
         "user11@example.com": "U0000000011",
         "user04@example.com": "U0000000004",
     }

@@ -48,6 +48,9 @@ _SLACK_USERS_BY_EMAIL = {
     "user01@example.com": "U0000000001",
     "user08@example.com": "U0000000008",
     "user09@example.com": "U0000000009",
+    # Production was originally allowlisted with this spelling. Keep it as
+    # an alias so the existing account receives User 09's reviewed Slack ID.
+    "user09-legacy@example.com": "U0000000009",
     "user11@example.com": "U0000000011",
     "user04@example.com": "U0000000004",
 }
