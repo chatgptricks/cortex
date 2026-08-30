@@ -281,6 +281,8 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 post_account TEXT NOT NULL,
                 post_shortcode TEXT NOT NULL,
+                post_title TEXT NOT NULL DEFAULT '',
+                is_custom INTEGER NOT NULL DEFAULT 0,
                 post_permalink TEXT NOT NULL DEFAULT '',
                 post_caption TEXT NOT NULL DEFAULT '',
                 post_type TEXT NOT NULL DEFAULT '',
@@ -444,6 +446,8 @@ def init_db() -> None:
         _ensure_column(conn, "dashboard_users", "is_admin", "is_admin INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "dashboard_users", "slack_user_id", "slack_user_id TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "queue_requests", "priority", "priority TEXT NOT NULL DEFAULT 'medium'")
+        _ensure_column(conn, "queue_requests", "post_title", "post_title TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "queue_requests", "is_custom", "is_custom INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "queue_requests", "slack_channel_id", "slack_channel_id TEXT")
         _ensure_column(conn, "queue_requests", "slack_message_ts", "slack_message_ts TEXT")
         _ensure_column(conn, "queue_schedule_drafts", "production_points", "production_points INTEGER")

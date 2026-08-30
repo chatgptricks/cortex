@@ -1529,6 +1529,7 @@ def dashboard_queue_reorder(
 QUEUE_V2_STATUSES = {"pool", "scheduled", "in_progress", "completed", "closed", "cancelled"}
 QUEUE_V2_TAGS = ["content", "design", "copy", "research", "review", "repurpose", "hot"]
 QUEUE_V2_PRIORITIES = ["low", "medium", "high", "urgent"]
+QUEUE_V2_POST_TYPES = ["Image", "Carousel", "Reel", "Promo", "Story", "Other"]
 QUEUE_V2_HOT_MULTIPLIER = 3.0
 # HOT routing starts at the reset moment that cleared the first batch. The
 # environment override makes a future reset explicit without another code
@@ -1591,6 +1592,27 @@ def _queue_v2_priority(value: str | None) -> str:
     clean = (value or "medium").strip().lower()
     if clean not in QUEUE_V2_PRIORITIES:
         raise HTTPException(status_code=400, detail="Priority must be low, medium, high, or urgent.")
+    return clean
+
+
+def _queue_v2_sentient_account(value: str | None) -> str:
+    """Validate the publishing account for a request created in Queue.
+
+    A manually-created request has no source dashboard post, but it still
+    needs a real Sentient destination so the designer knows where it will be
+    published. Keep this validation server-side instead of trusting the
+    account dropdown in the browser.
+    """
+    clean = str(value or "").strip().lstrip("@").lower()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Choose a Sentient account.")
+    account = next(
+        (item for item in list_accounts(active_only=True)
+         if item.get("handle") == clean and item.get("group") == "sentient"),
+        None,
+    )
+    if not account:
+        raise HTTPException(status_code=400, detail="Choose an active Sentient account.")
     return clean
 
 
@@ -1983,6 +2005,8 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row["id"], "post": {
             "account": row["post_account"], "shortcode": row["post_shortcode"],
+            "title": row.get("post_title") or "",
+            "isCustom": bool(row.get("is_custom")),
             "permalink": row["post_permalink"] or snapshot.get("permalink"),
             "caption": row["post_caption"] or snapshot.get("caption") or "",
             "type": row["post_type"] or snapshot.get("type") or "Image", "coverUrl": row["cover_url"],
@@ -1990,6 +2014,7 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
             "comments": snapshot.get("comments"),
         },
         "productionPoints": pp, "durationMinutes": pp * 10, "priority": row.get("priority") or "medium",
+        "title": row.get("post_title") or "", "isCustom": bool(row.get("is_custom")),
         "isHot": bool(snapshot.get("isHot")), "hotMultiplier": snapshot.get("hotMultiplier"),
         "tags": _queue_v2_json(row["tags"], []), "brief": row["brief"], "notes": row["notes"],
         "references": _queue_v2_json(row["reference_links"], []), "attachments": _queue_v2_json(row["attachments"], []),
@@ -2370,6 +2395,11 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
     scheduler_users = _queue_v2_scheduler_users() if (is_admin or "vc" in roles) else [
         user for user in _queue_v2_scheduler_users() if user["email"] == caller
     ]
+    sentient_accounts = [
+        {"handle": item["handle"], "label": item.get("label") or item["handle"]}
+        for item in list_accounts(active_only=True)
+        if item.get("group") == "sentient"
+    ]
     return {
         "viewer": {"email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)), "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles},
         "date": selected_date, "requests": requests, "planningRequests": planning_requests,
@@ -2379,6 +2409,7 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         "timeBlocks": [_queue_v2_ticket(dict(row)) for row in time_block_rows], "pendingTicketCount": pending_ticket_count,
         "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
         "schedulerUsers": scheduler_users,
+        "accounts": sentient_accounts,
         "tags": QUEUE_V2_TAGS, "priorities": QUEUE_V2_PRIORITIES,
         "hours": {"start": SCHEDULER_START, "end": SCHEDULER_END},
     }
@@ -2553,6 +2584,78 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
         "designers": sorted(designer_reports, key=lambda item: (-item["activeRequests"], item["email"])),
         "assignedPosts": assigned_posts,
     }
+
+
+@app.post("/api/dashboard/queue/v2/create")
+def dashboard_queue_v2_create(
+    request: Request,
+    account: Annotated[str, Form()],
+    title: Annotated[str, Form()],
+    post_type: Annotated[str, Form()] = "Image",
+    production_points: Annotated[int, Form()] = 3,
+    priority: Annotated[str, Form()] = "medium",
+    tags: Annotated[str | None, Form()] = None,
+    brief: Annotated[str | None, Form()] = None,
+    notes: Annotated[str | None, Form()] = None,
+    references: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Create a Queue request without a source post from the dashboard.
+
+    The request still uses the normal Queue lifecycle and scheduler. A
+    generated shortcode gives it a stable identity for attachments, history,
+    deep links, and live updates while keeping it out of the Instagram post
+    tables entirely.
+    """
+    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    clean_account = _queue_v2_sentient_account(account)
+    clean_title = str(title or "").strip()
+    if not clean_title:
+        raise HTTPException(status_code=400, detail="Post title is required.")
+    if len(clean_title) > 160:
+        raise HTTPException(status_code=400, detail="Post title must be 160 characters or fewer.")
+    clean_type = str(post_type or "Image").strip() or "Image"
+    if clean_type not in QUEUE_V2_POST_TYPES:
+        raise HTTPException(status_code=400, detail=f"Post type must be one of: {', '.join(QUEUE_V2_POST_TYPES)}.")
+    if production_points < 1:
+        raise HTTPException(status_code=400, detail="Production points must be at least 1.")
+    clean_priority = _queue_v2_priority(priority)
+    clean_tags = _queue_v2_tags(tags)
+    refs = _queue_v2_json(references, [])
+    if not isinstance(refs, list):
+        refs = []
+    clean_refs = [str(value).strip() for value in refs if str(value).strip()]
+    now = utc_now()
+    shortcode = f"manual-{secrets.token_hex(8)}"
+    clean_brief = str(brief or "").strip()
+    clean_notes = str(notes or "").strip()
+    with connect() as conn:
+        cursor = conn.execute(
+            """INSERT INTO queue_requests (
+                   post_account, post_shortcode, post_title, is_custom,
+                   post_permalink, post_caption, post_type, cover_url,
+                   production_points, priority, deadline_at, tags, brief, notes,
+                   reference_links, coordinator_email, created_at, updated_at
+               ) VALUES (?, ?, ?, 1, '', ?, ?, '', ?, ?, '', ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                clean_account, shortcode, clean_title, clean_brief, clean_type,
+                production_points, clean_priority, json.dumps(clean_tags),
+                clean_brief, clean_notes, json.dumps(clean_refs), caller, now, now,
+            ),
+        )
+        request_id = int(cursor.lastrowid)
+        _queue_v2_log(conn, request_id, caller, "created", {
+            "account": clean_account, "title": clean_title, "postType": clean_type,
+            "productionPoints": production_points, "priority": clean_priority,
+        })
+        _queue_v2_publish(conn, "created", caller, [request_id])
+        row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
+    _queue_v2_slack_log(
+        event_type="created", task_id=request_id, actor_email=caller,
+        account=clean_account, shortcode=shortcode, status="pool",
+        production_points=production_points, priority=clean_priority,
+        tags=clean_tags, brief=clean_brief, post_title=clean_title,
+    )
+    return {"ok": True, "request": _queue_v2_project(row)}
 
 
 @app.post("/api/dashboard/queue/v2/pool")

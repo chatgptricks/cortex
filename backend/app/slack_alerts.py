@@ -429,6 +429,7 @@ def notify_queue_assignment(**assignment: Any) -> bool:
 
 
 _QUEUE_CHANGE_LABELS = {
+    "created": "Post created",
     "pp_revision_requested": "PP revision requested",
     "pp_revision_approved": "PP revision approved",
     "pp_revision_rejected": "PP revision rejected",
@@ -472,6 +473,7 @@ def build_queue_change_message(
     requested_production_points: int | None = None,
     priority: str | None = None,
     tags: list[str] | None = None,
+    post_title: str | None = None,
     reason: str | None = None,
     brief: str | None = None,
     scheduled_date: str | None = None,
@@ -490,7 +492,7 @@ def build_queue_change_message(
     post_label = f"@{clean_account}" + (f" · `{clean_shortcode}`" if clean_shortcode else "")
     actor = _slack_actor(actor_email)
     designer = _slack_actor(designer_email) if designer_email else "—"
-    title = f"Queue · {label}"
+    heading = f"Queue · {label}"
 
     summary = f"*{post_label}*\n{actor}"
     if event_type.endswith("_requested"):
@@ -505,6 +507,8 @@ def build_queue_change_message(
         summary += " cancelled this Queue post."
     elif event_type == "deleted":
         summary += " deleted this Queue post."
+    elif event_type == "created":
+        summary += " created this Queue post directly in Queue."
     else:
         summary += "."
 
@@ -528,12 +532,23 @@ def build_queue_change_message(
         if clean_tags:
             fields.append({"type": "mrkdwn", "text": f"*Tags*\n{', '.join(f'`{tag}`' for tag in clean_tags)}"})
 
+    if post_title:
+        clean_title = str(post_title).strip()[:240]
+        if clean_title:
+            blocks_title = {"type": "section", "text": {"type": "mrkdwn", "text": f"*Title*\n{clean_title}"}}
+        else:
+            blocks_title = None
+    else:
+        blocks_title = None
+
     blocks: list[dict[str, Any]] = [
-        {"type": "header", "text": {"type": "plain_text", "text": title[:150], "emoji": True}},
+        {"type": "header", "text": {"type": "plain_text", "text": heading[:150], "emoji": True}},
         {"type": "section", "text": {"type": "mrkdwn", "text": summary[:2900]}},
     ]
     if fields:
         blocks.append({"type": "section", "fields": fields[:10]})
+    if blocks_title:
+        blocks.append(blocks_title)
     if reason:
         clean_reason = str(reason).strip()[:900]
         if clean_reason:
@@ -558,7 +573,7 @@ def build_queue_change_message(
         # the payload minimal for non-request audit entries.
         if blocks[-1]["elements"][0]["style"] is None:
             blocks[-1]["elements"][0].pop("style", None)
-    return {"text": f"{title}: {post_label}", "blocks": blocks}
+    return {"text": f"{heading}: {post_label}", "blocks": blocks}
 
 
 def notify_queue_change(**change: Any) -> bool:
