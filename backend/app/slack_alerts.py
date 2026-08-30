@@ -61,6 +61,20 @@ _SLACK_USERS_BY_EMAIL = {
 # depend directly on Slack's CDN behavior.
 _SLACK_PROFILE_IMAGES_BY_USER_ID = {
     "U08UYJMPJ76": "https://ca.slack-edge.com/T051C9S8WF6-U08UYJMPJ76-48854702e466-512",
+    "U06DZPVNTBR": "https://avatars.slack-edge.com/2025-06-12/9023440405959_ddacc2a6d424e16c4fe2_512.jpg",
+    "U0516SU09J9": "https://avatars.slack-edge.com/2026-06-02/11253859722599_2ae60b88a07e695d036a_512.png",
+    "U087U6470M6": "https://avatars.slack-edge.com/2025-01-03/8267226120864_6b516f7d62b8cad8964e_512.png",
+    "U0BAJA1AC6P": "https://avatars.slack-edge.com/2026-06-15/11369902632084_eafaf72aec3457a59aa7_512.png",
+    "U081LU7PVK3": "https://avatars.slack-edge.com/2024-11-18/8045058497845_73c7303c0945848d85f3_512.jpg",
+    "U0AGH0MJ3EH": "https://avatars.slack-edge.com/2026-03-24/10754323767527_488eeb1c1a6709bbf5bc_512.jpg",
+    "U0BH9R6EE4Q": "https://avatars.slack-edge.com/2026-07-13/11574787084643_22d89e6b9d30c967afcc_512.jpg",
+    "U0BGHD1HD0R": "https://avatars.slack-edge.com/2026-07-22/11652637217218_39a6074a2d8804631e81_512.jpg",
+    "U0BG04Q4Z8F": (
+        "https://secure.gravatar.com/avatar/e043ee897db72e2d751469166b4bd9cf.jpg"
+        "?s=512&d=https%3A%2F%2Fa.slack-edge.com%2Fdf10d%2Fimg%2Favatars%2Fava_0024-512.png"
+    ),
+    "U05QU9WCR1N": "https://avatars.slack-edge.com/2025-10-31/9823104036948_1fabdd834e6d992e735c_512.png",
+    "U0BLJHSUNJG": "https://avatars.slack-edge.com/2026-07-28/11697263630274_183c2680fe54e15ee3b6_512.png",
 }
 
 # The placeholder Trainee has no Slack account yet. Assignment DMs are
