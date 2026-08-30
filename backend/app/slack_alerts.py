@@ -55,6 +55,14 @@ _SLACK_USERS_BY_EMAIL = {
     "gabo@sentientagency.io": "U0BLJHSUNJG",
 }
 
+# Verified public Slack avatar URLs used when the bot token cannot read a
+# user's profile (for example, when it lacks the users:read scope). Queue still
+# serves these through the same-origin avatar proxy below, so clients never
+# depend directly on Slack's CDN behavior.
+_SLACK_PROFILE_IMAGES_BY_USER_ID = {
+    "U08UYJMPJ76": "https://ca.slack-edge.com/T051C9S8WF6-U08UYJMPJ76-48854702e466-512",
+}
+
 # The placeholder Trainee has no Slack account yet. Assignment DMs are
 # deliberately routed to Esteban for testing, while profile/avatar lookups
 # remain empty so Queue does not present Esteban as the trainee.
@@ -161,7 +169,7 @@ def slack_user_avatar(slack_user_id: str) -> tuple[bytes, str] | None:
         cached = _SLACK_AVATAR_CACHE.get(clean)
         if cached and now - cached[0] < _SLACK_AVATAR_TTL:
             return cached[1], cached[2]
-    image_url = slack_user_profile_images([clean]).get(clean)
+    image_url = slack_user_profile_images([clean]).get(clean) or _SLACK_PROFILE_IMAGES_BY_USER_ID.get(clean)
     if not image_url:
         return None
     try:
