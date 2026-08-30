@@ -2625,7 +2625,11 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
     """Small operational snapshot for Queue admins, intentionally separate
     from the scheduler payload so designers never receive team-wide totals."""
     _, is_admin, _ = _queue_v2_access(request)
-    if not is_admin:
+    # Dev is the owner/debug role and must be able to inspect the same
+    # cross-user Overview while previewing any Queue role. Keep this check
+    # local to the report endpoint so ordinary scheduler visibility remains
+    # governed by the real operating role.
+    if not is_admin and not getattr(request.state, "is_dev", False):
         raise HTTPException(status_code=403, detail="Admin access required.")
     with connect() as conn:
         rows = conn.execute("SELECT status, COUNT(*) AS count, COALESCE(SUM(production_points), 0) AS points FROM queue_requests GROUP BY status").fetchall()
