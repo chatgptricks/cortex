@@ -15,6 +15,7 @@ that.
 - Add Account moved out of the Dashboard filters and into Settings → Accounts. Queue's separate Admin/Reports button was removed; Reports has one home in Settings.
 - Users centralizes editable display name, operating role, Admin access, Slack ID, and managed Sentient accounts. `dashboard_users.display_name` is the live source; Queue receives it in its scheduler roster and falls back safely for older data.
 - Slack profile photos are fetched server-side and served through the same-origin `/api/dashboard/user-avatar/{slack_id}` asset route, so Queue and Settings do not depend on fragile Slack CDN URLs.
+- Manual `Reload counts` scrapes now also download and cache the returned Instagram cover (for canonical and generic dashboard posts), returning `cover_refreshed` so the card can recover from a missing or expired image.
 - Frontend verification: production build, Queue planner tests, Queue smoke, and Settings smoke. Backend verification: 16 pytest tests.
 
 ## What this is
