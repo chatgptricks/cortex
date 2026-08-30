@@ -4126,6 +4126,11 @@ def admin_list_users() -> dict[str, Any]:
         for user in users
     ]
     for user, slack_id in zip(users, slack_ids):
+        # Older roster rows may not have been edited since the Slack-ID field
+        # was introduced. Return the reviewed roster mapping in the live
+        # Users response so Settings can populate the field immediately.
+        if slack_id and not str(user.get("slack_user_id") or "").strip():
+            user["slack_user_id"] = slack_id
         user["avatar_url"] = f"/api/dashboard/user-avatar/{slack_id}" if slack_id else ""
     return {"users": users}
 

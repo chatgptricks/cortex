@@ -820,14 +820,30 @@ def seed_queue_role_roster() -> None:
         "gabo@sentientagency.io": "Gabo",
         "trainee@sentientagency.io": "Trainee",
     }
+    slack_user_ids = {
+        "esteban@sentientagency.io": "U08UYJMPJ76",
+        "louis@sentientagency.io": "U06DZPVNTBR",
+        "ivan@sentientagency.io": "U0516SU09J9",
+        "sergio@sentientagency.io": "U087U6470M6",
+        "victor@sentientagency.io": "U0BAJA1AC6P",
+        "egor@sentientagency.io": "U081LU7PVK3",
+        "santiagoflhi@gmail.com": "U0AGH0MJ3EH",
+        "dsflorezl@gmail.com": "U0BH9R6EE4Q",
+        "sara1107giraldo@gmail.com": "U0BGHD1HD0R",
+        "sebastianruizurquijo@gmail.com": "U0BG04Q4Z8F",
+        "tevi@sentientagency.io": "U05QU9WCR1N",
+        "gabo@sentientagency.io": "U0BLJHSUNJG",
+    }
     now = utc_now()
     with connect() as conn:
         for email, display_name in display_names.items():
+            slack_user_id = slack_user_ids.get(email, "")
             conn.execute(
                 """UPDATE dashboard_users
-                   SET display_name = CASE WHEN TRIM(display_name) = '' THEN ? ELSE display_name END
+                   SET display_name = CASE WHEN TRIM(display_name) = '' THEN ? ELSE display_name END,
+                       slack_user_id = CASE WHEN TRIM(slack_user_id) = '' THEN ? ELSE slack_user_id END
                    WHERE email = ?""",
-                (display_name, email),
+                (display_name, slack_user_id, email),
             )
         marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v4_seeded'").fetchone()
         if not marker:
