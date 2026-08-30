@@ -220,6 +220,7 @@ def init_db() -> None:
             -- Users tab in Settings without touching Render at all.
             CREATE TABLE IF NOT EXISTS dashboard_users (
                 email TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
                 role TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('admin', 'viewer')),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -447,6 +448,7 @@ def init_db() -> None:
         _ensure_column(conn, "dashboard_users", "operating_roles", "operating_roles TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "dashboard_users", "is_admin", "is_admin INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "dashboard_users", "slack_user_id", "slack_user_id TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "dashboard_users", "display_name", "display_name TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "queue_requests", "priority", "priority TEXT NOT NULL DEFAULT 'medium'")
         _ensure_column(conn, "queue_requests", "post_title", "post_title TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "queue_requests", "is_custom", "is_custom INTEGER NOT NULL DEFAULT 0")
@@ -673,10 +675,16 @@ def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: 
 
 # --- Sentient Dash users (Google sign-in allowlist + roles) ----------------
 
+def _default_dashboard_display_name(email: str) -> str:
+    local = email.strip().split("@", 1)[0].replace(".", " ").replace("_", " ").replace("-", " ")
+    words = ["".join(char for char in word if not char.isdigit()) for word in local.split()]
+    return " ".join(word.capitalize() for word in words if word) or "User"
+
+
 def list_dashboard_users() -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
-            """SELECT email, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at
+            """SELECT email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at
                FROM dashboard_users
                ORDER BY is_admin DESC, operating_role ASC, email ASC"""
         ).fetchall()
@@ -716,6 +724,7 @@ def count_dashboard_admins() -> int:
 def upsert_dashboard_user(
     email: str, role: str = "viewer", operating_role: str | None = None,
     is_admin: bool | None = None, slack_user_id: str | None = None,
+    display_name: str | None = None,
 ) -> None:
     if role not in ("admin", "viewer"):
         raise ValueError(f"Invalid legacy role: {role!r}")
@@ -729,9 +738,10 @@ def upsert_dashboard_user(
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO dashboard_users (email, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO dashboard_users (email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(email) DO UPDATE SET
+                display_name = CASE WHEN ? IS NULL THEN dashboard_users.display_name ELSE excluded.display_name END,
                 role = excluded.role, operating_role = excluded.operating_role,
                 operating_roles = CASE
                     WHEN dashboard_users.operating_roles LIKE '%"dev"%' THEN json_array(excluded.operating_role, 'dev')
@@ -741,7 +751,11 @@ def upsert_dashboard_user(
                 slack_user_id = CASE WHEN ? IS NULL THEN dashboard_users.slack_user_id ELSE excluded.slack_user_id END,
                 updated_at = excluded.updated_at
             """,
-            (email, legacy_role, operating_role, json.dumps([operating_role]), int(admin_value), (slack_user_id or "").strip(), now, now, slack_user_id),
+            (
+                email, (display_name or "").strip(), legacy_role, operating_role,
+                json.dumps([operating_role]), int(admin_value), (slack_user_id or "").strip(), now, now,
+                display_name, slack_user_id,
+            ),
         )
 
 
@@ -768,9 +782,9 @@ def seed_dashboard_users_from_env(allowed_emails: set[str], admin_emails: set[st
                 continue
             role = "admin" if email in admin_emails else "viewer"
             conn.execute(
-                """INSERT INTO dashboard_users (email, role, operating_role, is_admin, created_at, updated_at)
-                   VALUES (?, ?, 'sales', ?, ?, ?)""",
-                (email, role, int(role == "admin"), now, now),
+                """INSERT INTO dashboard_users (email, display_name, role, operating_role, is_admin, created_at, updated_at)
+                   VALUES (?, ?, ?, 'sales', ?, ?, ?)""",
+                (email, _default_dashboard_display_name(email), role, int(role == "admin"), now, now),
             )
 
 
@@ -791,8 +805,30 @@ def seed_queue_role_roster() -> None:
         "tevi@sentientagency.io": ("vc", False),
         "gabo@sentientagency.io": ("pd", False),
     }
+    display_names = {
+        "esteban@sentientagency.io": "Esteban",
+        "louis@sentientagency.io": "Louis",
+        "ivan@sentientagency.io": "Ivan",
+        "sergio@sentientagency.io": "Sergio",
+        "victor@sentientagency.io": "Victor",
+        "egor@sentientagency.io": "Egor",
+        "santiagoflhi@gmail.com": "Santiago",
+        "dsflorezl@gmail.com": "Florez",
+        "sara1107giraldo@gmail.com": "Sara",
+        "sebastianruizurquijo@gmail.com": "Sebastian",
+        "tevi@sentientagency.io": "Tevi",
+        "gabo@sentientagency.io": "Gabo",
+        "trainee@sentientagency.io": "Trainee",
+    }
     now = utc_now()
     with connect() as conn:
+        for email, display_name in display_names.items():
+            conn.execute(
+                """UPDATE dashboard_users
+                   SET display_name = CASE WHEN TRIM(display_name) = '' THEN ? ELSE display_name END
+                   WHERE email = ?""",
+                (display_name, email),
+            )
         marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v4_seeded'").fetchone()
         if not marker:
             for email, (operating_role, is_admin) in roster.items():

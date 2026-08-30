@@ -78,6 +78,9 @@ def queue_notification_slack_user_id(email: str | None) -> str:
 _SLACK_PROFILE_CACHE: tuple[float, dict[str, str]] | None = None
 _SLACK_PROFILE_LOCK = threading.Lock()
 _SLACK_PROFILE_TTL = 6 * 60 * 60
+_SLACK_AVATAR_CACHE: dict[str, tuple[float, bytes, str]] = {}
+_SLACK_AVATAR_LOCK = threading.Lock()
+_SLACK_AVATAR_TTL = 24 * 60 * 60
 
 
 def slack_user_profile_images(user_ids: list[str] | tuple[str, ...] | set[str]) -> dict[str, str]:
@@ -136,6 +139,48 @@ def slack_user_profile_images(user_ids: list[str] | tuple[str, ...] | set[str]) 
         except Exception:
             logger.exception("Slack profile lookup failed")
             return {user_id: cached[1][user_id] for user_id in wanted if cached and user_id in cached[1]}
+
+
+def slack_user_avatar(slack_user_id: str) -> tuple[bytes, str] | None:
+    """Download one Slack profile image for same-origin serving.
+
+    Slack's CDN URLs are not a reliable browser asset: they may be signed,
+    reject a referrer, or be inaccessible from a user's network even though
+    the bot can read them. Queue therefore serves a short-lived, same-origin
+    copy through the API. The process cache keeps this endpoint cheap while
+    still allowing Slack profile changes to appear within a day.
+    """
+    clean = str(slack_user_id or "").strip().upper()
+    if not clean or not clean.startswith("U"):
+        return None
+    now = time.monotonic()
+    with _SLACK_AVATAR_LOCK:
+        cached = _SLACK_AVATAR_CACHE.get(clean)
+        if cached and now - cached[0] < _SLACK_AVATAR_TTL:
+            return cached[1], cached[2]
+    image_url = slack_user_profile_images([clean]).get(clean)
+    if not image_url:
+        return None
+    try:
+        import httpx
+
+        response = httpx.get(
+            image_url,
+            headers={"User-Agent": "Sentient Dash Queue/1.0"},
+            follow_redirects=True,
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        media_type = str(response.headers.get("content-type") or "image/jpeg").split(";", 1)[0].strip().lower()
+        if not media_type.startswith("image/") or not response.content:
+            return None
+        value = (response.content, media_type)
+        with _SLACK_AVATAR_LOCK:
+            _SLACK_AVATAR_CACHE[clean] = (now, value[0], value[1])
+        return value
+    except Exception:
+        logger.exception("Slack avatar download failed for %s", clean)
+        return None
 
 
 def dashboard_url_for(account: str, shortcode: str) -> str:
