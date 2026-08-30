@@ -14,6 +14,7 @@ def _ticket_database(path):
         CREATE TABLE queue_requests (
             id INTEGER PRIMARY KEY,
             production_points INTEGER NOT NULL,
+            minutes_per_pp INTEGER NOT NULL DEFAULT 10,
             status TEXT NOT NULL,
             designer_email TEXT,
             scheduled_date TEXT,
@@ -31,6 +32,7 @@ def _ticket_database(path):
             scheduled_start_minutes INTEGER,
             recommended_accounts TEXT,
             production_points INTEGER,
+            minutes_per_pp INTEGER,
             updated_at TEXT
         );
         CREATE TABLE queue_tickets (
@@ -121,7 +123,7 @@ def test_personal_time_cannot_overlap_queue_work(monkeypatch, tmp_path):
     connect = _isolate(monkeypatch, database)
     with connect() as conn:
         conn.execute(
-            "INSERT INTO queue_requests VALUES (1, 3, 'scheduled', 'pd@example.com', '2026-09-01', 600, 'chatgptricks', 'POST1', '', '')"
+            "INSERT INTO queue_requests VALUES (1, 3, 10, 'scheduled', 'pd@example.com', '2026-09-01', 600, 'chatgptricks', 'POST1', '', '')"
         )
 
     with pytest.raises(HTTPException) as error:
@@ -144,7 +146,7 @@ def test_pp_revision_and_cancellation_ticket_actions(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_queue_v2_reflow_scheduled", lambda *args, **kwargs: 0)
     with connect() as conn:
         conn.execute(
-            "INSERT INTO queue_requests VALUES (1, 3, 'scheduled', 'pd@example.com', '2026-09-01', 600, 'chatgptricks', 'POST1', '', '')"
+            "INSERT INTO queue_requests VALUES (1, 3, 10, 'scheduled', 'pd@example.com', '2026-09-01', 600, 'chatgptricks', 'POST1', '', '')"
         )
 
     pp = main.dashboard_queue_v2_request_pp_revision(
