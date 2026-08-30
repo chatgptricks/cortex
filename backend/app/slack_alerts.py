@@ -519,10 +519,10 @@ def build_queue_change_message(
         verb = label
     elif approved:
         prefix = actor
-        verb = f"approved {label.lower()} for {subject}"
+        verb = f"approved {label.lower()}" if (designer_email or "").strip().lower() == (actor_email or "").strip().lower() else f"approved {label.lower()} for {subject}"
     elif rejected:
         prefix = actor
-        verb = f"rejected {label.lower()} for {subject}"
+        verb = f"rejected {label.lower()}" if (designer_email or "").strip().lower() == (actor_email or "").strip().lower() else f"rejected {label.lower()} for {subject}"
     else:
         prefix = actor
         verb = label
