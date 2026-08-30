@@ -764,6 +764,43 @@ def remove_dashboard_user(email: str) -> None:
         conn.execute("DELETE FROM dashboard_users WHERE email = ?", (email.strip().lower(),))
 
 
+_DASHBOARD_EMAIL_ALIASES = {
+    "sebastianruizurquillo@gmail.com": "sebastianruizurquijo@gmail.com",
+}
+
+
+def _migrate_dashboard_user_email_aliases(conn: sqlite3.Connection) -> None:
+    """Rename reviewed legacy email typos without losing Queue history.
+
+    This runs before the environment allowlist seed, so an old spelling in
+    Render cannot recreate a duplicate user after the canonical row exists.
+    """
+    reference_columns = (
+        ("account_lists", "owner_email"),
+        ("post_assignments", "assignee_email"),
+        ("post_assignments", "created_by_email"),
+        ("post_assignment_events", "actor_email"),
+        ("queue_requests", "designer_email"),
+        ("queue_requests", "coordinator_email"),
+        ("queue_request_events", "actor_email"),
+        ("queue_designer_accounts", "designer_email"),
+        ("queue_schedule_drafts", "coordinator_email"),
+        ("queue_schedule_drafts", "designer_email"),
+        ("queue_tickets", "requester_email"),
+        ("queue_tickets", "reviewer_email"),
+        ("queue_live_state", "actor_email"),
+        ("usage_log", "email"),
+    )
+    for legacy_email, canonical_email in _DASHBOARD_EMAIL_ALIASES.items():
+        legacy = conn.execute("SELECT email FROM dashboard_users WHERE email = ?", (legacy_email,)).fetchone()
+        canonical = conn.execute("SELECT email FROM dashboard_users WHERE email = ?", (canonical_email,)).fetchone()
+        if not legacy or canonical:
+            continue
+        for table, column in reference_columns:
+            conn.execute(f"UPDATE {table} SET {column} = ? WHERE {column} = ?", (canonical_email, legacy_email))
+        conn.execute("UPDATE dashboard_users SET email = ?, updated_at = ? WHERE email = ?", (canonical_email, utc_now(), legacy_email))
+
+
 def seed_dashboard_users_from_env(allowed_emails: set[str], admin_emails: set[str]) -> None:
     """One-time migration path: the allowlist used to live entirely in the
     ALLOWED_EMAILS/ADMIN_EMAILS env vars. On first startup after this table
@@ -772,10 +809,13 @@ def seed_dashboard_users_from_env(allowed_emails: set[str], admin_emails: set[st
     Emails already in the table (added/edited via the Users tab) are left
     alone -- this only fills in gaps, never overwrites.
     """
-    if not allowed_emails:
-        return
+    allowed_emails = {_DASHBOARD_EMAIL_ALIASES.get(email, email) for email in allowed_emails}
+    admin_emails = {_DASHBOARD_EMAIL_ALIASES.get(email, email) for email in admin_emails}
     now = utc_now()
     with connect() as conn:
+        _migrate_dashboard_user_email_aliases(conn)
+        if not allowed_emails:
+            return
         existing = {row["email"] for row in conn.execute("SELECT email FROM dashboard_users").fetchall()}
         for email in allowed_emails:
             if email in existing:
