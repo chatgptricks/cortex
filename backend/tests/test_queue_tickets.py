@@ -183,6 +183,44 @@ def test_pp_revision_and_cancellation_ticket_actions(monkeypatch, tmp_path):
         assert row["cancellation_reason"] == "Post no longer needed"
 
 
+def test_trainee_can_send_canva_design_and_vc_can_approve(monkeypatch, tmp_path):
+    database = tmp_path / "trainee-review.sqlite3"
+    _ticket_database(database)
+    connect = _isolate(monkeypatch, database)
+    monkeypatch.setattr(main, "_queue_v2_slack_log", lambda **kwargs: True)
+    monkeypatch.setattr(
+        main,
+        "_queue_v2_access",
+        lambda request, coordinator=False: (
+            "vc@example.com" if coordinator else "trainee@example.com",
+            bool(coordinator),
+            ["vc", "pd"] if coordinator else ["trainee", "pd"],
+        ),
+    )
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO queue_requests VALUES (1, 3, 16, 'completed', 'trainee@example.com', '2026-09-01', 600, 'chatgptricks', 'POST1', '', '')"
+        )
+
+    created = main.dashboard_queue_v2_request_trainee_review(
+        request=None,
+        request_id=1,
+        canva_link="https://www.canva.com/design/ABC123/edit",
+    )
+    assert created["ticket"]["type"] == "trainee_review"
+    assert created["ticket"]["status"] == "pending"
+    assert created["ticket"]["reason"] == "https://www.canva.com/design/ABC123/edit"
+
+    reviewed = main.dashboard_queue_v2_review_ticket(
+        ticket_id=created["ticket"]["id"],
+        request=None,
+        action="approve",
+        review_note=None,
+    )
+    assert reviewed["ticket"]["status"] == "approved"
+    assert reviewed["ticket"]["reviewerEmail"] == "vc@example.com"
+
+
 def test_account_access_ticket_assigns_active_sentient_accounts(monkeypatch, tmp_path):
     database = tmp_path / "account-access.sqlite3"
     _ticket_database(database)
