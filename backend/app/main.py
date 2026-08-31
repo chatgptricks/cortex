@@ -1914,7 +1914,7 @@ def _queue_v2_post_snapshot(account: str | None, shortcode: str | None) -> dict[
     }
 
 
-def _queue_v2_hot_source_rows(conn: Any) -> list[dict[str, Any]]:
+def _queue_v2_hot_source_rows(conn: Any, *, include_historic: bool = False) -> list[dict[str, Any]]:
     """Return source posts whose measured rate is strictly above 3x.
 
     The canonical account still lives in ``posts`` while all other accounts
@@ -1928,8 +1928,8 @@ def _queue_v2_hot_source_rows(conn: Any) -> list[dict[str, Any]]:
     post_columns = {row["name"] for row in conn.execute("PRAGMA table_info(posts)").fetchall()}
     dashboard_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dashboard_posts)").fetchall()}
     routing_start = _queue_v2_hot_routing_start(conn)
-    post_cutoff = " AND hot_marked_at >= ?" if "hot_marked_at" in post_columns else ""
-    dashboard_cutoff = " AND dp.hot_marked_at >= ?" if "hot_marked_at" in dashboard_columns else ""
+    post_cutoff = "" if include_historic else (" AND hot_marked_at >= ?" if "hot_marked_at" in post_columns else "")
+    dashboard_cutoff = "" if include_historic else (" AND dp.hot_marked_at >= ?" if "hot_marked_at" in dashboard_columns else "")
     canonical = conn.execute(
         "SELECT handle FROM accounts WHERE is_canonical = 1 AND is_active = 1 LIMIT 1"
     ).fetchone()
@@ -1958,6 +1958,37 @@ def _queue_v2_hot_source_rows(conn: Any) -> list[dict[str, Any]]:
     ).fetchall():
         rows.append(dict(row))
     return sorted(rows, key=lambda item: (-float(item.get("hot_rate_multiplier") or 0), str(item.get("account") or ""), str(item.get("shortcode") or "")))
+
+
+def _queue_v2_hot_pick_candidate(post: dict[str, Any]) -> dict[str, Any]:
+    """Project a live HOT source post as a temporary Pick candidate.
+
+    This does not create a Queue request merely because somebody opens Pick.
+    The request is materialized atomically only when a designer actually
+    claims it, keeping today's testing set broad without polluting the pool.
+    """
+    account = str(post.get("account") or "").strip().lower()
+    shortcode = str(post.get("shortcode") or "").strip()
+    caption = str(post.get("caption") or post.get("title") or "").strip()
+    multiplier = float(post.get("hot_rate_multiplier") or 0)
+    return {
+        "id": f"hot:{account}:{shortcode}", "isHotCandidate": True,
+        "post": {
+            "account": account, "shortcode": shortcode,
+            "title": str(post.get("title") or "").strip(), "isCustom": False,
+            "permalink": str(post.get("permalink") or f"https://www.instagram.com/p/{shortcode}/"),
+            "caption": caption, "type": str(post.get("post_type_label") or "Image"),
+            "coverUrl": f"/api/dashboard/covers/{account}/{post.get('id')}" if post.get("id") is not None else "",
+            "publishedAt": post.get("published_at"), "likes": post.get("likes"), "comments": post.get("comments"),
+        },
+        "productionPoints": 3, "minutesPerPP": QUEUE_V2_DEFAULT_MINUTES_PER_PP,
+        "durationMinutes": 3 * QUEUE_V2_DEFAULT_MINUTES_PER_PP,
+        "priority": "urgent", "tags": ["hot"], "brief": f"HOT post · {multiplier:.2f}× rate",
+        "notes": "Available as a temporary HOT Pick candidate.", "references": [], "attachments": [],
+        "status": "pool", "designerEmail": None, "coordinatorEmail": "system@sentientdash.app",
+        "recommendedAccounts": [], "scheduledDate": None, "scheduledStartMinutes": None,
+        "isHot": True, "hotMultiplier": multiplier,
+    }
 
 
 def _queue_v2_auto_pool_hot(conn: Any) -> list[int]:
@@ -2635,6 +2666,8 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         # posts detected before this feature was deployed (the Apify worker
         # also calls the same helper immediately after a fresh HOT check).
         _queue_v2_auto_pool_hot(conn)
+        hot_source_rows = _queue_v2_hot_source_rows(conn, include_historic=True)
+        all_queue_rows = conn.execute("SELECT * FROM queue_requests").fetchall()
         pool_rows = conn.execute(
             """SELECT * FROM queue_requests
                WHERE status = 'pool'
@@ -2719,13 +2752,24 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
     # separate so the existing pool visibility rules and coordinator UI remain
     # unchanged.
     pick_requests = [project_with_ticket_flags(row) for row in pool_rows]
-    # Keep a separately sorted HOT list so the PD picker can fall back to the
-    # highest-rate HOT posts when the ordinary pool is empty. In normal use
-    # these rows are already materialized in the pool by the helper above.
-    hot_pick_requests = sorted(
-        [task for task in pick_requests if "hot" in (task.get("tags") or []) or task.get("isHot")],
-        key=lambda task: (-float(task.get("hotMultiplier") or 0), task.get("id", 0)),
-    )
+    # During the test period, Pick may surface every currently-HOT source post
+    # rather than only the rows auto-materialized after the last Queue reset.
+    # Existing pool requests keep their real identity; an unqueued HOT post is
+    # a virtual candidate until a PD claims it.
+    existing_by_hot_key = {
+        (str(row["post_account"] or "").strip().lower(), str(row["post_shortcode"] or "").strip()): row
+        for row in all_queue_rows
+    }
+    hot_pick_requests: list[dict[str, Any]] = []
+    for source in hot_source_rows:
+        key = (str(source.get("account") or "").strip().lower(), str(source.get("shortcode") or "").strip())
+        existing = existing_by_hot_key.get(key)
+        if existing is not None:
+            if existing["status"] == "pool":
+                hot_pick_requests.append(project_with_ticket_flags(existing))
+            continue
+        hot_pick_requests.append(_queue_v2_hot_pick_candidate(source))
+    hot_pick_requests.sort(key=lambda task: (-float(task.get("hotMultiplier") or 0), str(task.get("id") or "")))
     planning_requests = [project_with_ticket_flags(row) for row in planning_rows]
     assigned_requests = [project_with_ticket_flags(row) for row in assigned_rows]
     live_drafts = [_queue_v2_project_draft(row) for row in draft_rows]
@@ -2802,7 +2846,9 @@ def dashboard_queue_v2_save_account_onboarding(
 @app.post("/api/dashboard/queue/v2/pick")
 def dashboard_queue_v2_pick(
     request: Request,
-    request_id: Annotated[int, Form()],
+    request_id: Annotated[int | None, Form()] = None,
+    hot_account: Annotated[str | None, Form()] = None,
+    hot_shortcode: Annotated[str | None, Form()] = None,
     scheduled_date: Annotated[str | None, Form()] = None,
     scheduled_start_minutes: Annotated[int | None, Form()] = None,
 ) -> dict[str, Any]:
@@ -2821,7 +2867,42 @@ def dashboard_queue_v2_pick(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
     with connect() as conn:
-        row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone()
+        row = None
+        if request_id is None and not (hot_account and hot_shortcode):
+            raise HTTPException(status_code=400, detail="Choose a pooled request or a HOT post.")
+        if request_id is None:
+            account = str(hot_account or "").strip().lstrip("@").lower()
+            shortcode = str(hot_shortcode or "").strip()
+            source = next((post for post in _queue_v2_hot_source_rows(conn, include_historic=True)
+                           if str(post.get("account") or "").strip().lower() == account and str(post.get("shortcode") or "").strip() == shortcode), None)
+            if source is None:
+                raise HTTPException(status_code=409, detail="That HOT post is no longer available for Pick.")
+            row = conn.execute(
+                "SELECT * FROM queue_requests WHERE post_account = ? AND post_shortcode = ?",
+                (account, shortcode),
+            ).fetchone()
+            if row is None:
+                multiplier = float(source.get("hot_rate_multiplier") or 0)
+                caption = str(source.get("caption") or source.get("title") or "").strip()
+                post_type = str(source.get("post_type_label") or "Image").strip() or "Image"
+                permalink = str(source.get("permalink") or f"https://www.instagram.com/p/{shortcode}/")
+                cover_url = f"/api/dashboard/covers/{account}/{source.get('id')}" if source.get("id") is not None else ""
+                cursor = conn.execute(
+                    """INSERT INTO queue_requests (
+                           post_account, post_shortcode, post_permalink, post_caption,
+                           post_type, cover_url, production_points, priority,
+                           deadline_at, tags, brief, notes, reference_links,
+                           coordinator_email, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, 3, 'urgent', '', ?, ?, ?, '[]', ?, ?, ?)""",
+                    (account, shortcode, permalink, caption, post_type, cover_url, json.dumps(["hot"]),
+                     f"HOT post · {multiplier:.2f}× rate",
+                     "Picked directly from the temporary HOT testing list.", caller, utc_now(), utc_now()),
+                )
+                request_id = int(cursor.lastrowid)
+                row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone()
+            else:
+                request_id = int(row["id"])
+        row = row or conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Queue request not found.")
         if row["status"] != "pool":
