@@ -47,6 +47,7 @@ def _ticket_database(path):
             scheduled_start_minutes INTEGER,
             duration_minutes INTEGER,
             requested_production_points INTEGER,
+            requested_accounts TEXT NOT NULL DEFAULT '[]',
             reason TEXT NOT NULL DEFAULT '',
             reviewer_email TEXT,
             review_note TEXT NOT NULL DEFAULT '',
@@ -54,6 +55,13 @@ def _ticket_database(path):
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE queue_designer_accounts (
+            designer_email TEXT NOT NULL,
+            account_handle TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(designer_email, account_handle)
+        );
+        CREATE TABLE accounts (handle TEXT PRIMARY KEY, group_name TEXT, is_active INTEGER);
         """
     )
     conn.commit()
@@ -173,3 +181,70 @@ def test_pp_revision_and_cancellation_ticket_actions(monkeypatch, tmp_path):
         row = conn.execute("SELECT status, cancellation_reason FROM queue_requests WHERE id = 1").fetchone()
         assert row["status"] == "cancelled"
         assert row["cancellation_reason"] == "Post no longer needed"
+
+
+def test_account_access_ticket_assigns_active_sentient_accounts(monkeypatch, tmp_path):
+    database = tmp_path / "account-access.sqlite3"
+    _ticket_database(database)
+    connect = _isolate(monkeypatch, database)
+    monkeypatch.setattr(main, "list_accounts", lambda active_only=True: [
+        {"handle": "chatgptricks", "group": "sentient"},
+        {"handle": "competitor", "group": "competitors"},
+    ])
+    with connect() as conn:
+        conn.execute("INSERT INTO accounts VALUES ('chatgptricks', 'sentient', 1)")
+
+    created = main.dashboard_queue_v2_request_account_access(
+        request=None,
+        accounts='["@chatgptricks", "@notaddedyet"]',
+        reason="I manage both.",
+    )
+    assert created["ticket"]["type"] == "account_access"
+    assert created["ticket"]["requestedAccounts"] == ["chatgptricks", "notaddedyet"]
+
+    reviewed = main.dashboard_queue_v2_review_ticket(
+        ticket_id=created["ticket"]["id"], request=None, action="approve", review_note=None,
+    )
+    assert reviewed["ticket"]["status"] == "approved"
+    with connect() as conn:
+        assigned = conn.execute(
+            "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = 'pd@example.com'"
+        ).fetchall()
+    assert [row["account_handle"] for row in assigned] == ["chatgptricks"]
+
+
+def test_admin_reset_clears_queue_state_but_preserves_accounts(monkeypatch, tmp_path):
+    database = tmp_path / "queue-reset.sqlite3"
+    _ticket_database(database)
+    connect = _isolate(monkeypatch, database)
+    monkeypatch.setattr(main, "_caller_email", lambda request: "admin@example.com")
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    with connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE post_assignments (id INTEGER PRIMARY KEY AUTOINCREMENT);
+            CREATE TABLE post_assignment_events (id INTEGER PRIMARY KEY AUTOINCREMENT);
+            CREATE TABLE queue_request_events (id INTEGER PRIMARY KEY AUTOINCREMENT);
+            CREATE TABLE queue_user_account_onboarding (user_email TEXT PRIMARY KEY, completed_at TEXT, updated_at TEXT);
+            CREATE TABLE scheduler_state (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+            """
+        )
+        conn.execute("INSERT INTO queue_requests VALUES (1, 3, 10, 'pool', NULL, NULL, NULL, 'chatgptricks', 'POST1', '', '')")
+        conn.execute("INSERT INTO queue_tickets (ticket_type, requester_email, status, created_at, updated_at) VALUES ('cancellation', 'pd@example.com', 'pending', 'now', 'now')")
+        conn.execute("INSERT INTO queue_designer_accounts VALUES ('pd@example.com', 'chatgptricks', 'now')")
+        conn.execute("INSERT INTO queue_user_account_onboarding VALUES ('pd@example.com', 'now', 'now')")
+        conn.execute("INSERT INTO accounts VALUES ('chatgptricks', 'sentient', 1)")
+    attachment = tmp_path / "queue_attachments" / "1"
+    attachment.mkdir(parents=True)
+    (attachment / "file.txt").write_text("queue only")
+
+    result = main.admin_queue_reset(request=None, confirmation="RESET_QUEUE")
+    assert result["ok"] is True
+    assert result["deleted"]["requests"] == 1
+    assert not (tmp_path / "queue_attachments").exists()
+    with connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS c FROM queue_requests").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM queue_tickets").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM queue_designer_accounts").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()["c"] == 1
+        assert conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_hot_routing_start'").fetchone()["value"] == result["hotRoutingStart"]

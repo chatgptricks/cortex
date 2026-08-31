@@ -1561,6 +1561,21 @@ QUEUE_V2_DEFAULT_MINUTES_PER_PP = 10
 QUEUE_V2_TRAINEE_MINUTES_PER_PP = 16
 
 
+def _queue_v2_hot_routing_start(conn: Any) -> str:
+    """Use the latest Queue reset as the HOT-pool watermark.
+
+    The environment default preserves the original rollout boundary, while a
+    clean reset moves the live boundary forward without a code or env change.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM scheduler_state WHERE key = 'queue_hot_routing_start'"
+        ).fetchone()
+    except Exception:
+        return QUEUE_V2_HOT_ROUTING_START
+    return str(row["value"] or QUEUE_V2_HOT_ROUTING_START) if row else QUEUE_V2_HOT_ROUTING_START
+
+
 def _queue_v2_slack_log(**change: Any) -> bool:
     """Best-effort audit delivery for Queue mutations.
 
@@ -1594,6 +1609,24 @@ def _queue_v2_json(value: Any, fallback: Any) -> Any:
         return parsed if isinstance(parsed, type(fallback)) else fallback
     except (TypeError, json.JSONDecodeError):
         return fallback
+
+
+def _queue_v2_clean_account_handles(value: Any) -> list[str]:
+    """Normalize a short list of Instagram handles supplied by a Queue user."""
+    if not isinstance(value, list):
+        raise HTTPException(status_code=400, detail="Accounts must be a list.")
+    handles: list[str] = []
+    for item in value:
+        handle = str(item or "").strip().lstrip("@").lower()
+        if not handle:
+            continue
+        if not re.fullmatch(r"[a-z0-9._]{1,30}", handle):
+            raise HTTPException(status_code=400, detail=f"Invalid Instagram handle: {item}")
+        if handle not in handles:
+            handles.append(handle)
+    if len(handles) > 12:
+        raise HTTPException(status_code=400, detail="Choose up to 12 accounts at a time.")
+    return handles
 
 
 def _queue_v2_user_roles(user: dict[str, Any] | Any) -> list[str]:
@@ -1723,6 +1756,7 @@ def _queue_v2_hot_source_rows(conn: Any) -> list[dict[str, Any]]:
     # those databases are upgraded in place.
     post_columns = {row["name"] for row in conn.execute("PRAGMA table_info(posts)").fetchall()}
     dashboard_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dashboard_posts)").fetchall()}
+    routing_start = _queue_v2_hot_routing_start(conn)
     post_cutoff = " AND hot_marked_at >= ?" if "hot_marked_at" in post_columns else ""
     dashboard_cutoff = " AND dp.hot_marked_at >= ?" if "hot_marked_at" in dashboard_columns else ""
     canonical = conn.execute(
@@ -1735,7 +1769,7 @@ def _queue_v2_hot_source_rows(conn: Any) -> list[dict[str, Any]]:
                FROM posts
                WHERE is_hot = 1 AND hot_rate_multiplier > ?
                  AND shortcode IS NOT NULL AND shortcode != ''{post_cutoff}""",
-            (QUEUE_V2_HOT_MULTIPLIER, QUEUE_V2_HOT_ROUTING_START) if post_cutoff else (QUEUE_V2_HOT_MULTIPLIER,),
+            (QUEUE_V2_HOT_MULTIPLIER, routing_start) if post_cutoff else (QUEUE_V2_HOT_MULTIPLIER,),
         ).fetchall():
             item = dict(row)
             item["account"] = canonical["handle"]
@@ -1749,7 +1783,7 @@ def _queue_v2_hot_source_rows(conn: Any) -> list[dict[str, Any]]:
            JOIN accounts a ON a.handle = dp.account
            WHERE a.is_active = 1 AND dp.is_hot = 1 AND dp.hot_rate_multiplier > ?
              AND dp.shortcode IS NOT NULL AND dp.shortcode != ''{dashboard_cutoff}""",
-        (QUEUE_V2_HOT_MULTIPLIER, QUEUE_V2_HOT_ROUTING_START) if dashboard_cutoff else (QUEUE_V2_HOT_MULTIPLIER,),
+        (QUEUE_V2_HOT_MULTIPLIER, routing_start) if dashboard_cutoff else (QUEUE_V2_HOT_MULTIPLIER,),
     ).fetchall():
         rows.append(dict(row))
     return sorted(rows, key=lambda item: (-float(item.get("hot_rate_multiplier") or 0), str(item.get("account") or ""), str(item.get("shortcode") or "")))
@@ -1884,7 +1918,11 @@ def _queue_v2_occupied(row: dict[str, Any], duration: int | None = None) -> dict
 
 def _queue_v2_ticket(row: dict[str, Any]) -> dict[str, Any]:
     request_id = row.get("request_id")
-    ticket_type = "move" if row.get("ticket_type") == "time_block" and row.get("block_category") == "move" and request_id is not None else row.get("ticket_type")
+    ticket_type = row.get("ticket_type")
+    if ticket_type == "time_block" and row.get("block_category") == "move" and request_id is not None:
+        ticket_type = "move"
+    elif ticket_type == "time_block" and row.get("block_category") == "account_request":
+        ticket_type = "account_access"
     request_summary = None
     if request_id is not None:
         request_summary = {
@@ -1900,6 +1938,7 @@ def _queue_v2_ticket(row: dict[str, Any]) -> dict[str, Any]:
         "category": row.get("block_category") or "", "title": row.get("title") or "",
         "scheduledDate": row.get("scheduled_date"), "scheduledStartMinutes": row.get("scheduled_start_minutes"),
         "durationMinutes": row.get("duration_minutes"), "requestedProductionPoints": row.get("requested_production_points"),
+        "requestedAccounts": _queue_v2_json(row.get("requested_accounts"), []),
         "reason": row.get("reason") or "", "reviewerEmail": row.get("reviewer_email"),
         "reviewNote": row.get("review_note") or "", "reviewedAt": row.get("reviewed_at"),
         "createdAt": row["created_at"], "updatedAt": row["updated_at"], "request": request_summary,
@@ -2200,6 +2239,25 @@ def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
     return result
 
 
+def _queue_v2_account_onboarding_state(conn: Any, user_email: str) -> dict[str, Any]:
+    """Return a durable first-use marker plus the user's account selection."""
+    selected = [
+        str(row["account_handle"])
+        for row in conn.execute(
+            "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ? ORDER BY account_handle",
+            (user_email,),
+        ).fetchall()
+    ]
+    try:
+        marker = conn.execute(
+            "SELECT 1 FROM queue_user_account_onboarding WHERE user_email = ?",
+            (user_email,),
+        ).fetchone()
+    except Exception:
+        marker = None
+    return {"completed": bool(marker), "selectedAccounts": selected}
+
+
 def _queue_v2_prepare_schedule_changes(
     conn: Any, entries: Any, *, ignore_draft_coordinator: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -2455,6 +2513,7 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
             [] if (is_admin or "vc" in roles) else [caller],
         ).fetchone()["c"])
         live_state = _queue_v2_live_snapshot(conn)
+        account_onboarding = _queue_v2_account_onboarding_state(conn, caller)
     def project_with_ticket_flags(row: Any) -> dict[str, Any]:
         item = _queue_v2_project(dict(row))
         item["pendingTickets"] = pending_tickets_by_request.get(int(item["id"]), [])
@@ -2502,9 +2561,47 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
         "schedulerUsers": scheduler_users,
         "accounts": sentient_accounts,
+        "accountOnboarding": account_onboarding,
         "tags": QUEUE_V2_TAGS, "priorities": QUEUE_V2_PRIORITIES,
         "hours": {"start": SCHEDULER_START, "end": SCHEDULER_END},
     }
+
+
+@app.post("/api/dashboard/queue/v2/account-onboarding")
+def dashboard_queue_v2_save_account_onboarding(
+    request: Request,
+    accounts: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Persist the accounts a Queue user can create for, including an empty choice."""
+    caller, _, _ = _queue_v2_access(request)
+    try:
+        submitted = json.loads(accounts or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Accounts must be valid JSON.") from exc
+    selected = _queue_v2_clean_account_handles(submitted)
+    active_sentient = {
+        str(item.get("handle") or "").strip().lower()
+        for item in list_accounts(active_only=True)
+        if item.get("group") == "sentient"
+    }
+    unavailable = [handle for handle in selected if handle not in active_sentient]
+    if unavailable:
+        raise HTTPException(status_code=400, detail="Choose active Sentient accounts only.")
+    now = utc_now()
+    with connect() as conn:
+        conn.execute("DELETE FROM queue_designer_accounts WHERE designer_email = ?", (caller,))
+        conn.executemany(
+            "INSERT INTO queue_designer_accounts (designer_email, account_handle, created_at) VALUES (?, ?, ?)",
+            [(caller, handle, now) for handle in selected],
+        )
+        conn.execute(
+            """INSERT INTO queue_user_account_onboarding (user_email, completed_at, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(user_email) DO UPDATE SET updated_at = excluded.updated_at""",
+            (caller, now, now),
+        )
+        _queue_v2_publish(conn, "designer_accounts_updated", caller)
+    return {"ok": True, "accountOnboarding": {"completed": True, "selectedAccounts": selected}}
 
 
 @app.post("/api/dashboard/queue/v2/pick")
@@ -3004,6 +3101,44 @@ def dashboard_queue_v2_create_time_block(
     return {"ok": True, "ticket": _queue_v2_ticket(row)}
 
 
+@app.post("/api/dashboard/queue/v2/tickets/account-access")
+def dashboard_queue_v2_request_account_access(
+    request: Request,
+    accounts: Annotated[str, Form()],
+    reason: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Ask coordinators to add accounts that are not yet available to the user."""
+    caller, _, _ = _queue_v2_access(request)
+    try:
+        requested = json.loads(accounts)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Accounts must be valid JSON.") from exc
+    handles = _queue_v2_clean_account_handles(requested)
+    if not handles:
+        raise HTTPException(status_code=400, detail="Add at least one account to request.")
+    now = utc_now()
+    with connect() as conn:
+        pending = conn.execute(
+            """SELECT 1 FROM queue_tickets
+               WHERE ticket_type = 'time_block' AND block_category = 'account_request'
+                 AND requester_email = ? AND status = 'pending'""",
+            (caller,),
+        ).fetchone()
+        if pending:
+            raise HTTPException(status_code=409, detail="You already have an account request pending.")
+        cursor = conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, status, block_category, title, requested_accounts,
+                reason, created_at, updated_at)
+               VALUES ('time_block', ?, 'pending', 'account_request', 'Account access request', ?, ?, ?, ?)""",
+            (caller, json.dumps(handles), (reason or "").strip()[:500], now, now),
+        )
+        ticket_id = int(cursor.lastrowid)
+        _queue_v2_publish(conn, "ticket_created", caller)
+        row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    return {"ok": True, "ticket": _queue_v2_ticket(row)}
+
+
 @app.post("/api/dashboard/queue/v2/tickets/pp-revision")
 def dashboard_queue_v2_request_pp_revision(
     request: Request,
@@ -3298,7 +3433,24 @@ def dashboard_queue_v2_review_ticket(
         ticket = dict(ticket_row)
         if ticket["status"] != "pending":
             raise HTTPException(status_code=409, detail="This ticket has already been reviewed.")
-        if clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "move":
+        if clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "account_request":
+            requested_handles = _queue_v2_json(ticket.get("requested_accounts"), [])
+            active_handles = {
+                str(item["handle"])
+                for item in conn.execute(
+                    "SELECT handle FROM accounts WHERE is_active = 1 AND group_name = 'sentient'"
+                ).fetchall()
+            }
+            approved_handles = [
+                handle for handle in _queue_v2_clean_account_handles(requested_handles)
+                if handle in active_handles
+            ]
+            conn.executemany(
+                "INSERT OR IGNORE INTO queue_designer_accounts (designer_email, account_handle, created_at) VALUES (?, ?, ?)",
+                [(ticket["requester_email"], handle, now) for handle in approved_handles],
+            )
+            queue_change_event = "account_access_approved"
+        elif clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "move":
             queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
             if not queue_row or queue_row["status"] != "scheduled":
                 raise HTTPException(status_code=409, detail="The Queue request can no longer be moved.")
@@ -4170,6 +4322,65 @@ def admin_upsert_user(
 @app.get("/api/admin/queue/designer-accounts")
 def admin_queue_designer_accounts() -> dict[str, Any]:
     return {"designers": _queue_v2_designers()}
+
+
+@app.post("/api/admin/queue/reset")
+def admin_queue_reset(
+    request: Request,
+    confirmation: Annotated[str, Form()],
+) -> dict[str, Any]:
+    """Start Queue from a clean operational state without touching Dash data.
+
+    This intentionally keeps dashboard users, roles, Sentient accounts, source
+    posts, tracker data, and global settings. It removes only Queue work,
+    requests, collaborative drafts/tickets, account selections, and files.
+    """
+    if confirmation.strip() != "RESET_QUEUE":
+        raise HTTPException(status_code=400, detail="Confirmation must be RESET_QUEUE.")
+    caller = _caller_email(request)
+    now = utc_now()
+    tables = {
+        "legacyAssignments": "post_assignments",
+        "legacyEvents": "post_assignment_events",
+        "requests": "queue_requests",
+        "requestEvents": "queue_request_events",
+        "drafts": "queue_schedule_drafts",
+        "tickets": "queue_tickets",
+        "designerAccounts": "queue_designer_accounts",
+        "accountOnboarding": "queue_user_account_onboarding",
+    }
+    with connect() as conn:
+        deleted = {
+            label: int(conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"])
+            for label, table in tables.items()
+        }
+        # Remove dependants first; Queue's migration databases can have a
+        # mix of SQLite foreign-key configurations, so this order is explicit.
+        for table in (
+            "queue_schedule_drafts", "queue_request_events", "queue_tickets", "queue_requests",
+            "post_assignment_events", "post_assignments", "queue_designer_accounts",
+            "queue_user_account_onboarding",
+        ):
+            conn.execute(f"DELETE FROM {table}")
+        conn.execute(
+            """INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_hot_routing_start', ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+            (now, now),
+        )
+        try:
+            conn.execute(
+                """DELETE FROM sqlite_sequence
+                   WHERE name IN ('post_assignments', 'post_assignment_events', 'queue_requests',
+                                  'queue_request_events', 'queue_schedule_drafts', 'queue_tickets')"""
+            )
+        except Exception:
+            # sqlite_sequence does not exist until an AUTOINCREMENT row has
+            # been created; its absence must not make a clean reset fail.
+            pass
+        revision = _queue_v2_publish(conn, "queue_reset", caller)
+    # Attachments are Queue-only and live in a fixed, non-user-derived path.
+    shutil.rmtree(DATA_DIR / "queue_attachments", ignore_errors=True)
+    return {"ok": True, "deleted": deleted, "hotRoutingStart": now, "liveRevision": revision}
 
 
 @app.post("/api/admin/queue/designer-accounts")
