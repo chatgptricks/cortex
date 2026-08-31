@@ -1,6 +1,8 @@
 import sqlite3
 from contextlib import contextmanager
 
+import httpx
+
 from app import main
 
 
@@ -54,6 +56,7 @@ def test_vc_can_create_custom_queue_post(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_queue_v2_access", lambda request, coordinator=False: ("vc@example.com", False, ["vc", "pd"]))
     monkeypatch.setattr(main, "_queue_v2_publish", lambda *args, **kwargs: 1)
     monkeypatch.setattr(main, "_queue_v2_slack_log", lambda **kwargs: True)
+    monkeypatch.setattr(main, "_queue_v2_public_url", lambda value: str(value))
 
     result = main.dashboard_queue_v2_create(
         request=None, account="chatgptricks", title="Launch carousel", post_type="Carousel",
@@ -80,3 +83,60 @@ def test_vc_can_create_custom_queue_post(monkeypatch, tmp_path):
     assert unassigned["post"]["account"] == ""
     assert unassigned["post"]["title"] == "Account chosen at assignment"
     assert unassigned["status"] == "pool"
+
+    sourced = main.dashboard_queue_v2_create(
+        request=None, title="A useful Reddit post", production_points=3, priority="medium",
+        source_url="https://www.reddit.com/r/example/comments/1",
+        source_description="A short source description.",
+        source_image_url="https://cdn.example.com/cover.jpg",
+    )["request"]
+    assert sourced["post"]["permalink"] == "https://www.reddit.com/r/example/comments/1"
+    assert sourced["post"]["caption"] == "A short source description."
+    assert sourced["post"]["coverUrl"] == "https://cdn.example.com/cover.jpg"
+    assert sourced["references"] == ["https://www.reddit.com/r/example/comments/1"]
+
+
+def test_source_preview_extracts_open_graph(monkeypatch):
+    class FakeResponse:
+        is_redirect = False
+        encoding = "utf-8"
+        headers = {"content-type": "text/html; charset=utf-8", "content-length": "420"}
+        content = b'''<html><head>
+          <meta property="og:title" content="A useful Reddit post" />
+          <meta property="og:description" content="A short source description." />
+          <meta property="og:image" content="https://cdn.example.com/cover.jpg" />
+          <link rel="canonical" href="https://www.reddit.com/r/example/comments/1" />
+        </head></html>'''
+
+        def raise_for_status(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def iter_bytes(self):
+            yield self.content
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def stream(self, method, url):
+            return FakeResponse()
+
+    monkeypatch.setattr(main, "_queue_v2_public_url", lambda value: str(value))
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: FakeClient())
+    preview = main._queue_v2_fetch_source_preview("https://www.reddit.com/r/example/comments/1")
+    assert preview == {
+        "sourceUrl": "https://www.reddit.com/r/example/comments/1",
+        "platform": "Reddit",
+        "title": "A useful Reddit post",
+        "description": "A short source description.",
+        "imageUrl": "https://cdn.example.com/cover.jpg",
+    }
