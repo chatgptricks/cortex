@@ -3,19 +3,22 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import re
 import secrets
 import shutil
+import socket
 import threading
 import time
 from datetime import UTC, datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Annotated, Any
 from types import SimpleNamespace
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -1565,6 +1568,168 @@ QUEUE_V2_POOL_DRAFT_DESIGNER = "__queue_pool__"
 QUEUE_V2_POOL_DRAFT_DATE = "0000-00-00"
 QUEUE_V2_DEFAULT_MINUTES_PER_PP = 10
 QUEUE_V2_TRAINEE_MINUTES_PER_PP = 16
+QUEUE_V2_SOURCE_MAX_BYTES = 1_500_000
+QUEUE_V2_SOURCE_REDIRECTS = 4
+
+
+class _QueueV2MetadataParser(HTMLParser):
+    """Small, dependency-free Open Graph parser for a queued source link."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.values: dict[str, str] = {}
+        self.canonical = ""
+        self.title = ""
+        self._in_title = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {str(key).lower(): str(value or "").strip() for key, value in attrs}
+        if tag.lower() == "meta":
+            key = (attributes.get("property") or attributes.get("name") or attributes.get("itemprop") or "").lower()
+            content = attributes.get("content") or ""
+            if key and content and key not in self.values:
+                self.values[key] = content
+        elif tag.lower() == "link" and "canonical" in attributes.get("rel", "").lower() and not self.canonical:
+            self.canonical = attributes.get("href") or ""
+        elif tag.lower() == "title":
+            self._in_title = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title and not self.title:
+            self.title = data.strip()
+
+
+def _queue_v2_trim_source_text(value: str | None, limit: int) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+def _queue_v2_public_url(value: str | None) -> str:
+    """Accept only public http(s) targets before making a source request."""
+    raw = str(value or "").strip()
+    if not raw or len(raw) > 2_000:
+        raise HTTPException(status_code=400, detail="Add a valid public source link.")
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail="Add a valid public http(s) source link.")
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname in {"localhost", "localhost.localdomain"}:
+        raise HTTPException(status_code=400, detail="The source link must be publicly reachable.")
+    try:
+        port = parsed.port or 443
+        addresses = {item[4][0] for item in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)}
+    except (ValueError, socket.gaierror) as exc:
+        raise HTTPException(status_code=400, detail="The source link could not be resolved.") from exc
+    if not addresses:
+        raise HTTPException(status_code=400, detail="The source link could not be resolved.")
+    for address in addresses:
+        try:
+            if not ipaddress.ip_address(address).is_global:
+                raise HTTPException(status_code=400, detail="The source link must be publicly reachable.")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="The source link is invalid.") from exc
+    return raw
+
+
+def _queue_v2_source_platform(url: str) -> str:
+    host = (urlsplit(url).hostname or "").lower()
+    if host.endswith("reddit.com") or host.endswith("redd.it"):
+        return "Reddit"
+    if host.endswith("x.com") or host.endswith("twitter.com"):
+        return "X"
+    if host.endswith("canva.com"):
+        return "Canva"
+    if host.endswith("linkedin.com"):
+        return "LinkedIn"
+    if host.endswith("facebook.com") or host.endswith("fb.watch"):
+        return "Facebook"
+    if host.endswith("instagram.com"):
+        return "Instagram"
+    return host.removeprefix("www.")
+
+
+def _queue_v2_safe_image_url(value: str | None, base_url: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    candidate = urljoin(base_url, raw)
+    parsed = urlsplit(candidate)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        return ""
+    return candidate[:2_000]
+
+
+def _queue_v2_fetch_source_preview(source_url: str) -> dict[str, str]:
+    """Fetch public Open Graph metadata for Reddit/X/Canva/etc. source links."""
+    import httpx
+
+    current = _queue_v2_public_url(source_url)
+    headers = {
+        "User-Agent": "SentientDash/1.0 (+https://sentientdash.app)",
+        "Accept": "text/html,application/xhtml+xml,image/avif,image/webp,image/*;q=0.8,*/*;q=0.5",
+    }
+    try:
+        with httpx.Client(timeout=httpx.Timeout(12.0, connect=5.0), follow_redirects=False, headers=headers) as client:
+            response: httpx.Response | None = None
+            raw = b""
+            content_type = ""
+            for _ in range(QUEUE_V2_SOURCE_REDIRECTS + 1):
+                with client.stream("GET", current) as candidate:
+                    response = candidate
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise HTTPException(status_code=422, detail="The source link redirects without a destination.")
+                        current = _queue_v2_public_url(urljoin(current, location))
+                        continue
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "").lower()
+                    content_length = response.headers.get("content-length")
+                    if content_length and content_length.isdigit() and int(content_length) > QUEUE_V2_SOURCE_MAX_BYTES:
+                        raise HTTPException(status_code=422, detail="The source page is too large to preview.")
+                    chunks = bytearray()
+                    for chunk in response.iter_bytes():
+                        chunks.extend(chunk)
+                        if len(chunks) > QUEUE_V2_SOURCE_MAX_BYTES:
+                            raise HTTPException(status_code=422, detail="The source page is too large to preview.")
+                    raw = bytes(chunks)
+                    break
+            if response is None or response.is_redirect:
+                raise HTTPException(status_code=422, detail="The source link redirects too many times.")
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=422, detail=f"The source link returned HTTP {exc.response.status_code}.") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=422, detail="The source link could not be fetched right now.") from exc
+
+    platform = _queue_v2_source_platform(current)
+    if content_type.startswith("image/"):
+        return {"sourceUrl": current, "platform": platform, "title": platform, "description": "", "imageUrl": current}
+    if "html" not in content_type and "xml" not in content_type:
+        raise HTTPException(status_code=422, detail="That link does not expose a previewable page.")
+    parser = _QueueV2MetadataParser()
+    parser.feed(raw.decode(response.encoding or "utf-8", errors="replace"))
+    parser.close()
+    title = _queue_v2_trim_source_text(
+        parser.values.get("og:title") or parser.values.get("twitter:title") or parser.title,
+        160,
+    )
+    description = _queue_v2_trim_source_text(
+        parser.values.get("og:description") or parser.values.get("twitter:description") or parser.values.get("description"),
+        2_000,
+    )
+    image = _queue_v2_safe_image_url(
+        parser.values.get("og:image") or parser.values.get("twitter:image") or parser.values.get("twitter:image:src"),
+        current,
+    )
+    canonical = _queue_v2_safe_image_url(parser.canonical, current) or current
+    if not title and not description and not image:
+        raise HTTPException(status_code=422, detail="No title, description, or image was available for that source link.")
+    return {"sourceUrl": canonical, "platform": platform, "title": title, "description": description, "imageUrl": image}
 
 
 def _queue_v2_hot_routing_start(conn: Any) -> str:
@@ -2809,6 +2974,16 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
     }
 
 
+@app.post("/api/dashboard/queue/v2/source-preview")
+def dashboard_queue_v2_source_preview(
+    request: Request,
+    source_url: Annotated[str, Form()],
+) -> dict[str, Any]:
+    """Return the public title, description and thumbnail for a Queue source."""
+    _queue_v2_access(request, coordinator=True)
+    return {"ok": True, "preview": _queue_v2_fetch_source_preview(source_url)}
+
+
 @app.post("/api/dashboard/queue/v2/create")
 def dashboard_queue_v2_create(
     request: Request,
@@ -2821,6 +2996,10 @@ def dashboard_queue_v2_create(
     brief: Annotated[str | None, Form()] = None,
     notes: Annotated[str | None, Form()] = None,
     references: Annotated[str | None, Form()] = None,
+    source_url: Annotated[str | None, Form()] = None,
+    source_title: Annotated[str | None, Form()] = None,
+    source_description: Annotated[str | None, Form()] = None,
+    source_image_url: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
     """Create a Queue request without a source post from the dashboard.
 
@@ -2854,6 +3033,12 @@ def dashboard_queue_v2_create(
     shortcode = f"manual-{secrets.token_hex(8)}"
     clean_brief = str(brief or "").strip()
     clean_notes = str(notes or "").strip()
+    clean_source_url = _queue_v2_public_url(source_url) if str(source_url or "").strip() else ""
+    clean_source_title = _queue_v2_trim_source_text(source_title, 160)
+    clean_source_description = _queue_v2_trim_source_text(source_description, 2_000)
+    clean_source_image = _queue_v2_safe_image_url(source_image_url, clean_source_url) if clean_source_url else ""
+    if clean_source_url and clean_source_url not in clean_refs:
+        clean_refs.insert(0, clean_source_url)
     with connect() as conn:
         cursor = conn.execute(
             """INSERT INTO queue_requests (
@@ -2861,9 +3046,9 @@ def dashboard_queue_v2_create(
                    post_permalink, post_caption, post_type, cover_url,
                    production_points, priority, deadline_at, tags, brief, notes,
                    reference_links, coordinator_email, created_at, updated_at
-               ) VALUES (?, ?, ?, 1, '', ?, ?, '', ?, ?, '', ?, ?, ?, ?, ?, ?, ?)""",
+               ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)""",
             (
-                clean_account, shortcode, clean_title, clean_brief, clean_type,
+                clean_account, shortcode, clean_title, clean_source_url, clean_source_description or clean_brief, clean_type, clean_source_image,
                 production_points, clean_priority, json.dumps(clean_tags),
                 clean_brief, clean_notes, json.dumps(clean_refs), caller, now, now,
             ),
@@ -2872,6 +3057,7 @@ def dashboard_queue_v2_create(
         _queue_v2_log(conn, request_id, caller, "created", {
             "account": clean_account, "title": clean_title, "postType": clean_type,
             "productionPoints": production_points, "priority": clean_priority,
+            "sourceUrl": clean_source_url, "sourceTitle": clean_source_title,
         })
         _queue_v2_publish(conn, "created", caller, [request_id])
         row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
