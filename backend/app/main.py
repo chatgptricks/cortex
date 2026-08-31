@@ -1945,6 +1945,27 @@ def _queue_v2_ticket(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _queue_v2_trainee_reviews(conn: Any) -> dict[int, dict[str, Any]]:
+    """Return the newest Canva review request for each Queue request."""
+    rows = conn.execute(
+        """SELECT id, request_id, status, reason, reviewer_email, review_note, reviewed_at, created_at
+           FROM queue_tickets
+           WHERE ticket_type = 'trainee_review' AND request_id IS NOT NULL
+           ORDER BY id DESC"""
+    ).fetchall()
+    reviews: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        item = dict(row)
+        request_id = int(item["request_id"])
+        if request_id not in reviews:
+            reviews[request_id] = {
+                "ticketId": int(item["id"]), "status": item["status"], "canvaLink": item.get("reason") or "",
+                "reviewerEmail": item.get("reviewer_email") or "", "reviewNote": item.get("review_note") or "",
+                "reviewedAt": item.get("reviewed_at"), "createdAt": item.get("created_at"),
+            }
+    return reviews
+
+
 def _queue_v2_ticket_rows(conn: Any, *, requester_email: str | None = None, pending_only: bool = False) -> list[dict[str, Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -2514,9 +2535,11 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         ).fetchone()["c"])
         live_state = _queue_v2_live_snapshot(conn)
         account_onboarding = _queue_v2_account_onboarding_state(conn, caller)
+        trainee_reviews = _queue_v2_trainee_reviews(conn)
     def project_with_ticket_flags(row: Any) -> dict[str, Any]:
         item = _queue_v2_project(dict(row))
         item["pendingTickets"] = pending_tickets_by_request.get(int(item["id"]), [])
+        item["traineeReview"] = trainee_reviews.get(int(item["id"]))
         return item
 
     requests = [project_with_ticket_flags(row) for row in rows]
@@ -2537,6 +2560,7 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
     live_drafts = [_queue_v2_project_draft(row) for row in draft_rows]
     for item in live_drafts:
         item["pendingTickets"] = pending_tickets_by_request.get(int(item["id"]), [])
+        item["traineeReview"] = trainee_reviews.get(int(item["id"]))
     if not (is_admin or "vc" in roles):
         requests = [item for item in requests if item["status"] != "pool"]
     scheduler_users = _queue_v2_scheduler_users() if (is_admin or "vc" in roles) else [
@@ -2685,12 +2709,17 @@ def dashboard_queue_v2_request_detail(request_id: int, request: Request) -> dict
     _queue_v2_require_visible(row, caller, is_admin, roles)
     with connect() as conn:
         draft_rows = _queue_v2_draft_rows(conn, request_ids={request_id})
+        trainee_review = _queue_v2_trainee_reviews(conn).get(request_id)
     if draft_rows and (
         is_admin or "vc" in roles or draft_rows[0]["draft_designer_email"] == caller
         or (draft_rows[0]["draft_designer_email"] == QUEUE_V2_POOL_DRAFT_DESIGNER and row.get("designer_email") == caller)
     ):
-        return {"request": _queue_v2_project_draft(draft_rows[0])}
-    return {"request": _queue_v2_project(row)}
+        item = _queue_v2_project_draft(draft_rows[0])
+        item["traineeReview"] = trainee_review
+        return {"request": item}
+    item = _queue_v2_project(row)
+    item["traineeReview"] = trainee_review
+    return {"request": item}
 
 
 @app.get("/api/dashboard/queue/v2/summary")
@@ -2719,15 +2748,10 @@ def dashboard_queue_v2_summary(request: Request) -> dict[str, Any]:
 
 @app.get("/api/dashboard/queue/v2/admin-report")
 def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
-    """Small operational snapshot for Queue admins, intentionally separate
-    from the scheduler payload so designers never receive team-wide totals."""
-    _, is_admin, _ = _queue_v2_access(request)
-    # Dev is the owner/debug role and must be able to inspect the same
-    # cross-user Overview while previewing any Queue role. Keep this check
-    # local to the report endpoint so ordinary scheduler visibility remains
-    # governed by the real operating role.
-    if not is_admin and not getattr(request.state, "is_dev", False):
-        raise HTTPException(status_code=403, detail="Admin access required.")
+    """Team-level Queue report, intentionally unavailable to PD-only users."""
+    _, is_admin, roles = _queue_v2_access(request)
+    if not is_admin and "vc" not in roles:
+        raise HTTPException(status_code=403, detail="VC or Admin access required.")
     with connect() as conn:
         rows = conn.execute("SELECT status, COUNT(*) AS count, COALESCE(SUM(production_points), 0) AS points FROM queue_requests GROUP BY status").fetchall()
         request_rows = [dict(row) for row in conn.execute("SELECT * FROM queue_requests").fetchall()]
@@ -3227,6 +3251,52 @@ def dashboard_queue_v2_request_cancellation(
     return {"ok": True, "ticket": _queue_v2_ticket(ticket_row)}
 
 
+@app.post("/api/dashboard/queue/v2/tickets/trainee-review")
+def dashboard_queue_v2_request_trainee_review(
+    request: Request,
+    request_id: Annotated[int, Form()],
+    canva_link: Annotated[str, Form()],
+) -> dict[str, Any]:
+    """Send a trainee's completed design to the VC/Admin approval inbox."""
+    caller, is_admin, roles = _queue_v2_access(request)
+    if is_admin or "trainee" not in roles:
+        raise HTTPException(status_code=403, detail="Only trainees can submit a design for review.")
+    row = _queue_v2_request(request_id)
+    if row.get("designer_email") != caller:
+        raise HTTPException(status_code=403, detail="Only the assigned trainee can submit this review.")
+    if row.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Complete the request before sending it for review.")
+    clean_link = canva_link.strip()
+    if not re.match(r"^https?://(?:www\.)?(?:canva\.com|canva\.design)/", clean_link, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="Add a valid Canva design link.")
+    now = utc_now()
+    with connect() as conn:
+        pending = conn.execute(
+            "SELECT 1 FROM queue_tickets WHERE ticket_type = 'trainee_review' AND request_id = ? AND status = 'pending'",
+            (request_id,),
+        ).fetchone()
+        if pending:
+            raise HTTPException(status_code=409, detail="This design is already waiting for review.")
+        cursor = conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, request_id, status, title, reason, created_at, updated_at)
+               VALUES ('trainee_review', ?, ?, 'pending', 'Trainee Canva review', ?, ?, ?)""",
+            (caller, request_id, clean_link, now, now),
+        )
+        ticket_id = int(cursor.lastrowid)
+        _queue_v2_log(conn, request_id, caller, "trainee_review_requested", {"canvaLink": clean_link})
+        _queue_v2_publish(conn, "ticket_created", caller, [request_id])
+        ticket_row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    _queue_v2_slack_log(
+        event_type="trainee_review_requested", task_id=request_id, ticket_id=ticket_id, actor_email=caller,
+        account=row.get("post_account"), shortcode=row.get("post_shortcode"), designer_email=caller,
+        status=row.get("status"), production_points=row.get("production_points"), priority=row.get("priority"),
+        tags=_queue_v2_json(row.get("tags"), []), reason=clean_link, brief=row.get("brief"),
+        scheduled_date=row.get("scheduled_date"), scheduled_start_minutes=row.get("scheduled_start_minutes"),
+    )
+    return {"ok": True, "ticket": _queue_v2_ticket(ticket_row)}
+
+
 @app.post("/api/dashboard/queue/v2/tickets/move")
 def dashboard_queue_v2_request_move(
     request: Request,
@@ -3515,6 +3585,13 @@ def dashboard_queue_v2_review_ticket(
             _queue_v2_log(conn, ticket["request_id"], caller, "cancellation_approved", {"reason": ticket["reason"]})
             queue_change_event = "cancellation_approved"
             affected_ids.add(int(ticket["request_id"]))
+        elif clean_action == "approve" and ticket["ticket_type"] == "trainee_review":
+            queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
+            if not queue_row or queue_row["status"] != "completed":
+                raise HTTPException(status_code=409, detail="The Queue request is no longer ready for trainee review.")
+            _queue_v2_log(conn, ticket["request_id"], caller, "trainee_review_approved", {"canvaLink": ticket.get("reason") or ""})
+            queue_change_event = "trainee_review_approved"
+            affected_ids.add(int(ticket["request_id"]))
         if ticket.get("request_id") and clean_action == "reject":
             _queue_v2_log(conn, ticket["request_id"], caller, f"{ticket['ticket_type']}_rejected", {"reviewNote": (review_note or "").strip()})
             queue_change_event = "move_rejected" if ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "move" else f"{ticket['ticket_type']}_rejected"
@@ -3737,7 +3814,7 @@ def dashboard_queue_v2_complete(request_id: int, request: Request) -> dict[str, 
 
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/close")
 def dashboard_queue_v2_close(request_id: int, request: Request, final_permalink: Annotated[str, Form()]) -> dict[str, Any]:
-    caller, is_admin, _ = _queue_v2_access(request)
+    caller, is_admin, roles = _queue_v2_access(request)
     row = _queue_v2_request(request_id)
     if not is_admin and row["designer_email"] != caller:
         raise HTTPException(status_code=403, detail="Only the assigned designer can close this request.")
@@ -3748,6 +3825,15 @@ def dashboard_queue_v2_close(request_id: int, request: Request, final_permalink:
         raise HTTPException(status_code=409, detail="Complete the request before closing it.")
     now = utc_now()
     with connect() as conn:
+        if not is_admin and "trainee" in roles:
+            review = conn.execute(
+                """SELECT status FROM queue_tickets
+                   WHERE ticket_type = 'trainee_review' AND request_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (request_id,),
+            ).fetchone()
+            if not review or review["status"] != "approved":
+                raise HTTPException(status_code=409, detail="A VC or Admin must approve the Canva design before it can be posted.")
         conn.execute("UPDATE queue_requests SET status = 'closed', final_permalink = ?, closed_at = ?, updated_at = ? WHERE id = ?", (link, now, now, request_id))
         _queue_v2_log(conn, request_id, caller, "closed", {"finalPermalink": link})
         _queue_v2_publish(conn, "request_closed", caller, [request_id])
