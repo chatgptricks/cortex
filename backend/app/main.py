@@ -237,6 +237,28 @@ ensure_directories()
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
+    followers_history: list[dict[str, Any]] = []
+    previous_followers: int | None = None
+    for snapshot in snapshots:
+        follower_count = snapshot["followers_count"]
+        followers_history.append({
+            "date": snapshot["captured_at"],
+            "followers": follower_count,
+            "followers_gained": None if previous_followers is None or follower_count is None else follower_count - previous_followers,
+            "posts_count": snapshot["posts_count"],
+            "following_count": snapshot["following_count"],
+            "full_name": snapshot["full_name"],
+            "verified": bool(snapshot["verified"]),
+            "private": bool(snapshot["private"]),
+            # That calendar day's posts (if any), for the historical-stats
+            # table's engagement-rate column -- independent of the weekly
+            # chart, which buckets by ISO week instead.
+            "avg_likes_that_day": (lambda vals: sum(vals) / len(vals) if vals else None)(_day_likes(snapshot["captured_at"])),
+            "posts_that_day": len(_day_likes(snapshot["captured_at"])),
+        })
+        if follower_count is not None:
+            previous_followers = follower_count
+
     return {
         "ok": True,
         "deployment": {
@@ -609,23 +631,7 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
         "handle": clean,
         "label": account.get("label"),
         "group": account.get("group"),
-        "followers_history": [
-            {
-                "date": s["captured_at"],
-                "followers": s["followers_count"],
-                "posts_count": s["posts_count"],
-                "following_count": s["following_count"],
-                "full_name": s["full_name"],
-                "verified": bool(s["verified"]),
-                "private": bool(s["private"]),
-                # That calendar day's posts (if any), for the historical-stats
-                # table's engagement-rate column -- independent of the weekly
-                # chart, which buckets by ISO week instead.
-                "avg_likes_that_day": (lambda vals: sum(vals) / len(vals) if vals else None)(_day_likes(s["captured_at"])),
-                "posts_that_day": len(_day_likes(s["captured_at"])),
-            }
-            for s in snapshots
-        ],
+        "followers_history": followers_history,
         "engagement_weekly": engagement_weekly,
     }
 
