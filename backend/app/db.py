@@ -294,9 +294,10 @@ def init_db() -> None:
                 ON post_assignment_events(assignment_id, created_at DESC);
 
             -- Queue V2 is a production scheduler, deliberately separate from
-            -- the earlier thumbnail board above.  A source post can have one
-            -- active production request at a time and the request retains its
-            -- own immutable work history even when the source post changes.
+            -- the earlier thumbnail board above.  A source post normally has
+            -- one active production request, while explicit Queue duplicates
+            -- use a private synthetic shortcode so several designers can be
+            -- assigned independent copies of the same source.
             CREATE TABLE IF NOT EXISTS queue_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 post_account TEXT NOT NULL,

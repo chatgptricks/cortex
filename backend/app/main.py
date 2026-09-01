@@ -4229,6 +4229,104 @@ def dashboard_queue_v2_edit(
     return {"ok": True, "request": _queue_v2_project(updated)}
 
 
+@app.post("/api/dashboard/queue/v2/requests/{request_id}/duplicate")
+def dashboard_queue_v2_duplicate(request_id: int, request: Request) -> dict[str, Any]:
+    """Create an independent Pool request from an existing Queue request.
+
+    Queue requests historically use ``(post_account, post_shortcode)`` as a
+    unique source key.  A duplicate therefore gets a private synthetic
+    shortcode while retaining the original permalink, caption, thumbnail and
+    production instructions.  This keeps the source post intact and lets
+    several designers work on separate copies without changing the existing
+    database constraint or the dashboard's source-post identity.
+    """
+    caller, is_admin, roles = _queue_v2_creator_access(request)
+    row = _queue_v2_request(request_id)
+    _queue_v2_require_visible(row, caller, is_admin, roles)
+    now = utc_now()
+    base_shortcode = str(row.get("post_shortcode") or f"request-{request_id}").strip() or f"request-{request_id}"
+    # Keep the suffix short enough for source-key consumers while making a
+    # collision vanishingly unlikely.  The retry also protects against the
+    # unlikely case of a copied row surviving a client retry.
+    duplicate_row: dict[str, Any] | None = None
+    source_attachments = _queue_v2_json(row.get("attachments"), [])
+    for _ in range(3):
+        duplicate_shortcode = f"{base_shortcode[:90]}--copy-{secrets.token_hex(4)}"
+        with connect() as conn:
+            try:
+                cursor = conn.execute(
+                    """INSERT INTO queue_requests (
+                           post_account, post_shortcode, post_title, is_custom,
+                           post_permalink, post_caption, post_type, cover_url,
+                           production_points, minutes_per_pp, priority, deadline_at,
+                           tags, brief, notes, reference_links, attachments,
+                           status, designer_email, coordinator_email,
+                           recommended_accounts, slack_channel_id, slack_message_ts,
+                           scheduled_date, scheduled_start_minutes,
+                           actual_started_at, completed_at, closed_at, final_permalink,
+                           cancellation_reason, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?,
+                                 'pool', NULL, ?, ?, NULL, NULL, NULL, NULL,
+                                 NULL, NULL, NULL, NULL, NULL, ?, ?)""",
+                    (
+                        row.get("post_account") or "", duplicate_shortcode,
+                        row.get("post_title") or "", int(bool(row.get("is_custom"))),
+                        row.get("post_permalink") or "", row.get("post_caption") or "",
+                        row.get("post_type") or "Image", row.get("cover_url") or "",
+                        max(1, int(row.get("production_points") or 1)),
+                        max(1, int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP)),
+                        "urgent" if row.get("priority") == "urgent" else "medium",
+                        json.dumps(_queue_v2_json(row.get("tags"), [])), row.get("brief") or "",
+                        row.get("notes") or "", json.dumps(_queue_v2_json(row.get("reference_links"), [])),
+                        json.dumps(source_attachments if isinstance(source_attachments, list) else []),
+                        caller, json.dumps(_queue_v2_json(row.get("recommended_accounts"), [])), now, now,
+                    ),
+                )
+                new_id = int(cursor.lastrowid)
+                _queue_v2_log(conn, new_id, caller, "duplicated", {"sourceRequestId": request_id})
+                _queue_v2_publish(conn, "request_duplicated", caller, [request_id, new_id])
+                duplicate_row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (new_id,)).fetchone())
+            except Exception as exc:
+                # A duplicate shortcode collision is safe to retry. Other
+                # database errors should be surfaced instead of pretending
+                # the copy was created.
+                if "unique" not in str(exc).lower() and "duplicate" not in str(exc).lower():
+                    raise
+        if duplicate_row:
+            break
+    if not duplicate_row:
+        raise HTTPException(status_code=409, detail="Could not create a duplicate request. Try again.")
+
+    # Attachments are stored outside SQLite under the request id. Copy the
+    # files as well as their metadata so every duplicate remains downloadable
+    # independently; a missing source file is harmless and simply leaves that
+    # attachment unavailable, matching normal Queue behavior.
+    if isinstance(source_attachments, list) and source_attachments:
+        source_dir = DATA_DIR / "queue_attachments" / str(request_id)
+        target_dir = DATA_DIR / "queue_attachments" / str(duplicate_row["id"])
+        for attachment in source_attachments:
+            attachment_id = str(attachment.get("id") or "").strip()
+            if not attachment_id or not re.fullmatch(r"[0-9a-f]{16}", attachment_id):
+                continue
+            matches = list(source_dir.glob(f"{attachment_id}.*")) + ([source_dir / attachment_id] if (source_dir / attachment_id).exists() else [])
+            if not matches:
+                continue
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for source_file in matches:
+                if source_file.is_file():
+                    shutil.copy2(source_file, target_dir / source_file.name)
+
+    _queue_v2_slack_log(
+        event_type="duplicated", task_id=int(duplicate_row["id"]), actor_email=caller,
+        account=duplicate_row.get("post_account"), shortcode=duplicate_row.get("post_shortcode"),
+        status="pool", production_points=duplicate_row.get("production_points"),
+        priority=duplicate_row.get("priority"), tags=_queue_v2_json(duplicate_row.get("tags"), []),
+        reason=f"Copy of Queue request #{request_id}", brief=duplicate_row.get("brief"),
+        post_title=duplicate_row.get("post_title"),
+    )
+    return {"ok": True, "request": _queue_v2_project(duplicate_row), "sourceRequestId": request_id}
+
+
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/attachments")
 def dashboard_queue_v2_add_attachment(request_id: int, request: Request, file: Annotated[UploadFile, File()]) -> dict[str, Any]:
     caller, is_admin, roles = _queue_v2_access(request)
