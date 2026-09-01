@@ -69,7 +69,7 @@ def test_vc_can_create_custom_queue_post(monkeypatch, tmp_path):
     assert created["post"]["title"] == "Launch carousel"
     assert created["post"]["account"] == "chatgptricks"
     assert created["productionPoints"] == 5
-    assert created["priority"] == "high"
+    assert created["priority"] == "normal"
     assert created["status"] == "pool"
     assert created["references"] == ["https://example.com/brief"]
     assert created["post"]["shortcode"].startswith("manual-")
