@@ -3460,6 +3460,7 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
             adjustments.append({"id": item["id"], "designerEmail": item["designer"], "scheduledDate": final_date, "scheduledStartMinutes": final_start})
             notifications.append({"task_id": item["id"], "assignee_email": item["designer"], "assigned_by_email": caller,
                                   "account": row["post_account"], "post_id": _queue_post_id(row["post_account"], row["post_shortcode"]),
+                                  "cover_url": row.get("cover_url") or "",
                                   "note": row["brief"], "notes": row["notes"], "references": _queue_v2_json(row["reference_links"], []),
                                   "priority": row["priority"], "tags": _queue_v2_json(row["tags"], []),
                                   "recommended_accounts": item["accounts"], "production_points": item["productionPoints"],
@@ -4454,6 +4455,7 @@ def dashboard_queue_v2_notify(request_id: int, request: Request) -> dict[str, An
         assignee_slack_id=(recipient["slack_user_id"] if recipient else "") or slack_user_id_for_email(row["designer_email"]),
         assigned_by_slack_id=(assigner["slack_user_id"] if assigner else "") or slack_user_id_for_email(caller),
         account=row["post_account"], post_id=_queue_post_id(row["post_account"], row["post_shortcode"]),
+        cover_url=row.get("cover_url") or "",
         note=row["brief"], notes=row["notes"], references=_queue_v2_json(row["reference_links"], []),
         priority=row["priority"], tags=_queue_v2_json(row["tags"], []),
         recommended_accounts=_queue_v2_json(row["recommended_accounts"], []), production_points=row["production_points"],

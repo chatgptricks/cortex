@@ -15,9 +15,7 @@ import threading
 import time
 import base64
 import json
-from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -324,6 +322,27 @@ def cover_url_for(account: str, post_id: int) -> str:
     return f"{_PUBLIC_API}/api/dashboard/covers/{account}/{post_id}"
 
 
+def _public_media_url(value: str | None) -> str:
+    """Turn a stored Queue media path into a URL Slack can fetch.
+
+    Queue stores dashboard covers as same-origin API paths. Slack cannot
+    resolve a relative path from a Block Kit image, so normalize those paths
+    to the public API host while leaving already-public CDN URLs untouched.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("https://"):
+        return raw
+    if raw.startswith("http://"):
+        # Slack requires an absolute URL; prefer the TLS equivalent when a
+        # legacy source happened to be saved with http://.
+        return f"https://{raw[7:]}"
+    if raw.startswith("/"):
+        return f"{_PUBLIC_API}{raw}"
+    return ""
+
+
 def build_queue_assignment_message(
     *,
     task_id: int,
@@ -345,88 +364,31 @@ def build_queue_assignment_message(
     scheduled_start_minutes: int | None = None,
     update: bool = False,
     assigned_by_slack_id: str | None = None,
+    cover_url: str | None = None,
 ) -> dict[str, Any]:
-    """A concise private assignment message with only actionable metadata."""
+    """Build the compact private DM sent for a Queue assignment.
+
+    The Queue side view is the source of truth for the brief, PP scope,
+    schedule, files, and history. Slack only needs to tell the designer who
+    assigned the work, which account it is for, show the thumbnail, and offer
+    one deep link back to Queue.
+    """
     assigner_id = (assigned_by_slack_id or "").strip() or _SLACK_USERS_BY_EMAIL.get(assigned_by_email.strip().lower())
     assigner = f"<@{assigner_id}>" if assigner_id else assigned_by_email.split("@", 1)[0]
     account_values = recommended_accounts if recommended_accounts is not None else ([recommended_account] if recommended_account else [])
-    destinations = [str(account).lstrip("@") for account in account_values if str(account).strip()]
-    destination = ", ".join(f"@{account}" for account in destinations)
-    metadata: list[str] = []
-    if due_date:
-        try:
-            due = datetime.fromisoformat(due_date.replace("Z", "+00:00")).astimezone(ZoneInfo("America/Costa_Rica")).strftime("%b %-d, %Y · %-I:%M %p")
-        except ValueError:
-            due = due_date
-        metadata.append(f"*Deadline*\n{due}")
-    if priority:
-        metadata.append(f"*Priority*\n{priority.replace('_', ' ').title()}")
-    if tags:
-        metadata.append(f"*Tags*\n{', '.join(f'`{tag}`' for tag in tags)}")
-    if production_points:
-        pp_minutes = max(1, int(minutes_per_pp or 10))
-        metadata.append(f"*Production*\n{production_points} PP · {production_points * pp_minutes} min")
-    if scheduled_date is not None and scheduled_start_minutes is not None:
-        hours, minutes = divmod(int(scheduled_start_minutes), 60)
-        scheduled = f"{scheduled_date} · {hours % 12 or 12}:{minutes:02d} {'AM' if hours < 12 else 'PM'}"
-        metadata.append(f"*Scheduled*\n{scheduled}")
-
-    # Follow-up notifications are intentionally compact. The first DM is the
-    # canonical card (with media and all context); subsequent schedule changes
-    # should read as a lightweight audit entry and, when possible, live in that
-    # original message's thread.
-    if update:
-        blocks: list[dict[str, Any]] = [
-            {"type": "header", "text": {"type": "plain_text", "text": "Queue update", "emoji": True}},
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"{assigner} updated this post{' for *' + destination + '*' if destination else ''}.",
-                },
-            },
-        ]
-        if metadata:
-            blocks.append({"type": "section", "fields": [{"type": "mrkdwn", "text": value} for value in metadata]})
-        blocks.append(
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "style": "primary",
-                        "text": {"type": "plain_text", "text": "Open in Queue", "emoji": True},
-                        "url": queue_url_for(task_id),
-                    }
-                ],
-            }
-        )
-        return {"text": f"{assigner} updated your Queue assignment{f' for {destination}' if destination else ''}.", "blocks": blocks}
-
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": "New Queue assignment", "emoji": True}},
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"{assigner} assigned this post{' for *' + destination + '*' if destination else ''}.",
-            },
-        },
-    ]
-    if note:
-        brief = note.strip()[:1800].replace("\n", "\n> ")
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Brief*\n> {brief}"}})
-    if notes:
-        extra = notes.strip()[:1600].replace("\n", "\n> ")
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Notes*\n> {extra}"}})
-    if references:
-        clean_references = [str(value).strip() for value in references if str(value).strip()][:8]
-        if clean_references:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*References*\n" + "\n".join(f"• <{value}|Open reference>" for value in clean_references)}})
-    if metadata:
-        blocks.append({"type": "section", "fields": [{"type": "mrkdwn", "text": value} for value in metadata]})
-    if post_id is not None:
-        blocks.append({"type": "image", "image_url": cover_url_for(account, post_id), "alt_text": f"Post from @{account}"})
+    destinations = [str(value).strip().lstrip("@") for value in account_values if str(value).strip()]
+    # Manual posts can be created without a publishing account. For source
+    # posts, the source account is still a useful fallback when no recommended
+    # destination was selected at scheduling time.
+    if not destinations and str(account or "").strip():
+        destinations = [str(account).strip().lstrip("@").lower()]
+    destination = ", ".join(f"@{value}" for value in destinations) or "the selected account"
+    verb = "updated this post" if update else "assigned you this post"
+    sentence = f"{assigner} {verb} for {destination}."
+    blocks: list[dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": sentence}}]
+    thumbnail = _public_media_url(cover_url) or (cover_url_for(account, post_id) if post_id is not None and str(account or "").strip() else "")
+    if thumbnail:
+        blocks.append({"type": "image", "image_url": thumbnail, "alt_text": f"Post thumbnail for {destination}"})
     blocks.append(
         {
             "type": "actions",
@@ -440,7 +402,7 @@ def build_queue_assignment_message(
             ],
         }
     )
-    return {"text": f"{assigner} assigned you a post{f' for {destination}' if destination else ''}.", "blocks": blocks}
+    return {"text": sentence, "blocks": blocks}
 
 
 def notify_queue_assignment_result(**assignment: Any) -> dict[str, Any]:
