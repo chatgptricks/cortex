@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import sqlite3
 import logging
 import os
 import re
@@ -62,6 +63,7 @@ from .db import (
     remove_dashboard_user,
     seed_dashboard_users_from_env,
     seed_queue_role_roster,
+    set_dashboard_user_time_zone,
     upsert_dashboard_user,
     utc_now,
     upsert_account_list,
@@ -172,10 +174,19 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         return JSONResponse(
             {"detail": "This Google account is not authorized for Sentient Dash."}, status_code=403
         )
+    client_time_zone = request.headers.get("x-sentient-time-zone", "").strip()
+    if client_time_zone in {"America/Costa_Rica", "America/Bogota"} and client_time_zone != access.get("time_zone"):
+        # The browser is the most reliable source for a person's real clock.
+        # Persist it so coordinators see Colombia's one-hour offset in the
+        # shared scheduler on their next refresh as well.
+        set_dashboard_user_time_zone(email, client_time_zone)
+        access["time_zone"] = client_time_zone
     is_admin = bool(access["is_admin"])
     base_is_admin = is_admin
     request.state.user_email = email
     request.state.is_admin = is_admin
+    request.state.time_zone = access.get("time_zone") or "America/Costa_Rica"
+    request.state.can_self_assign = bool(access.get("can_self_assign"))
     request.state.operating_role = access["operating_role"]
     try:
         request.state.operating_roles = json.loads(access.get("operating_roles") or "[]")
@@ -1798,6 +1809,18 @@ def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[st
     return email, is_admin, roles
 
 
+def _queue_v2_creator_access(request: Request) -> tuple[str, bool, list[str]]:
+    """Permit VC/Admin creation plus explicitly trusted self-assigning PDs."""
+    caller, is_admin, roles = _queue_v2_access(request)
+    if is_admin or "vc" in roles:
+        return caller, is_admin, roles
+    with connect() as conn:
+        row = conn.execute("SELECT can_self_assign FROM dashboard_users WHERE email = ?", (caller,)).fetchone()
+    if not row or not bool(row["can_self_assign"]):
+        raise HTTPException(status_code=403, detail="VC/Admin or self-assign access required.")
+    return caller, is_admin, roles
+
+
 def _queue_v2_json(value: Any, fallback: Any) -> Any:
     try:
         parsed = json.loads(value or "")
@@ -1831,6 +1854,24 @@ def _queue_v2_user_roles(user: dict[str, Any] | Any) -> list[str]:
     if "pd" not in normalized:
         normalized.append("pd")
     return normalized
+
+
+def _queue_v2_time_zone(user: dict[str, Any] | Any) -> str:
+    value = str(user.get("time_zone") or user.get("timeZone") or "").strip()
+    return value if value in {"America/Costa_Rica", "America/Bogota"} else "America/Costa_Rica"
+
+
+def _queue_v2_scheduler_preferences(conn: Any, viewer_email: str) -> dict[str, list[str]]:
+    row = conn.execute(
+        "SELECT hidden_users, row_order FROM queue_scheduler_preferences WHERE viewer_email = ?",
+        (viewer_email,),
+    ).fetchone()
+    if not row:
+        return {"hiddenUsers": [], "rowOrder": []}
+    def parse(value: Any) -> list[str]:
+        parsed = _queue_v2_json(value, [])
+        return list(dict.fromkeys(str(item).strip().lower() for item in parsed if str(item).strip())) if isinstance(parsed, list) else []
+    return {"hiddenUsers": parse(row["hidden_users"]), "rowOrder": parse(row["row_order"])}
 
 
 def _queue_v2_minutes_per_pp_for_roles(roles: list[str] | tuple[str, ...] | set[str] | None) -> int:
@@ -2432,6 +2473,8 @@ def _queue_v2_designers() -> list[dict[str, Any]]:
         "isAdmin": bool(user.get("is_admin")),
         "roles": _queue_v2_user_roles(user),
         "minutesPerPP": _queue_v2_minutes_per_pp_for_roles(_queue_v2_user_roles(user)),
+        "timeZone": _queue_v2_time_zone(user),
+        "canSelfAssign": bool(user.get("can_self_assign")),
         "accounts": by_designer.get(user["email"], []),
     } for user in users]
 
@@ -2470,6 +2513,8 @@ def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
             "isAdmin": bool(user.get("is_admin")),
             "roles": roles,
             "minutesPerPP": minutes_per_pp,
+            "timeZone": _queue_v2_time_zone(user),
+            "canSelfAssign": bool(user.get("can_self_assign")),
             "isQueueDesigner": "pd" in roles,
             # Return a same-origin proxy URL rather than Slack's CDN URL.
             # Slack image links can be signed/referrer-sensitive and fail in
@@ -2558,13 +2603,24 @@ def _queue_v2_prepare_schedule_changes(
             datetime.strptime(date, "%Y-%m-%d").date()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
-        designer_row = conn.execute(
-            "SELECT operating_role, operating_roles, slack_user_id FROM dashboard_users WHERE email = ?",
-            (designer,),
-        ).fetchone()
+        try:
+            designer_row = conn.execute(
+                "SELECT operating_role, operating_roles, slack_user_id, time_zone FROM dashboard_users WHERE email = ?",
+                (designer,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            designer_row = conn.execute(
+                "SELECT operating_role, operating_roles, slack_user_id FROM dashboard_users WHERE email = ?",
+                (designer,),
+            ).fetchone()
         designer_roles = _queue_v2_user_roles(dict(designer_row)) if designer_row else []
         if not designer_row or "pd" not in designer_roles:
             raise HTTPException(status_code=400, detail="Choose a Queue designer.")
+        designer_now = datetime.now(ZoneInfo(_queue_v2_time_zone(dict(designer_row))))
+        designer_today = designer_now.date().isoformat()
+        first_available_minute = min(SCHEDULER_END, ((designer_now.hour * 60 + designer_now.minute + 9) // 10) * 10)
+        if date < designer_today or (date == designer_today and start < first_available_minute):
+            raise HTTPException(status_code=409, detail="Queue work cannot be scheduled before that designer's current time.")
         minutes_per_pp = _queue_v2_minutes_per_pp_for_roles(designer_roles)
         allowed = {item["account_handle"] for item in conn.execute(
             "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ?", (designer,),
@@ -2763,6 +2819,7 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         ).fetchone()["c"])
         live_state = _queue_v2_live_snapshot(conn)
         account_onboarding = _queue_v2_account_onboarding_state(conn, caller)
+        scheduler_preferences = _queue_v2_scheduler_preferences(conn, caller)
         trainee_reviews = _queue_v2_trainee_reviews(conn)
     def project_with_ticket_flags(row: Any) -> dict[str, Any]:
         item = _queue_v2_project(dict(row))
@@ -2776,6 +2833,10 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
     # separate so the existing pool visibility rules and coordinator UI remain
     # unchanged.
     pick_requests = [project_with_ticket_flags(row) for row in pool_rows]
+    self_pool_requests = [
+        project_with_ticket_flags(row) for row in pool_rows
+        if str(row["coordinator_email"] or "").strip().lower() == caller
+    ]
     # During the test period, Pick may surface every currently-HOT source post
     # rather than only the rows auto-materialized after the last Queue reset.
     # Existing pool requests keep their real identity; an unqueued HOT post is
@@ -2817,14 +2878,18 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
             "canRoleSwitch": bool(getattr(request.state, "can_role_switch", False)),
             "availableOperatingRoles": list(getattr(request.state, "available_operating_roles", roles)),
             "minutesPerPP": _queue_v2_minutes_per_pp_for_roles(roles),
+            "timeZone": getattr(request.state, "time_zone", "America/Costa_Rica"),
+            "canSelfAssign": bool(getattr(request.state, "can_self_assign", False)),
         },
         "date": selected_date, "requests": requests, "planningRequests": planning_requests,
         "pickRequests": pick_requests,
+        "selfPoolRequests": self_pool_requests,
         "hotPickRequests": hot_pick_requests,
         "assignedRequests": assigned_requests, "liveDrafts": live_drafts, "liveRevision": live_state["revision"],
         "timeBlocks": [_queue_v2_ticket(dict(row)) for row in time_block_rows], "pendingTicketCount": pending_ticket_count,
         "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
         "schedulerUsers": scheduler_users,
+        "schedulerPreferences": scheduler_preferences,
         "accounts": sentient_accounts,
         "accountOnboarding": account_onboarding,
         "tags": QUEUE_V2_TAGS, "priorities": QUEUE_V2_PRIORITIES,
@@ -2867,6 +2932,38 @@ def dashboard_queue_v2_save_account_onboarding(
         )
         _queue_v2_publish(conn, "designer_accounts_updated", caller)
     return {"ok": True, "accountOnboarding": {"completed": True, "selectedAccounts": selected}}
+
+
+@app.post("/api/dashboard/queue/v2/scheduler-preferences")
+def dashboard_queue_v2_save_scheduler_preferences(
+    request: Request,
+    hidden_users: Annotated[str | None, Form()] = None,
+    row_order: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Save a coordinator's personal team-scheduler layout."""
+    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    try:
+        hidden = json.loads(hidden_users or "[]")
+        order = json.loads(row_order or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Scheduler preferences must be valid JSON.") from exc
+    if not isinstance(hidden, list) or not isinstance(order, list):
+        raise HTTPException(status_code=400, detail="Scheduler preferences must be lists.")
+    allowed = {item["email"] for item in list_dashboard_users()}
+    clean_hidden = [str(item).strip().lower() for item in hidden if str(item).strip().lower() in allowed]
+    clean_order = [str(item).strip().lower() for item in order if str(item).strip().lower() in allowed]
+    clean_hidden = list(dict.fromkeys(clean_hidden))
+    clean_order = list(dict.fromkeys(clean_order))
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO queue_scheduler_preferences (viewer_email, hidden_users, row_order, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(viewer_email) DO UPDATE SET hidden_users = excluded.hidden_users,
+                   row_order = excluded.row_order, updated_at = excluded.updated_at""",
+            (caller, json.dumps(clean_hidden), json.dumps(clean_order), utc_now()),
+        )
+        _queue_v2_publish(conn, "scheduler_preferences_updated", caller)
+    return {"ok": True, "schedulerPreferences": {"hiddenUsers": clean_hidden, "rowOrder": clean_order}}
 
 
 @app.post("/api/dashboard/queue/v2/pick")
@@ -3087,7 +3184,7 @@ def dashboard_queue_v2_source_preview(
     source_url: Annotated[str, Form()],
 ) -> dict[str, Any]:
     """Return the public title, description and thumbnail for a Queue source."""
-    _queue_v2_access(request, coordinator=True)
+    _queue_v2_creator_access(request)
     return {"ok": True, "preview": _queue_v2_fetch_source_preview(source_url)}
 
 
@@ -3115,7 +3212,7 @@ def dashboard_queue_v2_create(
     deep links, and live updates while keeping it out of the Instagram post
     tables entirely.
     """
-    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    caller, _, _ = _queue_v2_creator_access(request)
     # A manually-created request has no publishing account yet. The VC picks
     # the designer's recommended account when scheduling it, just like any
     # other pooled request. Validate an account only when one was supplied.
@@ -3217,11 +3314,14 @@ def dashboard_queue_v2_pool(
 
 @app.post("/api/dashboard/queue/v2/drafts")
 def dashboard_queue_v2_drafts(request: Request, changes: Annotated[str, Form()]) -> dict[str, Any]:
-    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    caller, is_admin, roles = _queue_v2_creator_access(request)
+    coordinator = is_admin or "vc" in roles
     entries = _queue_v2_json(changes, [])
     now = utc_now()
     with connect() as conn:
         prepared = _queue_v2_prepare_schedule_changes(conn, entries, ignore_draft_coordinator=caller)
+        if not coordinator and any(item["row"].get("coordinator_email") != caller or (item["designer"] not in {None, caller}) for item in prepared):
+            raise HTTPException(status_code=403, detail="Self-assignment can only plan your own Pool requests.")
         incoming_ids = {item["id"] for item in prepared}
         previous_ids = {int(row["request_id"]) for row in conn.execute(
             "SELECT request_id FROM queue_schedule_drafts WHERE coordinator_email = ?", (caller,),
@@ -3261,7 +3361,7 @@ def dashboard_queue_v2_drafts(request: Request, changes: Annotated[str, Form()])
 def dashboard_queue_v2_clear_drafts(
     request: Request, request_ids: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
-    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    caller, _, _ = _queue_v2_creator_access(request)
     parsed = _queue_v2_json(request_ids, []) if request_ids else []
     clean_ids = {int(value) for value in parsed if str(value).isdigit()} if isinstance(parsed, list) else set()
     with connect() as conn:
@@ -3286,7 +3386,8 @@ def dashboard_queue_v2_clear_drafts(
 
 @app.post("/api/dashboard/queue/v2/submit")
 def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()]) -> dict[str, Any]:
-    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    caller, is_admin, roles = _queue_v2_creator_access(request)
+    coordinator = is_admin or "vc" in roles
     entries = _queue_v2_json(changes, [])
     if not isinstance(entries, list) or not entries:
         raise HTTPException(status_code=400, detail="Add at least one schedule change before submitting.")
@@ -3297,6 +3398,8 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
     now = utc_now()
     with connect() as conn:
         prepared = _queue_v2_prepare_schedule_changes(conn, entries)
+        if not coordinator and any(item["row"].get("coordinator_email") != caller or (item["designer"] not in {None, caller}) for item in prepared):
+            raise HTTPException(status_code=403, detail="Self-assignment can only submit your own Pool requests.")
         assigner_row = conn.execute("SELECT slack_user_id FROM dashboard_users WHERE email = ?", (caller,)).fetchone()
         assigner_slack_id = assigner_row["slack_user_id"] if assigner_row else ""
         for item in prepared:
@@ -3392,8 +3495,13 @@ def dashboard_queue_v2_create_time_block(
     duration_minutes: Annotated[int, Form()],
     title: Annotated[str | None, Form()] = None,
     note: Annotated[str | None, Form()] = None,
+    designer_email: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
-    caller, _, _ = _queue_v2_access(request)
+    caller, is_admin, roles = _queue_v2_access(request)
+    coordinator = is_admin or "vc" in roles
+    target_designer = str(designer_email or caller).strip().lower()
+    if target_designer != caller and not coordinator:
+        raise HTTPException(status_code=403, detail="Only VCs and admins can add time for another user.")
     clean_category = category.strip().lower()
     if clean_category not in QUEUE_V2_TIME_CATEGORIES:
         raise HTTPException(status_code=400, detail="Choose meeting, break, promo, focus, or other.")
@@ -3410,18 +3518,79 @@ def dashboard_queue_v2_create_time_block(
     clean_note = (note or "").strip()[:500]
     now = utc_now()
     with connect() as conn:
-        _queue_v2_assert_time_available(conn, caller, scheduled_date, start, duration)
+        try:
+            user = conn.execute("SELECT email FROM dashboard_users WHERE email = ?", (target_designer,)).fetchone()
+        except sqlite3.OperationalError:
+            # Lightweight legacy stores used only by Queue tests did not have
+            # the access roster. Production always has it through init_db().
+            user = True
+        if not user:
+            raise HTTPException(status_code=400, detail="Choose a valid Queue user.")
+        _queue_v2_assert_time_available(conn, target_designer, scheduled_date, start, duration)
+        status = "approved" if coordinator else "pending"
         cursor = conn.execute(
             """INSERT INTO queue_tickets
                (ticket_type, requester_email, status, block_category, title, scheduled_date,
                 scheduled_start_minutes, duration_minutes, reason, created_at, updated_at)
-               VALUES ('time_block', ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (caller, clean_category, clean_title, scheduled_date, start, duration, clean_note, now, now),
+               VALUES ('time_block', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (target_designer, status, clean_category, clean_title, scheduled_date, start, duration, clean_note, now, now),
         )
         ticket_id = int(cursor.lastrowid)
-        _queue_v2_publish(conn, "ticket_created", caller)
+        _queue_v2_publish(conn, "time_block_created", caller)
         row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
     return {"ok": True, "ticket": _queue_v2_ticket(row)}
+
+
+@app.post("/api/dashboard/queue/v2/tickets/time-block/{ticket_id}")
+def dashboard_queue_v2_update_time_block(
+    ticket_id: int,
+    request: Request,
+    category: Annotated[str | None, Form()] = None,
+    scheduled_date: Annotated[str | None, Form()] = None,
+    scheduled_start_minutes: Annotated[int | None, Form()] = None,
+    duration_minutes: Annotated[int | None, Form()] = None,
+    title: Annotated[str | None, Form()] = None,
+    note: Annotated[str | None, Form()] = None,
+    delete: Annotated[bool, Form()] = False,
+) -> dict[str, Any]:
+    """Edit or remove a personal-time block from the contextual scheduler UI."""
+    caller, is_admin, roles = _queue_v2_access(request)
+    coordinator = is_admin or "vc" in roles
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone()
+        if not row or row["ticket_type"] != "time_block" or row["block_category"] in {"move", "account_request"}:
+            raise HTTPException(status_code=404, detail="Personal time block not found.")
+        block = dict(row)
+        if not coordinator and (block["requester_email"] != caller or block["status"] != "pending"):
+            raise HTTPException(status_code=403, detail="Only a VC/Admin can edit this time block.")
+        if delete:
+            conn.execute("DELETE FROM queue_tickets WHERE id = ?", (ticket_id,))
+            _queue_v2_publish(conn, "time_block_deleted", caller)
+            return {"ok": True, "deleted": ticket_id}
+        clean_category = str(category or block["block_category"] or "other").strip().lower()
+        if clean_category not in QUEUE_V2_TIME_CATEGORIES:
+            raise HTTPException(status_code=400, detail="Choose meeting, break, promo, focus, or other.")
+        clean_date = str(scheduled_date or block["scheduled_date"] or "")
+        try:
+            datetime.strptime(clean_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
+        start = int(scheduled_start_minutes if scheduled_start_minutes is not None else block["scheduled_start_minutes"])
+        duration = int(duration_minutes if duration_minutes is not None else block["duration_minutes"])
+        if start % 10 or start < SCHEDULER_START or start >= SCHEDULER_END or duration < 10 or duration % 10 or start + duration > SCHEDULER_END:
+            raise HTTPException(status_code=400, detail="Time blocks must use valid 10-minute slots within one day.")
+        _queue_v2_assert_time_available(conn, block["requester_email"], clean_date, start, duration, exclude_ticket_id=ticket_id)
+        next_title = (title if title is not None else block["title"] or "").strip()[:80] or clean_category.replace("_", " ").title()
+        next_note = (note if note is not None else block["reason"] or "").strip()[:500]
+        next_status = "approved" if coordinator else block["status"]
+        conn.execute(
+            """UPDATE queue_tickets SET status = ?, block_category = ?, title = ?, scheduled_date = ?,
+                   scheduled_start_minutes = ?, duration_minutes = ?, reason = ?, updated_at = ? WHERE id = ?""",
+            (next_status, clean_category, next_title, clean_date, start, duration, next_note, utc_now(), ticket_id),
+        )
+        _queue_v2_publish(conn, "time_block_updated", caller)
+        updated = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    return {"ok": True, "ticket": _queue_v2_ticket(updated)}
 
 
 @app.post("/api/dashboard/queue/v2/tickets/account-access")
@@ -4681,6 +4850,8 @@ def admin_upsert_user(
     is_admin: Annotated[bool | None, Form()] = None,
     slack_user_id: Annotated[str | None, Form()] = None,
     display_name: Annotated[str | None, Form()] = None,
+    time_zone: Annotated[str | None, Form()] = None,
+    can_self_assign: Annotated[bool | None, Form()] = None,
 ) -> dict[str, Any]:
     """Add a new allowed email, or change an existing one's role. Admins can
     add other admins or plain viewers; there's no further gate here because
@@ -4698,7 +4869,13 @@ def admin_upsert_user(
     clean_display_name = None if display_name is None else display_name.strip()
     if clean_display_name is not None and not clean_display_name:
         raise HTTPException(status_code=400, detail="Display name cannot be blank.")
-    upsert_dashboard_user(clean_email, role, operating_role, is_admin, clean_slack_id, clean_display_name)
+    clean_time_zone = None if time_zone is None else time_zone.strip()
+    if clean_time_zone is not None and clean_time_zone not in {"", "America/Costa_Rica", "America/Bogota"}:
+        raise HTTPException(status_code=400, detail="Time zone must be Costa Rica or Colombia.")
+    upsert_dashboard_user(
+        clean_email, role, operating_role, is_admin, clean_slack_id, clean_display_name,
+        clean_time_zone, can_self_assign,
+    )
     with connect() as conn:
         _queue_v2_publish(conn, "roster_updated", _caller_email(request))
     return {"ok": True, "users": list_dashboard_users()}

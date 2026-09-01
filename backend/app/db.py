@@ -473,6 +473,23 @@ def init_db() -> None:
         _ensure_column(conn, "dashboard_users", "is_admin", "is_admin INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "dashboard_users", "slack_user_id", "slack_user_id TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "dashboard_users", "display_name", "display_name TEXT NOT NULL DEFAULT ''")
+        # A Queue schedule is rendered against the assignee's local clock.
+        # Keep the canonical Olson name on the user instead of inferring it
+        # from a browser or an email address; Colombia and Costa Rica share
+        # Spanish but differ by one hour year-round.
+        _ensure_column(conn, "dashboard_users", "time_zone", "time_zone TEXT NOT NULL DEFAULT ''")
+        # Advanced PDs can curate their own work without gaining VC/Admin
+        # coordination powers. This is intentionally an explicit capability,
+        # not another operating role.
+        _ensure_column(conn, "dashboard_users", "can_self_assign", "can_self_assign INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS queue_scheduler_preferences (
+                   viewer_email TEXT PRIMARY KEY,
+                   hidden_users TEXT NOT NULL DEFAULT '[]',
+                   row_order TEXT NOT NULL DEFAULT '[]',
+                   updated_at TEXT NOT NULL
+               )"""
+        )
         _ensure_column(conn, "queue_requests", "priority", "priority TEXT NOT NULL DEFAULT 'medium'")
         _ensure_column(conn, "queue_requests", "post_title", "post_title TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "queue_requests", "is_custom", "is_custom INTEGER NOT NULL DEFAULT 0")
@@ -707,7 +724,8 @@ def _default_dashboard_display_name(email: str) -> str:
 def list_dashboard_users() -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
-            """SELECT email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at
+            """SELECT email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id,
+                      time_zone, can_self_assign, created_at, updated_at
                FROM dashboard_users
                ORDER BY is_admin DESC, operating_role ASC, email ASC"""
         ).fetchall()
@@ -725,7 +743,7 @@ def get_dashboard_user_role(email: str) -> str | None:
 def get_dashboard_user_access(email: str) -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute(
-            "SELECT email, operating_role, operating_roles, is_admin, role FROM dashboard_users WHERE email = ?",
+            "SELECT email, operating_role, operating_roles, is_admin, role, time_zone, can_self_assign FROM dashboard_users WHERE email = ?",
             (email.strip().lower(),),
         ).fetchone()
         if not row:
@@ -738,6 +756,17 @@ def get_dashboard_user_access(email: str) -> dict[str, Any] | None:
         return value
 
 
+def set_dashboard_user_time_zone(email: str, time_zone: str) -> None:
+    """Persist the recognized Queue clock without touching roles or access."""
+    if time_zone not in {"America/Costa_Rica", "America/Bogota"}:
+        return
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dashboard_users SET time_zone = ?, updated_at = ? WHERE email = ?",
+            (time_zone, utc_now(), email.strip().lower()),
+        )
+
+
 def count_dashboard_admins() -> int:
     with connect() as conn:
         row = conn.execute("SELECT COUNT(*) AS c FROM dashboard_users WHERE is_admin = 1 OR role = 'admin'").fetchone()
@@ -747,7 +776,8 @@ def count_dashboard_admins() -> int:
 def upsert_dashboard_user(
     email: str, role: str = "viewer", operating_role: str | None = None,
     is_admin: bool | None = None, slack_user_id: str | None = None,
-    display_name: str | None = None,
+    display_name: str | None = None, time_zone: str | None = None,
+    can_self_assign: bool | None = None,
 ) -> None:
     if role not in ("admin", "viewer"):
         raise ValueError(f"Invalid legacy role: {role!r}")
@@ -756,11 +786,23 @@ def upsert_dashboard_user(
     email = email.strip().lower()
     operating_role = operating_role or "sales"
     admin_value = bool(role == "admin") if is_admin is None else bool(is_admin)
+    if time_zone is not None and time_zone not in {"", "America/Costa_Rica", "America/Bogota"}:
+        raise ValueError(f"Invalid time zone: {time_zone!r}")
     legacy_role = "admin" if admin_value else "viewer"
     now = utc_now()
     with connect() as conn:
+        # Unit-test and legacy database fixtures can bypass init_db(). Keep
+        # this write path forward-compatible when those small databases do.
+        try:
+            conn.execute("ALTER TABLE dashboard_users ADD COLUMN time_zone TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE dashboard_users ADD COLUMN can_self_assign INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         existing = conn.execute(
-            "SELECT operating_role, operating_roles FROM dashboard_users WHERE email = ?",
+            "SELECT operating_role, operating_roles, time_zone, can_self_assign FROM dashboard_users WHERE email = ?",
             (email,),
         ).fetchone()
         existing_roles: list[str] = []
@@ -789,20 +831,22 @@ def upsert_dashboard_user(
             operating_roles = list(dict.fromkeys([operating_role, "pd"]))
         conn.execute(
             """
-            INSERT INTO dashboard_users (email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO dashboard_users (email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id, time_zone, can_self_assign, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(email) DO UPDATE SET
                 display_name = CASE WHEN ? IS NULL THEN dashboard_users.display_name ELSE excluded.display_name END,
                 role = excluded.role, operating_role = excluded.operating_role,
                 operating_roles = excluded.operating_roles,
                 is_admin = excluded.is_admin,
                 slack_user_id = CASE WHEN ? IS NULL THEN dashboard_users.slack_user_id ELSE excluded.slack_user_id END,
+                time_zone = CASE WHEN ? IS NULL THEN dashboard_users.time_zone ELSE excluded.time_zone END,
+                can_self_assign = CASE WHEN ? IS NULL THEN dashboard_users.can_self_assign ELSE excluded.can_self_assign END,
                 updated_at = excluded.updated_at
             """,
             (
                 email, (display_name or "").strip(), legacy_role, operating_role,
-                json.dumps(operating_roles), int(admin_value), (slack_user_id or "").strip(), now, now,
-                display_name, slack_user_id,
+                json.dumps(operating_roles), int(admin_value), (slack_user_id or "").strip(), (time_zone or "").strip(), int(bool(can_self_assign)), now, now,
+                display_name, slack_user_id, time_zone, can_self_assign,
             ),
         )
 
