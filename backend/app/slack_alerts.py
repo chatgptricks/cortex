@@ -13,9 +13,10 @@ import logging
 import os
 import threading
 import time
+import base64
+import json
 from datetime import datetime
 from typing import Any
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("uvicorn.error")
@@ -208,22 +209,28 @@ def slack_user_avatar(slack_user_id: str) -> tuple[bytes, str] | None:
         return None
 
 
+def _route_token(state: dict[str, Any]) -> str:
+    """Encode route state as a URL-safe opaque token shared by the clients."""
+    raw = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
 def dashboard_url_for(account: str, shortcode: str) -> str:
     """Deep link that opens this post in the dashboard's detail rail.
 
-    The dashboard keys a post by "account:shortcode" and reads ?post= on load,
-    so this lands on the post itself rather than on the grid. Preferred over
+    The dashboard keys a post by "account:shortcode" and reads it from the
+    opaque route token on load, so this lands on the post itself rather than on
+    the grid. Preferred over
     the Instagram permalink because the alert is a prompt to *do* something --
     mark it promo, read the numbers, pull the media -- and all of that lives in
     the dashboard.
     """
-    key = quote(f"{account}:{shortcode}", safe="")
-    return f"{_DASHBOARD}/?post={key}"
+    return f"{_DASHBOARD}/?r={_route_token({'post': f'{account}:{shortcode}'})}"
 
 
 def queue_url_for(task_id: int) -> str:
     """Deep link which opens exactly one Queue task's side panel."""
-    return f"{_DASHBOARD}/queue.html?task={quote(str(task_id), safe='')}"
+    return f"{_DASHBOARD}/queue.html?r={_route_token({'task': str(task_id)})}"
 
 
 def slack_configured() -> bool:
