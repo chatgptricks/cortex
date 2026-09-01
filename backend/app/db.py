@@ -962,6 +962,26 @@ def seed_queue_role_roster() -> None:
                 (now,),
             )
 
+        # Ivan is the non-Dev role-preview account: he needs every operating
+        # perspective available in Queue (VC, PD, Sales, and Trainee), while
+        # Admin remains granted through is_admin and Dev stays Esteban-only.
+        # This is a separate migration because v5 has already run in
+        # production and must not prevent the expanded capability set.
+        ivan_all_roles_marker = conn.execute(
+            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v7_ivan_all_non_dev'"
+        ).fetchone()
+        if not ivan_all_roles_marker:
+            conn.execute(
+                """UPDATE dashboard_users
+                   SET role = 'admin', operating_role = 'vc', operating_roles = ?, is_admin = 1, updated_at = ?
+                   WHERE email = ?""",
+                (json.dumps(["vc", "pd", "sales", "trainee"]), now, "ivan@sentientagency.io"),
+            )
+            conn.execute(
+                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v7_ivan_all_non_dev', '1', ?)",
+                (now,),
+            )
+
         # A real Trainee role uses longer production-point units. This seeded
         # placeholder keeps the scheduler and assignment flow testable before
         # the first trainee receives a company account. Notifications are
