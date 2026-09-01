@@ -72,13 +72,27 @@ class Cursor:
         translated = _sql(statement)
         self.raw.execute(translated, params)
         if re.match(r"\s*INSERT\b", translated, flags=re.IGNORECASE):
+            # `LASTVAL()` is useful for the Queue tables with generated IDs,
+            # but it raises when an INSERT targets a key-only table such as
+            # scheduler_state. Run the best-effort lookup inside a savepoint:
+            # otherwise that harmless lookup aborts the surrounding startup
+            # transaction and can take the entire API down.
+            savepoint = "sentient_lastrowid"
             try:
                 with self.connection.raw.cursor() as lookup:
+                    lookup.execute(f"SAVEPOINT {savepoint}")
                     lookup.execute("SELECT LASTVAL()")
                     value = lookup.fetchone()
                     self.lastrowid = int(value[0]) if value else None
             except Exception:
+                # PostgreSQL permits rolling back to a savepoint even after a
+                # failed statement has put the transaction in error state.
+                with self.connection.raw.cursor() as lookup:
+                    lookup.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 self.lastrowid = None
+            finally:
+                with self.connection.raw.cursor() as lookup:
+                    lookup.execute(f"RELEASE SAVEPOINT {savepoint}")
         return self
 
     def executemany(self, statement: str, params_seq: Any) -> "Cursor":
