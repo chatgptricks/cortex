@@ -2972,7 +2972,9 @@ def dashboard_queue_v2_save_scheduler_preferences(
                    row_order = excluded.row_order, updated_at = excluded.updated_at""",
             (caller, json.dumps(clean_hidden), json.dumps(clean_order), utc_now()),
         )
-        _queue_v2_publish(conn, "scheduler_preferences_updated", caller)
+        # This is a private VC layout preference, not shared Queue state.
+        # Broadcasting it forced every open scheduler to refetch after a
+        # harmless Hide/reorder action.
     return {"ok": True, "schedulerPreferences": {"hiddenUsers": clean_hidden, "rowOrder": clean_order}}
 
 
