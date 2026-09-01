@@ -521,6 +521,7 @@ def notify_queue_assignment(**assignment: Any) -> bool:
 
 _QUEUE_CHANGE_LABELS = {
     "created": "Post created",
+    "duplicated": "Request duplicated",
     "pp_revision_requested": "PP revision requested",
     "pp_revision_approved": "PP revision approved",
     "pp_revision_rejected": "PP revision rejected",
