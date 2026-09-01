@@ -199,6 +199,11 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         request.state.operating_role = preview_role
         request.state.operating_roles = [preview_role]
         request.state.is_admin = base_is_admin and preview_role == "admin"
+    # PD is the product-wide baseline. A secondary role changes the extra
+    # controls a person gets, but never removes their personal Queue, Pick,
+    # requests, or assigned-work workflow.
+    if "pd" not in request.state.operating_roles:
+        request.state.operating_roles.append("pd")
     if path.startswith("/api/admin/") and not (request.state.is_admin or request.state.is_dev):
         return JSONResponse({"detail": "Admin or Dev access required."}, status_code=403)
     request.state.user_uid = decoded.get("uid")
