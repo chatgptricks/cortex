@@ -38,3 +38,18 @@ def test_assignment_thumbnail_uses_public_api_url_for_stored_paths():
     )
     image = next(block for block in message["blocks"] if block["type"] == "image")
     assert image["image_url"] == "https://cortex-api-db2e.onrender.com/api/dashboard/covers/chatgptricks/42"
+
+
+def test_schedule_update_is_text_only():
+    message = build_queue_assignment_message(
+        task_id=101,
+        assignee_email="ivan@sentientagency.io",
+        assigned_by_email="esteban@sentientagency.io",
+        account="chatgptricks",
+        post_id=42,
+        cover_url="/api/dashboard/covers/chatgptricks/42",
+        recommended_accounts=["chatgptricks"],
+        update=True,
+    )
+    assert message["text"] == "<@U08UYJMPJ76> updated this post for @chatgptricks."
+    assert all(block["type"] != "image" for block in message["blocks"])
