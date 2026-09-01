@@ -99,3 +99,17 @@ def migrate_sqlite_to_postgres(sqlite_path: Path, database_url: str) -> dict[str
         return {"tables": len(tables), "rows": copied_rows}
     finally:
         source.close()
+
+
+def main() -> None:
+    """Run the import from a Render shell, never inside the web startup."""
+    from .config import DB_PATH, POSTGRES_MIGRATION_URL
+
+    if not POSTGRES_MIGRATION_URL:
+        raise SystemExit("POSTGRES_MIGRATION_URL is required.")
+    result = migrate_sqlite_to_postgres(DB_PATH, POSTGRES_MIGRATION_URL)
+    print(f"Copied {result['tables']} tables and {result['rows']} rows.")
+
+
+if __name__ == "__main__":
+    main()
