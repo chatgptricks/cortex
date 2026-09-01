@@ -1124,6 +1124,27 @@ def seed_queue_role_roster() -> None:
                 (now,),
             )
 
+        # Correct the two roster labels that were crossed in the production
+        # Users table. Keep their emails and Slack IDs untouched; this is a
+        # one-time data repair so later edits made in Settings remain the
+        # source of truth.
+        display_name_fix_marker = conn.execute(
+            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v9_fix_santiago_florez_names'"
+        ).fetchone()
+        if not display_name_fix_marker:
+            for email, display_name in (
+                ("santiagoflhi@gmail.com", "Santiago"),
+                ("dsflorezl@gmail.com", "Florez"),
+            ):
+                conn.execute(
+                    "UPDATE dashboard_users SET display_name = ?, updated_at = ? WHERE email = ?",
+                    (display_name, now, email),
+                )
+            conn.execute(
+                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v9_fix_santiago_florez_names', '1', ?)",
+                (now,),
+            )
+
         # A real Trainee role uses longer production-point units. This seeded
         # placeholder keeps the scheduler and assignment flow testable before
         # the first trainee receives a company account. Notifications are
