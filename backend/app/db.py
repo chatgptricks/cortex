@@ -38,10 +38,15 @@ def connect() -> Iterator[Any]:
 
 
 def init_db() -> None:
-    # Postgres is initialized by the verified one-time import below.  Keeping
-    # SQLite's schema bootstrap out of the runtime path avoids executing its
-    # JSON/PRAGMA-only migration statements against the new datastore.
+    # Postgres was initialized by a one-time SQLite import. New additive
+    # columns/tables still need to be applied after that cut-over: otherwise a
+    # normal feature deploy can reference a field that the imported schema
+    # never had and every authenticated request fails before reaching its
+    # route. Keep the large SQLite bootstrap out of Postgres, but always run
+    # the small idempotent runtime extension set.
     if DATABASE_URL:
+        with connect() as conn:
+            _ensure_runtime_schema_extensions(conn)
         return
     ensure_directories()
     with connect() as conn:
@@ -711,6 +716,31 @@ def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: 
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if name not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+
+def _ensure_runtime_schema_extensions(conn: Any) -> None:
+    """Apply additive schema introduced after the managed-Postgres import.
+
+    The Postgres compatibility connection translates PRAGMA table_info into
+    information_schema, so the same idempotent checks work for SQLite and
+    Postgres. Keep post-cutover additions here as well as in SQLite's full
+    bootstrap above so a newly deployed backend cannot outrun its database.
+    """
+    _ensure_column(conn, "dashboard_users", "time_zone", "time_zone TEXT NOT NULL DEFAULT ''")
+    _ensure_column(
+        conn,
+        "dashboard_users",
+        "can_self_assign",
+        "can_self_assign INTEGER NOT NULL DEFAULT 0",
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS queue_scheduler_preferences (
+               viewer_email TEXT PRIMARY KEY,
+               hidden_users TEXT NOT NULL DEFAULT '[]',
+               row_order TEXT NOT NULL DEFAULT '[]',
+               updated_at TEXT NOT NULL
+           )"""
+    )
 
 
 # --- Sentient Dash users (Google sign-in allowlist + roles) ----------------
