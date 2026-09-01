@@ -1284,7 +1284,7 @@ def dashboard_queue(
         "assignments": assignments,
         "metrics": _queue_metrics(all_assignments),
         "tagOptions": sorted(QUEUE_TAGS),
-        "priorityOptions": ["low", "medium", "high", "urgent"],
+        "priorityOptions": ["normal", "urgent"],
         "recommendedAccounts": [
             {"handle": account["handle"], "label": account["label"]}
             for account in list_accounts(active_only=True)
@@ -1587,7 +1587,7 @@ def dashboard_queue_reorder(
 # read-only historical record while every new request starts from a clean pool.
 QUEUE_V2_STATUSES = {"pool", "scheduled", "in_progress", "completed", "closed", "cancelled"}
 QUEUE_V2_TAGS = ["content", "design", "copy", "research", "review", "repurpose", "hot"]
-QUEUE_V2_PRIORITIES = ["low", "medium", "high", "urgent"]
+QUEUE_V2_PRIORITIES = ["normal", "urgent"]
 QUEUE_V2_POST_TYPES = ["Image", "Carousel", "Reel", "Promo", "Story", "Other"]
 QUEUE_V2_HOT_MULTIPLIER = 3.0
 # HOT routing starts at the reset moment that cleared the first batch. The
@@ -1881,9 +1881,15 @@ def _queue_v2_minutes_per_pp_for_roles(roles: list[str] | tuple[str, ...] | set[
 
 
 def _queue_v2_priority(value: str | None) -> str:
-    clean = (value or "medium").strip().lower()
+    clean = (value or "normal").strip().lower()
+    # Accept pre-migration clients momentarily, but collapse every former
+    # tier into regular work. Existing SQLite files have a legacy CHECK
+    # constraint, so `medium` remains only as the internal stored sentinel;
+    # every API projection is exposed as `normal` or `urgent`.
+    if clean in {"normal", "low", "medium", "high"}:
+        return "medium"
     if clean not in QUEUE_V2_PRIORITIES:
-        raise HTTPException(status_code=400, detail="Priority must be low, medium, high, or urgent.")
+        raise HTTPException(status_code=400, detail="Priority must be normal or urgent.")
     return clean
 
 
@@ -2375,7 +2381,7 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
             "comments": snapshot.get("comments"),
         },
         "productionPoints": pp, "minutesPerPP": minutes_per_pp,
-        "durationMinutes": pp * minutes_per_pp, "priority": row.get("priority") or "medium",
+        "durationMinutes": pp * minutes_per_pp, "priority": "urgent" if row.get("priority") == "urgent" else "normal",
         "title": row.get("post_title") or "", "isCustom": bool(row.get("is_custom")),
         "isHot": bool(snapshot.get("isHot")), "hotMultiplier": snapshot.get("hotMultiplier"),
         "tags": _queue_v2_json(row["tags"], []), "brief": row["brief"], "notes": row["notes"],
@@ -2755,12 +2761,12 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         pool_rows = conn.execute(
             """SELECT * FROM queue_requests
                WHERE status = 'pool'
-               ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+               ORDER BY CASE priority WHEN 'urgent' THEN 0 ELSE 1 END,
                         created_at, id"""
         ).fetchall()
         rows = conn.execute(
             f"""SELECT * FROM queue_requests WHERE {' AND '.join(clauses)}
-                 ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, id""",
+                 ORDER BY CASE priority WHEN 'urgent' THEN 0 ELSE 1 END, id""",
             params,
         ).fetchall()
         planning_params: list[Any] = []
@@ -3151,13 +3157,12 @@ def dashboard_queue_v2_admin_report(request: Request) -> dict[str, Any]:
             "email": designer["email"], "activeRequests": len(active),
             "productionPoints": sum(int(row["production_points"]) for row in active),
             "closedRequests": len(closed),
-            "urgentRequests": sum(1 for row in active if (row.get("priority") or "medium") == "urgent"),
-            "highPriorityRequests": sum(1 for row in active if (row.get("priority") or "medium") == "high"),
+            "urgentRequests": sum(1 for row in active if row.get("priority") == "urgent"),
             "averageActualMinutes": round(sum(actual_minutes) / len(actual_minutes)) if actual_minutes else None,
         })
     priority_totals = {priority: {"count": 0, "points": 0} for priority in QUEUE_V2_PRIORITIES}
     for row in request_rows:
-        priority = row.get("priority") or "medium"
+        priority = "urgent" if row.get("priority") == "urgent" else "normal"
         priority_totals[priority]["count"] += 1
         priority_totals[priority]["points"] += int(row["production_points"])
     # Admins need a durable, cross-day view of every request that has been
@@ -3199,7 +3204,7 @@ def dashboard_queue_v2_create(
     account: Annotated[str | None, Form()] = None,
     post_type: Annotated[str, Form()] = "Image",
     production_points: Annotated[int, Form()] = 3,
-    priority: Annotated[str, Form()] = "medium",
+    priority: Annotated[str, Form()] = "normal",
     tags: Annotated[str | None, Form()] = None,
     brief: Annotated[str | None, Form()] = None,
     notes: Annotated[str | None, Form()] = None,
@@ -3281,7 +3286,7 @@ def dashboard_queue_v2_create(
 @app.post("/api/dashboard/queue/v2/pool")
 def dashboard_queue_v2_pool(
     request: Request, account: Annotated[str, Form()], shortcode: Annotated[str, Form()],
-    production_points: Annotated[int, Form()], priority: Annotated[str, Form()] = "medium",
+    production_points: Annotated[int, Form()], priority: Annotated[str, Form()] = "normal",
     tags: Annotated[str | None, Form()] = None, brief: Annotated[str | None, Form()] = None,
     notes: Annotated[str | None, Form()] = None, references: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
@@ -4172,7 +4177,7 @@ def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/edit")
 def dashboard_queue_v2_edit(
     request_id: int, request: Request,
-    production_points: Annotated[int, Form()], priority: Annotated[str, Form()] = "medium",
+    production_points: Annotated[int, Form()], priority: Annotated[str, Form()] = "normal",
     tags: Annotated[str | None, Form()] = None, brief: Annotated[str | None, Form()] = None,
     notes: Annotated[str | None, Form()] = None, references: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
