@@ -386,7 +386,9 @@ def build_queue_assignment_message(
     verb = "updated this post" if update else "assigned you this post"
     sentence = f"{assigner} {verb} for {destination}."
     blocks: list[dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": sentence}}]
-    thumbnail = _public_media_url(cover_url) or (cover_url_for(account, post_id) if post_id is not None and str(account or "").strip() else "")
+    # Schedule updates are replies in the original DM thread. Keep those
+    # replies text-only so a moved block does not repost the same large image.
+    thumbnail = "" if update else (_public_media_url(cover_url) or (cover_url_for(account, post_id) if post_id is not None and str(account or "").strip() else ""))
     if thumbnail:
         blocks.append({"type": "image", "image_url": thumbnail, "alt_text": f"Post thumbnail for {destination}"})
     blocks.append(
