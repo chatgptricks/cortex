@@ -759,6 +759,34 @@ def upsert_dashboard_user(
     legacy_role = "admin" if admin_value else "viewer"
     now = utc_now()
     with connect() as conn:
+        existing = conn.execute(
+            "SELECT operating_role, operating_roles FROM dashboard_users WHERE email = ?",
+            (email,),
+        ).fetchone()
+        existing_roles: list[str] = []
+        if existing:
+            try:
+                parsed_roles = json.loads(existing["operating_roles"] or "[]")
+                if isinstance(parsed_roles, list):
+                    existing_roles = [
+                        str(value).strip().lower() for value in parsed_roles
+                        if str(value).strip().lower() in {"vc", "pd", "sales", "trainee", "dev"}
+                    ]
+            except (TypeError, json.JSONDecodeError):
+                existing_roles = []
+
+        # Post Designer is the baseline capability for every allowlisted user.
+        # Editing an unrelated field (display name, Slack ID, or Admin flag)
+        # must not collapse special multi-role accounts such as Ivan or
+        # Esteban back to a single role.
+        if email == "ivan@sentientagency.io":
+            operating_roles = ["vc", "pd", "sales", "trainee"]
+        elif email == "esteban@sentientagency.io":
+            operating_roles = list(dict.fromkeys([operating_role, "pd", "vc", "dev"]))
+        elif existing and existing["operating_role"] == operating_role:
+            operating_roles = list(dict.fromkeys([*existing_roles, operating_role, "pd"]))
+        else:
+            operating_roles = list(dict.fromkeys([operating_role, "pd"]))
         conn.execute(
             """
             INSERT INTO dashboard_users (email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at)
@@ -766,17 +794,14 @@ def upsert_dashboard_user(
             ON CONFLICT(email) DO UPDATE SET
                 display_name = CASE WHEN ? IS NULL THEN dashboard_users.display_name ELSE excluded.display_name END,
                 role = excluded.role, operating_role = excluded.operating_role,
-                operating_roles = CASE
-                    WHEN dashboard_users.operating_roles LIKE '%"dev"%' THEN json_array(excluded.operating_role, 'dev')
-                    ELSE json_array(excluded.operating_role)
-                END,
+                operating_roles = excluded.operating_roles,
                 is_admin = excluded.is_admin,
                 slack_user_id = CASE WHEN ? IS NULL THEN dashboard_users.slack_user_id ELSE excluded.slack_user_id END,
                 updated_at = excluded.updated_at
             """,
             (
                 email, (display_name or "").strip(), legacy_role, operating_role,
-                json.dumps([operating_role]), int(admin_value), (slack_user_id or "").strip(), now, now,
+                json.dumps(operating_roles), int(admin_value), (slack_user_id or "").strip(), now, now,
                 display_name, slack_user_id,
             ),
         )
@@ -982,6 +1007,45 @@ def seed_queue_role_roster() -> None:
                 (now,),
             )
 
+        # Normalize the reviewed production roster after Settings edits from
+        # older releases could silently collapse a user's capabilities. PD is
+        # implicit for everyone; the explicit role is their additional
+        # operating perspective. This migration is one-time so later, valid
+        # changes made in Settings remain authoritative.
+        reviewed_roles_marker = conn.execute(
+            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v8_reviewed_roster'"
+        ).fetchone()
+        if not reviewed_roles_marker:
+            reviewed_roles = {
+                "esteban@sentientagency.io": ("vc", ["vc", "pd", "dev"], True),
+                "louis@sentientagency.io": ("vc", ["vc", "pd"], True),
+                "ivan@sentientagency.io": ("vc", ["vc", "pd", "sales", "trainee"], True),
+                "sergio@sentientagency.io": ("vc", ["vc", "pd"], True),
+                "victor@sentientagency.io": ("sales", ["sales", "pd"], False),
+                "egor@sentientagency.io": ("sales", ["sales", "pd"], False),
+                "santiagoflhi@gmail.com": ("pd", ["pd"], False),
+                "dsflorezl@gmail.com": ("pd", ["pd"], False),
+                "sara1107giraldo@gmail.com": ("pd", ["pd"], False),
+                "sebastianruizurquijo@gmail.com": ("pd", ["pd"], False),
+                "tevi@sentientagency.io": ("vc", ["vc", "pd"], False),
+                "gabo@sentientagency.io": ("pd", ["pd"], False),
+                "trainee@sentientagency.io": ("trainee", ["trainee", "pd"], False),
+            }
+            for email, (operating_role, operating_roles, is_admin) in reviewed_roles.items():
+                conn.execute(
+                    """UPDATE dashboard_users
+                       SET role = ?, operating_role = ?, operating_roles = ?, is_admin = ?, updated_at = ?
+                       WHERE email = ?""",
+                    (
+                        "admin" if is_admin else "viewer", operating_role, json.dumps(operating_roles),
+                        int(is_admin), now, email,
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v8_reviewed_roster', '1', ?)",
+                (now,),
+            )
+
         # A real Trainee role uses longer production-point units. This seeded
         # placeholder keeps the scheduler and assignment flow testable before
         # the first trainee receives a company account. Notifications are
@@ -997,7 +1061,7 @@ def seed_queue_role_roster() -> None:
                    ON CONFLICT(email) DO UPDATE SET
                      role = 'viewer', operating_role = 'trainee', operating_roles = excluded.operating_roles,
                      is_admin = 0, updated_at = excluded.updated_at""",
-                ("trainee@sentientagency.io", json.dumps(["trainee"]), now, now),
+                ("trainee@sentientagency.io", json.dumps(["trainee", "pd"]), now, now),
             )
             conn.execute(
                 "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v6_trainee_test', '1', ?)",
