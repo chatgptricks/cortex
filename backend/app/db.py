@@ -7,9 +7,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
-from .config import DATABASE_URL, DB_PATH, POSTGRES_MIGRATION_URL, ensure_directories
+from .config import DATABASE_URL, DB_PATH, ensure_directories
 from .postgres import Connection as PostgresConnection
-from .postgres_migration import migrate_sqlite_to_postgres
 
 
 def utc_now() -> str:
@@ -676,17 +675,6 @@ def init_db() -> None:
         stripped = conn.total_changes - before_strip
     if stripped:
         _vacuum(stripped)
-    if POSTGRES_MIGRATION_URL:
-        with connect() as conn:
-            marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'postgres_migration_completed'").fetchone()
-            if not marker:
-                result = migrate_sqlite_to_postgres(DB_PATH, POSTGRES_MIGRATION_URL)
-                conn.execute(
-                    "INSERT INTO scheduler_state (key, value, updated_at) VALUES (?, ?, ?)",
-                    ("postgres_migration_completed", json.dumps(result), utc_now()),
-                )
-
-
 def _vacuum(stripped_rows: int) -> None:
     import logging
 
