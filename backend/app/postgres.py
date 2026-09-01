@@ -7,10 +7,41 @@ SQLite syntax differences we use at runtime; it does not interpolate values.
 from __future__ import annotations
 
 import re
+import threading
 from typing import Any
 
 import psycopg
+from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
+
+
+# The dashboard opens many independent HTTP requests at once (especially card
+# covers). Opening a database connection for each one can exhaust a small
+# managed Postgres instance during an ordinary page load. Keep a deliberately
+# small shared pool per web process instead: callers wait briefly for one of
+# these reusable connections rather than creating an unbounded connection
+# burst.
+_POOL: ConnectionPool | None = None
+_POOL_URL: str | None = None
+_POOL_LOCK = threading.Lock()
+
+
+def _connection_pool(url: str) -> ConnectionPool:
+    global _POOL, _POOL_URL
+    with _POOL_LOCK:
+        if _POOL is None or _POOL_URL != url:
+            if _POOL is not None:
+                _POOL.close()
+            _POOL = ConnectionPool(
+                conninfo=url,
+                min_size=1,
+                max_size=4,
+                timeout=15,
+                max_idle=120,
+                open=True,
+            )
+            _POOL_URL = url
+        return _POOL
 
 
 def _sql(sql: str) -> str:
@@ -69,7 +100,8 @@ class Connection:
     is_postgres = True
 
     def __init__(self, url: str) -> None:
-        self.raw = psycopg.connect(url, row_factory=dict_row)
+        self._pool = _connection_pool(url)
+        self.raw = self._pool.getconn()
 
     def execute(self, statement: str, params: Any = None) -> Cursor:
         pragma = re.match(r"\s*PRAGMA\s+table_info\(([^)]+)\)", statement, flags=re.IGNORECASE)
@@ -95,4 +127,4 @@ class Connection:
         self.raw.commit()
 
     def close(self) -> None:
-        self.raw.close()
+        self._pool.putconn(self.raw)
