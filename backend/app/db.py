@@ -713,7 +713,10 @@ def _vacuum(stripped_rows: int) -> None:
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: str) -> None:
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    # sqlite3 cursors are directly iterable; our Postgres compatibility
+    # cursor deliberately exposes fetchall() instead. Use the shared surface
+    # so startup migrations behave identically on both engines.
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if name not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
