@@ -5,6 +5,11 @@ Originally written by Claude on 2026-08-27; last updated by Codex on 2026-09-01.
 is the canonical full handover. This backend copy records the current backend
 release; read the frontend copy first for the complete role/UI history.
 
+## Current release: opaque Slack deep links (2026-09-01)
+
+- Slack dashboard and Queue links now carry a URL-safe opaque `r` token instead of readable account handles, post keys, or task ids. The token is portable obfuscation, not encryption, so recipients can open the link without a shared secret; frontend entry points decode it and continue to support legacy readable query links.
+- Keep `_route_token()` in `backend/app/slack_alerts.py` in sync with the frontend route codec whenever new deep-link state is added.
+
 ## Production hotfix: PostgreSQL runtime schema (2026-09-01)
 
 - Root cause of the production-wide authenticated failures was confirmed in Render logs: `get_dashboard_user_access()` selected `dashboard_users.time_zone`, but the managed Postgres database had been imported before that column was introduced. Every authenticated request failed in middleware with `psycopg.errors.UndefinedColumn`, while `/api/health` remained misleadingly green.
