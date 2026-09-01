@@ -23,6 +23,11 @@ def _path_from_env(name: str, default: Path) -> Path:
 DATA_DIR = _path_from_env("PREDICT_DATA_DIR", PROJECT_ROOT / "data")
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "predict.sqlite3"
+# Set only after the one-time SQLite import completes. Keeping this optional
+# makes the cutover reversible: removing DATABASE_URL returns the service to
+# its still-intact SQLite disk while the Postgres copy is investigated.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+POSTGRES_MIGRATION_URL = os.getenv("POSTGRES_MIGRATION_URL", "").strip()
 
 # Separate password gating Sentient Dash's various admin-write endpoints
 # (backfill, refresh, account settings, etc.) inside their own handlers.

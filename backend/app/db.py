@@ -7,7 +7,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
-from .config import DB_PATH, ensure_directories
+from .config import DATABASE_URL, DB_PATH, POSTGRES_MIGRATION_URL, ensure_directories
+from .postgres import Connection as PostgresConnection
+from .postgres_migration import migrate_sqlite_to_postgres
 
 
 def utc_now() -> str:
@@ -15,7 +17,15 @@ def utc_now() -> str:
 
 
 @contextmanager
-def connect() -> Iterator[sqlite3.Connection]:
+def connect() -> Iterator[Any]:
+    if DATABASE_URL:
+        conn = PostgresConnection(DATABASE_URL)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+        return
     ensure_directories()
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
@@ -29,6 +39,11 @@ def connect() -> Iterator[sqlite3.Connection]:
 
 
 def init_db() -> None:
+    # Postgres is initialized by the verified one-time import below.  Keeping
+    # SQLite's schema bootstrap out of the runtime path avoids executing its
+    # JSON/PRAGMA-only migration statements against the new datastore.
+    if DATABASE_URL:
+        return
     ensure_directories()
     with connect() as conn:
         conn.executescript(
@@ -661,6 +676,15 @@ def init_db() -> None:
         stripped = conn.total_changes - before_strip
     if stripped:
         _vacuum(stripped)
+    if POSTGRES_MIGRATION_URL:
+        with connect() as conn:
+            marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'postgres_migration_completed'").fetchone()
+            if not marker:
+                result = migrate_sqlite_to_postgres(DB_PATH, POSTGRES_MIGRATION_URL)
+                conn.execute(
+                    "INSERT INTO scheduler_state (key, value, updated_at) VALUES (?, ?, ?)",
+                    ("postgres_migration_completed", json.dumps(result), utc_now()),
+                )
 
 
 def _vacuum(stripped_rows: int) -> None:
