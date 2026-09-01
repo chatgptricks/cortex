@@ -19,6 +19,35 @@ def _postgres_ddl(statement: str) -> str:
     return re.sub(r"\bBLOB\b", "BYTEA", value, flags=re.IGNORECASE)
 
 
+def _tables_in_dependency_order(tables: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    """Create referenced tables before SQLite's inline foreign-key users."""
+    by_name = {str(row["name"]): row for row in tables}
+    resolved: list[sqlite3.Row] = []
+    visiting: set[str] = set()
+    seen: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in seen:
+            return
+        if name in visiting:
+            # SQLite permits cyclic foreign keys in its schema. Postgres can
+            # create the second relation once the first is present, so keep
+            # the original deterministic table order for this rare case.
+            return
+        visiting.add(name)
+        statement = str(by_name[name]["sql"] or "")
+        for dependency in re.findall(r"\bREFERENCES\s+[\"`\[]?([A-Za-z_][A-Za-z0-9_]*)", statement, flags=re.IGNORECASE):
+            if dependency in by_name:
+                visit(dependency)
+        visiting.remove(name)
+        seen.add(name)
+        resolved.append(by_name[name])
+
+    for table in tables:
+        visit(str(table["name"]))
+    return resolved
+
+
 def migrate_sqlite_to_postgres(sqlite_path: Path, database_url: str) -> dict[str, int]:
     """Copy schema, data and sequences once; fail rather than overwrite data."""
     source = sqlite3.connect(sqlite_path)
@@ -29,7 +58,7 @@ def migrate_sqlite_to_postgres(sqlite_path: Path, database_url: str) -> dict[str
             "WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL "
             "ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END, name"
         ).fetchall()
-        tables = [row for row in schema_rows if row["type"] == "table"]
+        tables = _tables_in_dependency_order([row for row in schema_rows if row["type"] == "table"])
         indexes = [row for row in schema_rows if row["type"] == "index"]
         with psycopg.connect(database_url) as target:
             with target.cursor() as cursor:
