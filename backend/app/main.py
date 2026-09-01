@@ -618,6 +618,37 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
             return []
         return daily.get(day, [])
 
+    # Keep the detail response deliberately distinct from the raw database
+    # schema.  The Tracker client consumes `followers` and `date`, while the
+    # snapshot table stores the more explicit `followers_count` and
+    # `captured_at` names.  Building this payload here also lets the
+    # historical table show per-day engagement without another query.
+    followers_history: list[dict[str, Any]] = []
+    previous_followers: int | None = None
+    for snapshot in snapshots:
+        follower_count = snapshot["followers_count"]
+        day_likes = _day_likes(snapshot["captured_at"])
+        followers_history.append(
+            {
+                "date": snapshot["captured_at"],
+                "followers": follower_count,
+                "followers_gained": (
+                    None
+                    if previous_followers is None or follower_count is None
+                    else follower_count - previous_followers
+                ),
+                "posts_count": snapshot["posts_count"],
+                "following_count": snapshot["following_count"],
+                "full_name": snapshot["full_name"],
+                "verified": bool(snapshot["verified"]),
+                "private": bool(snapshot["private"]),
+                "avg_likes_that_day": sum(day_likes) / len(day_likes) if day_likes else None,
+                "posts_that_day": len(day_likes),
+            }
+        )
+        if follower_count is not None:
+            previous_followers = follower_count
+
     return {
         "handle": clean,
         "label": account.get("label"),
