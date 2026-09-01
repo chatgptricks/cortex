@@ -15,6 +15,10 @@ from psycopg.rows import dict_row
 
 def _sql(sql: str) -> str:
     value = sql.replace("?", "%s")
+    # SQLite's NOCASE collation does not exist in Postgres.  The existing
+    # query surface uses it only for simple column ordering, where LOWER()
+    # preserves the intended case-insensitive behavior.
+    value = re.sub(r"\b([A-Za-z_][A-Za-z0-9_.]*)\s+COLLATE\s+NOCASE\b", r"LOWER(\1)", value, flags=re.IGNORECASE)
     if re.search(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", value, flags=re.IGNORECASE):
         value = re.sub(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", value, flags=re.IGNORECASE)
         if " ON CONFLICT " not in value.upper():
