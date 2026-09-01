@@ -2616,11 +2616,15 @@ def _queue_v2_prepare_schedule_changes(
         designer_roles = _queue_v2_user_roles(dict(designer_row)) if designer_row else []
         if not designer_row or "pd" not in designer_roles:
             raise HTTPException(status_code=400, detail="Choose a Queue designer.")
-        designer_now = datetime.now(ZoneInfo(_queue_v2_time_zone(dict(designer_row))))
-        designer_today = designer_now.date().isoformat()
-        first_available_minute = min(SCHEDULER_END, ((designer_now.hour * 60 + designer_now.minute + 9) // 10) * 10)
-        if date < designer_today or (date == designer_today and start < first_available_minute):
-            raise HTTPException(status_code=409, detail="Queue work cannot be scheduled before that designer's current time.")
+        # Every stored Queue position belongs to the single Costa Rica
+        # coordinator timeline. A Colombian designer reads the same instant
+        # one hour later in the UI; their timezone must never move the bar or
+        # make a valid coordinator placement look like it is in the past.
+        queue_now = datetime.now(SCHEDULER_TIMEZONE)
+        queue_today = queue_now.date().isoformat()
+        first_available_minute = min(SCHEDULER_END, ((queue_now.hour * 60 + queue_now.minute + 9) // 10) * 10)
+        if date < queue_today or (date == queue_today and start < first_available_minute):
+            raise HTTPException(status_code=409, detail="Queue work cannot be scheduled before the current Queue time.")
         minutes_per_pp = _queue_v2_minutes_per_pp_for_roles(designer_roles)
         allowed = {item["account_handle"] for item in conn.execute(
             "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ?", (designer,),
