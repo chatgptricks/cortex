@@ -1,9 +1,17 @@
 # Handover for Codex — Sentient Dash
 
-Originally written by Claude on 2026-08-27; last updated by Codex on 2026-08-30. This file is duplicated identically at the
-root of both repos below. Esteban is planning to merge the two repos into
-one — read the "Planned repo merge" section near the bottom before you start
-that.
+Originally written by Claude on 2026-08-27; last updated by Codex on 2026-09-01. The frontend copy at
+`/Users/tbnalfaro/Desktop/Codex Projects/09 Tricks Dash/Tricks Dash/FOR_CODEX.md`
+is the canonical full handover. This backend copy records the current backend
+release; read the frontend copy first for the complete role/UI history.
+
+## Production hotfix: PostgreSQL runtime schema (2026-09-01)
+
+- Root cause of the production-wide authenticated failures was confirmed in Render logs: `get_dashboard_user_access()` selected `dashboard_users.time_zone`, but the managed Postgres database had been imported before that column was introduced. Every authenticated request failed in middleware with `psycopg.errors.UndefinedColumn`, while `/api/health` remained misleadingly green.
+- Backend `main` is live at `f15aae7` (migration feature commit `ca576ca`, cursor compatibility fix `f15aae7`). `init_db()` now applies the small post-cutover schema extension set idempotently on Postgres: `dashboard_users.time_zone`, `dashboard_users.can_self_assign`, and `queue_scheduler_preferences`.
+- The missing preferences table was also the root cause of Queue Hide/Reorder returning `NOT FOUND` and reverting. Do not remove the Postgres runtime-extension path or restore the old unconditional early return in `init_db()`.
+- Frontend static release `5bf1cd4` publishes the pending standalone Tracker/Insights role access files. Live authenticated verification passed: Tracker rendered 45 accounts, Settings opened as `DEV`, and Queue rendered the coordinator schedule and navigation controls.
+- All 23 backend pytest tests pass, including the new idempotent runtime-schema regression test. Production `/api/health` reports `f15aae781aaddf11374ffedad46e70b7ac5291da`.
 
 ## Latest change: standalone Settings command center (2026-08-30)
 
