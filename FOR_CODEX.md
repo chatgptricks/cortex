@@ -5,7 +5,14 @@ Originally written by Claude on 2026-08-27; last updated by Codex on 2026-09-01.
 is the canonical full handover. This backend copy records the current backend
 release; read the frontend copy first for the complete role/UI history.
 
-## Current release: opaque Slack deep links (2026-09-01)
+## Current release: multi-account Queue assignment (2026-09-01)
+
+- Coordinators can right-click any request in the Queue Pool and choose `Assign to multiple accounts`. The compact account picker accepts one or more active Sentient accounts and resolves the existing `queue_designer_accounts` mapping to every eligible Queue user.
+- The source Pool row is consumed for the first matching user; each additional user receives an independent scheduled duplicate. A user who manages multiple selected accounts receives one copy with all matching recommended accounts, and attachment metadata/files are preserved.
+- Assignments are collision-safe and scheduled at the next available 10-minute slot. Each assignment gets the normal Queue Slack DM (thumbnail plus `Open in Queue` link); this automatic workflow does not emit routine SPOC log messages.
+- Endpoint: `POST /api/dashboard/queue/v2/requests/{request_id}/assign-accounts` with a JSON-encoded `accounts` form field. The frontend action is wired through the global contextual menu (`assign-multiple`) and updates Pool, scheduler, and Pick state optimistically after success.
+
+## Previous release: opaque Slack deep links (2026-09-01)
 
 - Slack dashboard and Queue links now carry a URL-safe opaque `r` token instead of readable account handles, post keys, or task ids. The token is portable obfuscation, not encryption, so recipients can open the link without a shared secret; frontend entry points decode it and continue to support legacy readable query links.
 - Keep `_route_token()` in `backend/app/slack_alerts.py` in sync with the frontend route codec whenever new deep-link state is added.
