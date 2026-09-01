@@ -72,17 +72,21 @@ def migrate_sqlite_to_postgres(sqlite_path: Path, database_url: str) -> dict[str
                 copied_rows = 0
                 for row in tables:
                     table = str(row["name"])
-                    data = source.execute(f'SELECT * FROM "{table}"').fetchall()
-                    if not data:
+                    source_cursor = source.execute(f'SELECT * FROM "{table}"')
+                    columns = [str(item[0]) for item in source_cursor.description or []]
+                    if not columns:
                         continue
-                    columns = list(data[0].keys())
                     statement = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
                         sql.Identifier(table),
                         sql.SQL(", ").join(map(sql.Identifier, columns)),
                         sql.SQL(", ").join(sql.Placeholder() for _ in columns),
                     )
-                    cursor.executemany(statement, [tuple(item[column] for column in columns) for item in data])
-                    copied_rows += len(data)
+                    # dashboard_posts contains raw Apify payloads and can be
+                    # large.  Streaming short batches avoids a second full
+                    # in-memory copy during the one-time import on Render.
+                    while batch := source_cursor.fetchmany(200):
+                        cursor.executemany(statement, (tuple(item[column] for column in columns) for item in batch))
+                        copied_rows += len(batch)
                     if "id" in columns:
                         cursor.execute(
                             sql.SQL("SELECT setval(pg_get_serial_sequence({}, 'id'), COALESCE((SELECT MAX(id) FROM {}), 1), true)").format(
