@@ -4344,6 +4344,224 @@ def dashboard_queue_v2_duplicate(request_id: int, request: Request) -> dict[str,
     return {"ok": True, "request": _queue_v2_project(duplicate_row), "sourceRequestId": request_id}
 
 
+@app.post("/api/dashboard/queue/v2/requests/{request_id}/assign-accounts")
+def dashboard_queue_v2_assign_multiple_accounts(
+    request_id: int,
+    request: Request,
+    accounts: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Assign a pooled request to every Queue user who manages the chosen accounts.
+
+    The source request is consumed from the Pool for the first target. Each
+    additional target user receives an independent scheduled copy, so
+    completing one account's version never changes another designer's work.
+    If a user manages more than one selected account, they receive one copy
+    with all of their matching destinations.
+    """
+    caller, is_admin, roles = _queue_v2_access(request, coordinator=True)
+    source = _queue_v2_request(request_id)
+    _queue_v2_require_visible(source, caller, is_admin, roles)
+    if source.get("status") != "pool":
+        raise HTTPException(status_code=409, detail="Only requests currently in the pool can be assigned to multiple accounts.")
+    try:
+        submitted = json.loads(accounts or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Accounts must be valid JSON.") from exc
+    selected = _queue_v2_clean_account_handles(submitted)
+    if not selected:
+        raise HTTPException(status_code=400, detail="Choose at least one Sentient account.")
+
+    active_sentient = {
+        str(item.get("handle") or "").strip().lower()
+        for item in list_accounts(active_only=True)
+        if item.get("group") == "sentient"
+    }
+    if any(handle not in active_sentient for handle in selected):
+        raise HTTPException(status_code=400, detail="Choose active Sentient accounts only.")
+
+    # Resolve account ownership and current Slack IDs in one transaction.
+    # Every dashboard user is PD-capable, but only users with an explicit
+    # account mapping are eligible for this automatic assignment.
+    with connect() as conn:
+        roster = [dict(row) for row in conn.execute(
+            "SELECT email, slack_user_id, operating_role, operating_roles FROM dashboard_users"
+        ).fetchall()]
+        roster_by_email = {str(row["email"]).strip().lower(): row for row in roster}
+        slack_by_email = {
+            email: str(row.get("slack_user_id") or "").strip().upper()
+            for email, row in roster_by_email.items()
+        }
+        owner_rows = conn.execute(
+            "SELECT designer_email, account_handle FROM queue_designer_accounts"
+        ).fetchall()
+        accounts_by_user: dict[str, list[str]] = {}
+        for owner in owner_rows:
+            email = str(owner["designer_email"] or "").strip().lower()
+            handle = str(owner["account_handle"] or "").strip().lower()
+            if email not in roster_by_email or handle not in selected:
+                continue
+            accounts_by_user.setdefault(email, []).append(handle)
+        rank = {handle: index for index, handle in enumerate(selected)}
+        assignments = [
+            {"designerEmail": email, "accounts": sorted(set(handles), key=lambda handle: rank.get(handle, 999))}
+            for email, handles in accounts_by_user.items()
+        ]
+        assignments.sort(key=lambda item: item["designerEmail"])
+        if not assignments:
+            raise HTTPException(status_code=409, detail="No Queue users manage the selected accounts yet.")
+
+        local_now = datetime.now(SCHEDULER_TIMEZONE)
+        initial_date = local_now.date().isoformat()
+        initial_start = ((local_now.hour * 60 + local_now.minute + 9) // 10) * 10
+        if initial_start >= SCHEDULER_END:
+            initial_date = (local_now.date() + timedelta(days=1)).isoformat()
+            initial_start = SCHEDULER_START
+        source_attachments = _queue_v2_json(source.get("attachments"), [])
+        source_tags = _queue_v2_json(source.get("tags"), [])
+        source_references = _queue_v2_json(source.get("reference_links"), [])
+        source_shortcode = str(source.get("post_shortcode") or f"request-{request_id}").strip() or f"request-{request_id}"
+        source_priority = "urgent" if source.get("priority") == "urgent" else "medium"
+        now = utc_now()
+        created_rows: list[dict[str, Any]] = []
+
+        for assignment_index, assignment in enumerate(assignments):
+            designer = assignment["designerEmail"]
+            target_accounts = assignment["accounts"]
+            target_roles = _queue_v2_user_roles(roster_by_email[designer])
+            minutes_per_pp = _queue_v2_minutes_per_pp_for_roles(target_roles)
+            production_points = max(1, int(source.get("production_points") or 1))
+            duration = production_points * minutes_per_pp
+            occupied = _queue_v2_time_occupied(conn, designer, initial_date)
+            scheduled_date, scheduled_start = next_available_slot(initial_date, initial_start, duration, occupied)
+
+            # Reuse the source row for the first target. This consumes the
+            # pool item instead of leaving an extra unassigned copy behind;
+            # every additional target receives a synthetic independent copy.
+            if assignment_index == 0:
+                conn.execute(
+                    """UPDATE queue_requests
+                       SET designer_email = ?, coordinator_email = ?,
+                           recommended_accounts = ?, minutes_per_pp = ?,
+                           status = 'scheduled', scheduled_date = ?,
+                           scheduled_start_minutes = ?, slack_channel_id = NULL,
+                           slack_message_ts = NULL, updated_at = ?
+                       WHERE id = ?""",
+                    (designer, caller, json.dumps(target_accounts), minutes_per_pp,
+                     scheduled_date, scheduled_start, now, request_id),
+                )
+                _queue_v2_log(conn, request_id, caller, "multi_account_assigned", {
+                    "sourceRequestId": request_id, "accounts": target_accounts,
+                    "scheduledDate": scheduled_date, "scheduledStartMinutes": scheduled_start,
+                })
+                created_rows.append(dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone()))
+                continue
+
+            duplicate_row: dict[str, Any] | None = None
+            for _ in range(8):
+                duplicate_shortcode = f"{source_shortcode[:80]}--copy-{secrets.token_hex(5)}"
+                if conn.execute(
+                    "SELECT 1 FROM queue_requests WHERE post_account = ? AND post_shortcode = ?",
+                    (source.get("post_account") or "", duplicate_shortcode),
+                ).fetchone():
+                    continue
+                cursor = conn.execute(
+                    """INSERT INTO queue_requests (
+                           post_account, post_shortcode, post_title, is_custom,
+                           post_permalink, post_caption, post_type, cover_url,
+                           production_points, minutes_per_pp, priority, deadline_at,
+                           tags, brief, notes, reference_links, attachments,
+                           status, designer_email, coordinator_email,
+                           recommended_accounts, slack_channel_id, slack_message_ts,
+                           scheduled_date, scheduled_start_minutes,
+                           actual_started_at, completed_at, closed_at, final_permalink,
+                           cancellation_reason, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?,
+                                 'scheduled', ?, ?, ?, NULL, NULL, ?, ?,
+                                 NULL, NULL, NULL, NULL, NULL, ?, ?)""",
+                    (
+                        source.get("post_account") or "", duplicate_shortcode,
+                        source.get("post_title") or "", int(bool(source.get("is_custom"))),
+                        source.get("post_permalink") or "", source.get("post_caption") or "",
+                        source.get("post_type") or "Image", source.get("cover_url") or "",
+                        production_points, minutes_per_pp, source_priority,
+                        json.dumps(source_tags if isinstance(source_tags, list) else []), source.get("brief") or "",
+                        source.get("notes") or "", json.dumps(source_references if isinstance(source_references, list) else []),
+                        json.dumps(source_attachments if isinstance(source_attachments, list) else []),
+                        designer, caller, json.dumps(target_accounts), scheduled_date, scheduled_start, now, now,
+                    ),
+                )
+                new_id = int(cursor.lastrowid)
+                _queue_v2_log(conn, new_id, caller, "multi_account_assigned", {
+                    "sourceRequestId": request_id, "accounts": target_accounts,
+                    "scheduledDate": scheduled_date, "scheduledStartMinutes": scheduled_start,
+                })
+                duplicate_row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (new_id,)).fetchone())
+                break
+            if duplicate_row is None:
+                raise HTTPException(status_code=409, detail="Could not create an independent assignment copy. Try again.")
+            created_rows.append(duplicate_row)
+
+        created_ids = [int(row["id"]) for row in created_rows]
+        _queue_v2_publish(conn, "requests_assigned_to_accounts", caller, [request_id, *created_ids])
+
+    # Copy attachment files after the DB transaction. A missing source file is
+    # harmless, and metadata remains available in every independent copy.
+    if isinstance(source_attachments, list) and source_attachments:
+        source_dir = DATA_DIR / "queue_attachments" / str(request_id)
+        for created in created_rows:
+            # The first assignment reuses the source row and therefore already
+            # points at this directory; only synthetic copies need file copies.
+            if int(created["id"]) == request_id:
+                continue
+            target_dir = DATA_DIR / "queue_attachments" / str(created["id"])
+            for attachment in source_attachments:
+                if not isinstance(attachment, dict):
+                    continue
+                attachment_id = str(attachment.get("id") or "").strip()
+                if not attachment_id or not re.fullmatch(r"[0-9a-f]{16}", attachment_id):
+                    continue
+                matches = list(source_dir.glob(f"{attachment_id}.*")) + ([source_dir / attachment_id] if (source_dir / attachment_id).exists() else [])
+                if not matches:
+                    continue
+                target_dir.mkdir(parents=True, exist_ok=True)
+                for source_file in matches:
+                    if source_file.is_file():
+                        shutil.copy2(source_file, target_dir / source_file.name)
+
+    from .slack_alerts import notify_queue_assignment_result, slack_user_id_for_email
+    notifications: list[dict[str, Any]] = []
+    for created, assignment in zip(created_rows, assignments):
+        recipient = slack_by_email.get(assignment["designerEmail"]) or slack_user_id_for_email(assignment["designerEmail"])
+        sent_result = notify_queue_assignment_result(
+            task_id=int(created["id"]), assignee_email=assignment["designerEmail"], assigned_by_email=caller,
+            assignee_slack_id=recipient, assigned_by_slack_id=slack_user_id_for_email(caller),
+            account=created.get("post_account"), post_id=_queue_post_id(created.get("post_account"), created.get("post_shortcode")),
+            cover_url=created.get("cover_url") or "", note=created.get("brief"), notes=created.get("notes"),
+            references=_queue_v2_json(created.get("reference_links"), []), priority=created.get("priority"),
+            tags=_queue_v2_json(created.get("tags"), []), recommended_accounts=assignment["accounts"],
+            production_points=created.get("production_points"), minutes_per_pp=created.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP,
+            scheduled_date=created.get("scheduled_date"), scheduled_start_minutes=created.get("scheduled_start_minutes"),
+        )
+        sent = bool(sent_result.get("sent"))
+        if sent and sent_result.get("channelId") and sent_result.get("messageTs"):
+            with connect() as conn:
+                conn.execute(
+                    "UPDATE queue_requests SET slack_channel_id = ?, slack_message_ts = ?, updated_at = ? WHERE id = ?",
+                    (sent_result["channelId"], sent_result["messageTs"], utc_now(), int(created["id"])),
+                )
+                _queue_v2_log(conn, int(created["id"]), caller, "slack_sent", {"multiAccountAssignment": True})
+        notifications.append({"requestId": int(created["id"]), "designerEmail": assignment["designerEmail"], "sent": sent})
+
+    return {
+        "ok": True,
+        "sourceRequestId": request_id,
+        "requests": [_queue_v2_project(row) for row in created_rows],
+        "assignments": assignments,
+        "unassignedAccounts": [handle for handle in selected if not any(handle in item["accounts"] for item in assignments)],
+        "notifications": {"sent": sum(1 for item in notifications if item["sent"]), "failed": sum(1 for item in notifications if not item["sent"]), "results": notifications},
+    }
+
+
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/attachments")
 def dashboard_queue_v2_add_attachment(request_id: int, request: Request, file: Annotated[UploadFile, File()]) -> dict[str, Any]:
     caller, is_admin, roles = _queue_v2_access(request)
