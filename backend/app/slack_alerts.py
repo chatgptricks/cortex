@@ -486,6 +486,8 @@ def notify_queue_assignment(**assignment: Any) -> bool:
 _QUEUE_CHANGE_LABELS = {
     "created": "Post created",
     "duplicated": "Request duplicated",
+    "time_block_requested": "Time block requested",
+    "account_access_requested": "Account access requested",
     "pp_revision_requested": "PP revision requested",
     "pp_revision_approved": "PP revision approved",
     "pp_revision_rejected": "PP revision rejected",
@@ -499,6 +501,25 @@ _QUEUE_CHANGE_LABELS = {
     "cancelled": "Queue post cancelled",
     "deleted": "Queue post deleted",
 }
+
+# #spoc-dashboard is an approval inbox, not a general Queue activity feed.
+# Keep this allowlist deliberately explicit: a new Queue mutation must opt in
+# before it can create channel noise. Approval outcomes, assignments, edits,
+# pool returns, cancellations, and other operational events stay in Queue's
+# own history and never get posted here.
+QUEUE_SPOC_APPROVAL_REQUEST_EVENTS = frozenset({
+    "time_block_requested",
+    "account_access_requested",
+    "pp_revision_requested",
+    "move_requested",
+    "cancellation_requested",
+    "trainee_review_requested",
+})
+
+
+def is_queue_spoc_approval_request(event_type: str | None) -> bool:
+    """Return whether an event belongs in the SPOC approval inbox."""
+    return str(event_type or "").strip().lower() in QUEUE_SPOC_APPROVAL_REQUEST_EVENTS
 
 
 def _slack_actor(email: str | None) -> str:
@@ -546,6 +567,7 @@ def build_queue_change_message(
     attachment is required to understand the event, while the Queue button
     lands on the request's side view for the people who need to act on it.
     """
+    event_type = str(event_type or "").strip().lower()
     # SPOC is a high-volume audit channel. Keep every event to one readable
     # line and put the actionable controls in one compact button row. Slack
     # renders user mentions as their familiar display names, while the
@@ -559,13 +581,14 @@ def build_queue_change_message(
         "cancellation": "Cancellation",
         "move": "Move",
         "time_block": "Time block",
+        "account_access": "Account access",
         "created": "Created",
         "returned_to_pool": "Returned to pool",
         "cancelled": "Cancelled",
         "deleted": "Deleted",
     }.get(base_type, _QUEUE_CHANGE_LABELS.get(event_type, event_type.replace("_", " ").title()))
     clean_shortcode = str(shortcode or "").strip()
-    identifier = clean_shortcode or str(task_id or "").strip() or str(post_title or "").strip()[:80] or "unidentified"
+    identifier = clean_shortcode or str(task_id or "").strip() or str(ticket_id or "").strip() or str(post_title or "").strip()[:80] or "unidentified"
     subject_email = designer_email or actor_email
     subject = _slack_actor(subject_email)
     actor = _slack_actor(actor_email)
@@ -589,10 +612,14 @@ def build_queue_change_message(
             parts.append(f"{int(production_points)} PPs → {int(requested_production_points)} PPs")
         else:
             parts.append(f"{int(production_points)} PPs")
-    if base_type == "move":
+    if base_type in {"move", "time_block"}:
         schedule = _queue_change_schedule(scheduled_date, scheduled_start_minutes)
         if schedule:
             parts.append(schedule)
+    if base_type == "account_access" and account:
+        clean_accounts = " ".join(str(account).split())[:300]
+        if clean_accounts:
+            parts.append(clean_accounts if clean_accounts.startswith("@") else f"for {clean_accounts}")
     if clean_reason:
         parts.append(f'"{clean_reason.replace(chr(34), chr(39))}"')
     if brief and requested:
@@ -604,7 +631,7 @@ def build_queue_change_message(
 
     line = " · ".join(part for part in parts if part)
     blocks: list[dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": line[:2900]}}]
-    if task_id is not None:
+    if task_id is not None or ticket_id is not None:
         elements: list[dict[str, Any]] = []
         if requested and ticket_id is not None:
             elements.append({
@@ -612,11 +639,18 @@ def build_queue_change_message(
                 "style": "primary", "text": {"type": "plain_text", "text": "Approve", "emoji": True},
                 "confirm": {"title": {"type": "plain_text", "text": "Approve Queue request?"}, "text": {"type": "plain_text", "text": "This will apply the change in Queue."}, "confirm": {"type": "plain_text", "text": "Approve"}, "deny": {"type": "plain_text", "text": "Cancel"}},
             })
-        elements.append({
-            "type": "button", "text": {"type": "plain_text", "text": "Check Post", "emoji": True},
-            "url": queue_url_for(task_id),
-        })
-        blocks.append({"type": "actions", "elements": elements})
+        if task_id is not None:
+            elements.append({
+                "type": "button", "text": {"type": "plain_text", "text": "Check Post", "emoji": True},
+                "url": queue_url_for(task_id),
+            })
+        elif ticket_id is not None:
+            elements.append({
+                "type": "button", "text": {"type": "plain_text", "text": "Open Requests", "emoji": True},
+                "url": f"{_DASHBOARD}/queue.html",
+            })
+        if elements:
+            blocks.append({"type": "actions", "elements": elements})
     fallback = " · ".join(part.replace("`", "") for part in parts if part)
     return {"text": fallback[:2900], "blocks": blocks}
 
@@ -628,6 +662,10 @@ def notify_queue_change(**change: Any) -> bool:
     transaction. A missing token, missing channel membership, or transient
     Slack failure must never turn a successful Queue action into a 500.
     """
+    event_type = str(change.get("event_type") or "").strip().lower()
+    if not is_queue_spoc_approval_request(event_type):
+        logger.debug("Queue SPOC log skipped for non-approval event: %s", event_type or "unknown")
+        return False
     token = os.getenv("SLACK_BOT_TOKEN", "").strip()
     if not token:
         logger.warning("Queue change log skipped: SLACK_BOT_TOKEN is not configured")

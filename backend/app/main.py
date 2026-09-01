@@ -3550,6 +3550,16 @@ def dashboard_queue_v2_create_time_block(
         ticket_id = int(cursor.lastrowid)
         _queue_v2_publish(conn, "time_block_created", caller)
         row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    # Personal time created by a PD is provisional and needs coordinator
+    # approval. Coordinator-created blocks are already firm and stay out of
+    # the SPOC approval inbox.
+    if status == "pending":
+        _queue_v2_slack_log(
+            event_type="time_block_requested", task_id=None, ticket_id=ticket_id,
+            actor_email=caller, designer_email=target_designer, status=status,
+            reason=clean_note, scheduled_date=scheduled_date,
+            scheduled_start_minutes=start,
+        )
     return {"ok": True, "ticket": _queue_v2_ticket(row)}
 
 
@@ -3640,6 +3650,12 @@ def dashboard_queue_v2_request_account_access(
         ticket_id = int(cursor.lastrowid)
         _queue_v2_publish(conn, "ticket_created", caller)
         row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    _queue_v2_slack_log(
+        event_type="account_access_requested", task_id=None, ticket_id=ticket_id,
+        actor_email=caller, designer_email=caller, status="pending",
+        account=" ".join(f"@{handle}" for handle in handles),
+        reason=(reason or "").strip(),
+    )
     return {"ok": True, "ticket": _queue_v2_ticket(row)}
 
 
