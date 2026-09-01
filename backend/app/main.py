@@ -173,6 +173,7 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
             {"detail": "This Google account is not authorized for Sentient Dash."}, status_code=403
         )
     is_admin = bool(access["is_admin"])
+    base_is_admin = is_admin
     request.state.user_email = email
     request.state.is_admin = is_admin
     request.state.operating_role = access["operating_role"]
@@ -182,15 +183,22 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         request.state.operating_roles = []
     if not request.state.operating_roles:
         request.state.operating_roles = [access["operating_role"]]
-    # Dev is a private role for Esteban. Keep this separate from the active
-    # operating role so a preview cannot make the role switcher disappear.
-    request.state.is_dev = email == "esteban@sentientagency.io" and "dev" in request.state.operating_roles
-    # Esteban's Dev role can safely preview a restricted operating role. This
-    # is deliberately a reduction of privileges, never an escalation.
+    # Keep the user's actual capabilities separately from the currently active
+    # UI role. Esteban can preview every restricted role; Ivan can switch only
+    # between roles he already has, never into Dev or an unassigned privilege.
+    request.state.available_operating_roles = list(dict.fromkeys(request.state.operating_roles))
+    request.state.is_dev = email == "esteban@sentientagency.io"
+    request.state.can_role_switch = request.state.is_dev or email == "ivan@sentientagency.io"
     preview_role = request.headers.get("x-queue-role-preview", "").strip().lower()
-    if request.state.is_dev and preview_role in {"sales", "pd", "vc", "trainee", "admin"}:
+    allowed_preview_roles = set(request.state.available_operating_roles)
+    if base_is_admin:
+        allowed_preview_roles.add("admin")
+    if request.state.is_dev:
+        allowed_preview_roles = {"sales", "pd", "vc", "trainee", "admin"}
+    if request.state.can_role_switch and preview_role in allowed_preview_roles:
+        request.state.operating_role = preview_role
         request.state.operating_roles = [preview_role]
-        request.state.is_admin = preview_role == "admin"
+        request.state.is_admin = base_is_admin and preview_role == "admin"
     if path.startswith("/api/admin/") and not (request.state.is_admin or request.state.is_dev):
         return JSONResponse({"detail": "Admin or Dev access required."}, status_code=403)
     request.state.user_uid = decoded.get("uid")
@@ -295,6 +303,8 @@ def dashboard_me(request: Request) -> dict[str, Any]:
         "operating_role": getattr(request.state, "operating_role", "sales"),
         "operating_roles": getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]),
         "is_dev": bool(getattr(request.state, "is_dev", False)),
+        "can_role_switch": bool(getattr(request.state, "can_role_switch", False)),
+        "available_operating_roles": getattr(request.state, "available_operating_roles", [getattr(request.state, "operating_role", "sales")]),
     }
 
 
@@ -2768,6 +2778,8 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         "viewer": {
             "email": caller, "isAdmin": is_admin, "isDev": bool(getattr(request.state, "is_dev", False)),
             "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles,
+            "canRoleSwitch": bool(getattr(request.state, "can_role_switch", False)),
+            "availableOperatingRoles": list(getattr(request.state, "available_operating_roles", roles)),
             "minutesPerPP": _queue_v2_minutes_per_pp_for_roles(roles),
         },
         "date": selected_date, "requests": requests, "planningRequests": planning_requests,
