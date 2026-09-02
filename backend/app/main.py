@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .apify_sync import (
@@ -48,6 +48,7 @@ from .config import (
     UPLOAD_DIR,
     ensure_directories,
 )
+from .media_storage import materialize_local_path, redirect_url, store_uploaded_media
 from .db import (
     delete_account_list,
     all_account_snapshots,
@@ -905,8 +906,19 @@ def dashboard_post_transcript(account: str, shortcode: str) -> PlainTextResponse
     )
 
 
+def _media_response(reference: str | Path | None, detail: str) -> Response:
+    """Serve legacy disk media or redirect durable R2 media without proxying it."""
+    direct_url = redirect_url(reference)
+    if direct_url:
+        return RedirectResponse(direct_url, status_code=307)
+    path = materialize_local_path(reference)
+    if path:
+        return FileResponse(path)
+    raise HTTPException(status_code=404, detail=detail)
+
+
 @app.get("/api/dashboard/covers/{account}/{post_id}")
-def dashboard_cover(account: str, post_id: int) -> FileResponse:
+def dashboard_cover(account: str, post_id: int) -> Response:
     """Serve a post cover for any account. Non-canonical accounts lazily
     download and cache from the original CDN URL on first request (avoids
     eagerly downloading covers for every post during import/backfill).
@@ -921,10 +933,7 @@ def dashboard_cover(account: str, post_id: int) -> FileResponse:
             row = conn.execute("SELECT image_path FROM posts WHERE id = ?", (post_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Post cover not found.")
-        image_path = Path(str(row["image_path"]))
-        if not image_path.is_file():
-            raise HTTPException(status_code=404, detail="Post cover file is unavailable.")
-        return FileResponse(image_path)
+        return _media_response(row["image_path"], "Post cover file is unavailable.")
 
     with connect() as conn:
         row = conn.execute(
@@ -934,9 +943,13 @@ def dashboard_cover(account: str, post_id: int) -> FileResponse:
     if not row:
         raise HTTPException(status_code=404, detail="Post cover not found.")
 
-    image_path = Path(str(row["cover_image_path"])) if row["cover_image_path"] else None
-    if image_path and image_path.is_file():
-        return FileResponse(image_path)
+    if row["cover_image_path"]:
+        try:
+            return _media_response(row["cover_image_path"], "Post cover file is unavailable.")
+        except HTTPException:
+            # Preserve the existing lazy repair if a legacy cache disappeared
+            # while Instagram's signed source URL is still fresh.
+            pass
 
     cover_source_url = row["cover_source_url"]
     if not cover_source_url:
@@ -957,17 +970,17 @@ def dashboard_cover(account: str, post_id: int) -> FileResponse:
     elif "webp" in content_type:
         suffix = ".webp"
 
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    new_path = UPLOAD_DIR / f"dash-{account}-{os.urandom(16).hex()}{suffix}"
-    new_path.write_bytes(response.content)
+    new_reference = store_uploaded_media(
+        f"dash-{account}-{os.urandom(16).hex()}{suffix}", response.content, content_type=content_type
+    )
 
     with connect() as conn:
         conn.execute(
             "UPDATE dashboard_posts SET cover_image_path = ? WHERE id = ?",
-            (str(new_path), post_id),
+            (new_reference, post_id),
         )
 
-    return FileResponse(new_path)
+    return _media_response(new_reference, "Post cover file is unavailable.")
 
 
 def _caller_email(request: Request) -> str:
@@ -6313,16 +6326,13 @@ def admin_fetch_avatar(
 
 
 @app.get("/api/dashboard/avatar/{handle}")
-def dashboard_avatar(handle: str) -> FileResponse:
-    """Serves a cached local copy of the account's profile picture."""
+def dashboard_avatar(handle: str) -> Response:
+    """Serves a cached account avatar from R2 or the legacy local disk."""
     with connect() as conn:
         row = conn.execute("SELECT avatar_path FROM accounts WHERE handle = ?", (handle,)).fetchone()
     if not row or not row["avatar_path"]:
         raise HTTPException(status_code=404, detail="No profile picture cached for this account.")
-    avatar_path = Path(str(row["avatar_path"]))
-    if not avatar_path.is_file():
-        raise HTTPException(status_code=404, detail="Profile picture file is unavailable.")
-    return FileResponse(avatar_path)
+    return _media_response(row["avatar_path"], "Profile picture file is unavailable.")
 
 
 @app.get("/api/dashboard/user-avatar/{slack_user_id}")

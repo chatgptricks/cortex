@@ -238,9 +238,7 @@ def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> Path | N
 
     import httpx
 
-    from .config import UPLOAD_DIR
-
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    from .media_storage import materialize_local_path, store_uploaded_media
     try:
         with httpx.Client(timeout=30.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
             response = client.get(cover_source_url)
@@ -249,12 +247,11 @@ def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> Path | N
     except Exception:
         return None
 
-    path = UPLOAD_DIR / f"{dest_stem}{suffix}"
     try:
-        path.write_bytes(data)
+        reference = store_uploaded_media(f"{dest_stem}{suffix}", data)
     except OSError:
         return None
-    return path
+    return materialize_local_path(reference)
 
 
 def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
@@ -314,8 +311,10 @@ def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
     give_up: list[tuple[str, int]] = []
 
     for row in dash:
-        path = Path(str(row["cover_image_path"])) if row["cover_image_path"] else None
-        if path is None or not path.is_file():
+        from .media_storage import materialize_local_path
+
+        path = materialize_local_path(row["cover_image_path"])
+        if path is None:
             stem = f"dash-{row['account']}-{str(row['shortcode'] or row['id']).strip()}"
             path = ensure_local_cover(row["cover_source_url"], stem)
             if path is None:
@@ -987,14 +986,13 @@ def _insert_new_chatgptricks_posts(
     """
     import httpx
 
-    from .config import UPLOAD_DIR
     from .db import connect, utc_now
+    from .media_storage import store_uploaded_media
 
     summary: dict[str, Any] = {"added": 0, "failed": 0, "items": []}
     if not new_items:
         return summary
 
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     total = len(new_items)
 
     def _tick(index: int, shortcode: str) -> None:
@@ -1033,8 +1031,7 @@ def _insert_new_chatgptricks_posts(
             # Keyed by shortcode rather than random bytes: re-importing a post
             # overwrites its own cover instead of orphaning the old file on
             # disk with no way to ever find or clean it up.
-            image_path = UPLOAD_DIR / f"cover-{shortcode}{suffix}"
-            image_path.write_bytes(image_bytes)
+            image_path = store_uploaded_media(f"cover-{shortcode}{suffix}", image_bytes)
 
             caption = _clean_text(item.get("caption"))
             title = _title_from_caption(caption) or f"Instagram post {shortcode}"
@@ -1063,7 +1060,7 @@ def _insert_new_chatgptricks_posts(
                         post_type_label,
                         source_ref,
                         shortcode,
-                        str(image_path),
+                        image_path,
                         f"instagram-{shortcode}{suffix}",
                         "queued",
                         5,
@@ -1089,14 +1086,13 @@ def _insert_new_dashboard_posts(
     """
     import httpx
 
-    from .config import UPLOAD_DIR
     from .db import connect, utc_now
+    from .media_storage import store_uploaded_media
 
     summary: dict[str, Any] = {"added": 0, "failed": 0, "items": []}
     if not new_items:
         return summary
 
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     total = len(new_items)
 
     with httpx.Client(timeout=60.0, headers={"User-Agent": "Mozilla/5.0"}) as image_client:
@@ -1112,9 +1108,7 @@ def _insert_new_dashboard_posts(
                     # Keyed by account+shortcode rather than random bytes so a
                     # re-import overwrites its own cover instead of orphaning
                     # the previous file on disk forever.
-                    image_path = UPLOAD_DIR / f"dash-{account}-{shortcode}{suffix}"
-                    image_path.write_bytes(image_bytes)
-                    cover_path = str(image_path)
+                    cover_path = store_uploaded_media(f"dash-{account}-{shortcode}{suffix}", image_bytes)
                 except httpx.HTTPError:
                     cover_path = None
 
@@ -1871,10 +1865,9 @@ def store_avatar_from_url(handle: str, image_url: str) -> str:
     """
     import httpx
 
-    from .config import UPLOAD_DIR
     from .db import connect, utc_now
+    from .media_storage import store_uploaded_media
 
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     clean = handle.strip().lstrip("@").lower()
     suffix = ".jpg"
     try:
@@ -1886,17 +1879,16 @@ def store_avatar_from_url(handle: str, image_url: str) -> str:
                 suffix = ".png"
             elif "webp" in content_type:
                 suffix = ".webp"
-            avatar_path = UPLOAD_DIR / f"avatar-{clean}{suffix}"
-            avatar_path.write_bytes(response.content)
+            avatar_path = store_uploaded_media(f"avatar-{clean}{suffix}", response.content, content_type=content_type)
     except httpx.HTTPError as exc:
         raise ApifySyncError(f"Could not download the profile picture: {exc}") from exc
 
     with connect() as conn:
         conn.execute(
             "UPDATE accounts SET avatar_path = ?, updated_at = ? WHERE handle = ?",
-            (str(avatar_path), utc_now(), clean),
+            (avatar_path, utc_now(), clean),
         )
-    return str(avatar_path)
+    return avatar_path
 
 
 def _refresh_cover_from_item(table: str, handle: str, shortcode: str, row: Any, item: dict[str, Any]) -> bool:
@@ -1915,31 +1907,28 @@ def _refresh_cover_from_item(table: str, handle: str, shortcode: str, row: Any, 
 
     import httpx
 
-    from .config import UPLOAD_DIR
     from .db import connect, utc_now
+    from .media_storage import store_uploaded_media
 
     try:
         with httpx.Client(timeout=60.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
             response = client.get(image_url)
             response.raise_for_status()
         image_bytes, suffix = _compress_cover(response.content)
-        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         if table == "posts":
-            image_path = UPLOAD_DIR / f"cover-{shortcode}{suffix}"
-            image_path.write_bytes(image_bytes)
+            image_path = store_uploaded_media(f"cover-{shortcode}{suffix}", image_bytes)
             with connect() as conn:
                 conn.execute(
                     "UPDATE posts SET image_path = ?, updated_at = ? WHERE id = ?",
-                    (str(image_path), utc_now(), int(row["id"])),
+                    (image_path, utc_now(), int(row["id"])),
                 )
         else:
-            image_path = UPLOAD_DIR / f"dash-{handle}-{shortcode}{suffix}"
-            image_path.write_bytes(image_bytes)
+            image_path = store_uploaded_media(f"dash-{handle}-{shortcode}{suffix}", image_bytes)
             with connect() as conn:
                 conn.execute(
                     "UPDATE dashboard_posts SET cover_source_url = ?, cover_image_path = ?, updated_at = ? "
                     "WHERE id = ? AND account = ?",
-                    (image_url, str(image_path), utc_now(), int(row["id"]), handle),
+                    (image_url, image_path, utc_now(), int(row["id"]), handle),
                 )
     except (httpx.HTTPError, OSError, ValueError, TypeError):
         return False
