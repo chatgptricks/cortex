@@ -136,6 +136,7 @@ def init_db() -> None:
                 likes INTEGER,
                 comments INTEGER,
                 caption TEXT,
+                transcript TEXT,
                 post_type_label TEXT,
                 is_animated INTEGER NOT NULL DEFAULT 0,
                 permalink TEXT,
@@ -584,6 +585,10 @@ def init_db() -> None:
         _ensure_column(conn, "dashboard_posts", "coauthors", "coauthors TEXT")
         _ensure_column(conn, "dashboard_posts", "tagged_users", "tagged_users TEXT")
         _ensure_column(conn, "dashboard_posts", "dimensions", "dimensions TEXT")
+        # Reels can optionally return an audio transcript. It is deliberately
+        # stored separately from the visible caption: it powers search and a
+        # download-only workflow without leaking into the card UI.
+        _ensure_column(conn, "dashboard_posts", "transcript", "transcript TEXT")
         _ensure_column(conn, "dashboard_posts", "enriched_at", "enriched_at TEXT")
         # Sorting/filtering by reel performance is the main reason these exist.
         conn.execute(
@@ -749,6 +754,7 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     # full bootstrap. Otherwise production would accept the UI form but fail
     # on its first account read after deployment.
     _ensure_column(conn, "accounts", "scrape_mode", "scrape_mode TEXT NOT NULL DEFAULT 'posts'")
+    _ensure_column(conn, "dashboard_posts", "transcript", "transcript TEXT")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS queue_scheduler_preferences (
                viewer_email TEXT PRIMARY KEY,

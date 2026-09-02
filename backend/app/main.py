@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .apify_sync import (
@@ -753,7 +753,7 @@ def dashboard_posts() -> dict[str, Any]:
             SELECT id, account, shortcode, published_at, likes, comments, caption,
                    post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
                    hook_text, music_song, music_artist, music_audio_id, uses_original_audio,
-                   is_promo, hidden
+                   is_promo, hidden, transcript
             FROM dashboard_posts
             """
         ).fetchall()
@@ -842,6 +842,10 @@ def dashboard_posts() -> dict[str, Any]:
                     if post.get("music_audio_id")
                     else None
                 ),
+                # This remains hidden in the UI, but rides with the protected
+                # data feed so the existing client-side search can index it.
+                "transcript": str(post.get("transcript") or "").strip(),
+                "transcriptAvailable": bool(str(post.get("transcript") or "").strip()),
             }
         )
 
@@ -877,6 +881,28 @@ def dashboard_posts() -> dict[str, Any]:
             "Average likes": round(total_likes / len(known_likes)) if known_likes else 0,
         },
     }
+
+
+@app.get("/api/dashboard/posts/{account}/{shortcode}/transcript")
+def dashboard_post_transcript(account: str, shortcode: str) -> PlainTextResponse:
+    """Downloads a Reel transcript without exposing it in the dashboard feed."""
+    clean_account = account.strip().lstrip("@").lower()
+    clean_shortcode = shortcode.strip()
+    if not clean_account or not clean_shortcode:
+        raise HTTPException(status_code=404, detail="Post not found.")
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT transcript FROM dashboard_posts WHERE account = ? AND shortcode = ?",
+            (clean_account, clean_shortcode),
+        ).fetchone()
+    transcript = str(row["transcript"] or "").strip() if row else ""
+    if not transcript:
+        raise HTTPException(status_code=404, detail="No transcript is available for this Reel.")
+    filename = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{clean_account}-{clean_shortcode}-transcript.txt")
+    return PlainTextResponse(
+        transcript + "\n",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/dashboard/covers/{account}/{post_id}")
