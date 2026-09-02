@@ -17,7 +17,7 @@ def test_collect_short_term_items_uses_the_selected_profile_surface(monkeypatch)
                 {"shortCode": "both-post", "ownerUsername": "both", "type": "Image"},
             ]
         return [
-            {"shortCode": "reel-only", "ownerUsername": "reels", "type": "Video"},
+            {"shortCode": "reel-only", "owner": {"username": "reels"}, "type": "Video"},
             {"shortCode": "both-reel", "ownerUsername": "both", "type": "Video"},
         ]
 

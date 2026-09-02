@@ -341,6 +341,7 @@ def init_db() -> None:
                 completed_at TEXT,
                 closed_at TEXT,
                 final_permalink TEXT,
+                final_permalinks TEXT NOT NULL DEFAULT '[]',
                 cancellation_reason TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -507,6 +508,7 @@ def init_db() -> None:
         _ensure_column(conn, "queue_requests", "slack_message_ts", "slack_message_ts TEXT")
         _ensure_column(conn, "queue_schedule_drafts", "production_points", "production_points INTEGER")
         _ensure_column(conn, "queue_requests", "minutes_per_pp", "minutes_per_pp INTEGER NOT NULL DEFAULT 10")
+        _ensure_column(conn, "queue_requests", "final_permalinks", "final_permalinks TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "queue_schedule_drafts", "minutes_per_pp", "minutes_per_pp INTEGER")
         _ensure_column(conn, "queue_tickets", "requested_accounts", "requested_accounts TEXT NOT NULL DEFAULT '[]'")
         conn.execute("DROP INDEX IF EXISTS idx_queue_requests_status")
