@@ -1195,6 +1195,33 @@ def _insert_new_posts(
     return _insert_new_dashboard_posts(account, new_items, on_progress=on_progress)
 
 
+def _store_existing_reel_transcripts(account: str, cfg: dict[str, Any], items: list[dict[str, Any]]) -> int:
+    """Persist transcripts returned for Reels that were already on file.
+
+    Imports normally insert only new rows. Without this small update path, a
+    one-time transcript extraction for an existing Reel would be paid for but
+    discarded because its shortcode already exists in the dashboard.
+    """
+    if cfg["is_canonical"]:
+        return 0
+    from .db import connect, utc_now
+
+    updated = 0
+    with connect() as conn:
+        for item in items:
+            shortcode = str(item.get("shortCode") or "").strip()
+            transcript = extract_apify_fields(item).get("transcript")
+            if not shortcode or not transcript:
+                continue
+            cursor = conn.execute(
+                "UPDATE dashboard_posts SET transcript = ?, updated_at = ? "
+                "WHERE account = ? AND shortcode = ? AND COALESCE(transcript, '') != ?",
+                (transcript, utc_now(), account, shortcode, transcript),
+            )
+            updated += cursor.rowcount or 0
+    return updated
+
+
 # ---------------------------------------------------------------------------
 # Minimum post age before the one-time HOT decision is made. Matches the
 # scheduler's tightest cadence (30 min during posting hours): once half an hour
@@ -1387,6 +1414,7 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
     new_items = [it for it in items if it.get("shortCode") and it["shortCode"] not in existing_shortcodes]
     new_items.sort(key=lambda it: it.get("timestamp") or "")
     insert_summary = _insert_new_posts(account, cfg, new_items)
+    transcript_updates = _store_existing_reel_transcripts(account, cfg, items)
 
     # Re-read so freshly-inserted posts are also eligible for the engagement
     # pass below (a post that's brand new is, by definition, well within the
@@ -1515,7 +1543,7 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
                     sent += 1
             engagement_summary["slack_alerts_sent"] = sent
 
-    return {"new_posts": insert_summary, "engagement": engagement_summary}
+    return {"new_posts": insert_summary, "engagement": engagement_summary, "transcripts_updated": transcript_updates}
 
 
 def run_short_term_cycle(account: str, results_limit: int = _SHORT_RESULTS_LIMIT) -> dict[str, Any]:
@@ -1795,7 +1823,9 @@ def run_backfill(
         already_had=len(existing_shortcodes),
         fetched=len(items),
     )
-    return _insert_new_posts(account, cfg, new_items, on_progress=on_progress)
+    summary = _insert_new_posts(account, cfg, new_items, on_progress=on_progress)
+    summary["transcripts_updated"] = _store_existing_reel_transcripts(account, cfg, items)
+    return summary
 
 
 def fetch_profile_preview(handle: str) -> dict[str, Any]:
