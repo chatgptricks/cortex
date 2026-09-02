@@ -1259,6 +1259,19 @@ def _is_reel_item(item: dict[str, Any]) -> bool:
     return product_type in {"clips", "reel", "reels"} or item_type in {"reel", "clips"} or "/reel/" in url
 
 
+def _item_owner_username(item: dict[str, Any]) -> str:
+    """Normalize the account owner across Apify's post and Reel payloads.
+
+    The official Reel actor commonly returns ``owner.username`` while the
+    profile scraper returns ``ownerUsername``. Treating only the latter as
+    authoritative made valid Reel rows impossible to attribute to one of our
+    configured accounts, so they were silently discarded before import.
+    """
+    owner = item.get("owner")
+    nested = owner.get("username") if isinstance(owner, dict) else ""
+    return str(item.get("ownerUsername") or nested or item.get("username") or "").strip().lstrip("@").lower()
+
+
 _INSTAGRAM_CONTENT_URL = re.compile(r"instagram\.com/(?:p|reel|tv)/([^/?#]+)", re.IGNORECASE)
 
 
@@ -1314,7 +1327,7 @@ def _collect_short_term_items(
         post_items = _fetch_apify_items(_short_term_payload(post_handles, results_limit, now))
         post_owner_to_account = {cfg["handle"].lower(): account for account, cfg in post_configs.items()}
         for item in post_items:
-            account = post_owner_to_account.get((item.get("ownerUsername") or "").lower())
+            account = post_owner_to_account.get(_item_owner_username(item))
             if account and not _is_reel_item(item):
                 items_by_account[account].append(item)
 
@@ -1328,7 +1341,7 @@ def _collect_short_term_items(
         )
         reel_owner_to_account = {cfg["handle"].lower(): account for account, cfg in reel_configs.items()}
         for item in reel_items:
-            account = reel_owner_to_account.get((item.get("ownerUsername") or "").lower())
+            account = reel_owner_to_account.get(_item_owner_username(item))
             if account:
                 items_by_account[account].append(item)
 

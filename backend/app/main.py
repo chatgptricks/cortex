@@ -1850,6 +1850,33 @@ def _queue_v2_clean_account_handles(value: Any) -> list[str]:
     return handles
 
 
+def _queue_v2_final_permalinks(row: dict[str, Any]) -> list[dict[str, str]]:
+    """Return one published Instagram permalink per destination account.
+
+    ``final_permalink`` predates multi-account assignments. Keep it as the
+    canonical first link for old integrations, while exposing the complete
+    per-account record to Queue.
+    """
+    saved = _queue_v2_json(row.get("final_permalinks"), [])
+    links: list[dict[str, str]] = []
+    if isinstance(saved, list):
+        for item in saved:
+            if not isinstance(item, dict):
+                continue
+            account = str(item.get("account") or "").strip().lstrip("@").lower()
+            url = str(item.get("url") or "").strip()
+            if account and url and not any(entry["account"] == account for entry in links):
+                links.append({"account": account, "url": url})
+    if links:
+        return links
+    legacy = str(row.get("final_permalink") or "").strip()
+    if not legacy:
+        return []
+    destinations = _queue_v2_clean_account_handles(_queue_v2_json(row.get("recommended_accounts"), []))
+    fallback_account = destinations[0] if destinations else str(row.get("post_account") or "").strip().lstrip("@").lower() or "instagram"
+    return [{"account": fallback_account, "url": legacy}]
+
+
 def _queue_v2_user_roles(user: dict[str, Any] | Any) -> list[str]:
     """Return effective Queue roles; every dashboard user is PD-capable."""
     roles = _queue_v2_json(user.get("operating_roles"), [user.get("operating_role") or "sales"])
@@ -2393,7 +2420,7 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
         "recommendedAccounts": _queue_v2_json(row["recommended_accounts"], []),
         "scheduledDate": row["scheduled_date"], "scheduledStartMinutes": row["scheduled_start_minutes"],
         "actualStartedAt": row["actual_started_at"], "completedAt": row["completed_at"], "closedAt": row["closed_at"],
-        "finalPermalink": row["final_permalink"], "cancellationReason": row["cancellation_reason"],
+        "finalPermalink": row["final_permalink"], "finalPermalinks": _queue_v2_final_permalinks(row), "cancellationReason": row["cancellation_reason"],
         "createdAt": row["created_at"], "updatedAt": row["updated_at"],
     }
 
@@ -3294,6 +3321,7 @@ def dashboard_queue_v2_pool(
     production_points: Annotated[int, Form()], priority: Annotated[str, Form()] = "normal",
     tags: Annotated[str | None, Form()] = None, brief: Annotated[str | None, Form()] = None,
     notes: Annotated[str | None, Form()] = None, references: Annotated[str | None, Form()] = None,
+    recommended_accounts: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
     # Internal self-assignment users may add an existing Dashboard post to
     # their own Pool, but do not gain the rest of the coordinator surface.
@@ -3673,6 +3701,33 @@ def dashboard_queue_v2_request_pp_revision(
 ) -> dict[str, Any]:
     caller, _, _ = _queue_v2_access(request)
     row = _queue_v2_request(request_id)
+    current_accounts = _queue_v2_clean_account_handles(_queue_v2_json(row.get("recommended_accounts"), []))
+    selected_accounts = current_accounts
+    if recommended_accounts is not None:
+        try:
+            selected_accounts = _queue_v2_clean_account_handles(json.loads(recommended_accounts))
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Target accounts must be valid JSON.") from exc
+        active_sentient = {
+            str(item.get("handle") or "").strip().lower()
+            for item in list_accounts(active_only=True)
+            if item.get("group") == "sentient"
+        }
+        if any(account not in active_sentient for account in selected_accounts):
+            raise HTTPException(status_code=400, detail="Choose active Sentient accounts only.")
+        if row.get("designer_email"):
+            with connect() as conn:
+                allowed = {
+                    str(item["account_handle"] or "").strip().lower()
+                    for item in conn.execute(
+                        "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ?",
+                        (row["designer_email"],),
+                    ).fetchall()
+                }
+            if any(account not in allowed for account in selected_accounts):
+                raise HTTPException(status_code=400, detail="Every target account must be managed by the assigned user.")
+        if row.get("status") == "closed" and selected_accounts != current_accounts:
+            raise HTTPException(status_code=409, detail="Reopen the request before changing its published destination accounts.")
     if row.get("designer_email") != caller:
         raise HTTPException(status_code=403, detail="Only the assigned designer can request a PP revision.")
     if row["status"] not in {"scheduled", "in_progress"}:
@@ -4225,9 +4280,9 @@ def dashboard_queue_v2_edit(
     with connect() as conn:
         conn.execute(
             """UPDATE queue_requests SET production_points = ?, priority = ?, tags = ?, brief = ?, notes = ?,
-               reference_links = ?, updated_at = ? WHERE id = ?""",
+               reference_links = ?, recommended_accounts = ?, updated_at = ? WHERE id = ?""",
             (production_points, clean_priority, json.dumps(clean_tags), (brief or "").strip(), (notes or "").strip(),
-             json.dumps(clean_refs), now, request_id),
+             json.dumps(clean_refs), json.dumps(selected_accounts), now, request_id),
         )
         # Keep an existing collaborative placement's provisional duration in
         # sync with the edited request so its live block and PP count change
@@ -4238,6 +4293,7 @@ def dashboard_queue_v2_edit(
         )
         _queue_v2_log(conn, request_id, caller, "edited", {
             "productionPoints": production_points, "priority": clean_priority, "tags": clean_tags,
+            "recommendedAccounts": selected_accounts,
         })
         if row.get("designer_email") and row.get("status") in {"scheduled", "in_progress", "completed", "closed"}:
             _queue_v2_reflow_scheduled(conn, row["designer_email"], caller, priority_id=request_id if row["status"] == "scheduled" else None)
@@ -4630,16 +4686,49 @@ def dashboard_queue_v2_complete(request_id: int, request: Request) -> dict[str, 
 
 
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/close")
-def dashboard_queue_v2_close(request_id: int, request: Request, final_permalink: Annotated[str, Form()]) -> dict[str, Any]:
+def dashboard_queue_v2_close(
+    request_id: int,
+    request: Request,
+    final_permalink: Annotated[str | None, Form()] = None,
+    final_permalinks: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
     caller, is_admin, roles = _queue_v2_access(request)
     row = _queue_v2_request(request_id)
     if not is_admin and row["designer_email"] != caller:
         raise HTTPException(status_code=403, detail="Only the assigned designer can close this request.")
-    link = final_permalink.strip()
-    if not re.match(r"^https?://(www\.)?instagram\.com/(p|reel)/[^/?#]+/?", link):
-        raise HTTPException(status_code=400, detail="Add a valid Instagram post or Reel permalink.")
     if row["status"] != "completed":
         raise HTTPException(status_code=409, detail="Complete the request before closing it.")
+    destinations = _queue_v2_clean_account_handles(_queue_v2_json(row.get("recommended_accounts"), []))
+    if not destinations:
+        fallback = str(row.get("post_account") or "").strip().lstrip("@").lower() or "instagram"
+        destinations = [fallback]
+    submitted: Any
+    if final_permalinks is not None:
+        try:
+            submitted = json.loads(final_permalinks)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Published links must be valid JSON.") from exc
+    else:
+        submitted = [{"account": destinations[0], "url": str(final_permalink or "").strip()}]
+    if isinstance(submitted, dict):
+        submitted = [{"account": account, "url": url} for account, url in submitted.items()]
+    if not isinstance(submitted, list):
+        raise HTTPException(status_code=400, detail="Published links must be a list of account links.")
+    links_by_account: dict[str, str] = {}
+    for item in submitted:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="Every published link must include an account and URL.")
+        account = str(item.get("account") or "").strip().lstrip("@").lower()
+        link = str(item.get("url") or "").strip()
+        if account not in destinations or account in links_by_account:
+            raise HTTPException(status_code=400, detail="Provide exactly one published link for every target account.")
+        if not re.match(r"^https?://(www\.)?instagram\.com/(p|reel)/[^/?#]+/?", link):
+            raise HTTPException(status_code=400, detail=f"Add a valid Instagram post or Reel permalink for @{account}.")
+        links_by_account[account] = link
+    if set(links_by_account) != set(destinations):
+        raise HTTPException(status_code=400, detail="Add the published Instagram link for every target account before closing.")
+    final_links = [{"account": account, "url": links_by_account[account]} for account in destinations]
+    link = final_links[0]["url"]
     now = utc_now()
     with connect() as conn:
         if not is_admin and "trainee" in roles:
@@ -4651,8 +4740,8 @@ def dashboard_queue_v2_close(request_id: int, request: Request, final_permalink:
             ).fetchone()
             if not review or review["status"] != "approved":
                 raise HTTPException(status_code=409, detail="A VC or Admin must approve the Canva design before it can be posted.")
-        conn.execute("UPDATE queue_requests SET status = 'closed', final_permalink = ?, closed_at = ?, updated_at = ? WHERE id = ?", (link, now, now, request_id))
-        _queue_v2_log(conn, request_id, caller, "closed", {"finalPermalink": link})
+        conn.execute("UPDATE queue_requests SET status = 'closed', final_permalink = ?, final_permalinks = ?, closed_at = ?, updated_at = ? WHERE id = ?", (link, json.dumps(final_links), now, now, request_id))
+        _queue_v2_log(conn, request_id, caller, "closed", {"finalPermalink": link, "finalPermalinks": final_links})
         _queue_v2_publish(conn, "request_closed", caller, [request_id])
     return {"ok": True}
 
