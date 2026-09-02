@@ -40,6 +40,14 @@ SENTIENT_OCR_URL = os.getenv("SENTIENT_OCR_URL")
 SENTIENT_OCR_TOKEN = os.getenv("SENTIENT_OCR_TOKEN")
 SENTIENT_OCR_TIMEOUT = float(os.getenv("SENTIENT_OCR_TIMEOUT", "300"))
 
+# R2 is opt-in: a deployment before the bucket credentials are added behaves
+# exactly like the current Render-disk deployment.
+R2_MEDIA_ENABLED = os.getenv("R2_MEDIA_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip("/")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
+
 # Origins the deployed frontends are served from. These are baked in rather
 # than left to an env var because they're a property of where this app lives,
 # not of a particular deployment -- and a missing env var silently breaks
