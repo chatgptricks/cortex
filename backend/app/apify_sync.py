@@ -415,6 +415,7 @@ _EXTRACT_COLUMNS = (
     "coauthors",
     "tagged_users",
     "dimensions",
+    "transcript",
 )
 
 
@@ -464,6 +465,20 @@ def extract_apify_fields(item: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         raw_json = None
 
+    # The Reels actor currently calls this field `transcript`; keep a few
+    # compatible aliases because older runs and actor revisions have used
+    # alternate nesting/names. A transcript is never appended to `caption`.
+    transcript = None
+    for key in ("transcript", "audioTranscript", "audio_transcript", "transcription"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            transcript = _clean_text(value)
+            break
+    if transcript is None and isinstance(item.get("audio"), dict):
+        value = item["audio"].get("transcript")
+        if isinstance(value, str) and value.strip():
+            transcript = _clean_text(value)
+
     return {
         "raw_json": raw_json,
         "video_views": _as_int(item.get("videoViewCount")),
@@ -489,6 +504,7 @@ def extract_apify_fields(item: dict[str, Any]) -> dict[str, Any]:
         "coauthors": _join_list(item.get("coauthorProducers"), key="username"),
         "tagged_users": _join_list(item.get("taggedUsers"), key="username"),
         "dimensions": f"{width}x{height}" if width and height else None,
+        "transcript": transcript or None,
     }
 
 
@@ -1241,6 +1257,9 @@ def _short_term_reels_payload(handles: list[str], results_limit: int, now: datet
         "username": handles,
         "resultsLimit": results_limit,
         "skipPinnedPosts": True,
+        # Paid optional output from Apify's Reels actor. It is requested only
+        # for Reels, never for ordinary post-feed refreshes.
+        "includeTranscript": True,
         "onlyPostsNewerThan": (now - timedelta(hours=_SHORT_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
@@ -1705,6 +1724,7 @@ def run_backfill(
     reel_payload: dict[str, Any] = {
         "username": [cfg["handle"]],
         "resultsLimit": results_limit,
+        "includeTranscript": True,
         # The Reels actor has its own pagination over the Reels tab. This is
         # intentionally not a /<handle>/reels URL passed to the profile actor:
         # that actor only accepts profile and individual-reel URLs.

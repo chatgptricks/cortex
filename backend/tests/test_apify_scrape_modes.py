@@ -40,6 +40,16 @@ def test_collect_short_term_items_uses_the_selected_profile_surface(monkeypatch)
     ]
     assert calls[1][0] == apify_sync.APIFY_REEL_ACTOR_ID
     assert calls[1][1]["username"] == ["reels", "both"]
+    assert calls[1][1]["includeTranscript"] is True
+
+
+def test_reel_transcript_is_promoted_without_touching_caption() -> None:
+    extracted = apify_sync.extract_apify_fields({
+        "caption": "Visible Instagram caption",
+        "transcript": "Text spoken in the Reel.",
+    })
+
+    assert extracted["transcript"] == "Text spoken in the Reel."
 
 
 def test_dedupe_items_excludes_a_reel_returned_by_both_actor_shapes() -> None:
