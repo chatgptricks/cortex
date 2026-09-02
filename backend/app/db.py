@@ -166,6 +166,10 @@ def init_db() -> None:
                 label TEXT NOT NULL,
                 group_name TEXT NOT NULL CHECK(group_name IN ('sentient', 'competitors')),
                 hot_threshold INTEGER NOT NULL DEFAULT 600,
+                -- Which public Instagram surface this account follows. New
+                -- accounts choose this in Settings; existing accounts keep
+                -- the historical posts-only behaviour through the default.
+                scrape_mode TEXT NOT NULL DEFAULT 'posts',
                 is_canonical INTEGER NOT NULL DEFAULT 0,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
@@ -521,6 +525,7 @@ def init_db() -> None:
         # own CDN URLs (via Apify) are signed and expire, so we download once
         # and serve our own copy instead of persisting the raw CDN URL.
         _ensure_column(conn, "accounts", "avatar_path", "avatar_path TEXT")
+        _ensure_column(conn, "accounts", "scrape_mode", "scrape_mode TEXT NOT NULL DEFAULT 'posts'")
         # OCR text extracted from the cover image, mirroring posts.hook_text.
         # Powers the dashboard's "includes cover text" search for every
         # non-canonical account (previously only chatgptricks had this).
@@ -737,6 +742,11 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
         "can_self_assign",
         "can_self_assign INTEGER NOT NULL DEFAULT 0",
     )
+    # Accounts already existed when the managed Postgres database was first
+    # imported, so this additive field must run here as well as in SQLite's
+    # full bootstrap. Otherwise production would accept the UI form but fail
+    # on its first account read after deployment.
+    _ensure_column(conn, "accounts", "scrape_mode", "scrape_mode TEXT NOT NULL DEFAULT 'posts'")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS queue_scheduler_preferences (
                viewer_email TEXT PRIMARY KEY,
