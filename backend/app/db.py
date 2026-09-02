@@ -1169,6 +1169,25 @@ def seed_queue_role_roster() -> None:
                 (now,),
             )
 
+        # Gabo's former self-assignment bypass never granted coordinator
+        # permissions reliably. Replace it with the durable, ordinary VC
+        # operating role once; later Settings edits still remain authoritative.
+        gabo_vc_marker = conn.execute(
+            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v10_gabo_vc'"
+        ).fetchone()
+        if not gabo_vc_marker:
+            conn.execute(
+                """UPDATE dashboard_users
+                   SET role = 'viewer', operating_role = 'vc', operating_roles = ?,
+                       is_admin = 0, can_self_assign = 0, updated_at = ?
+                   WHERE email = 'gabo@sentientagency.io'""",
+                (json.dumps(["vc", "pd"]), now),
+            )
+            conn.execute(
+                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v10_gabo_vc', '1', ?)",
+                (now,),
+            )
+
         # A real Trainee role uses longer production-point units. This seeded
         # placeholder keeps the scheduler and assignment flow testable before
         # the first trainee receives a company account. Notifications are
