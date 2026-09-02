@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 APIFY_ACTOR_ID = "apify~instagram-scraper"
+APIFY_REEL_ACTOR_ID = "apify~instagram-reel-scraper"
+VALID_SCRAPE_MODES = ("posts", "reels", "both")
 
 # Progress callback used by run_backfill() and everything it calls, so the
 # admin UI can show what's actually happening (starting the scrape, waiting
@@ -55,11 +57,13 @@ def get_account_config(handle: str) -> dict[str, Any]:
     if row is None:
         raise ApifySyncError(f"Unknown account '{handle}'.")
     is_canonical = bool(row["is_canonical"])
+    scrape_mode = row["scrape_mode"] if "scrape_mode" in row.keys() else "posts"
     return {
         "handle": row["handle"],
         "label": row["label"],
         "group": row["group_name"],
         "hot_threshold": row["hot_threshold"],
+        "scrape_mode": scrape_mode if scrape_mode in VALID_SCRAPE_MODES else "posts",
         "is_canonical": is_canonical,
         "is_active": bool(row["is_active"]),
         "table": "posts" if is_canonical else "dashboard_posts",
@@ -81,6 +85,7 @@ def list_accounts(active_only: bool = False) -> list[dict[str, Any]]:
             "label": row["label"],
             "group": row["group_name"],
             "hot_threshold": row["hot_threshold"],
+            "scrape_mode": row["scrape_mode"] if "scrape_mode" in row.keys() and row["scrape_mode"] in VALID_SCRAPE_MODES else "posts",
             "is_canonical": bool(row["is_canonical"]),
             "is_active": bool(row["is_active"]),
             "has_avatar": bool(row["avatar_path"]),
@@ -89,7 +94,9 @@ def list_accounts(active_only: bool = False) -> list[dict[str, Any]]:
     ]
 
 
-def create_account(handle: str, label: str, group: str, hot_threshold: int) -> dict[str, Any]:
+def create_account(
+    handle: str, label: str, group: str, hot_threshold: int, scrape_mode: str = "posts"
+) -> dict[str, Any]:
     """Self-serve account creation. Always non-canonical -- new accounts
     always write into the generic dashboard_posts table, never `posts`.
     """
@@ -100,6 +107,8 @@ def create_account(handle: str, label: str, group: str, hot_threshold: int) -> d
         raise ApifySyncError("Account handle is required.")
     if group not in VALID_GROUPS:
         raise ApifySyncError(f"Group must be one of {VALID_GROUPS}.")
+    if scrape_mode not in VALID_SCRAPE_MODES:
+        raise ApifySyncError(f"Scrape mode must be one of {VALID_SCRAPE_MODES}.")
     label = (label or handle).strip()
     now_iso = utc_now()
 
@@ -109,10 +118,10 @@ def create_account(handle: str, label: str, group: str, hot_threshold: int) -> d
             raise ApifySyncError(f"Account '{handle}' already exists.")
         conn.execute(
             """
-            INSERT INTO accounts (handle, label, group_name, hot_threshold, is_canonical, is_active, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 0, 1, ?, ?)
+            INSERT INTO accounts (handle, label, group_name, hot_threshold, scrape_mode, is_canonical, is_active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?)
             """,
-            (handle, label, group, hot_threshold, now_iso, now_iso),
+            (handle, label, group, hot_threshold, scrape_mode, now_iso, now_iso),
         )
 
     return get_account_config(handle)
@@ -829,7 +838,9 @@ def _post_age_hours(published_at: str | None, now: datetime) -> float | None:
     return (now - dt).total_seconds() / 3600.0
 
 
-def _fetch_apify_items(payload: dict[str, Any], timeout: float = 180.0) -> list[dict[str, Any]]:
+def _fetch_apify_items(
+    payload: dict[str, Any], timeout: float = 180.0, actor_id: str = APIFY_ACTOR_ID
+) -> list[dict[str, Any]]:
     token = os.getenv("APIFY_TOKEN", "").strip()
     if not token:
         raise ApifySyncError("APIFY_TOKEN is not configured on the server.")
@@ -838,7 +849,7 @@ def _fetch_apify_items(payload: dict[str, Any], timeout: float = 180.0) -> list[
     except ImportError as exc:
         raise ApifySyncError("httpx is not installed in the backend environment.") from exc
 
-    url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
+    url = f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items"
     try:
         with httpx.Client(timeout=timeout) as client:
             response = client.post(url, params={"token": token}, json=payload)
@@ -856,6 +867,7 @@ def _run_apify_actor_and_fetch(
     max_wait_seconds: float = 1800.0,
     poll_interval: float = 8.0,
     on_progress: ProgressFn = None,
+    actor_id: str = APIFY_ACTOR_ID,
 ) -> list[dict[str, Any]]:
     """Starts the actor run and polls for completion with short, separate
     requests instead of holding one long-lived connection open for the
@@ -880,7 +892,7 @@ def _run_apify_actor_and_fetch(
     import time
 
     _emit(on_progress, phase="starting_apify_run")
-    start_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs"
+    start_url = f"https://api.apify.com/v2/acts/{actor_id}/runs"
     try:
         with httpx.Client(timeout=30.0) as client:
             start_response = client.post(start_url, params={"token": token}, json=payload)
@@ -1217,6 +1229,90 @@ def _short_term_payload(handles: list[str], results_limit: int, now: datetime) -
     }
 
 
+def _short_term_reels_payload(handles: list[str], results_limit: int, now: datetime) -> dict[str, Any]:
+    """Equivalent small lookback request for the dedicated Reels actor.
+
+    The general profile actor reads Instagram's post feed, while this actor
+    traverses the profile's Reels surface. Keeping the two requests separate
+    is what makes an account configured as "Reels" stay reels-only after its
+    initial import.
+    """
+    return {
+        "username": handles,
+        "resultsLimit": results_limit,
+        "skipPinnedPosts": True,
+        "onlyPostsNewerThan": (now - timedelta(hours=_SHORT_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _is_reel_item(item: dict[str, Any]) -> bool:
+    """Recognise a Reel in the general Instagram Scraper payload.
+
+    The profile feed can contain clips alongside ordinary posts, so filtering
+    here prevents the Posts-only choice from silently importing Reels. The
+    dedicated Reel actor needs no such filter because every one of its rows is
+    already a Reel.
+    """
+    product_type = str(item.get("productType") or "").lower()
+    item_type = str(item.get("type") or "").lower()
+    url = str(item.get("url") or "").lower()
+    return product_type in {"clips", "reel", "reels"} or item_type in {"reel", "clips"} or "/reel/" in url
+
+
+def _dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate the union from both actor runs by Instagram shortcode."""
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for item in items:
+        shortcode = item.get("shortCode")
+        if not shortcode or shortcode in seen:
+            continue
+        seen.add(shortcode)
+        unique.append(item)
+    return unique
+
+
+def _collect_short_term_items(
+    configs: dict[str, dict[str, Any]], results_limit: int, now: datetime
+) -> dict[str, list[dict[str, Any]]]:
+    """Fetch each configured account surface in two batched, small runs.
+
+    `both` deliberately means the union of the Posts tab (with clips removed)
+    and the Reels tab, rather than trusting the feed actor to expose every
+    Reel. A single actor failure is still allowed to surface to the scheduler,
+    matching the pre-existing shared-fetch behaviour.
+    """
+    items_by_account: dict[str, list[dict[str, Any]]] = {account: [] for account in configs}
+
+    post_configs = {
+        account: cfg for account, cfg in configs.items() if cfg["scrape_mode"] in {"posts", "both"}
+    }
+    if post_configs:
+        post_handles = [cfg["handle"] for cfg in post_configs.values()]
+        post_items = _fetch_apify_items(_short_term_payload(post_handles, results_limit, now))
+        post_owner_to_account = {cfg["handle"].lower(): account for account, cfg in post_configs.items()}
+        for item in post_items:
+            account = post_owner_to_account.get((item.get("ownerUsername") or "").lower())
+            if account and not _is_reel_item(item):
+                items_by_account[account].append(item)
+
+    reel_configs = {
+        account: cfg for account, cfg in configs.items() if cfg["scrape_mode"] in {"reels", "both"}
+    }
+    if reel_configs:
+        reel_handles = [cfg["handle"] for cfg in reel_configs.values()]
+        reel_items = _fetch_apify_items(
+            _short_term_reels_payload(reel_handles, results_limit, now), actor_id=APIFY_REEL_ACTOR_ID
+        )
+        reel_owner_to_account = {cfg["handle"].lower(): account for account, cfg in reel_configs.items()}
+        for item in reel_items:
+            account = reel_owner_to_account.get((item.get("ownerUsername") or "").lower())
+            if account:
+                items_by_account[account].append(item)
+
+    return {account: _dedupe_items(items) for account, items in items_by_account.items()}
+
+
 def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
     """Shared per-account logic: insert brand-new posts from `items`, then
     refresh likes/comments (and do the one-time HOT check) on every existing
@@ -1382,8 +1478,7 @@ def run_short_term_cycle(account: str, results_limit: int = _SHORT_RESULTS_LIMIT
     """
     cfg = get_account_config(account)
     now = datetime.now(UTC)
-    payload = _short_term_payload([cfg["handle"]], results_limit, now)
-    items = _fetch_apify_items(payload)
+    items = _collect_short_term_items({account: cfg}, results_limit, now)[account]
     return _process_short_term_items(account, cfg, items, now)
 
 
@@ -1417,17 +1512,7 @@ def run_short_term_cycle_batch(accounts: list[str], results_limit: int = _SHORT_
     if not configs:
         return results
 
-    handles = [cfg["handle"] for cfg in configs.values()]
-    payload = _short_term_payload(handles, results_limit, now)
-    items = _fetch_apify_items(payload)
-
-    handle_to_account = {cfg["handle"].lower(): account for account, cfg in configs.items()}
-    items_by_account: dict[str, list[dict[str, Any]]] = {account: [] for account in configs}
-    for item in items:
-        owner = (item.get("ownerUsername") or "").lower()
-        account = handle_to_account.get(owner)
-        if account:
-            items_by_account[account].append(item)
+    items_by_account = _collect_short_term_items(configs, results_limit, now)
 
     for account, cfg in configs.items():
         try:
@@ -1573,7 +1658,7 @@ def run_backfill(
     table = cfg["table"]
     scope_sql, scope_params = _account_scope(table, account)
 
-    payload: dict[str, Any] = {
+    post_payload: dict[str, Any] = {
         "directUrls": [f"https://www.instagram.com/{cfg['handle']}/"],
         "resultsType": "posts",
         "resultsLimit": results_limit,
@@ -1581,16 +1666,17 @@ def run_backfill(
         # historical import -- we want manually pinned posts included too
         # (they still count toward the account's real post history), so
         # don't skip them here.
-        #
-        # Tried forcing RESIDENTIAL proxies here to fight Instagram's
-        # CheerioCrawler BLOCKED responses on large accounts -- confirmed via
-        # run logs that it didn't help (still got blocked repeatedly, in one
-        # case worse than the datacenter default) and it costs more, so
-        # reverted. The block looks tied to the actor's plain-HTTP request
-        # fingerprint rather than IP reputation.
+    }
+    reel_payload: dict[str, Any] = {
+        "username": [cfg["handle"]],
+        "resultsLimit": results_limit,
+        # The Reels actor has its own pagination over the Reels tab. This is
+        # intentionally not a /<handle>/reels URL passed to the profile actor:
+        # that actor only accepts profile and individual-reel URLs.
     }
     if date_from:
-        payload["onlyPostsNewerThan"] = date_from
+        post_payload["onlyPostsNewerThan"] = date_from
+        reel_payload["onlyPostsNewerThan"] = date_from
     # Large/full-history pulls (hundreds to low thousands of posts) can take
     # many minutes to scrape. run-sync-get-dataset-items holds one HTTP
     # connection open for the whole duration, and we confirmed via Apify's
@@ -1598,8 +1684,24 @@ def run_backfill(
     # Render<->Apify path on longer scrapes -- the run still SUCCEEDS and
     # gets billed, but we never receive the response. Start-and-poll instead
     # so no single connection needs to stay open for more than ~30s.
-    _emit(on_progress, phase="preparing", account=account)
-    items = _run_apify_actor_and_fetch(payload, max_wait_seconds=1800.0, on_progress=on_progress)
+    _emit(on_progress, phase="preparing", account=account, scrape_mode=cfg["scrape_mode"])
+    items: list[dict[str, Any]] = []
+    if cfg["scrape_mode"] in {"posts", "both"}:
+        post_items = _run_apify_actor_and_fetch(
+            post_payload, max_wait_seconds=1800.0, on_progress=on_progress
+        )
+        # The feed actor also exposes some clips. The Posts choice represents
+        # the profile's non-Reel posts, so remove those rows before storing.
+        items.extend(item for item in post_items if not _is_reel_item(item))
+    if cfg["scrape_mode"] in {"reels", "both"}:
+        reel_items = _run_apify_actor_and_fetch(
+            reel_payload,
+            max_wait_seconds=1800.0,
+            on_progress=on_progress,
+            actor_id=APIFY_REEL_ACTOR_ID,
+        )
+        items.extend(reel_items)
+    items = _dedupe_items(items)
 
     if date_to:
         try:

@@ -12,6 +12,12 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
         """CREATE TABLE dashboard_users (
                email TEXT PRIMARY KEY,
                updated_at TEXT NOT NULL
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE accounts (
+               handle TEXT PRIMARY KEY,
+               updated_at TEXT NOT NULL
            )"""
     )
 
@@ -24,6 +30,11 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
     }
     assert columns["time_zone"]["dflt_value"] == "''"
     assert columns["can_self_assign"]["dflt_value"] == "0"
+    account_columns = {
+        row["name"]: row
+        for row in connection.execute("PRAGMA table_info(accounts)").fetchall()
+    }
+    assert account_columns["scrape_mode"]["dflt_value"] == "'posts'"
 
     connection.execute(
         "INSERT INTO queue_scheduler_preferences (viewer_email, updated_at) VALUES (?, ?)",
@@ -33,4 +44,3 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
         "SELECT hidden_users, row_order FROM queue_scheduler_preferences"
     ).fetchone()
     assert dict(row) == {"hidden_users": "[]", "row_order": "[]"}
-

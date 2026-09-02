@@ -5449,16 +5449,21 @@ def temp_runs(password: str, limit: int = 15) -> dict[str, Any]:
     _require_admin(password)
     import httpx
 
-    from .apify_sync import APIFY_ACTOR_ID
+    from .apify_sync import APIFY_ACTOR_ID, APIFY_REEL_ACTOR_ID
 
     token = os.getenv("APIFY_TOKEN", "").strip()
     with httpx.Client(timeout=30.0) as client:
-        r = client.get(
-            f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs",
-            params={"token": token, "limit": limit, "desc": "true"},
-        )
-        r.raise_for_status()
-        items = r.json().get("data", {}).get("items", [])
+        items: list[dict[str, Any]] = []
+        for actor_id in (APIFY_ACTOR_ID, APIFY_REEL_ACTOR_ID):
+            r = client.get(
+                f"https://api.apify.com/v2/acts/{actor_id}/runs",
+                params={"token": token, "limit": limit, "desc": "true"},
+            )
+            r.raise_for_status()
+            for item in r.json().get("data", {}).get("items", []):
+                if isinstance(item, dict):
+                    items.append({**item, "actorId": actor_id})
+    items.sort(key=lambda item: item.get("startedAt") or "", reverse=True)
     return {
         "runs": [
             {
@@ -5468,8 +5473,9 @@ def temp_runs(password: str, limit: int = 15) -> dict[str, Any]:
                 "finishedAt": i.get("finishedAt"),
                 "usd": i.get("usageTotalUsd"),
                 "datasetId": i.get("defaultDatasetId"),
+                "actorId": i.get("actorId"),
             }
-            for i in items
+            for i in items[:limit]
         ]
     }
 
@@ -6008,6 +6014,7 @@ def admin_create_account(
     label: Annotated[str, Form()] = "",
     group: Annotated[str, Form()] = "competitors",
     hot_threshold: Annotated[int, Form()] = 600,
+    scrape_mode: Annotated[str, Form()] = "posts",
 ) -> dict[str, Any]:
     """Self-serve account creation: register a new IG handle under Sentient
     or Competitors, no code changes or redeploy required. Always
@@ -6020,7 +6027,7 @@ def admin_create_account(
     ):
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
     try:
-        account = create_account(handle, label, group, hot_threshold)
+        account = create_account(handle, label, group, hot_threshold, scrape_mode)
     except ApifySyncError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"account": account}
