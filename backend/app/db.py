@@ -749,6 +749,16 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
 
 # --- Sentient Dash users (Google sign-in allowlist + roles) ----------------
 
+# Self-assignment is an internal Queue exception, not a role that Settings
+# admins should grant accidentally. Keep the approved roster in code and
+# project it into every user response so the UI can describe it without
+# exposing an editable marker.
+INTERNAL_SELF_ASSIGN_EMAILS = frozenset({"gabo@sentientagency.io"})
+
+
+def _has_internal_self_assign(email: str) -> bool:
+    return email.strip().lower() in INTERNAL_SELF_ASSIGN_EMAILS
+
 def _default_dashboard_display_name(email: str) -> str:
     local = email.strip().split("@", 1)[0].replace(".", " ").replace("_", " ").replace("-", " ")
     words = ["".join(char for char in word if not char.isdigit()) for word in local.split()]
@@ -763,7 +773,10 @@ def list_dashboard_users() -> list[dict[str, Any]]:
                FROM dashboard_users
                ORDER BY is_admin DESC, operating_role ASC, email ASC"""
         ).fetchall()
-        return [dict(row) for row in rows]
+        users = [dict(row) for row in rows]
+        for user in users:
+            user["can_self_assign"] = int(_has_internal_self_assign(str(user.get("email") or "")))
+        return users
 
 
 def get_dashboard_user_role(email: str) -> str | None:
@@ -787,6 +800,7 @@ def get_dashboard_user_access(email: str) -> dict[str, Any] | None:
         # migration has run; honour it during that tiny transition window.
         value["is_admin"] = bool(value["is_admin"] or value["role"] == "admin")
         value["operating_role"] = value["operating_role"] or "sales"
+        value["can_self_assign"] = _has_internal_self_assign(email)
         return value
 
 

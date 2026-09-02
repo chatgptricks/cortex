@@ -1810,13 +1810,11 @@ def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[st
 
 
 def _queue_v2_creator_access(request: Request) -> tuple[str, bool, list[str]]:
-    """Permit VC/Admin creation plus explicitly trusted self-assigning PDs."""
+    """Permit VC/Admin creation plus the internal self-assignment exception."""
     caller, is_admin, roles = _queue_v2_access(request)
     if is_admin or "vc" in roles:
         return caller, is_admin, roles
-    with connect() as conn:
-        row = conn.execute("SELECT can_self_assign FROM dashboard_users WHERE email = ?", (caller,)).fetchone()
-    if not row or not bool(row["can_self_assign"]):
+    if not bool(getattr(request.state, "can_self_assign", False)):
         raise HTTPException(status_code=403, detail="VC/Admin or self-assign access required.")
     return caller, is_admin, roles
 
