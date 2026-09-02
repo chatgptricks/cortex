@@ -319,6 +319,10 @@ def dashboard_me(request: Request) -> dict[str, Any]:
         "operating_role": getattr(request.state, "operating_role", "sales"),
         "operating_roles": getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]),
         "is_dev": bool(getattr(request.state, "is_dev", False)),
+        # This is intentionally narrower than coordinator access: it only
+        # unlocks the Queue creation flows that are internally approved for
+        # the user, never the broader VC/Admin dashboard tools.
+        "can_self_assign": bool(getattr(request.state, "can_self_assign", False)),
         "can_role_switch": bool(getattr(request.state, "can_role_switch", False)),
         "available_operating_roles": getattr(request.state, "available_operating_roles", [getattr(request.state, "operating_role", "sales")]),
     }
@@ -3290,7 +3294,9 @@ def dashboard_queue_v2_pool(
     tags: Annotated[str | None, Form()] = None, brief: Annotated[str | None, Form()] = None,
     notes: Annotated[str | None, Form()] = None, references: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
-    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    # Internal self-assignment users may add an existing Dashboard post to
+    # their own Pool, but do not gain the rest of the coordinator surface.
+    caller, _, _ = _queue_v2_creator_access(request)
     if production_points < 1:
         raise HTTPException(status_code=400, detail="Production points must be at least 1.")
     clean_account, clean_shortcode = _queue_post_exists(account, shortcode)
