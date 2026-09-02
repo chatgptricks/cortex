@@ -40,3 +40,13 @@ def test_collect_short_term_items_uses_the_selected_profile_surface(monkeypatch)
     ]
     assert calls[1][0] == apify_sync.APIFY_REEL_ACTOR_ID
     assert calls[1][1]["username"] == ["reels", "both"]
+
+
+def test_dedupe_items_excludes_a_reel_returned_by_both_actor_shapes() -> None:
+    items = apify_sync._dedupe_items([
+        {"shortCode": "same-media", "url": "https://www.instagram.com/p/same-media/"},
+        {"url": "https://www.instagram.com/reel/same-media/?igsh=test"},
+        {"url": "https://www.instagram.com/reel/url-only-media/"},
+    ])
+
+    assert [item["shortCode"] for item in items] == ["same-media", "url-only-media"]

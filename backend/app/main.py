@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .apify_sync import (
     VALID_GROUPS,
+    VALID_SCRAPE_MODES,
     ApifySyncError,
     create_account,
     fetch_and_store_avatar,
@@ -6040,6 +6041,7 @@ def admin_update_account_settings(
     hot_threshold: Annotated[int | None, Form()] = None,
     label: Annotated[str | None, Form()] = None,
     group: Annotated[str | None, Form()] = None,
+    scrape_mode: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
     """Edit an account's tunables from the dashboard's Settings panel. Only the
     fields actually supplied are changed, so the panel can PATCH one value at a
@@ -6070,6 +6072,11 @@ def admin_update_account_settings(
             raise HTTPException(status_code=400, detail=f"group must be one of {VALID_GROUPS}.")
         updates.append("group_name = ?")
         params.append(group)
+    if scrape_mode is not None:
+        if scrape_mode not in VALID_SCRAPE_MODES:
+            raise HTTPException(status_code=400, detail=f"scrape_mode must be one of {VALID_SCRAPE_MODES}.")
+        updates.append("scrape_mode = ?")
+        params.append(scrape_mode)
 
     if not updates:
         raise HTTPException(status_code=400, detail="Nothing to update.")
