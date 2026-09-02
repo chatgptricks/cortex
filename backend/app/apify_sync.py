@@ -1259,16 +1259,38 @@ def _is_reel_item(item: dict[str, Any]) -> bool:
     return product_type in {"clips", "reel", "reels"} or item_type in {"reel", "clips"} or "/reel/" in url
 
 
+_INSTAGRAM_CONTENT_URL = re.compile(r"instagram\.com/(?:p|reel|tv)/([^/?#]+)", re.IGNORECASE)
+
+
+def _item_shortcode(item: dict[str, Any]) -> str | None:
+    """Return the stable Instagram code even when an actor only returns a URL.
+
+    The Posts and Reels actors do not always serialize the same field set for
+    a media item. Their URLs remain stable, though, so deriving the shortcode
+    from either shape lets the union and the database's existing-item check
+    reject the same media reliably.
+    """
+    for field in ("shortCode", "shortcode", "code"):
+        value = str(item.get(field) or "").strip()
+        if value:
+            return value
+    match = _INSTAGRAM_CONTENT_URL.search(str(item.get("url") or ""))
+    return match.group(1) if match else None
+
+
 def _dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Deduplicate the union from both actor runs by Instagram shortcode."""
+    """Deduplicate the Posts/Reels union by stable Instagram media code."""
     seen: set[str] = set()
     unique: list[dict[str, Any]] = []
     for item in items:
-        shortcode = item.get("shortCode")
+        shortcode = _item_shortcode(item)
         if not shortcode or shortcode in seen:
             continue
         seen.add(shortcode)
-        unique.append(item)
+        # The downstream import code deliberately only consumes `shortCode`.
+        # Normalize the URL-only Reels actor shape once here instead of
+        # treating it as a new/undetectable post later in the pipeline.
+        unique.append({**item, "shortCode": shortcode})
     return unique
 
 
