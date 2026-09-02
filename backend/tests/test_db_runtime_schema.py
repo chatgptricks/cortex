@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from app.db import _ensure_runtime_schema_extensions
+from app.db import _ensure_runtime_schema_extensions, _has_internal_self_assign
 
 
 def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> None:
@@ -44,3 +44,7 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
         "SELECT hidden_users, row_order FROM queue_scheduler_preferences"
     ).fetchone()
     assert dict(row) == {"hidden_users": "[]", "row_order": "[]"}
+
+
+def test_gabo_is_not_an_internal_self_assignment_exception() -> None:
+    assert not _has_internal_self_assign("gabo@sentientagency.io")

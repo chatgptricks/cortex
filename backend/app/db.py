@@ -760,10 +760,10 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
 # --- Sentient Dash users (Google sign-in allowlist + roles) ----------------
 
 # Self-assignment is an internal Queue exception, not a role that Settings
-# admins should grant accidentally. Keep the approved roster in code and
-# project it into every user response so the UI can describe it without
-# exposing an editable marker.
-INTERNAL_SELF_ASSIGN_EMAILS = frozenset({"gabo@sentientagency.io"})
+# admins should grant accidentally. There are currently no approved
+# exceptions: Gabo is a normal VC, so his capabilities come from his
+# persisted operating role rather than this bypass.
+INTERNAL_SELF_ASSIGN_EMAILS = frozenset()
 
 
 def _has_internal_self_assign(email: str) -> bool:
