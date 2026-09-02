@@ -22,7 +22,8 @@ def backfill(limit: int, *, dry_run: bool) -> dict[str, int]:
         with connect() as conn:
             rows = conn.execute(
                 f"SELECT id, {column} AS media_ref FROM {table} WHERE {column} IS NOT NULL "
-                f"AND TRIM({column}) != '' AND {column} NOT LIKE 'r2://uploads/%' ORDER BY id LIMIT ?", (remaining,)
+                f"AND TRIM({column}) != '' AND {column} NOT LIKE ? ORDER BY id LIMIT ?",
+                ("r2://uploads/%", remaining),
             ).fetchall()
         for row in rows:
             reference = str(row["media_ref"])

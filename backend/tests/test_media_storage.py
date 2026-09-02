@@ -1,4 +1,6 @@
-from app import media_storage
+from contextlib import contextmanager
+
+from app import media_backfill, media_storage
 
 
 def test_local_write_remains_the_default_when_r2_is_off(tmp_path, monkeypatch):
@@ -49,3 +51,39 @@ def test_media_filename_cannot_escape_uploads(tmp_path, monkeypatch):
         assert "single filename" in str(exc)
     else:
         raise AssertionError("Expected an invalid filename to be rejected")
+
+
+def test_backfill_binds_the_r2_prefix_for_postgres_compatibility(monkeypatch):
+    class FakeCursor:
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchall(self):
+            return self.rows
+
+    class FakeConnection:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, statement, params=()):
+            self.calls.append((statement, params))
+            if statement.startswith("SELECT"):
+                return FakeCursor([{"id": 9, "media_ref": "/var/data/uploads/cover.jpg"}])
+            return FakeCursor()
+
+    connection = FakeConnection()
+
+    @contextmanager
+    def fake_connect():
+        yield connection
+
+    monkeypatch.setattr(media_backfill, "_SOURCES", (("dashboard_posts", "cover_image_path"),))
+    monkeypatch.setattr(media_backfill, "connect", fake_connect)
+    monkeypatch.setattr(media_backfill, "init_db", lambda: None)
+    monkeypatch.setattr(media_backfill, "r2_enabled", lambda: True)
+    monkeypatch.setattr(media_backfill, "upload_legacy_local_media", lambda path: "r2://uploads/cover.jpg")
+
+    assert media_backfill.backfill(1, dry_run=False) == {"scanned": 1, "uploaded": 1, "skipped": 0, "failed": 0}
+    select_statement, select_params = connection.calls[0]
+    assert "NOT LIKE ?" in select_statement
+    assert select_params == ("r2://uploads/%", 1)
