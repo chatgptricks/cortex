@@ -11,6 +11,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from app.apify_sync import (
+    APIFY_REEL_ACTOR_ID,
     _refresh_cover_from_item,
     _run_apify_actor_and_fetch,
     store_avatar_from_url,
@@ -106,6 +107,25 @@ def normalize_chatgptricks(results_limit: int) -> dict[str, int]:
     return result
 
 
+def normalize_chatgptricks_reels(results_limit: int) -> dict[str, int]:
+    """Recover historical Reels that are absent from the profile-post feed."""
+    rows = _targets("chatgptricks")
+    if not rows:
+        return {"targets": 0, "matched": 0, "uploaded": 0, "unmatched": 0}
+    items = _run_apify_actor_and_fetch(
+        {
+            "username": ["chatgptricks"],
+            "resultsLimit": results_limit,
+            "includeTranscript": True,
+        },
+        max_wait_seconds=2400.0,
+        actor_id=APIFY_REEL_ACTOR_ID,
+    )
+    result = _apply(rows, items)
+    print({"source": "chatgptricks_reels", "actor_items": len(items), **result}, flush=True)
+    return result
+
+
 def normalize_direct(rows: list[Any], batch_size: int, source: str) -> dict[str, int]:
     total = {"targets": 0, "matched": 0, "uploaded": 0, "unmatched": 0}
     for start in range(0, len(rows), batch_size):
@@ -183,7 +203,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Normalize legacy post covers with Apify.")
     parser.add_argument(
         "--source",
-        choices=("chatgptricks", "instagram", "all", "retry"),
+        choices=("chatgptricks", "chatgptricks_reels", "instagram", "all", "retry"),
         default="all",
     )
     parser.add_argument("--batch-size", type=int, default=100)
@@ -193,6 +213,8 @@ def main() -> None:
         parser.error("batch-size and profile-limit must be positive")
     if args.source in {"chatgptricks", "all"}:
         normalize_chatgptricks(args.profile_limit)
+    if args.source == "chatgptricks_reels":
+        normalize_chatgptricks_reels(args.profile_limit)
     if args.source in {"instagram", "all"}:
         print(
             {
