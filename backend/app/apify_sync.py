@@ -1891,7 +1891,15 @@ def store_avatar_from_url(handle: str, image_url: str) -> str:
     return avatar_path
 
 
-def _refresh_cover_from_item(table: str, handle: str, shortcode: str, row: Any, item: dict[str, Any]) -> bool:
+def _refresh_cover_from_item(
+    table: str,
+    handle: str,
+    shortcode: str,
+    row: Any,
+    item: dict[str, Any],
+    *,
+    image_timeout_seconds: float = 60.0,
+) -> bool:
     """Cache the fresh cover returned by the manual post scrape.
 
     Cover routes are deliberately lazy, so a signed Instagram URL can expire
@@ -1911,7 +1919,10 @@ def _refresh_cover_from_item(table: str, handle: str, shortcode: str, row: Any, 
     from .media_storage import store_uploaded_media
 
     try:
-        with httpx.Client(timeout=60.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        with httpx.Client(
+            timeout=image_timeout_seconds,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as client:
             response = client.get(image_url)
             response.raise_for_status()
         image_bytes, suffix = _compress_cover(response.content)
