@@ -77,7 +77,14 @@ def _apply(rows: Iterable[Any], items: list[dict[str, Any]]) -> dict[str, int]:
             continue
         result["matched"] += 1
         result["uploaded"] += int(
-            _refresh_cover_from_item("posts", "", shortcode, row, item)
+            _refresh_cover_from_item(
+                "posts",
+                "",
+                shortcode,
+                row,
+                item,
+                image_timeout_seconds=15.0,
+            )
         )
     return result
 
