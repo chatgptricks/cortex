@@ -48,7 +48,7 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
 R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
 R2_BACKFILL_ENABLED = os.getenv("R2_BACKFILL_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
-R2_BACKFILL_BATCH_SIZE = max(1, min(int(os.getenv("R2_BACKFILL_BATCH_SIZE", "25")), 100))
+R2_BACKFILL_BATCH_SIZE = max(1, min(int(os.getenv("R2_BACKFILL_BATCH_SIZE", "25")), 150))
 R2_BACKFILL_INTERVAL_SECONDS = max(30, int(os.getenv("R2_BACKFILL_INTERVAL_SECONDS", "60")))
 
 # Origins the deployed frontends are served from. These are baked in rather
