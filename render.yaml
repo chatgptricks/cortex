@@ -9,7 +9,9 @@ services:
     disk:
       name: cortex-data
       mountPath: /var/data
-      sizeGB: 2
+      # This disk already exists at 50 GB in Render. Keep the Blueprint aligned
+      # with production so configuration syncs do not attempt an unsupported shrink.
+      sizeGB: 50
     envVars:
       - key: PREDICT_DATA_DIR
         value: /var/data
