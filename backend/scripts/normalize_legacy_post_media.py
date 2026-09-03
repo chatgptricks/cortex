@@ -42,6 +42,17 @@ def _all_post_targets() -> list[Any]:
         ).fetchall()
 
 
+def _fallback_targets(source_prefix: str) -> list[Any]:
+    """Posts whose lost legacy path was normalized to the native fallback."""
+    with connect() as conn:
+        return conn.execute(
+            "SELECT id, shortcode FROM posts WHERE image_path = ? "
+            "AND source_ref LIKE ? AND shortcode IS NOT NULL "
+            "AND TRIM(shortcode) != '' ORDER BY id",
+            ("", f"{source_prefix}:%"),
+        ).fetchall()
+
+
 def _avatar_targets() -> list[Any]:
     with connect() as conn:
         return conn.execute(
@@ -109,7 +120,7 @@ def normalize_chatgptricks(results_limit: int) -> dict[str, int]:
 
 def normalize_chatgptricks_reels(results_limit: int) -> dict[str, int]:
     """Recover historical Reels that are absent from the profile-post feed."""
-    rows = _targets("chatgptricks")
+    rows = _fallback_targets("chatgptricks")
     if not rows:
         return {"targets": 0, "matched": 0, "uploaded": 0, "unmatched": 0}
     items = _run_apify_actor_and_fetch(
