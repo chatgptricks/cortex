@@ -226,10 +226,10 @@ def reset_stuck_ocr_claims() -> int:
     return int(a or 0) + int(b or 0)
 
 
-def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> Path | None:
+def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> tuple[str, Path] | None:
     """Downloads + compresses a cover that was never cached locally (covers are
     fetched lazily, so thousands of rows have a source URL but no file). Returns
-    the local path, or None if there's no URL or the CDN link has expired --
+    the durable reference and local processing path, or None if there's no URL or the CDN link has expired --
     Instagram's URLs are signed and die after a few days, so this fails often
     for older posts and the caller should treat None as "give up on this row".
     """
@@ -251,7 +251,8 @@ def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> Path | N
         reference = store_uploaded_media(f"{dest_stem}{suffix}", data)
     except OSError:
         return None
-    return materialize_local_path(reference)
+    path = materialize_local_path(reference)
+    return (reference, path) if path else None
 
 
 def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
@@ -273,6 +274,7 @@ def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
     it on some accounts' cover templates).
     """
     from .db import connect, utc_now
+    from .media_storage import cleanup_materialized_path, materialize_local_path
 
     from .sentient_ocr import extract_images_text_sentient
 
@@ -311,18 +313,17 @@ def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
     give_up: list[tuple[str, int]] = []
 
     for row in dash:
-        from .media_storage import materialize_local_path
-
         path = materialize_local_path(row["cover_image_path"])
         if path is None:
             stem = f"dash-{row['account']}-{str(row['shortcode'] or row['id']).strip()}"
-            path = ensure_local_cover(row["cover_source_url"], stem)
-            if path is None:
+            restored = ensure_local_cover(row["cover_source_url"], stem)
+            if restored is None:
                 give_up.append(("dashboard_posts", int(row["id"])))
                 continue
+            reference, path = restored
             with connect() as conn:
                 conn.execute(
-                    "UPDATE dashboard_posts SET cover_image_path = ? WHERE id = ?", (str(path), int(row["id"]))
+                    "UPDATE dashboard_posts SET cover_image_path = ? WHERE id = ?", (reference, int(row["id"]))
                 )
         jobs.append(("dashboard_posts", int(row["id"]), path))
 
@@ -359,6 +360,8 @@ def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
                     conn.execute("UPDATE dashboard_posts SET ocr_checked = 0 WHERE id = ?", (row_id,))
                 else:
                     conn.execute("UPDATE posts SET hook_text = '' WHERE id = ?", (row_id,))
+        for _, _, path in jobs:
+            cleanup_materialized_path(path)
         raise
 
     now_iso = utc_now()
@@ -378,6 +381,8 @@ def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
                     (text or "-", now_iso, row_id),
                 )
     summary["sent"] = len(jobs)
+    for _, _, path in jobs:
+        cleanup_materialized_path(path)
     return summary
 
 

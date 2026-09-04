@@ -4670,17 +4670,17 @@ def dashboard_queue_v2_add_attachment(request_id: int, request: Request, file: A
     clean_name = Path(file.filename or "attachment").name
     suffix = Path(clean_name).suffix[:12]
     attachment_id = secrets.token_hex(8)
-    folder = DATA_DIR / "queue_attachments" / str(request_id)
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / f"{attachment_id}{suffix}"
     payload = file.file.read(20 * 1024 * 1024 + 1)
     if len(payload) > 20 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Queue attachments must be 20 MB or smaller.")
-    target.write_bytes(payload)
+    media_ref = store_uploaded_media(
+        f"queue-{request_id}-{attachment_id}{suffix}", payload,
+        content_type=file.content_type or "application/octet-stream",
+    )
     attachments = _queue_v2_json(row["attachments"], [])
     attachments.append({
         "id": attachment_id, "name": clean_name, "size": len(payload),
-        "contentType": file.content_type or "application/octet-stream", "uploadedAt": utc_now(),
+        "contentType": file.content_type or "application/octet-stream", "uploadedAt": utc_now(), "mediaRef": media_ref,
     })
     now = utc_now()
     with connect() as conn:
@@ -4692,7 +4692,7 @@ def dashboard_queue_v2_add_attachment(request_id: int, request: Request, file: A
 
 
 @app.get("/api/dashboard/queue/v2/requests/{request_id}/attachments/{attachment_id}")
-def dashboard_queue_v2_attachment(request_id: int, attachment_id: str, request: Request) -> FileResponse:
+def dashboard_queue_v2_attachment(request_id: int, attachment_id: str, request: Request) -> Response:
     if not re.fullmatch(r"[0-9a-f]{16}", attachment_id):
         raise HTTPException(status_code=404, detail="Queue attachment not found.")
     caller, is_admin, roles = _queue_v2_access(request)
@@ -4701,6 +4701,10 @@ def dashboard_queue_v2_attachment(request_id: int, attachment_id: str, request: 
     attachment = next((item for item in _queue_v2_json(row["attachments"], []) if item.get("id") == attachment_id), None)
     if not attachment:
         raise HTTPException(status_code=404, detail="Queue attachment not found.")
+    media_ref = attachment.get("mediaRef") if isinstance(attachment, dict) else None
+    direct_url = redirect_url(media_ref)
+    if direct_url:
+        return RedirectResponse(direct_url, status_code=307)
     folder = DATA_DIR / "queue_attachments" / str(request_id)
     matches = list(folder.glob(f"{attachment_id}.*")) + ([folder / attachment_id] if (folder / attachment_id).exists() else [])
     if not matches or not matches[0].is_file():
@@ -5176,9 +5180,8 @@ def admin_slack_custom(
         data = image.file.read(_ALERT_IMAGE_MAX_BYTES + 1)
         if len(data) > _ALERT_IMAGE_MAX_BYTES:
             raise HTTPException(status_code=400, detail="Image is too large (8 MB max).")
-        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         filename = f"alert-{secrets.token_hex(16)}{suffix}"
-        (UPLOAD_DIR / filename).write_bytes(data)
+        store_uploaded_media(filename, data, content_type=image.content_type)
         image_url = alert_image_url_for(filename)
 
     sent = notify_custom(clean_message, title=(title or "").strip() or None, image_url=image_url)
@@ -5186,7 +5189,7 @@ def admin_slack_custom(
 
 
 @app.get("/api/admin/alert-image/{filename}")
-def admin_alert_image(filename: str) -> FileResponse:
+def admin_alert_image(filename: str) -> Response:
     """Serves an image attached to a custom alert. Unauthenticated on
     purpose -- Slack's own servers fetch this URL to render the image
     inline in the message, and can't send a Bearer token when they do.
@@ -5195,10 +5198,15 @@ def admin_alert_image(filename: str) -> FileResponse:
     path-traversal guard, not a real access check."""
     if not _ALERT_IMAGE_NAME_RE.match(filename):
         raise HTTPException(status_code=404, detail="Not found.")
+    # A failed R2 write intentionally leaves a local safety copy. Serve that
+    # copy first; successful R2-only writes have no disk file and redirect.
     path = UPLOAD_DIR / filename
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Not found.")
-    return FileResponse(path)
+    if path.is_file():
+        return FileResponse(path)
+    direct_url = redirect_url(f"r2://uploads/{filename}")
+    if direct_url:
+        return RedirectResponse(direct_url, status_code=307)
+    raise HTTPException(status_code=404, detail="Not found.")
 
 
 @app.get("/api/admin/slack-status")

@@ -3,9 +3,8 @@
 Database rows historically contain absolute paths under ``/var/data/uploads``.
 This module accepts those paths as well as ``r2://uploads/<filename>`` refs, so
 the application can move one object at a time without a schema migration or a
-flag day. New writes always keep the local copy during the migration; when R2
-is configured they are uploaded there too and the durable R2 reference is
-returned for the database to use.
+flag day. R2 is the durable source of truth; the Render-disk mirror is an
+explicit, temporary migration switch.
 """
 
 from __future__ import annotations
@@ -13,11 +12,20 @@ from __future__ import annotations
 import logging
 import mimetypes
 import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from .config import R2_ACCESS_KEY_ID, R2_BUCKET, R2_ENDPOINT_URL, R2_MEDIA_ENABLED, R2_SECRET_ACCESS_KEY, UPLOAD_DIR
+from .config import (
+    R2_ACCESS_KEY_ID,
+    R2_BUCKET,
+    R2_ENDPOINT_URL,
+    R2_LOCAL_MIRROR_ENABLED,
+    R2_MEDIA_ENABLED,
+    R2_SECRET_ACCESS_KEY,
+    UPLOAD_DIR,
+)
 
 logger = logging.getLogger("uvicorn.error")
 _REF_PREFIX = "r2://"
@@ -66,10 +74,7 @@ def _local_path_for_key(key: str) -> Path:
     return UPLOAD_DIR / Path(key).name
 
 
-def store_uploaded_media(filename: str, payload: bytes, *, content_type: str | None = None) -> str:
-    """Keep the current local safety copy; return an R2 reference only after upload succeeds."""
-    reference = _reference_for_filename(filename)
-    local_path = _local_path_for_key(_object_key(reference))
+def _write_local_fallback(local_path: Path, payload: bytes) -> None:
     local_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = local_path.with_name(f".{local_path.name}.{os.getpid()}.tmp")
     try:
@@ -77,7 +82,14 @@ def store_uploaded_media(filename: str, payload: bytes, *, content_type: str | N
         os.replace(temp_path, local_path)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def store_uploaded_media(filename: str, payload: bytes, *, content_type: str | None = None) -> str:
+    """Store durable media in R2, retaining a local fallback only when needed."""
+    reference = _reference_for_filename(filename)
+    local_path = _local_path_for_key(_object_key(reference))
     if not r2_enabled():
+        _write_local_fallback(local_path, payload)
         return str(local_path)
     try:
         _client().put_object(Bucket=R2_BUCKET, Key=_object_key(reference), Body=payload,
@@ -85,7 +97,10 @@ def store_uploaded_media(filename: str, payload: bytes, *, content_type: str | N
                              CacheControl="public, max-age=31536000, immutable")
     except Exception:
         logger.exception("R2 upload failed for %s; retaining local media fallback", filename)
+        _write_local_fallback(local_path, payload)
         return str(local_path)
+    if R2_LOCAL_MIRROR_ENABLED:
+        _write_local_fallback(local_path, payload)
     return reference
 
 
@@ -102,7 +117,12 @@ def redirect_url(reference: str | Path | None) -> str | None:
 
 
 def materialize_local_path(reference: str | Path | None) -> Path | None:
-    """Resolve media to a local file for OCR and a safe fallback response."""
+    """Resolve media to a local file for OCR and a safe fallback response.
+
+    With the durable mirror disabled, R2 reads land in a process-local temp
+    file rather than recreating a billed Render-disk cache. Public media
+    responses redirect to R2 and do not call this function in normal use.
+    """
     if reference is None:
         return None
     if not is_r2_reference(reference):
@@ -114,16 +134,32 @@ def materialize_local_path(reference: str | Path | None) -> Path | None:
         return local_path
     if not r2_enabled():
         return None
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = local_path.with_name(f".{local_path.name}.{os.getpid()}.download")
+    if R2_LOCAL_MIRROR_ENABLED:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = local_path.with_name(f".{local_path.name}.{os.getpid()}.download")
+    else:
+        handle = tempfile.NamedTemporaryFile(prefix="cortex-r2-", suffix=Path(key).suffix, delete=False)
+        temp_path = Path(handle.name)
+        handle.close()
     try:
         _client().download_file(R2_BUCKET, key, str(temp_path))
-        os.replace(temp_path, local_path)
-        return local_path
+        if R2_LOCAL_MIRROR_ENABLED:
+            os.replace(temp_path, local_path)
+            return local_path
+        return temp_path
     except Exception:
         logger.exception("Could not materialize R2 media %s", reference)
         temp_path.unlink(missing_ok=True)
         return None
+
+
+def cleanup_materialized_path(path: str | Path | None) -> None:
+    """Remove a non-mirrored R2 processing file once its immediate job ends."""
+    if path is None:
+        return
+    candidate = Path(path)
+    if candidate.parent == Path(tempfile.gettempdir()) and candidate.name.startswith("cortex-r2-"):
+        candidate.unlink(missing_ok=True)
 
 
 def upload_legacy_local_media(path: str | Path) -> str | None:

@@ -22,7 +22,7 @@ def test_r2_reference_resolves_to_its_local_safety_copy(tmp_path, monkeypatch):
     assert media_storage.materialize_local_path("r2://uploads/avatar-sentient.jpg") == local
 
 
-def test_r2_write_returns_a_durable_reference_while_retaining_local_copy(tmp_path, monkeypatch):
+def test_r2_write_returns_a_durable_reference_without_a_local_mirror(tmp_path, monkeypatch):
     class FakeClient:
         def __init__(self):
             self.calls = []
@@ -34,11 +34,12 @@ def test_r2_write_returns_a_durable_reference_while_retaining_local_copy(tmp_pat
     client = FakeClient()
     monkeypatch.setattr(media_storage, "UPLOAD_DIR", upload_dir)
     monkeypatch.setattr(media_storage, "R2_BUCKET", "sentient-media")
+    monkeypatch.setattr(media_storage, "R2_LOCAL_MIRROR_ENABLED", False)
     monkeypatch.setattr(media_storage, "r2_enabled", lambda: True)
     monkeypatch.setattr(media_storage, "_client", lambda: client)
     reference = media_storage.store_uploaded_media("cover-post.webp", b"image", content_type="image/webp")
     assert reference == "r2://uploads/cover-post.webp"
-    assert (upload_dir / "cover-post.webp").read_bytes() == b"image"
+    assert not (upload_dir / "cover-post.webp").exists()
     assert client.calls[0]["Key"] == "uploads/cover-post.webp"
 
 

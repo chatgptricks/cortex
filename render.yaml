@@ -23,6 +23,8 @@ services:
         value: "150"
       - key: R2_BACKFILL_INTERVAL_SECONDS
         value: "60"
+      - key: R2_LOCAL_MIRROR_ENABLED
+        value: "false"
       - key: TRICKS_DASH_REFRESH_PASSWORD
         sync: false
       - key: SENTIENT_OCR_URL
