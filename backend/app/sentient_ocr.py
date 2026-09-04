@@ -12,7 +12,7 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
-from .config import SENTIENT_OCR_TIMEOUT, SENTIENT_OCR_TOKEN, SENTIENT_OCR_URL
+from .config import SENTIENT_OCR_MAX_FILES_PER_REQUEST, SENTIENT_OCR_TIMEOUT, SENTIENT_OCR_TOKEN, SENTIENT_OCR_URL
 
 
 class SentientOcrUnavailable(RuntimeError):
@@ -44,6 +44,16 @@ def extract_images_text_sentient(image_paths: list[Path]) -> list[dict[str, Any]
     headers = {}
     if SENTIENT_OCR_TOKEN:
         headers["Authorization"] = f"Bearer {SENTIENT_OCR_TOKEN}"
+
+    results: list[dict[str, Any]] = []
+    for start in range(0, len(image_paths), SENTIENT_OCR_MAX_FILES_PER_REQUEST):
+        results.extend(_extract_batch(image_paths[start : start + SENTIENT_OCR_MAX_FILES_PER_REQUEST], headers))
+    return results
+
+
+def _extract_batch(image_paths: list[Path], headers: dict[str, str]) -> list[dict[str, Any]]:
+    """Submit one bounded multipart OCR request without retaining prior batches."""
+    import httpx
 
     handles = []
     try:

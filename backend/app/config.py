@@ -39,6 +39,10 @@ TRICKS_DASH_REFRESH_PASSWORD = os.getenv("TRICKS_DASH_REFRESH_PASSWORD", "").str
 SENTIENT_OCR_URL = os.getenv("SENTIENT_OCR_URL")
 SENTIENT_OCR_TOKEN = os.getenv("SENTIENT_OCR_TOKEN")
 SENTIENT_OCR_TIMEOUT = float(os.getenv("SENTIENT_OCR_TIMEOUT", "300"))
+# Keep multipart OCR requests small enough for the web instance. The OCR
+# worker receives the same total queue over sequential requests, without a
+# burst of hundreds of full-resolution images resident at once.
+SENTIENT_OCR_MAX_FILES_PER_REQUEST = max(1, min(int(os.getenv("SENTIENT_OCR_MAX_FILES_PER_REQUEST", "10")), 20))
 
 # R2 is opt-in: a deployment before the bucket credentials are added behaves
 # exactly like the current Render-disk deployment.

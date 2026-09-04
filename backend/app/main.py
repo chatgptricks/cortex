@@ -3740,33 +3740,6 @@ def dashboard_queue_v2_request_pp_revision(
 ) -> dict[str, Any]:
     caller, _, _ = _queue_v2_access(request)
     row = _queue_v2_request(request_id)
-    current_accounts = _queue_v2_clean_account_handles(_queue_v2_json(row.get("recommended_accounts"), []))
-    selected_accounts = current_accounts
-    if recommended_accounts is not None:
-        try:
-            selected_accounts = _queue_v2_clean_account_handles(json.loads(recommended_accounts))
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Target accounts must be valid JSON.") from exc
-        active_sentient = {
-            str(item.get("handle") or "").strip().lower()
-            for item in list_accounts(active_only=True)
-            if item.get("group") == "sentient"
-        }
-        if any(account not in active_sentient for account in selected_accounts):
-            raise HTTPException(status_code=400, detail="Choose active Sentient accounts only.")
-        if row.get("designer_email"):
-            with connect() as conn:
-                allowed = {
-                    str(item["account_handle"] or "").strip().lower()
-                    for item in conn.execute(
-                        "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ?",
-                        (row["designer_email"],),
-                    ).fetchall()
-                }
-            if any(account not in allowed for account in selected_accounts):
-                raise HTTPException(status_code=400, detail="Every target account must be managed by the assigned user.")
-        if row.get("status") == "closed" and selected_accounts != current_accounts:
-            raise HTTPException(status_code=409, detail="Reopen the request before changing its published destination accounts.")
     if row.get("designer_email") != caller:
         raise HTTPException(status_code=403, detail="Only the assigned designer can request a PP revision.")
     if row["status"] not in {"scheduled", "in_progress"}:
@@ -6041,13 +6014,13 @@ def temp_backfill_status() -> dict[str, Any]:
 @app.post("/api/admin/ocr/start")
 def temp_ocr_start(
     password: Annotated[str, Form()],
-    batch_size: int = 100,
+    batch_size: int = 10,
     max_batches: int = 200,
-    workers: int = 3,
+    workers: int = 1,
 ) -> dict[str, Any]:
     """kick off the background OCR sweep. `workers` threads run in
-    parallel; row claiming is serialized so they never process the same cover
-    twice. Always OCRs the full cover image via Sentient Dash's own worker
+    sequentially; row claiming is serialized so jobs never process the same
+    cover twice or overload the API instance. Always OCRs the full cover image via Sentient Dash's own worker
     (sentient_ocr.py) -- no crop-region option here anymore. Remove after use.
     """
     _require_admin(password)
@@ -6057,7 +6030,7 @@ def temp_ocr_start(
         if _OCR_RUN["running"]:
             return {"already_running": True, **_OCR_RUN}
         released = reset_stuck_ocr_claims()
-        workers = max(1, min(workers, 6))
+        workers = 1
         _OCR_RUN.update(
             {
                 "running": True,
@@ -6070,7 +6043,7 @@ def temp_ocr_start(
                 "workers_live": workers,
             }
         )
-    size = max(1, min(batch_size, 100))
+    size = max(1, min(batch_size, 10))
     for i in range(workers):
         threading.Thread(target=_ocr_worker, args=(size, max_batches), daemon=True, name=f"ocr-sweep-{i}").start()
     return {"started": True, "batch_size": size, "workers": workers, "released": released}
