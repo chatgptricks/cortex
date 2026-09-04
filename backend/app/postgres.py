@@ -18,9 +18,12 @@ from psycopg.rows import dict_row
 # The dashboard opens many independent HTTP requests at once (especially card
 # covers). Opening a database connection for each one can exhaust a small
 # managed Postgres instance during an ordinary page load. Keep a deliberately
-# small shared pool per web process instead: callers wait briefly for one of
-# these reusable connections rather than creating an unbounded connection
-# burst.
+# shared pool per web process instead: callers wait briefly for one of these
+# reusable connections rather than creating an unbounded connection burst.
+# Four connections is not enough for a normal Dashboard + Queue refresh: each
+# browser opens several authenticated reads at once, and a 15-second wait
+# occupied every request-worker until even `/api/health` timed out. Twelve is
+# still deliberately bounded but leaves room for concurrent page data.
 _POOL: ConnectionPool | None = None
 _POOL_URL: str | None = None
 _POOL_LOCK = threading.Lock()
@@ -35,8 +38,8 @@ def _connection_pool(url: str) -> ConnectionPool:
             _POOL = ConnectionPool(
                 conninfo=url,
                 min_size=1,
-                max_size=4,
-                timeout=15,
+                max_size=12,
+                timeout=5,
                 max_idle=120,
                 open=True,
             )
