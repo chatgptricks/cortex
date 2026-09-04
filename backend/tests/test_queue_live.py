@@ -38,6 +38,7 @@ def test_live_revision_is_durable(monkeypatch, tmp_path):
 
 
 def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
+    future_date = "2099-09-01"
     database = tmp_path / "queue-drafts.sqlite3"
     conn = sqlite3.connect(database)
     conn.executescript(
@@ -66,7 +67,7 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
     conn.execute("INSERT INTO queue_requests VALUES (2, 3, 10, 'pool', NULL, NULL, NULL, 'chatgptricks', 'TWO', 'vc@example.com', '')")
     conn.execute("INSERT INTO queue_requests VALUES (3, 3, 10, 'pool', NULL, NULL, NULL, 'chatgptricks', 'THREE', 'vc@example.com', '')")
     conn.execute("INSERT INTO queue_designer_accounts VALUES ('pd@example.com', 'chatgptricks')")
-    conn.execute("INSERT INTO queue_schedule_drafts VALUES (1, 'other-vc@example.com', 'pd@example.com', '2026-09-01', 540, '[]', NULL, 10, '')")
+    conn.execute("INSERT INTO queue_schedule_drafts VALUES (1, 'other-vc@example.com', 'pd@example.com', ?, 540, '[]', NULL, 10, '')", (future_date,))
     conn.commit()
     conn.close()
 
@@ -83,14 +84,14 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "connect", isolated_connect)
     with isolated_connect() as value:
         prepared = main._queue_v2_prepare_schedule_changes(value, [{
-            "id": 2, "designerEmail": "pd@example.com", "scheduledDate": "2026-09-01",
+            "id": 2, "designerEmail": "pd@example.com", "scheduledDate": future_date,
             "scheduledStartMinutes": 540, "recommendedAccounts": [],
         }])
         trainee = main._queue_v2_prepare_schedule_changes(value, [{
-            "id": 3, "designerEmail": "trainee@sentientagency.io", "scheduledDate": "2026-09-01",
+            "id": 3, "designerEmail": "trainee@sentientagency.io", "scheduledDate": future_date,
             "scheduledStartMinutes": 600, "recommendedAccounts": [],
         }])
-    assert prepared[0]["date"] == "2026-09-01"
+    assert prepared[0]["date"] == future_date
     assert prepared[0]["start"] == 570
     assert trainee[0]["minutesPerPP"] == 16
     assert trainee[0]["duration"] == 48

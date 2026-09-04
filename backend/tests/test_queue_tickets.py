@@ -251,6 +251,56 @@ def test_account_access_ticket_assigns_active_sentient_accounts(monkeypatch, tmp
     assert [row["account_handle"] for row in assigned] == ["chatgptricks"]
 
 
+def test_pd_post_suggestion_requires_review_without_pool_access(monkeypatch, tmp_path):
+    database = tmp_path / "post-suggestion.sqlite3"
+    _ticket_database(database)
+    _isolate(monkeypatch, database)
+    monkeypatch.setattr(main, "_queue_v2_public_url", lambda value: str(value).strip())
+    monkeypatch.setattr(main, "_queue_v2_slack_log", lambda **kwargs: True)
+
+    created = main.dashboard_queue_v2_create_post_suggestion(
+        request=None,
+        source_url="https://www.instagram.com/reel/CODEX123/",
+        reason="Strong hook and a format our audience has not seen yet.",
+    )
+    assert created["ticket"]["type"] == "post_suggestion"
+    assert created["ticket"]["status"] == "pending"
+    assert created["ticket"]["title"] == "https://www.instagram.com/reel/CODEX123/"
+
+    reviewed = main.dashboard_queue_v2_review_ticket(
+        ticket_id=created["ticket"]["id"], request=None, action="approve", review_note=None,
+    )
+    assert reviewed["ticket"]["type"] == "post_suggestion"
+    assert reviewed["ticket"]["status"] == "approved"
+
+    with pytest.raises(HTTPException) as error:
+        main.dashboard_queue_v2_create_post_suggestion(
+            request=None, source_url="https://example.com/post", reason="Wrong source.",
+        )
+    assert error.value.status_code == 400
+
+
+def test_explicit_user_pp_duration_overrides_role_default():
+    assert main._queue_v2_minutes_per_pp_for_user({"operating_roles": "[\"pd\", \"trainee\"]", "minutes_per_pp": 22}) == 22
+    assert main._queue_v2_minutes_per_pp_for_user({"operating_roles": "[\"pd\", \"trainee\"]"}) == main.QUEUE_V2_TRAINEE_MINUTES_PER_PP
+
+
+def test_queue_retention_removes_old_non_request_tickets(monkeypatch, tmp_path):
+    database = tmp_path / "ticket-retention.sqlite3"
+    _ticket_database(database)
+    connect = _isolate(monkeypatch, database)
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, status, block_category, title, reason, created_at, updated_at)
+               VALUES ('time_block', 'pd@example.com', 'approved', 'post_suggestion', 'Old post', 'Old reason', '2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00')"""
+        )
+    with connect() as conn:
+        assert main._queue_v2_purge_expired(conn) == []
+    with connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS count FROM queue_tickets").fetchone()["count"] == 0
+
+
 def test_admin_reset_clears_queue_state_but_preserves_accounts(monkeypatch, tmp_path):
     database = tmp_path / "queue-reset.sqlite3"
     _ticket_database(database)

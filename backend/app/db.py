@@ -342,6 +342,9 @@ def init_db() -> None:
                 completed_at TEXT,
                 closed_at TEXT,
                 final_permalink TEXT,
+                -- One final Instagram permalink per destination account. The
+                -- legacy singular value remains as the primary link for old
+                -- clients and integrations.
                 final_permalinks TEXT NOT NULL DEFAULT '[]',
                 cancellation_reason TEXT,
                 created_at TEXT NOT NULL,
@@ -494,6 +497,7 @@ def init_db() -> None:
         # coordination powers. This is intentionally an explicit capability,
         # not another operating role.
         _ensure_column(conn, "dashboard_users", "can_self_assign", "can_self_assign INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "dashboard_users", "minutes_per_pp", "minutes_per_pp INTEGER")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS queue_scheduler_preferences (
                    viewer_email TEXT PRIMARY KEY,
@@ -507,6 +511,7 @@ def init_db() -> None:
         _ensure_column(conn, "queue_requests", "is_custom", "is_custom INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "queue_requests", "slack_channel_id", "slack_channel_id TEXT")
         _ensure_column(conn, "queue_requests", "slack_message_ts", "slack_message_ts TEXT")
+        _ensure_column(conn, "queue_requests", "final_permalinks", "final_permalinks TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "queue_schedule_drafts", "production_points", "production_points INTEGER")
         _ensure_column(conn, "queue_requests", "minutes_per_pp", "minutes_per_pp INTEGER NOT NULL DEFAULT 10")
         _ensure_column(conn, "queue_requests", "final_permalinks", "final_permalinks TEXT NOT NULL DEFAULT '[]'")
@@ -749,6 +754,7 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
         "can_self_assign",
         "can_self_assign INTEGER NOT NULL DEFAULT 0",
     )
+    _ensure_column(conn, "dashboard_users", "minutes_per_pp", "minutes_per_pp INTEGER")
     # Accounts already existed when the managed Postgres database was first
     # imported, so this additive field must run here as well as in SQLite's
     # full bootstrap. Otherwise production would accept the UI form but fail
@@ -787,7 +793,7 @@ def list_dashboard_users() -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
             """SELECT email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id,
-                      time_zone, can_self_assign, created_at, updated_at
+                      time_zone, can_self_assign, minutes_per_pp, created_at, updated_at
                FROM dashboard_users
                ORDER BY is_admin DESC, operating_role ASC, email ASC"""
         ).fetchall()
@@ -808,7 +814,7 @@ def get_dashboard_user_role(email: str) -> str | None:
 def get_dashboard_user_access(email: str) -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute(
-            "SELECT email, operating_role, operating_roles, is_admin, role, time_zone, can_self_assign FROM dashboard_users WHERE email = ?",
+            "SELECT email, operating_role, operating_roles, is_admin, role, time_zone, can_self_assign, minutes_per_pp FROM dashboard_users WHERE email = ?",
             (email.strip().lower(),),
         ).fetchone()
         if not row:
@@ -843,7 +849,7 @@ def upsert_dashboard_user(
     email: str, role: str = "viewer", operating_role: str | None = None,
     is_admin: bool | None = None, slack_user_id: str | None = None,
     display_name: str | None = None, time_zone: str | None = None,
-    can_self_assign: bool | None = None,
+    can_self_assign: bool | None = None, minutes_per_pp: int | None = None,
 ) -> None:
     if role not in ("admin", "viewer"):
         raise ValueError(f"Invalid legacy role: {role!r}")
@@ -854,6 +860,8 @@ def upsert_dashboard_user(
     admin_value = bool(role == "admin") if is_admin is None else bool(is_admin)
     if time_zone is not None and time_zone not in {"", "America/Costa_Rica", "America/Bogota"}:
         raise ValueError(f"Invalid time zone: {time_zone!r}")
+    if minutes_per_pp is not None and not 1 <= int(minutes_per_pp) <= 240:
+        raise ValueError("minutes_per_pp must be between 1 and 240")
     legacy_role = "admin" if admin_value else "viewer"
     now = utc_now()
     with connect() as conn:
@@ -865,6 +873,10 @@ def upsert_dashboard_user(
             pass
         try:
             conn.execute("ALTER TABLE dashboard_users ADD COLUMN can_self_assign INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE dashboard_users ADD COLUMN minutes_per_pp INTEGER")
         except sqlite3.OperationalError:
             pass
         existing = conn.execute(
@@ -897,8 +909,8 @@ def upsert_dashboard_user(
             operating_roles = list(dict.fromkeys([operating_role, "pd"]))
         conn.execute(
             """
-            INSERT INTO dashboard_users (email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id, time_zone, can_self_assign, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO dashboard_users (email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id, time_zone, can_self_assign, minutes_per_pp, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(email) DO UPDATE SET
                 display_name = CASE WHEN ? IS NULL THEN dashboard_users.display_name ELSE excluded.display_name END,
                 role = excluded.role, operating_role = excluded.operating_role,
@@ -907,12 +919,13 @@ def upsert_dashboard_user(
                 slack_user_id = CASE WHEN ? IS NULL THEN dashboard_users.slack_user_id ELSE excluded.slack_user_id END,
                 time_zone = CASE WHEN ? IS NULL THEN dashboard_users.time_zone ELSE excluded.time_zone END,
                 can_self_assign = CASE WHEN ? IS NULL THEN dashboard_users.can_self_assign ELSE excluded.can_self_assign END,
+                minutes_per_pp = CASE WHEN ? IS NULL THEN dashboard_users.minutes_per_pp ELSE excluded.minutes_per_pp END,
                 updated_at = excluded.updated_at
             """,
             (
                 email, (display_name or "").strip(), legacy_role, operating_role,
-                json.dumps(operating_roles), int(admin_value), (slack_user_id or "").strip(), (time_zone or "").strip(), int(bool(can_self_assign)), now, now,
-                display_name, slack_user_id, time_zone, can_self_assign,
+                json.dumps(operating_roles), int(admin_value), (slack_user_id or "").strip(), (time_zone or "").strip(), int(bool(can_self_assign)), minutes_per_pp, now, now,
+                display_name, slack_user_id, time_zone, can_self_assign, minutes_per_pp,
             ),
         )
 
@@ -1010,8 +1023,8 @@ def seed_queue_role_roster() -> None:
         "sergio@sentientagency.io": "Sergio",
         "victor@sentientagency.io": "Victor",
         "egor@sentientagency.io": "Egor",
-        "santiagoflhi@gmail.com": "Santiago",
-        "dsflorezl@gmail.com": "Florez",
+        "santiagoflhi@gmail.com": "Florez",
+        "dsflorezl@gmail.com": "Santiago",
         "sara1107giraldo@gmail.com": "Sara",
         "sebastianruizurquijo@gmail.com": "Sebastian",
         "sebastianruizurquillo@gmail.com": "Sebastian",
@@ -1156,24 +1169,22 @@ def seed_queue_role_roster() -> None:
                 (now,),
             )
 
-        # Correct the two roster labels that were crossed in the production
-        # Users table. Keep their emails and Slack IDs untouched; this is a
-        # one-time data repair so later edits made in Settings remain the
-        # source of truth.
+        # The initial repair shipped with these two display labels reversed.
+        # Keep emails/Slack IDs untouched and explicitly supersede it once.
         display_name_fix_marker = conn.execute(
-            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v9_fix_santiago_florez_names'"
+            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v10_fix_santiago_florez_names'"
         ).fetchone()
         if not display_name_fix_marker:
             for email, display_name in (
-                ("santiagoflhi@gmail.com", "Santiago"),
-                ("dsflorezl@gmail.com", "Florez"),
+                ("santiagoflhi@gmail.com", "Florez"),
+                ("dsflorezl@gmail.com", "Santiago"),
             ):
                 conn.execute(
                     "UPDATE dashboard_users SET display_name = ?, updated_at = ? WHERE email = ?",
                     (display_name, now, email),
                 )
             conn.execute(
-                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v9_fix_santiago_florez_names', '1', ?)",
+                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v10_fix_santiago_florez_names', '1', ?)",
                 (now,),
             )
 

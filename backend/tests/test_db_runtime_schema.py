@@ -30,6 +30,7 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
     }
     assert columns["time_zone"]["dflt_value"] == "''"
     assert columns["can_self_assign"]["dflt_value"] == "0"
+    assert "minutes_per_pp" in columns
     account_columns = {
         row["name"]: row
         for row in connection.execute("PRAGMA table_info(accounts)").fetchall()
@@ -44,7 +45,5 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
         "SELECT hidden_users, row_order FROM queue_scheduler_preferences"
     ).fetchone()
     assert dict(row) == {"hidden_users": "[]", "row_order": "[]"}
-
-
 def test_gabo_is_not_an_internal_self_assignment_exception() -> None:
     assert not _has_internal_self_assign("gabo@sentientagency.io")
