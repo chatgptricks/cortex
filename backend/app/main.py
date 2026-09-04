@@ -254,18 +254,51 @@ app.add_middleware(
 # dashboard show "Could not load the shared Post DB" instead of the sign-in
 # gate.
 
+_startup_ready = threading.Event()
+_startup_started_at = time.monotonic()
+_startup_error = ""
+
+
+def _finish_startup_in_background() -> None:
+    """Run database setup only after Uvicorn can answer Render's health check.
+
+    Render gives the process five seconds for its first health response. A
+    cold Postgres connection plus schema extension checks can exceed that
+    limit, causing Render to kill a service that would otherwise become
+    healthy seconds later. Keep the web listener immediately available and
+    retry the idempotent setup independently.
+    """
+    global _startup_error
+    logger = logging.getLogger(__name__)
+    delays = (1, 3, 8, 15, 30)
+    attempt = 0
+    while True:
+        try:
+            init_db()
+            seed_dashboard_users_from_env(_SEED_ALLOWED_EMAILS, _SEED_ADMIN_EMAILS)
+            seed_queue_role_roster()
+            repaired = _queue_v2_reflow_all_schedules()
+            if repaired:
+                logger.info("Queue startup repair reflowed %s scheduled request(s)", repaired)
+            if SCHEDULER_ENABLED:
+                start_scheduler()
+            else:
+                logger.info("Scheduler disabled for this deployment")
+            _startup_error = ""
+            _startup_ready.set()
+            logger.info("Sentient Dash startup maintenance complete")
+            return
+        except Exception as exc:  # pragma: no cover - protection for managed DB handoffs
+            attempt += 1
+            _startup_error = f"{type(exc).__name__}: {exc}"
+            delay = delays[min(attempt - 1, len(delays) - 1)]
+            logger.exception("Startup maintenance attempt %s failed; retrying in %ss", attempt, delay)
+            time.sleep(delay)
+
+
 @app.on_event("startup")
 def startup() -> None:
-    init_db()
-    seed_dashboard_users_from_env(_SEED_ALLOWED_EMAILS, _SEED_ADMIN_EMAILS)
-    seed_queue_role_roster()
-    repaired = _queue_v2_reflow_all_schedules()
-    if repaired:
-        logging.getLogger(__name__).info("Queue startup repair reflowed %s scheduled request(s)", repaired)
-    if SCHEDULER_ENABLED:
-        start_scheduler()
-    else:
-        logging.getLogger(__name__).info("Scheduler disabled for this deployment")
+    threading.Thread(target=_finish_startup_in_background, daemon=True, name="sentient-startup").start()
 
 
 ensure_directories()
@@ -275,6 +308,11 @@ ensure_directories()
 def health() -> dict[str, Any]:
     return {
         "ok": True,
+        "ready": _startup_ready.is_set(),
+        "startup": {
+            "elapsed_seconds": round(time.monotonic() - _startup_started_at, 1),
+            "last_error": _startup_error or None,
+        },
         "deployment": {
             "commit": os.getenv("RENDER_GIT_COMMIT"),
             "service": os.getenv("RENDER_SERVICE_NAME"),
