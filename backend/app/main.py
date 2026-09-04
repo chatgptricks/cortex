@@ -38,6 +38,7 @@ from .apify_sync import (
     refresh_single_post,
     run_backfill,
     run_manual_refresh,
+    run_short_term_cycle_batch,
     store_avatar_from_url,
 )
 from .post_media import PostMediaError, build_zip, collect_media, fetch_one
@@ -5430,6 +5431,41 @@ def dashboard_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
         except ApifySyncError as exc:
             results[handle] = {"error": str(exc)}
     return results
+
+
+@app.post("/api/dashboard/posts/catch-up")
+def dashboard_posts_catch_up(password: Annotated[str, Form()]) -> dict[str, Any]:
+    """One-off recovery for an interrupted Dashboard post cycle.
+
+    This intentionally uses one batched *posts* actor request across active
+    accounts. It reaches farther back than the inexpensive 12-hour cadence,
+    but never includes the separate Reels actor; Reels stay a deliberately
+    targeted, manual operation.
+    """
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+
+    accounts = list_accounts(active_only=True)
+    handles = [account["handle"] for account in accounts]
+    try:
+        results = run_short_term_cycle_batch(
+            handles,
+            # This is a recovery pass, not the scheduled cadence. A larger
+            # per-profile cap makes a 24-hour gap recoverable in one run.
+            results_limit=50,
+            include_reels=False,
+            lookback_hours=24,
+        )
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=502, detail=f"Post catch-up failed: {exc}") from exc
+
+    return {
+        "lookback_hours": 24,
+        "accounts": handles,
+        "results": results,
+    }
 
 
 @app.post("/api/admin/slack-test")
