@@ -280,10 +280,16 @@ def _finish_startup_in_background() -> None:
             repaired = _queue_v2_reflow_all_schedules()
             if repaired:
                 logger.info("Queue startup repair reflowed %s scheduled request(s)", repaired)
-            if SCHEDULER_ENABLED:
+            # Ingestion, OCR and R2 backfills can process many images at once.
+            # Never let that workload share the public API process: an OOM or
+            # a CPU-heavy sync made Render miss its five-second health probe
+            # and took the entire Dashboard/Queue down.  A dedicated worker
+            # opts in explicitly; the web service stays request-only.
+            run_scheduler_here = SCHEDULER_ENABLED and os.getenv("SENTIENT_WEB_RUN_SCHEDULER", "false").strip().lower() in {"1", "true", "yes"}
+            if run_scheduler_here:
                 start_scheduler()
             else:
-                logger.info("Scheduler disabled for this deployment")
+                logger.info("Scheduler disabled in the web process; run it from the dedicated worker")
             _startup_error = ""
             _startup_ready.set()
             logger.info("Sentient Dash startup maintenance complete")
