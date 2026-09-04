@@ -56,6 +56,8 @@ def test_media_filename_cannot_escape_uploads(tmp_path, monkeypatch):
 
 def test_backfill_binds_the_r2_prefix_for_postgres_compatibility(monkeypatch):
     class FakeCursor:
+        rowcount = 1
+
         def __init__(self, rows=None):
             self.rows = rows or []
 
