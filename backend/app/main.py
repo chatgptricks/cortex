@@ -5702,6 +5702,7 @@ def admin_list_users() -> dict[str, Any]:
         for user in users
     ]
     for user, slack_id in zip(users, slack_ids):
+        user["stored_slack_user_id"] = user.get("slack_user_id") or ""
         # Older roster rows may not have been edited since the Slack-ID field
         # was introduced. Return the reviewed roster mapping in the live
         # Users response so Settings can populate the field immediately.
@@ -5723,11 +5724,19 @@ def admin_upsert_user(
     time_zone: Annotated[str | None, Form()] = None,
     can_self_assign: Annotated[bool | None, Form()] = None,
     minutes_per_pp: Annotated[int | None, Form()] = None,
+    clear_fields: Annotated[str, Form()] = "",
 ) -> dict[str, Any]:
     """Add a new allowed email, or change an existing one's role. Admins can
     add other admins or plain viewers; there's no further gate here because
     /api/admin/* already requires an admin session to reach this at all."""
     clean_email = email.strip().lower()
+    cleared = {field.strip() for field in clear_fields.split(",") if field.strip()}
+    if cleared - {"slack_user_id", "time_zone", "minutes_per_pp"}:
+        raise HTTPException(status_code=400, detail="Unsupported field reset.")
+    if "slack_user_id" in cleared:
+        slack_user_id = ""
+    if "time_zone" in cleared:
+        time_zone = ""
     if not clean_email or "@" not in clean_email:
         raise HTTPException(status_code=400, detail="Enter a valid email address.")
     if role not in ("admin", "viewer"):
@@ -5748,10 +5757,11 @@ def admin_upsert_user(
     upsert_dashboard_user(
         clean_email, role, operating_role, is_admin, clean_slack_id, clean_display_name,
         clean_time_zone, can_self_assign, minutes_per_pp,
+        clear_minutes_per_pp="minutes_per_pp" in cleared,
     )
     with connect() as conn:
         _queue_v2_publish(conn, "roster_updated", _caller_email(request))
-    return {"ok": True, "users": list_dashboard_users()}
+    return {"ok": True, **admin_list_users()}
 
 
 @app.get("/api/admin/queue/designer-accounts")
