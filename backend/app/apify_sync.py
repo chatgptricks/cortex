@@ -1353,7 +1353,7 @@ def _dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _collect_short_term_items(
-    configs: dict[str, dict[str, Any]], results_limit: int, now: datetime
+    configs: dict[str, dict[str, Any]], results_limit: int, now: datetime, *, include_reels: bool = True
 ) -> dict[str, list[dict[str, Any]]]:
     """Fetch each configured account surface in two batched, small runs.
 
@@ -1376,9 +1376,12 @@ def _collect_short_term_items(
             if account and not _is_reel_item(item):
                 items_by_account[account].append(item)
 
+    # The Reels actor is materially more expensive than the profile-posts
+    # actor. Automated cycles must never invoke it: only a deliberately
+    # targeted, single-account manual refresh/backfill can opt in.
     reel_configs = {
         account: cfg for account, cfg in configs.items() if cfg["scrape_mode"] in {"reels", "both"}
-    }
+    } if include_reels else {}
     if reel_configs:
         reel_handles = [cfg["handle"] for cfg in reel_configs.values()]
         reel_items = _fetch_apify_items(
@@ -1545,7 +1548,9 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
     return {"new_posts": insert_summary, "engagement": engagement_summary, "transcripts_updated": transcript_updates}
 
 
-def run_short_term_cycle(account: str, results_limit: int = _SHORT_RESULTS_LIMIT) -> dict[str, Any]:
+def run_short_term_cycle(
+    account: str, results_limit: int = _SHORT_RESULTS_LIMIT, *, include_reels: bool = True
+) -> dict[str, Any]:
     """Single-account entry point: (1) pulls the last ~30h of posts and
     inserts any brand-new ones, and (2) refreshes likes/comments on all
     existing posts <=24h old, doing a one-time "first hour" HOT check the
@@ -1559,11 +1564,13 @@ def run_short_term_cycle(account: str, results_limit: int = _SHORT_RESULTS_LIMIT
     """
     cfg = get_account_config(account)
     now = datetime.now(UTC)
-    items = _collect_short_term_items({account: cfg}, results_limit, now)[account]
+    items = _collect_short_term_items({account: cfg}, results_limit, now, include_reels=include_reels)[account]
     return _process_short_term_items(account, cfg, items, now)
 
 
-def run_short_term_cycle_batch(accounts: list[str], results_limit: int = _SHORT_RESULTS_LIMIT) -> dict[str, dict[str, Any]]:
+def run_short_term_cycle_batch(
+    accounts: list[str], results_limit: int = _SHORT_RESULTS_LIMIT, *, include_reels: bool = False
+) -> dict[str, dict[str, Any]]:
     """Same job as run_short_term_cycle, but for every account in one Apify
     call: a single actor run scrapes all accounts' profile URLs at once
     (resultsLimit is documented as "per URL", so each account still gets up
@@ -1593,7 +1600,7 @@ def run_short_term_cycle_batch(accounts: list[str], results_limit: int = _SHORT_
     if not configs:
         return results
 
-    items_by_account = _collect_short_term_items(configs, results_limit, now)
+    items_by_account = _collect_short_term_items(configs, results_limit, now, include_reels=include_reels)
 
     for account, cfg in configs.items():
         try:
@@ -1709,9 +1716,9 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
     return summary
 
 
-def run_manual_refresh(account: str) -> dict[str, Any]:
-    """Manual 'Refresh' button override: runs both cycles immediately."""
-    short_term = run_short_term_cycle(account)
+def run_manual_refresh(account: str, *, include_reels: bool = True) -> dict[str, Any]:
+    """Manual single-account refresh. Reels require this explicit opt-in."""
+    short_term = run_short_term_cycle(account, include_reels=include_reels)
     daily = run_daily_cycle(account)
     return {"short_term": short_term, "daily": daily}
 
