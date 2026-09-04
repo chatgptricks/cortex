@@ -3301,24 +3301,26 @@ def dashboard_queue_v2_request_detail(request_id: int, request: Request) -> dict
 @app.get("/api/dashboard/queue/v2/summary")
 def dashboard_queue_v2_summary(request: Request) -> dict[str, Any]:
     caller = _caller_email(request)
-    roles = list(getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]))
-    is_admin = bool(getattr(request.state, "is_admin", False))
     with connect() as conn:
-        if is_admin or "vc" in roles:
-            row = conn.execute("SELECT COUNT(*) AS c FROM queue_requests WHERE status IN ('pool','scheduled','in_progress','completed')").fetchone()
-            draft_count = 0
-        else:
-            row = conn.execute("SELECT COUNT(*) AS c FROM queue_requests WHERE designer_email = ? AND status IN ('scheduled','in_progress','completed')", (caller,)).fetchone()
-            draft_count = int(conn.execute(
-                """SELECT COUNT(*) AS c FROM queue_schedule_drafts d
-                   WHERE d.designer_email = ?
-                     AND NOT EXISTS (
-                       SELECT 1 FROM queue_requests r
-                       WHERE r.id = d.request_id AND r.designer_email = ?
-                         AND r.status IN ('scheduled','in_progress','completed')
-                     )""",
-                (caller, caller),
-            ).fetchone()["c"])
+        # The navigation bubble is a personal work indicator, not a workload
+        # report. An Admin or VC can see everyone in Queue, but their own
+        # Dashboard button must only surface posts assigned to their account.
+        row = conn.execute(
+            """SELECT COUNT(*) AS c FROM queue_requests
+               WHERE designer_email = ?
+                 AND status IN ('scheduled','in_progress','completed')""",
+            (caller,),
+        ).fetchone()
+        draft_count = int(conn.execute(
+            """SELECT COUNT(*) AS c FROM queue_schedule_drafts d
+               WHERE d.designer_email = ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM queue_requests r
+                   WHERE r.id = d.request_id AND r.designer_email = ?
+                     AND r.status IN ('scheduled','in_progress','completed')
+                 )""",
+            (caller, caller),
+        ).fetchone()["c"])
     return {"pending": int(row["c"] if row else 0) + draft_count}
 
 
