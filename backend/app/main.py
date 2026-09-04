@@ -205,6 +205,7 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     request.state.is_dev = email == "esteban@sentientagency.io"
     request.state.can_role_switch = request.state.is_dev or email == "ivan@sentientagency.io"
     preview_role = request.headers.get("x-queue-role-preview", "").strip().lower()
+    request.state.queue_role_preview_active = False
     allowed_preview_roles = set(request.state.available_operating_roles)
     if base_is_admin:
         allowed_preview_roles.add("admin")
@@ -214,6 +215,7 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         request.state.operating_role = preview_role
         request.state.operating_roles = [preview_role]
         request.state.is_admin = base_is_admin and preview_role == "admin"
+        request.state.queue_role_preview_active = True
     # PD is the product-wide baseline. A secondary role changes the extra
     # controls a person gets, but never removes their personal Queue, Pick,
     # requests, or assigned-work workflow.
@@ -1862,6 +1864,16 @@ def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[st
     email = _caller_email(request)
     is_admin = bool(getattr(request.state, "is_admin", False))
     roles = list(getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]))
+    # Esteban's Queue role selector is a *restricted-view* switch, not a way
+    # for a Settings edit or an old database row to lock the Dev account out
+    # of its own production board.  Keep full Queue coordination in the
+    # normal Dev view and the Admin/VC previews; the Sales, PD and Trainee
+    # previews deliberately remain constrained so they are useful for QA.
+    is_dev = bool(getattr(request.state, "is_dev", False))
+    preview_active = bool(getattr(request.state, "queue_role_preview_active", False))
+    active_role = str(getattr(request.state, "operating_role", "")).strip().lower()
+    if is_dev and (not preview_active or active_role in {"admin", "vc"}):
+        is_admin = True
     if coordinator and not (is_admin or "vc" in roles):
         raise HTTPException(status_code=403, detail="Queue coordination access required.")
     # Every authenticated dashboard user has baseline PD access. Explicit
