@@ -14,6 +14,22 @@ def _path_from_env(name: str, default: Path) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an optional integer without making a blank Render field fatal."""
+    try:
+        return int(os.getenv(name, str(default)).strip() or default)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read an optional numeric timeout without making a blank field fatal."""
+    try:
+        return float(os.getenv(name, str(default)).strip() or default)
+    except ValueError:
+        return default
+
+
 # PREDICT_DATA_DIR / predict.sqlite3 are legacy names from when this backend
 # was Predict's -- Predict is archived, but this is still the live Sentient
 # Dash database file (dashboard_posts, accounts, dashboard_users,
@@ -38,11 +54,11 @@ TRICKS_DASH_REFRESH_PASSWORD = os.getenv("TRICKS_DASH_REFRESH_PASSWORD", "").str
 # cover image; there is no crop-region setting here on purpose.
 SENTIENT_OCR_URL = os.getenv("SENTIENT_OCR_URL")
 SENTIENT_OCR_TOKEN = os.getenv("SENTIENT_OCR_TOKEN")
-SENTIENT_OCR_TIMEOUT = float(os.getenv("SENTIENT_OCR_TIMEOUT", "300"))
+SENTIENT_OCR_TIMEOUT = _env_float("SENTIENT_OCR_TIMEOUT", 300)
 # Keep multipart OCR requests small enough for the web instance. The OCR
 # worker receives the same total queue over sequential requests, without a
 # burst of hundreds of full-resolution images resident at once.
-SENTIENT_OCR_MAX_FILES_PER_REQUEST = max(1, min(int(os.getenv("SENTIENT_OCR_MAX_FILES_PER_REQUEST", "10")), 20))
+SENTIENT_OCR_MAX_FILES_PER_REQUEST = max(1, min(_env_int("SENTIENT_OCR_MAX_FILES_PER_REQUEST", 10), 20))
 
 # R2 is opt-in: a deployment before the bucket credentials are added behaves
 # exactly like the current Render-disk deployment.
@@ -56,8 +72,8 @@ R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
 # R2 the only durable copy while retaining a local fallback if an upload fails.
 R2_LOCAL_MIRROR_ENABLED = os.getenv("R2_LOCAL_MIRROR_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
 R2_BACKFILL_ENABLED = os.getenv("R2_BACKFILL_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
-R2_BACKFILL_BATCH_SIZE = max(1, min(int(os.getenv("R2_BACKFILL_BATCH_SIZE", "25")), 150))
-R2_BACKFILL_INTERVAL_SECONDS = max(30, int(os.getenv("R2_BACKFILL_INTERVAL_SECONDS", "60")))
+R2_BACKFILL_BATCH_SIZE = max(1, min(_env_int("R2_BACKFILL_BATCH_SIZE", 25), 150))
+R2_BACKFILL_INTERVAL_SECONDS = max(30, _env_int("R2_BACKFILL_INTERVAL_SECONDS", 60))
 
 # Origins the deployed frontends are served from. These are baked in rather
 # than left to an env var because they're a property of where this app lives,
