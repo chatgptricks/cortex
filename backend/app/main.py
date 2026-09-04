@@ -2182,6 +2182,64 @@ def _queue_v2_post_snapshot(account: str | None, shortcode: str | None) -> dict[
     }
 
 
+def _queue_v2_post_snapshot_cache(conn: Any, rows: list[Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Load Queue source-post details in two bounded queries.
+
+    Queue used to call ``_queue_v2_post_snapshot`` once for every card. Each
+    call leased another Postgres connection, which turns a coordinator's
+    schedule into dozens of database round trips. A Queue refresh must remain
+    read-only and bounded even while many teammates open it together.
+    """
+    pairs = {
+        (str(row["post_account"] or "").strip().lower(), str(row["post_shortcode"] or "").strip())
+        for row in rows
+        if str(row["post_account"] or "").strip() and str(row["post_shortcode"] or "").strip()
+    }
+    if not pairs:
+        return {}
+    accounts = sorted({account for account, _ in pairs})
+    shortcodes = sorted({shortcode for _, shortcode in pairs})
+    cache: dict[tuple[str, str], dict[str, Any]] = {}
+    canonical = conn.execute(
+        "SELECT handle FROM accounts WHERE is_canonical = 1 AND is_active = 1 LIMIT 1"
+    ).fetchone()
+    canonical_handle = str(canonical["handle"]).strip().lower() if canonical else ""
+    if canonical_handle and canonical_handle in accounts:
+        for row in conn.execute(
+            """SELECT id, shortcode, caption, title, post_type_label, published_at, likes, comments,
+                      is_hot, hot_rate_multiplier
+               FROM posts WHERE shortcode = ANY(?)""",
+            (shortcodes,),
+        ).fetchall():
+            item = dict(row)
+            key = (canonical_handle, str(item["shortcode"]))
+            if key in pairs:
+                cache[key] = {
+                    "id": item["id"], "caption": item.get("caption") or item.get("title") or "",
+                    "type": item.get("post_type_label") or "Image", "publishedAt": item.get("published_at"),
+                    "likes": item.get("likes"), "comments": item.get("comments"),
+                    "isHot": bool(item.get("is_hot")), "hotMultiplier": item.get("hot_rate_multiplier"),
+                    "permalink": f"https://www.instagram.com/p/{item['shortcode']}/",
+                }
+    for row in conn.execute(
+        """SELECT id, account, shortcode, caption, post_type_label, published_at, likes, comments, permalink,
+                  is_hot, hot_rate_multiplier
+           FROM dashboard_posts WHERE account = ANY(?) AND shortcode = ANY(?)""",
+        (accounts, shortcodes),
+    ).fetchall():
+        item = dict(row)
+        key = (str(item["account"]).strip().lower(), str(item["shortcode"]))
+        if key in pairs:
+            cache[key] = {
+                "id": item["id"], "caption": item.get("caption") or "",
+                "type": item.get("post_type_label") or "Image", "publishedAt": item.get("published_at"),
+                "likes": item.get("likes"), "comments": item.get("comments"),
+                "isHot": bool(item.get("is_hot")), "hotMultiplier": item.get("hot_rate_multiplier"),
+                "permalink": item.get("permalink") or f"https://www.instagram.com/p/{item['shortcode']}/",
+            }
+    return cache
+
+
 def _queue_v2_existing_dashboard_post_from_url(source_url: str) -> dict[str, str] | None:
     """Resolve an Instagram permalink to an already-indexed Dashboard post."""
     match = re.match(r"^https?://(?:www\.)?instagram\.com/(?:p|reel)/([^/?#]+)", str(source_url or "").strip(), re.I)
@@ -2619,10 +2677,10 @@ def _queue_v2_reflow_all_schedules() -> int:
         return sum(_queue_v2_reflow_scheduled(conn, designer, "queue-system@sentientdash.app") for designer in designers)
 
 
-def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
+def _queue_v2_project(row: dict[str, Any], snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
     pp = int(row["production_points"])
     minutes_per_pp = max(1, int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP))
-    snapshot = _queue_v2_post_snapshot(row["post_account"], row["post_shortcode"])
+    snapshot = snapshot if snapshot is not None else _queue_v2_post_snapshot(row["post_account"], row["post_shortcode"])
     published_post = _queue_v2_published_dashboard_post(row)
     return {
         "id": row["id"], "post": {
@@ -3015,11 +3073,11 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         expired_ids = _queue_v2_purge_expired(conn)
         if expired_ids:
             _queue_v2_publish(conn, "retention_purged", "queue-retention@sentientdash.app", expired_ids)
-        # HOT routing is idempotent and runs at read time as a safety net for
-        # posts detected before this feature was deployed (the Apify worker
-        # also calls the same helper immediately after a fresh HOT check).
-        _queue_v2_auto_pool_hot(conn)
-        hot_source_rows = _queue_v2_hot_source_rows(conn, include_historic=True)
+        # Never run HOT routing in this public read path. It scans/imports
+        # source posts and writes Queue rows, so opening Queue could consume
+        # enough CPU and DB connections to take down every user. The dedicated
+        # ingestion worker owns that idempotent action instead.
+        hot_source_rows = _queue_v2_hot_source_rows(conn, include_historic=False)
         all_queue_rows = conn.execute("SELECT * FROM queue_requests").fetchall()
         pool_rows = conn.execute(
             """SELECT * FROM queue_requests
@@ -3104,10 +3162,13 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         account_onboarding = _queue_v2_account_onboarding_state(conn, caller)
         scheduler_preferences = _queue_v2_scheduler_preferences(conn, caller)
         trainee_reviews = _queue_v2_trainee_reviews(conn)
+        snapshot_cache = _queue_v2_post_snapshot_cache(conn, all_queue_rows)
     for request_id in expired_ids:
         shutil.rmtree(DATA_DIR / "queue_attachments" / str(request_id), ignore_errors=True)
     def project_with_ticket_flags(row: Any) -> dict[str, Any]:
-        item = _queue_v2_project(dict(row))
+        raw = dict(row)
+        snapshot = snapshot_cache.get((str(raw.get("post_account") or "").strip().lower(), str(raw.get("post_shortcode") or "").strip()))
+        item = _queue_v2_project(raw, snapshot)
         item["pendingTickets"] = pending_tickets_by_request.get(int(item["id"]), [])
         item["traineeReview"] = trainee_reviews.get(int(item["id"]))
         return item
