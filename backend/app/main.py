@@ -1944,6 +1944,41 @@ def _queue_v2_final_permalinks(row: dict[str, Any]) -> list[dict[str, str]]:
     return [{"account": fallback_account, "url": legacy}]
 
 
+def _queue_v2_published_dashboard_post(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Project the delivered Dashboard post into a closed Queue request.
+
+    Closing a request stores Instagram permalinks immediately, while the
+    Dashboard receives the actual post on its next import.  Once that import
+    has happened, the Queue detail must show what was published rather than
+    the original inspiration/source.  Until then, return ``None`` so the UI
+    can keep the source card as an honest fallback.
+    """
+    if row.get("status") != "closed":
+        return None
+    for final_link in _queue_v2_final_permalinks(row):
+        match = _queue_v2_existing_dashboard_post_from_url(final_link["url"])
+        if not match:
+            continue
+        snapshot = _queue_v2_post_snapshot(match["account"], match["shortcode"])
+        if not snapshot:
+            continue
+        return {
+            "id": snapshot.get("id"),
+            "account": match["account"],
+            "shortcode": match["shortcode"],
+            "title": snapshot.get("caption") or "",
+            "isCustom": False,
+            "permalink": snapshot.get("permalink") or final_link["url"],
+            "caption": snapshot.get("caption") or "",
+            "type": snapshot.get("type") or "Image",
+            "coverUrl": "",
+            "publishedAt": snapshot.get("publishedAt"),
+            "likes": snapshot.get("likes"),
+            "comments": snapshot.get("comments"),
+        }
+    return None
+
+
 def _queue_v2_user_roles(user: dict[str, Any] | Any) -> list[str]:
     """Return effective Queue roles; every dashboard user is PD-capable."""
     roles = _queue_v2_json(user.get("operating_roles"), [user.get("operating_role") or "sales"])
@@ -2534,6 +2569,7 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
     pp = int(row["production_points"])
     minutes_per_pp = max(1, int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP))
     snapshot = _queue_v2_post_snapshot(row["post_account"], row["post_shortcode"])
+    published_post = _queue_v2_published_dashboard_post(row)
     return {
         "id": row["id"], "post": {
             "account": row["post_account"], "shortcode": row["post_shortcode"],
@@ -2560,6 +2596,7 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
         "scheduledDate": row["scheduled_date"], "scheduledStartMinutes": row["scheduled_start_minutes"],
         "actualStartedAt": row["actual_started_at"], "completedAt": row["completed_at"], "closedAt": row["closed_at"],
         "finalPermalink": row["final_permalink"], "finalPermalinks": _queue_v2_final_permalinks(row), "cancellationReason": row["cancellation_reason"],
+        "publishedPost": published_post,
         "createdAt": row["created_at"], "updatedAt": row["updated_at"],
     }
 
