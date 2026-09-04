@@ -75,6 +75,12 @@ R2_BACKFILL_ENABLED = os.getenv("R2_BACKFILL_ENABLED", "false").strip().lower() 
 R2_BACKFILL_BATCH_SIZE = max(1, min(_env_int("R2_BACKFILL_BATCH_SIZE", 25), 150))
 R2_BACKFILL_INTERVAL_SECONDS = max(30, _env_int("R2_BACKFILL_INTERVAL_SECONDS", 60))
 
+# A parallel deployment must not independently run scheduled refreshes,
+# publishing jobs, or R2 maintenance against the shared production database.
+# The active production instance keeps the default; the pre-cutover instance
+# explicitly sets this to false until traffic moves to it.
+SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+
 # Origins the deployed frontends are served from. These are baked in rather
 # than left to an env var because they're a property of where this app lives,
 # not of a particular deployment -- and a missing env var silently breaks

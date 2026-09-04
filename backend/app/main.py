@@ -44,6 +44,7 @@ from .post_media import PostMediaError, build_zip, collect_media, fetch_one
 from .config import (
     DATA_DIR,
     EXTRA_CORS_ORIGINS,
+    SCHEDULER_ENABLED,
     TRICKS_DASH_REFRESH_PASSWORD,
     UPLOAD_DIR,
     ensure_directories,
@@ -258,7 +259,10 @@ def startup() -> None:
     repaired = _queue_v2_reflow_all_schedules()
     if repaired:
         logging.getLogger(__name__).info("Queue startup repair reflowed %s scheduled request(s)", repaired)
-    start_scheduler()
+    if SCHEDULER_ENABLED:
+        start_scheduler()
+    else:
+        logging.getLogger(__name__).info("Scheduler disabled for this deployment")
 
 
 ensure_directories()
