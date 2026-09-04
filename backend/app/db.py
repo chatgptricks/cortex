@@ -913,20 +913,21 @@ def upsert_dashboard_user(
             INSERT INTO dashboard_users (email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id, time_zone, can_self_assign, minutes_per_pp, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(email) DO UPDATE SET
-                display_name = CASE WHEN ? IS NULL THEN dashboard_users.display_name ELSE excluded.display_name END,
+                display_name = CASE WHEN ? = 1 THEN dashboard_users.display_name ELSE excluded.display_name END,
                 role = excluded.role, operating_role = excluded.operating_role,
                 operating_roles = excluded.operating_roles,
                 is_admin = excluded.is_admin,
-                slack_user_id = CASE WHEN ? IS NULL THEN dashboard_users.slack_user_id ELSE excluded.slack_user_id END,
-                time_zone = CASE WHEN ? IS NULL THEN dashboard_users.time_zone ELSE excluded.time_zone END,
-                can_self_assign = CASE WHEN ? IS NULL THEN dashboard_users.can_self_assign ELSE excluded.can_self_assign END,
-                minutes_per_pp = CASE WHEN ? = 1 THEN NULL WHEN ? IS NULL THEN dashboard_users.minutes_per_pp ELSE excluded.minutes_per_pp END,
+                slack_user_id = CASE WHEN ? = 1 THEN dashboard_users.slack_user_id ELSE excluded.slack_user_id END,
+                time_zone = CASE WHEN ? = 1 THEN dashboard_users.time_zone ELSE excluded.time_zone END,
+                can_self_assign = CASE WHEN ? = 1 THEN dashboard_users.can_self_assign ELSE excluded.can_self_assign END,
+                minutes_per_pp = CASE WHEN ? = 1 THEN NULL WHEN ? = 1 THEN dashboard_users.minutes_per_pp ELSE excluded.minutes_per_pp END,
                 updated_at = excluded.updated_at
             """,
             (
                 email, (display_name or "").strip(), legacy_role, operating_role,
                 json.dumps(operating_roles), int(admin_value), (slack_user_id or "").strip(), (time_zone or "").strip(), int(bool(can_self_assign)), minutes_per_pp, now, now,
-                display_name, slack_user_id, time_zone, can_self_assign, int(clear_minutes_per_pp), minutes_per_pp,
+                int(display_name is None), int(slack_user_id is None), int(time_zone is None),
+                int(can_self_assign is None), int(clear_minutes_per_pp), int(minutes_per_pp is None),
             ),
         )
 

@@ -100,6 +100,8 @@ def test_existing_user_columns_never_trigger_duplicate_ddl(monkeypatch, tmp_path
         def execute(self, statement, params=()):
             if statement.startswith("ALTER TABLE"):
                 raise RuntimeError("Postgres DuplicateColumn aborts this transaction")
+            if "? IS NULL" in statement:
+                raise RuntimeError("Postgres cannot infer an untyped optional parameter")
             return self.connection.execute(statement, params)
 
     @contextmanager
