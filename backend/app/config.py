@@ -47,6 +47,10 @@ R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip("/")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
 R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
+# During the R2 cutover this was kept on so every successful upload also left
+# a Render-disk copy. Once all legacy media is backfilled, disabling it makes
+# R2 the only durable copy while retaining a local fallback if an upload fails.
+R2_LOCAL_MIRROR_ENABLED = os.getenv("R2_LOCAL_MIRROR_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
 R2_BACKFILL_ENABLED = os.getenv("R2_BACKFILL_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 R2_BACKFILL_BATCH_SIZE = max(1, min(int(os.getenv("R2_BACKFILL_BATCH_SIZE", "25")), 150))
 R2_BACKFILL_INTERVAL_SECONDS = max(30, int(os.getenv("R2_BACKFILL_INTERVAL_SECONDS", "60")))
