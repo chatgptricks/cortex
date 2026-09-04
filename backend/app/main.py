@@ -304,14 +304,24 @@ def _finish_startup_in_background() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    threading.Thread(target=_finish_startup_in_background, daemon=True, name="sentient-startup").start()
+    # Database migrations, roster repairs and ingestion are maintenance work,
+    # not a prerequisite for serving requests.  They can each fan out into
+    # many database operations; starting them in the public process meant a
+    # busy Dashboard could starve every Uvicorn worker before the first health
+    # probe.  The production database is already migrated, so keep this off
+    # unless an operator deliberately enables a maintenance run on the web.
+    if os.getenv("SENTIENT_WEB_RUN_STARTUP_MAINTENANCE", "false").strip().lower() in {"1", "true", "yes"}:
+        threading.Thread(target=_finish_startup_in_background, daemon=True, name="sentient-startup").start()
+    else:
+        _startup_ready.set()
+        logging.getLogger(__name__).info("Web startup maintenance disabled; public API is request-only")
 
 
 ensure_directories()
 
 
 @app.get("/api/health")
-def health() -> dict[str, Any]:
+async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "ready": _startup_ready.is_set(),
