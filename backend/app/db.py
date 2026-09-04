@@ -765,6 +765,11 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     # extension pass.
     if conn.execute("PRAGMA table_info(dashboard_posts)").fetchall():
         _ensure_column(conn, "dashboard_posts", "transcript", "transcript TEXT")
+    # Queue closure now stores one Instagram permalink per destination. The
+    # managed Postgres import predates this field, so omitting it makes the
+    # post feed and Queue reads fail before they can return the existing data.
+    if conn.execute("PRAGMA table_info(queue_requests)").fetchall():
+        _ensure_column(conn, "queue_requests", "final_permalinks", "final_permalinks TEXT NOT NULL DEFAULT '[]'")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS queue_scheduler_preferences (
                viewer_email TEXT PRIMARY KEY,

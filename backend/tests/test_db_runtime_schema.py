@@ -20,6 +20,12 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
                updated_at TEXT NOT NULL
            )"""
     )
+    connection.execute(
+        """CREATE TABLE queue_requests (
+               id INTEGER PRIMARY KEY,
+               updated_at TEXT NOT NULL
+           )"""
+    )
 
     _ensure_runtime_schema_extensions(connection)
     _ensure_runtime_schema_extensions(connection)
@@ -36,6 +42,11 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
         for row in connection.execute("PRAGMA table_info(accounts)").fetchall()
     }
     assert account_columns["scrape_mode"]["dflt_value"] == "'posts'"
+    queue_columns = {
+        row["name"]: row
+        for row in connection.execute("PRAGMA table_info(queue_requests)").fetchall()
+    }
+    assert queue_columns["final_permalinks"]["dflt_value"] == "'[]'"
 
     connection.execute(
         "INSERT INTO queue_scheduler_preferences (viewer_email, updated_at) VALUES (?, ?)",
