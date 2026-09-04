@@ -13,7 +13,6 @@ _SOURCES = (("dashboard_posts", "cover_image_path"), ("posts", "image_path"), ("
 def backfill(limit: int, *, dry_run: bool) -> dict[str, int]:
     if not r2_enabled():
         raise RuntimeError("R2 is not enabled. Configure and enable R2_MEDIA_ENABLED first.")
-    init_db()
     result = {"scanned": 0, "uploaded": 0, "skipped": 0, "failed": 0}
     remaining = limit
     for table, column in _SOURCES:
@@ -32,13 +31,21 @@ def backfill(limit: int, *, dry_run: bool) -> dict[str, int]:
             if dry_run:
                 result["skipped"] += 1
                 continue
-            remote_ref = upload_legacy_local_media(reference)
+            try:
+                remote_ref = upload_legacy_local_media(reference)
+            except Exception:
+                result["failed"] += 1
+                continue
             if not remote_ref:
                 result["failed"] += 1
                 continue
             with connect() as conn:
-                conn.execute(f"UPDATE {table} SET {column} = ? WHERE id = ?", (remote_ref, int(row["id"])))
-            result["uploaded"] += 1
+                cursor = conn.execute(
+                    f"UPDATE {table} SET {column} = ? WHERE id = ? AND {column} = ?",
+                    (remote_ref, int(row["id"]), reference),
+                )
+                updated = cursor.rowcount == 1
+            result["uploaded" if updated else "skipped"] += 1
     return result
 
 
@@ -49,6 +56,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.limit < 1:
         parser.error("--limit must be at least 1")
+    init_db()
     print("media R2 backfill:", backfill(args.limit, dry_run=args.dry_run))
 
 

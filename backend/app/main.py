@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from .apify_sync import (
     VALID_GROUPS,
@@ -169,11 +170,11 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         return JSONResponse({"detail": "Sign in required."}, status_code=401)
     token = header[len("Bearer ") :].strip()
     try:
-        decoded = firebase_auth.verify_id_token(token)
+        decoded = await run_in_threadpool(firebase_auth.verify_id_token, token)
     except Exception:
         return JSONResponse({"detail": "Your session expired -- please sign in again."}, status_code=401)
     email = (decoded.get("email") or "").strip().lower()
-    access = get_dashboard_user_access(email)
+    access = await run_in_threadpool(get_dashboard_user_access, email)
     if access is None:
         return JSONResponse(
             {"detail": "This Google account is not authorized for Sentient Dash."}, status_code=403
@@ -183,7 +184,7 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         # The browser is the most reliable source for a person's real clock.
         # Persist it so coordinators see Colombia's one-hour offset in the
         # shared scheduler on their next refresh as well.
-        set_dashboard_user_time_zone(email, client_time_zone)
+        await run_in_threadpool(set_dashboard_user_time_zone, email, client_time_zone)
         access["time_zone"] = client_time_zone
     is_admin = bool(access["is_admin"])
     base_is_admin = is_admin
@@ -228,7 +229,7 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     try:
         # Feeds the Users tab's usage heatmap. Best-effort: a failed insert
         # here should never turn into a failed request for the user.
-        log_usage_event(email, path, request.method)
+        await run_in_threadpool(log_usage_event, email, path, request.method)
     except Exception:
         logging.getLogger(__name__).warning("usage log insert failed", exc_info=True)
     return await call_next(request)
@@ -2505,6 +2506,25 @@ def _queue_v2_live_snapshot(conn: Any) -> dict[str, Any]:
     }
 
 
+_queue_stream_lock = asyncio.Lock()
+_queue_stream_state: dict[str, Any] | None = None
+_queue_stream_checked_at = 0.0
+
+
+def _read_queue_stream_state() -> dict[str, Any]:
+    with connect() as conn:
+        return _queue_v2_live_snapshot(conn)
+
+
+async def _queue_v2_stream_snapshot() -> dict[str, Any]:
+    global _queue_stream_state, _queue_stream_checked_at
+    async with _queue_stream_lock:
+        if _queue_stream_state is None or time.monotonic() - _queue_stream_checked_at >= 0.75:
+            _queue_stream_state = await run_in_threadpool(_read_queue_stream_state)
+            _queue_stream_checked_at = time.monotonic()
+        return _queue_stream_state
+
+
 def _queue_v2_duration(row: dict[str, Any]) -> int:
     minutes_per_pp = max(1, int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP))
     planned = max(minutes_per_pp, int(row["production_points"]) * minutes_per_pp)
@@ -3438,8 +3458,7 @@ async def dashboard_queue_v2_live(request: Request, after: int = 0) -> Streaming
         nonlocal last_revision
         keepalive_at = time.monotonic()
         while not await request.is_disconnected():
-            with connect() as conn:
-                state = _queue_v2_live_snapshot(conn)
+            state = await _queue_v2_stream_snapshot()
             if state["revision"] > last_revision:
                 last_revision = state["revision"]
                 payload = json.dumps(state, separators=(",", ":"))

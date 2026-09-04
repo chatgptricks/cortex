@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,8 @@ _DAILY_JOB_AT = (7, 0)  # 7:00am CST
 
 _started = False
 _lock = threading.Lock()
+_stop_event = threading.Event()
+_thread: threading.Thread | None = None
 
 _SHORT_BUCKET_KEY = "last_short_bucket"
 _DAILY_DATE_KEY = "last_daily_date"
@@ -57,7 +60,7 @@ def _state_get(key: str) -> str | None:
         return row["value"] if row else None
     except Exception:
         logger.exception("Failed to read scheduler state %s", key)
-        return None
+        raise
 
 
 def _state_set(key: str, value: str) -> None:
@@ -72,7 +75,21 @@ def _state_set(key: str, value: str) -> None:
             )
     except Exception:
         logger.exception("Failed to persist scheduler state %s", key)
+        raise
 
+
+def _claim_bucket(key: str, value: str) -> bool:
+    from .db import connect, utc_now
+
+    with connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO scheduler_state (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at "
+            "WHERE scheduler_state.value < excluded.value",
+            (key, value, utc_now()),
+        )
+        claimed = cursor.rowcount == 1
+    return claimed
 
 
 
@@ -259,50 +276,74 @@ def _tick() -> None:
 
     _run_media_backfill(now_cst)
 
-    # Never pauses: every 30 min during posting hours, hourly overnight. A post
-    # published at 2am still gets its first-hour HOT check on time.
     bucket = _bucket_key(now_cst)
-    if bucket != _state_get(_SHORT_BUCKET_KEY):
+    if _claim_bucket(_SHORT_BUCKET_KEY, bucket):
         # Claim the bucket *before* running so a crash mid-job doesn't leave
         # it unclaimed and re-fire on the next 30s tick.
-        _state_set(_SHORT_BUCKET_KEY, bucket)
         _check_disk()  # cheap (one statvfs) and runs before the jobs that write
         _run_short_term_jobs()
         _run_ocr_job()
 
     daily_trigger = now_cst.replace(hour=_DAILY_JOB_AT[0], minute=_DAILY_JOB_AT[1], second=0, microsecond=0)
     today = now_cst.strftime("%Y-%m-%d")
-    if now_cst >= daily_trigger and _state_get(_DAILY_DATE_KEY) != today:
-        _state_set(_DAILY_DATE_KEY, today)
+    if now_cst >= daily_trigger and _claim_bucket(_DAILY_DATE_KEY, today):
         _run_daily_jobs()
         _run_account_snapshot_job()
 
 
 def _loop() -> None:
-    while True:
+    while not _stop_event.is_set():
         try:
             _tick()
         except Exception:
             logger.exception("Engagement scheduler tick failed")
-        time.sleep(30)
+        # Event.wait lets a dedicated worker exit promptly on SIGTERM instead
+        # of waiting for an idle 30-second loop before Render can replace it.
+        _stop_event.wait(30)
+
+
+def scheduler_enabled() -> bool:
+    """Whether this process owns the long-running ingestion scheduler.
+
+    Defaults to enabled for backward compatibility while an existing Render
+    web service is migrated. Production explicitly disables it on the API and
+    enables it only on the dedicated background worker.
+    """
+    from .config import SCHEDULER_ENABLED
+
+    value = os.getenv("SENTIENT_SCHEDULER_ENABLED", "true").strip().lower()
+    return SCHEDULER_ENABLED and value not in {"0", "false", "no", "off"}
 
 
 def start_scheduler() -> None:
-    """Starts a single in-process background thread that drives both
-    automated jobs. Safe to call multiple times (no-ops after the first).
-    Relies on the web service running as a single always-on instance
-    (Render 'standard' plan) -- if the service is ever scaled to multiple
-    instances, each would run its own scheduler and jobs would fire once
-    per instance.
-    """
-    global _started
+    """Start one local thread; durable claims arbitrate hourly/daily slots."""
+    global _started, _thread
+    if not scheduler_enabled():
+        logger.info("Engagement scheduler disabled for this process")
+        return
     with _lock:
         if _started:
             return
         _started = True
-    thread = threading.Thread(target=_loop, daemon=True, name="engagement-scheduler")
-    thread.start()
+        _stop_event.clear()
+        _thread = threading.Thread(target=_loop, daemon=True, name="engagement-scheduler")
+        _thread.start()
     logger.info(
-        "Engagement scheduler started (short-term: every 30min 7am-11pm CST, hourly overnight; "
+        "Engagement scheduler started (short-term: hourly; "
         "daily: 7:00am fixed CST)"
     )
+
+
+def stop_scheduler(timeout: float = 20.0) -> None:
+    """Request a clean scheduler shutdown when Render replaces its worker."""
+    global _started, _thread
+    with _lock:
+        thread = _thread
+        if not thread:
+            return
+        _stop_event.set()
+    thread.join(timeout=timeout)
+    with _lock:
+        if _thread is thread and not thread.is_alive():
+            _thread = None
+            _started = False
