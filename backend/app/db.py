@@ -859,6 +859,7 @@ def upsert_dashboard_user(
     is_admin: bool | None = None, slack_user_id: str | None = None,
     display_name: str | None = None, time_zone: str | None = None,
     can_self_assign: bool | None = None, minutes_per_pp: int | None = None,
+    clear_minutes_per_pp: bool = False,
 ) -> None:
     if role not in ("admin", "viewer"):
         raise ValueError(f"Invalid legacy role: {role!r}")
@@ -876,18 +877,9 @@ def upsert_dashboard_user(
     with connect() as conn:
         # Unit-test and legacy database fixtures can bypass init_db(). Keep
         # this write path forward-compatible when those small databases do.
-        try:
-            conn.execute("ALTER TABLE dashboard_users ADD COLUMN time_zone TEXT NOT NULL DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            conn.execute("ALTER TABLE dashboard_users ADD COLUMN can_self_assign INTEGER NOT NULL DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            conn.execute("ALTER TABLE dashboard_users ADD COLUMN minutes_per_pp INTEGER")
-        except sqlite3.OperationalError:
-            pass
+        _ensure_column(conn, "dashboard_users", "time_zone", "time_zone TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "dashboard_users", "can_self_assign", "can_self_assign INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "dashboard_users", "minutes_per_pp", "minutes_per_pp INTEGER")
         existing = conn.execute(
             "SELECT operating_role, operating_roles, time_zone, can_self_assign FROM dashboard_users WHERE email = ?",
             (email,),
@@ -928,13 +920,13 @@ def upsert_dashboard_user(
                 slack_user_id = CASE WHEN ? IS NULL THEN dashboard_users.slack_user_id ELSE excluded.slack_user_id END,
                 time_zone = CASE WHEN ? IS NULL THEN dashboard_users.time_zone ELSE excluded.time_zone END,
                 can_self_assign = CASE WHEN ? IS NULL THEN dashboard_users.can_self_assign ELSE excluded.can_self_assign END,
-                minutes_per_pp = CASE WHEN ? IS NULL THEN dashboard_users.minutes_per_pp ELSE excluded.minutes_per_pp END,
+                minutes_per_pp = CASE WHEN ? = 1 THEN NULL WHEN ? IS NULL THEN dashboard_users.minutes_per_pp ELSE excluded.minutes_per_pp END,
                 updated_at = excluded.updated_at
             """,
             (
                 email, (display_name or "").strip(), legacy_role, operating_role,
                 json.dumps(operating_roles), int(admin_value), (slack_user_id or "").strip(), (time_zone or "").strip(), int(bool(can_self_assign)), minutes_per_pp, now, now,
-                display_name, slack_user_id, time_zone, can_self_assign, minutes_per_pp,
+                display_name, slack_user_id, time_zone, can_self_assign, int(clear_minutes_per_pp), minutes_per_pp,
             ),
         )
 

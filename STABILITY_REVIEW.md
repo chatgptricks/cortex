@@ -29,6 +29,12 @@ The live health endpoint was reachable and reported ready on commit `0675d563fb8
 
 ## Remaining architecture constraints
 
+### User administration follow-up
+
+An authenticated POST of an unchanged existing profile reproduced HTTP 500 on the initial stability release. The user write path attempted unconditional `ALTER TABLE ... ADD COLUMN` statements, catching only SQLite exceptions. PostgreSQL raises a different duplicate-column exception and aborts the transaction. User writes now check schema metadata before adding missing legacy columns; repeated updates to an existing schema issue no DDL. Optional field resets are explicit, and user-save responses retain avatar metadata and expose the stored Slack field separately from the legacy display fallback.
+
+The frontend keeps user badges, adds search and save status, preserves drafts after failed writes and across other users' saves, validates inputs, limits pending request duration, and reads back the user after an ambiguous response before declaring failure. It does not replay non-idempotent account actions. Regression coverage includes lost acknowledgements, validation/permission errors, timeout handling, failed-save retry through the real Settings component, duplicate-column protection and explicit field clearing. The full backend suite now contains 56 passing tests.
+
 The checked-in Render Blueprint still attaches a 50 GB disk to the web service. Render documents that attached persistent disks disable zero-downtime deployments: https://render.com/docs/disks and https://render.com/docs/deploys. Do not remove this disk based on R2 configuration alone: verify every legacy media reference, attachment, fallback write and database dependency first, and retain a recoverable backup.
 
 The code already separates scheduled work from the web process by default. Actual worker provisioning, enabled flags and deployment ownership have not been verified in Render during this review. Do not turn on a second scheduler or move traffic based only on the Blueprint. Atomic slot claims prevent duplicate execution of the same slot, not overlapping different slots or recovery of an interrupted import. Claims deliberately retain the existing at-most-once behavior: a crash after claiming can skip the unfinished work. Durable job checkpoints and worker ownership/leases are still needed for resumable imports and controlled deployments.
