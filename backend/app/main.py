@@ -784,8 +784,12 @@ def tracker_snapshot_now() -> dict[str, Any]:
     return {"ok": True, **result}
 
 
-@app.get("/api/dashboard/posts")
-def dashboard_posts() -> dict[str, Any]:
+_DASHBOARD_POSTS_CACHE_LOCK = threading.Lock()
+_DASHBOARD_POSTS_CACHE_CONTENT: bytes | None = None
+_DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0.0
+
+
+def _dashboard_posts_payload() -> dict[str, Any]:
     """Unified, public, read-only projection across every account. Each
     post is tagged with `account` and `group` (sentient/competitors) so the
     frontend can build the All/Sentient/Competitors tabs and per-tab account
@@ -954,6 +958,27 @@ def dashboard_posts() -> dict[str, Any]:
             "Average likes": round(total_likes / len(known_likes)) if known_likes else 0,
         },
     }
+
+
+@app.get("/api/dashboard/posts")
+def dashboard_posts() -> Response:
+    """Serve one shared, short-lived Dashboard payload to concurrent users.
+
+    The dashboard currently needs the complete searchable dataset. Rebuilding
+    and serializing 55k posts for every tab at the same time briefly used more
+    than this service's 2 GB memory limit. Keep one compact JSON representation
+    for a few seconds, guarded so a cold cache cannot stampede Postgres.
+    """
+    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
+    now = time.monotonic()
+    with _DASHBOARD_POSTS_CACHE_LOCK:
+        if _DASHBOARD_POSTS_CACHE_CONTENT is not None and now < _DASHBOARD_POSTS_CACHE_EXPIRES_AT:
+            content = _DASHBOARD_POSTS_CACHE_CONTENT
+        else:
+            content = json.dumps(_dashboard_posts_payload(), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            _DASHBOARD_POSTS_CACHE_CONTENT = content
+            _DASHBOARD_POSTS_CACHE_EXPIRES_AT = time.monotonic() + 20.0
+    return Response(content=content, media_type="application/json")
 
 
 @app.get("/api/dashboard/posts/{account}/{shortcode}/transcript")
