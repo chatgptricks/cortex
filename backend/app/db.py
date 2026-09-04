@@ -760,7 +760,11 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     # full bootstrap. Otherwise production would accept the UI form but fail
     # on its first account read after deployment.
     _ensure_column(conn, "accounts", "scrape_mode", "scrape_mode TEXT NOT NULL DEFAULT 'posts'")
-    _ensure_column(conn, "dashboard_posts", "transcript", "transcript TEXT")
+    # Minimal runtime-schema fixtures may not include the optional generic
+    # post table at all; production imports always create it before this
+    # extension pass.
+    if conn.execute("PRAGMA table_info(dashboard_posts)").fetchall():
+        _ensure_column(conn, "dashboard_posts", "transcript", "transcript TEXT")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS queue_scheduler_preferences (
                viewer_email TEXT PRIMARY KEY,
