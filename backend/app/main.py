@@ -190,6 +190,7 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     request.state.is_admin = is_admin
     request.state.time_zone = access.get("time_zone") or "America/Costa_Rica"
     request.state.can_self_assign = bool(access.get("can_self_assign"))
+    request.state.minutes_per_pp = access.get("minutes_per_pp")
     request.state.operating_role = access["operating_role"]
     try:
         request.state.operating_roles = json.loads(access.get("operating_roles") or "[]")
@@ -764,7 +765,7 @@ def dashboard_posts() -> dict[str, Any]:
         ).fetchall()
         queue_rows = conn.execute(
             """SELECT id, post_account, post_shortcode, status, designer_email, coordinator_email,
-                      production_points, actual_started_at, completed_at, final_permalink
+                      production_points, actual_started_at, completed_at, final_permalink, final_permalinks
                FROM queue_requests"""
         ).fetchall()
 
@@ -860,7 +861,18 @@ def dashboard_posts() -> dict[str, Any]:
     queue_by_source = {(row["post_account"], row["post_shortcode"]): dict(row) for row in queue_rows}
     def _normal_permalink(value: str | None) -> str:
         return (value or "").strip().rstrip("/").split("?")[0]
-    queue_by_final = {_normal_permalink(row["final_permalink"]): dict(row) for row in queue_rows if row["final_permalink"]}
+    queue_by_final: dict[str, dict[str, Any]] = {}
+    for queue_row in queue_rows:
+        item = dict(queue_row)
+        final_urls = [item.get("final_permalink")]
+        final_urls.extend(
+            link.get("url") for link in _queue_v2_json(item.get("final_permalinks"), [])
+            if isinstance(link, dict) and link.get("url")
+        )
+        for final_url in final_urls:
+            normalized = _normal_permalink(final_url)
+            if normalized:
+                queue_by_final[normalized] = item
     for post in posts:
         source = queue_by_source.get((post.get("account"), post.get("shortcode")))
         if source:
@@ -1953,6 +1965,17 @@ def _queue_v2_minutes_per_pp_for_roles(roles: list[str] | tuple[str, ...] | set[
     return QUEUE_V2_TRAINEE_MINUTES_PER_PP if "trainee" in normalized else QUEUE_V2_DEFAULT_MINUTES_PER_PP
 
 
+def _queue_v2_minutes_per_pp_for_user(user: dict[str, Any] | Any) -> int:
+    """Use the explicit per-user PP duration when an admin configured one."""
+    try:
+        configured = int(user.get("minutes_per_pp") or user.get("minutesPerPP") or 0)
+    except (TypeError, ValueError, AttributeError):
+        configured = 0
+    if 1 <= configured <= 240:
+        return configured
+    return _queue_v2_minutes_per_pp_for_roles(_queue_v2_user_roles(user))
+
+
 def _queue_v2_priority(value: str | None) -> str:
     clean = (value or "normal").strip().lower()
     # Accept pre-migration clients momentarily, but collapse every former
@@ -2056,6 +2079,20 @@ def _queue_v2_post_snapshot(account: str | None, shortcode: str | None) -> dict[
         "isHot": bool(item.get("is_hot")), "hotMultiplier": item.get("hot_rate_multiplier"),
         "permalink": item.get("permalink") or f"https://www.instagram.com/p/{shortcode}/",
     }
+
+
+def _queue_v2_existing_dashboard_post_from_url(source_url: str) -> dict[str, str] | None:
+    """Resolve an Instagram permalink to an already-indexed Dashboard post."""
+    match = re.match(r"^https?://(?:www\.)?instagram\.com/(?:p|reel)/([^/?#]+)", str(source_url or "").strip(), re.I)
+    if not match:
+        return None
+    shortcode = match.group(1)
+    with connect() as conn:
+        canonical = conn.execute("SELECT 1 FROM posts WHERE shortcode = ?", (shortcode,)).fetchone()
+        if canonical:
+            return {"account": "chatgptricks", "shortcode": shortcode}
+        row = conn.execute("SELECT account FROM dashboard_posts WHERE shortcode = ? ORDER BY id DESC LIMIT 1", (shortcode,)).fetchone()
+    return {"account": row["account"], "shortcode": shortcode} if row else None
 
 
 def _queue_v2_hot_source_rows(conn: Any, *, include_historic: bool = False) -> list[dict[str, Any]]:
@@ -2216,6 +2253,47 @@ def _queue_v2_log(conn: Any, request_id: int, actor: str, event_type: str, detai
     )
 
 
+def _queue_v2_purge_expired(conn: Any) -> list[int]:
+    """Enforce Queue's 14-day operational retention window.
+
+    Open work is never purged. Once a request is closed or cancelled, its
+    request row, detailed event history and attachments are operational data
+    and expire together after fourteen days.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=14)).isoformat(timespec="seconds")
+    try:
+        rows = conn.execute(
+            """SELECT id FROM queue_requests
+               WHERE status IN ('closed','cancelled')
+                 AND COALESCE(closed_at, updated_at) < ?""",
+            (cutoff,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Old test/one-off databases can predate closed_at; their updated_at
+        # is still a conservative retention marker until init_db migrates it.
+        rows = conn.execute(
+            """SELECT id FROM queue_requests
+               WHERE status IN ('closed','cancelled') AND updated_at < ?""",
+            (cutoff,),
+        ).fetchall()
+    ids = [int(row["id"]) for row in rows]
+    # Suggestions and personal-time tickets have no request id. They are
+    # Queue operational data too, so do not let reviewed (or abandoned)
+    # tickets become an unbounded hidden history beside the 14-day post log.
+    conn.execute(
+        "DELETE FROM queue_tickets WHERE request_id IS NULL AND created_at < ?",
+        (cutoff,),
+    )
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    conn.execute(f"DELETE FROM queue_schedule_drafts WHERE request_id IN ({placeholders})", ids)
+    conn.execute(f"DELETE FROM queue_tickets WHERE request_id IN ({placeholders})", ids)
+    conn.execute(f"DELETE FROM queue_request_events WHERE request_id IN ({placeholders})", ids)
+    conn.execute(f"DELETE FROM queue_requests WHERE id IN ({placeholders})", ids)
+    return ids
+
+
 def _queue_v2_publish(conn: Any, event_type: str, actor: str, request_ids: list[int] | set[int] | tuple[int, ...] = ()) -> int:
     """Advance Queue's durable live revision inside the caller transaction."""
     now = utc_now()
@@ -2269,6 +2347,8 @@ def _queue_v2_ticket(row: dict[str, Any]) -> dict[str, Any]:
         ticket_type = "move"
     elif ticket_type == "time_block" and row.get("block_category") == "account_request":
         ticket_type = "account_access"
+    elif ticket_type == "time_block" and row.get("block_category") == "post_suggestion":
+        ticket_type = "post_suggestion"
     request_summary = None
     if request_id is not None:
         request_summary = {
@@ -2460,6 +2540,10 @@ def _queue_v2_project(row: dict[str, Any]) -> dict[str, Any]:
         "tags": _queue_v2_json(row["tags"], []), "brief": row["brief"], "notes": row["notes"],
         "references": _queue_v2_json(row["reference_links"], []), "attachments": _queue_v2_json(row["attachments"], []),
         "status": row["status"], "designerEmail": row["designer_email"], "coordinatorEmail": row["coordinator_email"],
+        # PRC identifies the source of the readiness check without granting
+        # any extra operating capability. HOT automation is explicitly named
+        # so it is never mistaken for a human approval.
+        "prc": "Auto PRC" if ("hot" in _queue_v2_json(row["tags"], []) or str(row.get("coordinator_email") or "").startswith("system@")) else (row.get("coordinator_email") or ""),
         "recommendedAccounts": _queue_v2_json(row["recommended_accounts"], []),
         "scheduledDate": row["scheduled_date"], "scheduledStartMinutes": row["scheduled_start_minutes"],
         "actualStartedAt": row["actual_started_at"], "completedAt": row["completed_at"], "closedAt": row["closed_at"],
@@ -2551,7 +2635,7 @@ def _queue_v2_designers() -> list[dict[str, Any]]:
         "displayName": user.get("display_name") or "",
         "isAdmin": bool(user.get("is_admin")),
         "roles": _queue_v2_user_roles(user),
-        "minutesPerPP": _queue_v2_minutes_per_pp_for_roles(_queue_v2_user_roles(user)),
+        "minutesPerPP": _queue_v2_minutes_per_pp_for_user(user),
         "timeZone": _queue_v2_time_zone(user),
         "canSelfAssign": bool(user.get("can_self_assign")),
         "accounts": by_designer.get(user["email"], []),
@@ -2578,7 +2662,7 @@ def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for user in users:
         roles = _queue_v2_user_roles(user)
-        minutes_per_pp = _queue_v2_minutes_per_pp_for_roles(roles)
+        minutes_per_pp = _queue_v2_minutes_per_pp_for_user(user)
         slack_id = str(user.get("slack_user_id") or "").strip().upper() or slack_user_id_for_email(user.get("email"))
         managed_accounts = by_designer.get(user["email"], [])
         account_avatars = {
@@ -2684,7 +2768,7 @@ def _queue_v2_prepare_schedule_changes(
             raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
         try:
             designer_row = conn.execute(
-                "SELECT operating_role, operating_roles, slack_user_id, time_zone FROM dashboard_users WHERE email = ?",
+                "SELECT operating_role, operating_roles, slack_user_id, time_zone, minutes_per_pp FROM dashboard_users WHERE email = ?",
                 (designer,),
             ).fetchone()
         except sqlite3.OperationalError:
@@ -2704,7 +2788,7 @@ def _queue_v2_prepare_schedule_changes(
         first_available_minute = min(SCHEDULER_END, ((queue_now.hour * 60 + queue_now.minute + 9) // 10) * 10)
         if date < queue_today or (date == queue_today and start < first_available_minute):
             raise HTTPException(status_code=409, detail="Queue work cannot be scheduled before the current Queue time.")
-        minutes_per_pp = _queue_v2_minutes_per_pp_for_roles(designer_roles)
+        minutes_per_pp = _queue_v2_minutes_per_pp_for_user(dict(designer_row))
         allowed = {item["account_handle"] for item in conn.execute(
             "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ?", (designer,),
         ).fetchall()}
@@ -2825,6 +2909,9 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         clauses.append("designer_email = ?")
         params.append(caller)
     with connect() as conn:
+        expired_ids = _queue_v2_purge_expired(conn)
+        if expired_ids:
+            _queue_v2_publish(conn, "retention_purged", "queue-retention@sentientdash.app", expired_ids)
         # HOT routing is idempotent and runs at read time as a safety net for
         # posts detected before this feature was deployed (the Apify worker
         # also calls the same helper immediately after a fresh HOT check).
@@ -2862,6 +2949,16 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
                    ORDER BY scheduled_date, scheduled_start_minutes, id""",
                 (caller,),
             ).fetchall()
+        recent_closed_scope = "" if (is_admin or "vc" in roles) else " AND designer_email = ?"
+        recent_closed_params: list[Any] = [(datetime.now(UTC) - timedelta(hours=24)).isoformat(timespec="seconds")]
+        if not (is_admin or "vc" in roles):
+            recent_closed_params.append(caller)
+        recent_closed_rows = conn.execute(
+            f"""SELECT * FROM queue_requests
+                WHERE status = 'closed' AND closed_at IS NOT NULL AND closed_at >= ?{recent_closed_scope}
+                ORDER BY closed_at DESC""",
+            recent_closed_params,
+        ).fetchall()
         draft_rows = _queue_v2_draft_rows(
             conn,
             designer_email=None if (is_admin or "vc" in roles) else caller,
@@ -2904,6 +3001,8 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         account_onboarding = _queue_v2_account_onboarding_state(conn, caller)
         scheduler_preferences = _queue_v2_scheduler_preferences(conn, caller)
         trainee_reviews = _queue_v2_trainee_reviews(conn)
+    for request_id in expired_ids:
+        shutil.rmtree(DATA_DIR / "queue_attachments" / str(request_id), ignore_errors=True)
     def project_with_ticket_flags(row: Any) -> dict[str, Any]:
         item = _queue_v2_project(dict(row))
         item["pendingTickets"] = pending_tickets_by_request.get(int(item["id"]), [])
@@ -2960,7 +3059,10 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
             "operatingRole": roles[0] if roles else "sales", "operatingRoles": roles,
             "canRoleSwitch": bool(getattr(request.state, "can_role_switch", False)),
             "availableOperatingRoles": list(getattr(request.state, "available_operating_roles", roles)),
-            "minutesPerPP": _queue_v2_minutes_per_pp_for_roles(roles),
+            "minutesPerPP": _queue_v2_minutes_per_pp_for_user({
+                "operating_roles": roles,
+                "minutes_per_pp": getattr(request.state, "minutes_per_pp", None),
+            }),
             "timeZone": getattr(request.state, "time_zone", "America/Costa_Rica"),
             "canSelfAssign": bool(getattr(request.state, "can_self_assign", False)),
         },
@@ -2968,7 +3070,9 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         "pickRequests": pick_requests,
         "selfPoolRequests": self_pool_requests,
         "hotPickRequests": hot_pick_requests,
-        "assignedRequests": assigned_requests, "liveDrafts": live_drafts, "liveRevision": live_state["revision"],
+        "assignedRequests": assigned_requests,
+        "recentClosedRequests": [project_with_ticket_flags(row) for row in recent_closed_rows],
+        "liveDrafts": live_drafts, "liveRevision": live_state["revision"],
         "timeBlocks": [_queue_v2_ticket(dict(row)) for row in time_block_rows], "pendingTicketCount": pending_ticket_count,
         "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
         "schedulerUsers": scheduler_users,
@@ -3269,7 +3373,11 @@ def dashboard_queue_v2_source_preview(
 ) -> dict[str, Any]:
     """Return the public title, description and thumbnail for a Queue source."""
     _queue_v2_creator_access(request)
-    return {"ok": True, "preview": _queue_v2_fetch_source_preview(source_url)}
+    preview = _queue_v2_fetch_source_preview(source_url)
+    existing = _queue_v2_existing_dashboard_post_from_url(preview.get("sourceUrl") or source_url)
+    if existing:
+        preview["dashboardPost"] = existing
+    return {"ok": True, "preview": preview}
 
 
 @app.post("/api/dashboard/queue/v2/create")
@@ -3572,6 +3680,51 @@ def dashboard_queue_v2_tickets(request: Request) -> dict[str, Any]:
     with connect() as conn:
         rows = _queue_v2_ticket_rows(conn, requester_email=None if coordinator else caller)
     return {"tickets": [_queue_v2_ticket(row) for row in rows]}
+
+
+@app.post("/api/dashboard/queue/v2/tickets/post-suggestion")
+def dashboard_queue_v2_create_post_suggestion(
+    request: Request,
+    source_url: Annotated[str, Form()],
+    reason: Annotated[str, Form()],
+) -> dict[str, Any]:
+    """Let a PD propose a source without gaining Pool/Create permissions."""
+    caller, _, roles = _queue_v2_access(request)
+    if "pd" not in roles:
+        raise HTTPException(status_code=403, detail="Only PD users can suggest posts.")
+    clean_url = _queue_v2_public_url(source_url)
+    if not clean_url:
+        raise HTTPException(status_code=400, detail="Paste a valid public Instagram post link.")
+    parsed = urlsplit(clean_url)
+    if not (parsed.hostname or "").lower().endswith("instagram.com"):
+        raise HTTPException(status_code=400, detail="Suggestions must link to an Instagram post.")
+    clean_reason = reason.strip()[:1000]
+    if not clean_reason:
+        raise HTTPException(status_code=400, detail="Explain why this post should work.")
+    now = utc_now()
+    with connect() as conn:
+        pending = conn.execute(
+            """SELECT 1 FROM queue_tickets
+               WHERE ticket_type = 'time_block' AND block_category = 'post_suggestion'
+                 AND requester_email = ? AND title = ? AND status = 'pending'""",
+            (caller, clean_url),
+        ).fetchone()
+        if pending:
+            raise HTTPException(status_code=409, detail="This post is already awaiting review.")
+        cursor = conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, status, block_category, title, reason, created_at, updated_at)
+               VALUES ('time_block', ?, 'pending', 'post_suggestion', ?, ?, ?, ?)""",
+            (caller, clean_url, clean_reason, now, now),
+        )
+        ticket_id = int(cursor.lastrowid)
+        _queue_v2_publish(conn, "post_suggestion_created", caller)
+        row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    _queue_v2_slack_log(
+        event_type="post_suggestion_created", task_id=None, ticket_id=ticket_id,
+        actor_email=caller, reason=clean_reason,
+    )
+    return {"ok": True, "ticket": _queue_v2_ticket(row)}
 
 
 @app.post("/api/dashboard/queue/v2/tickets/time-block")
@@ -4117,6 +4270,11 @@ def dashboard_queue_v2_review_ticket(
             _queue_v2_reflow_scheduled(conn, queue_item["designer_email"], caller, ticket["request_id"])
             queue_change_event = "move_approved"
             affected_ids.add(int(ticket["request_id"]))
+        elif clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "post_suggestion":
+            # Approval deliberately leaves the proposed source as a ticket.
+            # The VC/Admin uses its populated Create Post form next, which is
+            # the only operation that can create a Pool item.
+            queue_change_event = "post_suggestion_approved"
         elif clean_action == "approve" and ticket["ticket_type"] == "time_block":
             _queue_v2_assert_time_available(
                 conn, ticket["requester_email"], ticket["scheduled_date"],
@@ -4505,7 +4663,7 @@ def dashboard_queue_v2_assign_multiple_accounts(
             designer = assignment["designerEmail"]
             target_accounts = assignment["accounts"]
             target_roles = _queue_v2_user_roles(roster_by_email[designer])
-            minutes_per_pp = _queue_v2_minutes_per_pp_for_roles(target_roles)
+            minutes_per_pp = _queue_v2_minutes_per_pp_for_user(roster_by_email[designer])
             production_points = max(1, int(source.get("production_points") or 1))
             duration = production_points * minutes_per_pp
             occupied = _queue_v2_time_occupied(conn, designer, initial_date)
@@ -5315,6 +5473,7 @@ def admin_upsert_user(
     display_name: Annotated[str | None, Form()] = None,
     time_zone: Annotated[str | None, Form()] = None,
     can_self_assign: Annotated[bool | None, Form()] = None,
+    minutes_per_pp: Annotated[int | None, Form()] = None,
 ) -> dict[str, Any]:
     """Add a new allowed email, or change an existing one's role. Admins can
     add other admins or plain viewers; there's no further gate here because
@@ -5335,9 +5494,11 @@ def admin_upsert_user(
     clean_time_zone = None if time_zone is None else time_zone.strip()
     if clean_time_zone is not None and clean_time_zone not in {"", "America/Costa_Rica", "America/Bogota"}:
         raise HTTPException(status_code=400, detail="Time zone must be Costa Rica or Colombia.")
+    if minutes_per_pp is not None and not 1 <= minutes_per_pp <= 240:
+        raise HTTPException(status_code=400, detail="Minutes per PP must be between 1 and 240.")
     upsert_dashboard_user(
         clean_email, role, operating_role, is_admin, clean_slack_id, clean_display_name,
-        clean_time_zone, can_self_assign,
+        clean_time_zone, can_self_assign, minutes_per_pp,
     )
     with connect() as conn:
         _queue_v2_publish(conn, "roster_updated", _caller_email(request))
