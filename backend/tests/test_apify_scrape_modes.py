@@ -43,6 +43,24 @@ def test_collect_short_term_items_uses_the_selected_profile_surface(monkeypatch)
     assert calls[1][1]["includeTranscript"] is True
 
 
+def test_automated_collection_never_starts_the_reels_actor(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_fetch(payload, timeout=180.0, actor_id=apify_sync.APIFY_ACTOR_ID):
+        calls.append(actor_id)
+        return []
+
+    monkeypatch.setattr(apify_sync, "_fetch_apify_items", fake_fetch)
+    apify_sync._collect_short_term_items(
+        {"both": {"handle": "both", "scrape_mode": "both"}},
+        20,
+        datetime.now(UTC),
+        include_reels=False,
+    )
+
+    assert calls == [apify_sync.APIFY_ACTOR_ID]
+
+
 def test_reel_transcript_is_promoted_without_touching_caption() -> None:
     extracted = apify_sync.extract_apify_fields({
         "caption": "Visible Instagram caption",

@@ -5423,7 +5423,10 @@ def dashboard_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
     for account in list_accounts(active_only=True):
         handle = account["handle"]
         try:
-            results[handle] = run_manual_refresh(handle)
+            # This is a bulk dashboard action, not the deliberate
+            # account-specific Reel operation. It may refresh normal posts,
+            # but it must never fan out into the expensive Reels actor.
+            results[handle] = run_manual_refresh(handle, include_reels=False)
         except ApifySyncError as exc:
             results[handle] = {"error": str(exc)}
     return results
