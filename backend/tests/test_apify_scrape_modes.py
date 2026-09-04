@@ -61,6 +61,15 @@ def test_automated_collection_never_starts_the_reels_actor(monkeypatch) -> None:
     assert calls == [apify_sync.APIFY_ACTOR_ID]
 
 
+def test_manual_post_catch_up_can_extend_the_normal_posts_window() -> None:
+    now = datetime(2026, 9, 4, 18, 0, tzinfo=UTC)
+
+    payload = apify_sync._short_term_payload(["account"], 50, now, lookback_hours=24)
+
+    assert payload["resultsLimit"] == 50
+    assert payload["onlyPostsNewerThan"] == "2026-09-03T18:00:00Z"
+
+
 def test_reel_transcript_is_promoted_without_touching_caption() -> None:
     extracted = apify_sync.extract_apify_fields({
         "caption": "Visible Instagram caption",

@@ -1245,7 +1245,9 @@ _SHORT_RESULTS_LIMIT = 20
 # ---------------------------------------------------------------------------
 
 
-def _short_term_payload(handles: list[str], results_limit: int, now: datetime) -> dict[str, Any]:
+def _short_term_payload(
+    handles: list[str], results_limit: int, now: datetime, *, lookback_hours: int = _SHORT_LOOKBACK_HOURS
+) -> dict[str, Any]:
     return {
         "directUrls": [f"https://www.instagram.com/{handle}/" for handle in handles],
         "resultsType": "posts",
@@ -1267,7 +1269,7 @@ def _short_term_payload(handles: list[str], results_limit: int, now: datetime) -
         # over -- hourly cycles give 12 chances to catch anything. Only the
         # like/comment refresh wants a long tail, and the daily cycle already
         # records final numbers for posts older than this.
-        "onlyPostsNewerThan": (now - timedelta(hours=_SHORT_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "onlyPostsNewerThan": (now - timedelta(hours=lookback_hours)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 
@@ -1353,7 +1355,12 @@ def _dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _collect_short_term_items(
-    configs: dict[str, dict[str, Any]], results_limit: int, now: datetime, *, include_reels: bool = True
+    configs: dict[str, dict[str, Any]],
+    results_limit: int,
+    now: datetime,
+    *,
+    include_reels: bool = True,
+    lookback_hours: int = _SHORT_LOOKBACK_HOURS,
 ) -> dict[str, list[dict[str, Any]]]:
     """Fetch each configured account surface in two batched, small runs.
 
@@ -1369,7 +1376,9 @@ def _collect_short_term_items(
     }
     if post_configs:
         post_handles = [cfg["handle"] for cfg in post_configs.values()]
-        post_items = _fetch_apify_items(_short_term_payload(post_handles, results_limit, now))
+        post_items = _fetch_apify_items(
+            _short_term_payload(post_handles, results_limit, now, lookback_hours=lookback_hours)
+        )
         post_owner_to_account = {cfg["handle"].lower(): account for account, cfg in post_configs.items()}
         for item in post_items:
             account = post_owner_to_account.get(_item_owner_username(item))
@@ -1396,7 +1405,14 @@ def _collect_short_term_items(
     return {account: _dedupe_items(items) for account, items in items_by_account.items()}
 
 
-def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
+def _process_short_term_items(
+    account: str,
+    cfg: dict[str, Any],
+    items: list[dict[str, Any]],
+    now: datetime,
+    *,
+    lookback_hours: int = _SHORT_LOOKBACK_HOURS,
+) -> dict[str, Any]:
     """Shared per-account logic: insert brand-new posts from `items`, then
     refresh likes/comments (and do the one-time HOT check) on every existing
     post <=24h old. `items` is whatever this account's slice of a (possibly
@@ -1436,7 +1452,7 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
         # the lookback can't be in `items`, so counting it as eligible would
         # only inflate the "unmatched" tally and make a healthy cycle look
         # broken. Keep the two in lockstep.
-        if age_hours is None or age_hours > _SHORT_LOOKBACK_HOURS:
+        if age_hours is None or age_hours > lookback_hours:
             continue
         eligible[shortcode] = {"id": row["id"], "hot_checked": bool(row["hot_checked"]), "age_hours": age_hours}
 
@@ -1549,7 +1565,11 @@ def _process_short_term_items(account: str, cfg: dict[str, Any], items: list[dic
 
 
 def run_short_term_cycle(
-    account: str, results_limit: int = _SHORT_RESULTS_LIMIT, *, include_reels: bool = True
+    account: str,
+    results_limit: int = _SHORT_RESULTS_LIMIT,
+    *,
+    include_reels: bool = True,
+    lookback_hours: int = _SHORT_LOOKBACK_HOURS,
 ) -> dict[str, Any]:
     """Single-account entry point: (1) pulls the last ~30h of posts and
     inserts any brand-new ones, and (2) refreshes likes/comments on all
@@ -1564,12 +1584,18 @@ def run_short_term_cycle(
     """
     cfg = get_account_config(account)
     now = datetime.now(UTC)
-    items = _collect_short_term_items({account: cfg}, results_limit, now, include_reels=include_reels)[account]
-    return _process_short_term_items(account, cfg, items, now)
+    items = _collect_short_term_items(
+        {account: cfg}, results_limit, now, include_reels=include_reels, lookback_hours=lookback_hours
+    )[account]
+    return _process_short_term_items(account, cfg, items, now, lookback_hours=lookback_hours)
 
 
 def run_short_term_cycle_batch(
-    accounts: list[str], results_limit: int = _SHORT_RESULTS_LIMIT, *, include_reels: bool = False
+    accounts: list[str],
+    results_limit: int = _SHORT_RESULTS_LIMIT,
+    *,
+    include_reels: bool = False,
+    lookback_hours: int = _SHORT_LOOKBACK_HOURS,
 ) -> dict[str, dict[str, Any]]:
     """Same job as run_short_term_cycle, but for every account in one Apify
     call: a single actor run scrapes all accounts' profile URLs at once
@@ -1600,11 +1626,15 @@ def run_short_term_cycle_batch(
     if not configs:
         return results
 
-    items_by_account = _collect_short_term_items(configs, results_limit, now, include_reels=include_reels)
+    items_by_account = _collect_short_term_items(
+        configs, results_limit, now, include_reels=include_reels, lookback_hours=lookback_hours
+    )
 
     for account, cfg in configs.items():
         try:
-            results[account] = _process_short_term_items(account, cfg, items_by_account[account], now)
+            results[account] = _process_short_term_items(
+                account, cfg, items_by_account[account], now, lookback_hours=lookback_hours
+            )
         except Exception as exc:
             results[account] = {"error": f"processing failed: {exc}"}
     return results
