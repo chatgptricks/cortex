@@ -1003,6 +1003,37 @@ def dashboard_stacks_merge(keys: Annotated[str, Form()]) -> dict[str, Any]:
     return result
 
 
+@app.post('/api/dashboard/stacks/separate')
+def dashboard_stacks_separate(keys: Annotated[str, Form()]) -> dict[str, Any]:
+    from .topic_stacks import separate
+    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
+    with _DASHBOARD_POSTS_CACHE_LOCK:
+        try:
+            parsed = json.loads(keys)
+            if not isinstance(parsed, list):
+                raise ValueError('Select at least one post.')
+            result = separate(parsed)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _DASHBOARD_POSTS_CACHE_CONTENT = None
+        _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0
+    return result
+
+
+@app.post('/api/dashboard/stacks/find-similar')
+def dashboard_stacks_find_similar(post_key: Annotated[str, Form()]) -> dict[str, Any]:
+    from .topic_stacks import find_similar
+    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
+    with _DASHBOARD_POSTS_CACHE_LOCK:
+        try:
+            result = find_similar(post_key)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _DASHBOARD_POSTS_CACHE_CONTENT = None
+        _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0
+    return result
+
+
 @app.get("/api/dashboard/posts/{account}/{shortcode}/transcript")
 def dashboard_post_transcript(account: str, shortcode: str) -> PlainTextResponse:
     """Downloads a Reel transcript without exposing it in the dashboard feed."""
