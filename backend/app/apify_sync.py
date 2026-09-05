@@ -1190,8 +1190,14 @@ def _insert_new_posts(
     account: str, cfg: dict[str, Any], new_items: list[dict[str, Any]], on_progress: ProgressFn = None
 ) -> dict[str, Any]:
     if cfg["is_canonical"]:
-        return _insert_new_chatgptricks_posts(new_items, on_progress=on_progress)
-    return _insert_new_dashboard_posts(account, new_items, on_progress=on_progress)
+        summary = _insert_new_chatgptricks_posts(new_items, on_progress=on_progress)
+    else:
+        summary = _insert_new_dashboard_posts(account, new_items, on_progress=on_progress)
+    if summary.get('added'):
+        from .topic_stacks import attach
+        inserted = {item['shortcode'] for item in summary.get('items', []) if item.get('status') == 'added'}
+        attach([{'account': account, 'shortcode': str(item.get('shortCode') or ''), 'caption': _clean_text(item.get('caption')), 'postDate': _published_at(item)} for item in new_items if str(item.get('shortCode') or '') in inserted])
+    return summary
 
 
 def _store_existing_reel_transcripts(account: str, cfg: dict[str, Any], items: list[dict[str, Any]]) -> int:
