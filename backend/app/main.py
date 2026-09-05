@@ -810,7 +810,7 @@ def _dashboard_posts_payload() -> dict[str, Any]:
                 SELECT id, title, caption, hook_text, published_at, likes, comments,
                        post_type_label, shortcode, image_path, is_animated,
                        source_row_number, created_at, section, is_hot, hot_rate_multiplier,
-                       is_promo, hidden
+                       is_promo, hidden, is_deleted
                 FROM posts
                 """
             ).fetchall()
@@ -821,7 +821,7 @@ def _dashboard_posts_payload() -> dict[str, Any]:
             SELECT id, account, shortcode, published_at, likes, comments, caption,
                    post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
                    hook_text, music_song, music_artist, music_audio_id, uses_original_audio,
-                   is_promo, hidden, transcript
+                   is_promo, hidden, is_deleted, transcript
             FROM dashboard_posts
             """
         ).fetchall()
@@ -859,6 +859,7 @@ def _dashboard_posts_payload() -> dict[str, Any]:
                     "hotMultiplier": post.get("hot_rate_multiplier"),
                     "isPromo": bool(post.get("is_promo")),
                     "hidden": bool(post.get("hidden")),
+                    "isDeleted": bool(post.get("is_deleted")),
                     "account": handle,
                     "group": group_by_handle.get(handle, "sentient"),
                     # The canonical `posts` table predates the music columns
@@ -897,6 +898,7 @@ def _dashboard_posts_payload() -> dict[str, Any]:
                 "hotMultiplier": post.get("hot_rate_multiplier"),
                 "isPromo": bool(post.get("is_promo")),
                 "hidden": bool(post.get("hidden")),
+                "isDeleted": bool(post.get("is_deleted")),
                 "account": account,
                 "group": group_by_handle.get(account, "competitors"),
                 "musicSong": post.get("music_song"),
@@ -5409,6 +5411,11 @@ def dashboard_post_reload(
     try:
         return refresh_single_post(account, shortcode)
     except ApifySyncError as exc:
+        if "may have been deleted" in str(exc):
+            global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
+            _DASHBOARD_POSTS_CACHE_CONTENT = None
+            _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0.0
+            return {"account": account, "shortcode": shortcode, "deleted": True}
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 

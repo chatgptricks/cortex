@@ -569,6 +569,10 @@ def init_db() -> None:
         for _post_table in ("posts", "dashboard_posts"):
             _ensure_column(conn, _post_table, "is_promo", "is_promo INTEGER NOT NULL DEFAULT 0")
             _ensure_column(conn, _post_table, "hidden", "hidden INTEGER NOT NULL DEFAULT 0")
+            # A manual refresh can prove that Instagram no longer serves a
+            # post. Keep that fact on the source row instead of silently
+            # leaving a card that looks current.
+            _ensure_column(conn, _post_table, "is_deleted", "is_deleted INTEGER NOT NULL DEFAULT 0")
         # audio_id was added to extract_apify_fields after ~5.5k posts already had
         # raw_json captured -- backfill it from the payload we already paid for
         # instead of waiting for those rows to be re-scraped. Cheap once caught up:
