@@ -13,7 +13,7 @@ services:
       - key: SENTIENT_SCHEDULER_ENABLED
         value: "true"
       - key: R2_BACKFILL_ENABLED
-        value: "false"
+        value: "true"
       - key: R2_BACKFILL_BATCH_SIZE
         value: "150"
       - key: R2_BACKFILL_INTERVAL_SECONDS
