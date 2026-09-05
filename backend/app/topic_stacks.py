@@ -156,3 +156,12 @@ def find_similar(post_key):
         members = [row['post_key'] for row in conn.execute('SELECT post_key FROM topic_stack_members WHERE stack_id = ? ORDER BY post_key', (destination,)).fetchall()]
         result = {'stackId': destination, 'postKeys': members, 'stackSize': len(members), 'matchedCount': len(members) - 1}
         return result
+
+def stack_keys(post_key):
+    """Return the durable members for one post without triggering classification."""
+    with connect() as conn:
+        initialize(conn)
+        row = conn.execute('SELECT stack_id FROM topic_stack_members WHERE post_key = ?', (post_key,)).fetchone()
+        if not row:
+            return []
+        return [item['post_key'] for item in conn.execute('SELECT post_key FROM topic_stack_members WHERE stack_id = ? ORDER BY post_key', (row['stack_id'],)).fetchall()]

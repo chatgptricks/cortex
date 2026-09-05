@@ -1034,6 +1034,17 @@ def dashboard_stacks_find_similar(post_key: Annotated[str, Form()]) -> dict[str,
     return result
 
 
+@app.get('/api/dashboard/stacks/{account}/{shortcode}')
+def dashboard_stack_members(account: str, shortcode: str) -> dict[str, Any]:
+    """Load one persisted stack for Queue and other detail views on demand."""
+    from .topic_stacks import attach, stack_keys
+    payload = _dashboard_posts_payload()
+    attach(payload['posts'])
+    keys = set(stack_keys(f'{account}:{shortcode}'))
+    posts = [post for post in payload['posts'] if f"{post.get('account')}:{post.get('shortcode')}" in keys]
+    return {'posts': posts, 'stackSize': len(keys)}
+
+
 @app.get("/api/dashboard/posts/{account}/{shortcode}/transcript")
 def dashboard_post_transcript(account: str, shortcode: str) -> PlainTextResponse:
     """Downloads a Reel transcript without exposing it in the dashboard feed."""
@@ -2321,6 +2332,21 @@ def _queue_v2_post_snapshot_cache(conn: Any, rows: list[Any]) -> dict[tuple[str,
                 "isHot": bool(item.get("is_hot")), "hotMultiplier": item.get("hot_rate_multiplier"),
                 "permalink": item.get("permalink") or f"https://www.instagram.com/p/{item['shortcode']}/",
             }
+    from .topic_stacks import initialize as initialize_topic_stacks
+    initialize_topic_stacks(conn)
+    post_keys = [f'{account}:{shortcode}' for account, shortcode in pairs]
+    if post_keys:
+        marks = ','.join('?' for _ in post_keys)
+        memberships = conn.execute(
+            f'''SELECT post_key, stack_id, COUNT(*) OVER (PARTITION BY stack_id) AS stack_size
+                FROM topic_stack_members WHERE post_key IN ({marks})''', tuple(post_keys)
+        ).fetchall()
+        for member in memberships:
+            account, shortcode = member['post_key'].split(':', 1)
+            snapshot = cache.get((account, shortcode))
+            if snapshot:
+                snapshot['stackId'] = member['stack_id']
+                snapshot['stackSize'] = member['stack_size']
     return cache
 
 
@@ -2795,6 +2821,7 @@ def _queue_v2_project(row: dict[str, Any], snapshot: dict[str, Any] | None = Non
             "type": row["post_type"] or snapshot.get("type") or "Image", "coverUrl": row["cover_url"],
             "publishedAt": snapshot.get("publishedAt"), "likes": snapshot.get("likes"),
             "comments": snapshot.get("comments"),
+            "stackId": snapshot.get("stackId"), "stackSize": snapshot.get("stackSize"),
         },
         "productionPoints": pp, "minutesPerPP": minutes_per_pp,
         "durationMinutes": pp * minutes_per_pp, "priority": "urgent" if row.get("priority") == "urgent" else "normal",
