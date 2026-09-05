@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: starter
     buildCommand: pip install -r backend/requirements-server.txt
-    startCommand: python -m app.worker
+    startCommand: cd backend && python -m app.worker
     envVars:
       - key: PREDICT_DATA_DIR
         value: /var/data
