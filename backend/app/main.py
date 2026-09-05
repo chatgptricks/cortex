@@ -1039,12 +1039,19 @@ def dashboard_stacks_find_similar(post_key: Annotated[str, Form()]) -> dict[str,
 @app.get('/api/dashboard/stacks/{account}/{shortcode}')
 def dashboard_stack_members(account: str, shortcode: str) -> dict[str, Any]:
     """Load one persisted stack for Queue and other detail views on demand."""
-    from .topic_stacks import stack_keys
-    # This is a read path for Queue. Membership is created only when posts
-    # enter the Dashboard payload; never classify the full catalog again when
-    # someone opens a Queue detail panel.
+    from .topic_stacks import attach, stack_keys
+    # Queue reads one persisted group. Bootstrap only this one post if a
+    # fresh process has not seen it yet; never reclassify the full catalog.
+    clean_account = account.strip().lstrip('@').lower()
+    clean_shortcode = shortcode.strip()
     payload = _dashboard_posts_payload()
-    keys = set(stack_keys(f'{account}:{shortcode}'))
+    post_key = f'{clean_account}:{clean_shortcode}'
+    keys = set(stack_keys(post_key))
+    if not keys:
+        source = next((post for post in payload['posts'] if f"{post.get('account')}:{post.get('shortcode')}" == post_key), None)
+        if source:
+            attach([source])
+            keys = set(stack_keys(post_key))
     posts = [post for post in payload['posts'] if f"{post.get('account')}:{post.get('shortcode')}" in keys]
     return {'posts': posts, 'stackSize': len(keys)}
 
