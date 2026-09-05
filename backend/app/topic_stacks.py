@@ -98,3 +98,61 @@ def merge(keys):
         conn.execute(f'UPDATE topic_stack_members SET stack_id = ? WHERE stack_id IN ({marks})', (destination, *groups))
         members = [row['post_key'] for row in conn.execute('SELECT post_key FROM topic_stack_members WHERE stack_id = ? ORDER BY post_key', (destination,)).fetchall()]
         return {'stackId': destination, 'postKeys': members, 'stackSize': len(members)}
+
+def separate(keys):
+    """Give selected posts their own durable stacks without reclassifying them."""
+    keys = list(dict.fromkeys(keys))
+    if not 1 <= len(keys) <= 500 or any(not isinstance(k, str) or len(k) > 300 for k in keys):
+        raise ValueError('Select between 1 and 500 posts.')
+    with connect() as conn:
+        lock(conn)
+        marks = ','.join('?' for _ in keys)
+        rows = conn.execute(f'SELECT post_key, stack_id FROM topic_stack_members WHERE post_key IN ({marks})', tuple(keys)).fetchall()
+        if len(rows) != len(keys):
+            raise ValueError('Some posts are no longer available. Refresh and try again.')
+        affected = set(keys)
+        for row in rows:
+            conn.execute('UPDATE topic_stack_members SET stack_id = ? WHERE post_key = ?', (uuid.uuid4().hex, row['post_key']))
+        groups = {row['stack_id'] for row in rows}
+        group_marks = ','.join('?' for _ in groups)
+        affected.update(row['post_key'] for row in conn.execute(f'SELECT post_key FROM topic_stack_members WHERE stack_id IN ({group_marks})', tuple(groups)).fetchall())
+        return memberships(conn, affected)
+
+def memberships(conn, keys):
+    keys = sorted(set(keys))
+    if not keys:
+        return {'members': []}
+    marks = ','.join('?' for _ in keys)
+    rows = conn.execute(f'SELECT post_key, stack_id FROM topic_stack_members WHERE post_key IN ({marks})', tuple(keys)).fetchall()
+    counts = Counter(row['stack_id'] for row in conn.execute('SELECT stack_id FROM topic_stack_members').fetchall())
+    return {'members': [{'postKey': row['post_key'], 'stackId': row['stack_id'], 'stackSize': counts[row['stack_id']]} for row in rows]}
+
+def find_similar(post_key):
+    """User-triggered search across the stored topic signatures; never runs on reload."""
+    if not isinstance(post_key, str) or not post_key or len(post_key) > 300:
+        raise ValueError('Choose a valid post.')
+    with connect() as conn:
+        lock(conn)
+        reference = conn.execute('SELECT stack_id, words FROM topic_stack_members WHERE post_key = ?', (post_key,)).fetchone()
+        if not reference:
+            raise ValueError('This post is no longer available. Refresh and try again.')
+        reference_words = set(json.loads(reference['words']))
+        matching_groups = set()
+        for row in conn.execute('SELECT post_key, stack_id, words FROM topic_stack_members WHERE post_key != ?', (post_key,)).fetchall():
+            other = set(json.loads(row['words']))
+            shared = len(reference_words & other)
+            score = shared / len(reference_words | other) if reference_words | other else 0
+            coverage = shared / min(len(reference_words), len(other)) if reference_words and other else 0
+            if shared >= 5 and (score >= .38 or coverage >= .70):
+                matching_groups.add(row['stack_id'])
+        if not matching_groups:
+            result = memberships(conn, [post_key])
+            result['matchedCount'] = 0
+            return result
+        matching_groups.add(reference['stack_id'])
+        marks = ','.join('?' for _ in matching_groups)
+        destination = sorted(matching_groups)[0]
+        conn.execute(f'UPDATE topic_stack_members SET stack_id = ? WHERE stack_id IN ({marks})', (destination, *sorted(matching_groups)))
+        members = [row['post_key'] for row in conn.execute('SELECT post_key FROM topic_stack_members WHERE stack_id = ? ORDER BY post_key', (destination,)).fetchall()]
+        result = {'stackId': destination, 'postKeys': members, 'stackSize': len(members), 'matchedCount': len(members) - 1}
+        return result

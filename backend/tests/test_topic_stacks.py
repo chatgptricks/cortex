@@ -43,3 +43,21 @@ def test_manual_merge_is_durable_and_includes_existing_members():
     with pytest.raises(ValueError): topic_stacks.merge(['test:a', 'missing:x'])
     topic_stacks.attach(posts)
     assert all(p['stackSize'] == 3 for p in posts)
+
+def test_separate_keeps_posts_out_of_their_old_stack_after_reload():
+    posts = [post('a', CAPTION), post('b', CAPTION)]
+    topic_stacks.attach(posts)
+    result = topic_stacks.separate(['test:a'])
+    states = {row['postKey']: row for row in result['members']}
+    assert states['test:a']['stackSize'] == 1
+    assert states['test:b']['stackSize'] == 1
+    topic_stacks.attach(posts)
+    assert posts[0]['stackId'] != posts[1]['stackId']
+
+def test_find_similar_merges_matching_existing_posts_only_when_requested():
+    posts = [post('a', CAPTION), post('b', CAPTION), post('c', 'A completely unrelated cooking recipe with tomatoes and basil')]
+    topic_stacks.attach(posts)
+    topic_stacks.separate(['test:a', 'test:b'])
+    result = topic_stacks.find_similar('test:a')
+    assert result['matchedCount'] == 1
+    assert set(result['postKeys']) == {'test:a', 'test:b'}
