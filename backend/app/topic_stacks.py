@@ -139,11 +139,13 @@ def find_similar(post_key):
         reference_words = set(json.loads(reference['words']))
         matching_groups = set()
         for row in conn.execute('SELECT post_key, stack_id, words FROM topic_stack_members WHERE post_key != ?', (post_key,)).fetchall():
+            if row['stack_id'] == reference['stack_id']:
+                continue
             other = set(json.loads(row['words']))
             shared = len(reference_words & other)
             score = shared / len(reference_words | other) if reference_words | other else 0
             coverage = shared / min(len(reference_words), len(other)) if reference_words and other else 0
-            if shared >= 5 and (score >= .38 or coverage >= .70):
+            if shared >= 4 and (score >= .28 or coverage >= .60):
                 matching_groups.add(row['stack_id'])
         if not matching_groups:
             result = memberships(conn, [post_key])
