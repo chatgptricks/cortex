@@ -977,10 +977,30 @@ def dashboard_posts() -> Response:
         if _DASHBOARD_POSTS_CACHE_CONTENT is not None and now < _DASHBOARD_POSTS_CACHE_EXPIRES_AT:
             content = _DASHBOARD_POSTS_CACHE_CONTENT
         else:
-            content = json.dumps(_dashboard_posts_payload(), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            from .topic_stacks import attach
+            payload = _dashboard_posts_payload()
+            attach(payload['posts'])
+            content = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             _DASHBOARD_POSTS_CACHE_CONTENT = content
             _DASHBOARD_POSTS_CACHE_EXPIRES_AT = time.monotonic() + 20.0
     return Response(content=content, media_type="application/json")
+
+
+@app.post('/api/dashboard/stacks/merge')
+def dashboard_stacks_merge(keys: Annotated[str, Form()]) -> dict[str, Any]:
+    from .topic_stacks import merge
+    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
+    with _DASHBOARD_POSTS_CACHE_LOCK:
+        try:
+            parsed = json.loads(keys)
+            if not isinstance(parsed, list):
+                raise ValueError('Select at least two posts.')
+            result = merge(parsed)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _DASHBOARD_POSTS_CACHE_CONTENT = None
+        _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0
+    return result
 
 
 @app.get("/api/dashboard/posts/{account}/{shortcode}/transcript")
