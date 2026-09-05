@@ -46,6 +46,17 @@ def test_scheduler_claim_has_one_winner(isolated_database):
     assert scheduler._claim_bucket("hour", "2026-09-04T16")
 
 
+def test_scheduler_uses_requested_45_minute_window():
+    from datetime import datetime, timedelta, timezone
+
+    cst = timezone(timedelta(hours=-6))
+    assert scheduler._bucket_key(datetime(2026, 9, 5, 6, 15, tzinfo=cst)) == "2026-09-05T06:15"
+    assert scheduler._bucket_key(datetime(2026, 9, 5, 7, 0, tzinfo=cst)) == "2026-09-05T07:00"
+    assert scheduler._bucket_key(datetime(2026, 9, 5, 23, 30, tzinfo=cst)) == "2026-09-05T23:30"
+    assert scheduler._bucket_key(datetime(2026, 9, 6, 0, 0, tzinfo=cst)) == "2026-09-06T00:00"
+    assert scheduler._bucket_key(datetime(2026, 9, 5, 6, 14, tzinfo=cst)) == "2026-09-05T06:00"
+
+
 def test_scheduler_never_runs_paid_jobs_without_durable_claim(monkeypatch):
     def unavailable():
         raise RuntimeError("database unavailable")

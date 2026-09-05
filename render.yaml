@@ -1,4 +1,31 @@
 services:
+  - type: worker
+    name: cortex-ingestion-worker
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r backend/requirements-server.txt
+    startCommand: python -m app.worker
+    envVars:
+      - key: PREDICT_DATA_DIR
+        value: /var/data
+      - key: DATABASE_URL
+        sync: false
+      - key: SENTIENT_SCHEDULER_ENABLED
+        value: "true"
+      - key: R2_BACKFILL_ENABLED
+        value: "true"
+      - key: R2_BACKFILL_BATCH_SIZE
+        value: "150"
+      - key: R2_BACKFILL_INTERVAL_SECONDS
+        value: "60"
+      - key: R2_LOCAL_MIRROR_ENABLED
+        value: "false"
+      - key: APIFY_TOKEN
+        sync: false
+      - key: SENTIENT_OCR_URL
+        sync: false
+      - key: SENTIENT_OCR_TOKEN
+        sync: false
   - type: web
     name: cortex-api
     runtime: python

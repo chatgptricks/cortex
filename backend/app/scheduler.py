@@ -14,7 +14,9 @@ logger = logging.getLogger("uvicorn.error")
 _CST = timezone(timedelta(hours=-6))
 
 # The short-term job (new posts + recent-post engagement + the one-time HOT
-# check) runs hourly, around the clock.
+# check) runs every 45 minutes from 6:15am through 11:15pm CST, then hourly
+# overnight. The 6:15 anchor avoids drifting against the requested operating
+# window when the worker wakes a few seconds late.
 #
 # It used to run every 30 minutes during posting hours (40 cycles/day). That
 # was the entire Apify bill: apify/instagram-scraper is billed per result at
@@ -24,12 +26,13 @@ _CST = timezone(timedelta(hours=-6))
 # cycles/day, ~$165/month -- which is what pushed the account past its usage
 # limit and silently killed two days of Tracker history.
 #
-# Halving the cadence halves that, and costs little: the HOT check is one-time
-# and fires as soon as a post is >= _HOT_MIN_AGE_HOURS (0.5h) old, so the only
-# effect is that a HOT post is flagged up to ~1.5h after publishing instead of
-# ~1h. The rate itself stays exact -- it is computed from the post's real age,
-# not from an assumed cycle interval.
+# The 45-minute cadence keeps the former cost reduction while shortening the
+# maximum wait for a new post. The HOT check is one-time and fires as soon as
+# a post is >= _HOT_MIN_AGE_HOURS old; its rate is computed from real age.
 _DAILY_JOB_AT = (7, 0)  # 7:00am CST
+_SHORT_START_MINUTES = 6 * 60 + 15
+_SHORT_END_MINUTES = 24 * 60
+_SHORT_INTERVAL_MINUTES = 45
 
 _started = False
 _lock = threading.Lock()
@@ -95,19 +98,18 @@ def _claim_bucket(key: str, value: str) -> bool:
 
 def _bucket_key(now_cst: datetime) -> str:
     """Identifier for the current slot, so a tick loop that wakes every ~30s only
-    fires the job once per slot. One hourly slot ('2026-07-27T03'), around the
-    clock.
-
-    Previously this returned a half-hourly key during posting hours. Slots are
-    only ever compared against the last one stored, so shortening the format is
-    safe across the switchover: the first hourly key simply differs from
-    whatever half-hourly key was saved, and the job fires once.
+    fires the job once per slot. Daytime slots are anchored at 06:15 CST and
+    overnight slots fall on the top of each hour.
 
     HOT detection is unaffected by the cadence: the check computes a real
-    likes/hour rate from the post's actual age rather than assuming exactly
-    1.0h, so it stays accurate wherever the tick lands.
+    likes/hour rate from the post's actual age.
     """
-    return now_cst.strftime("%Y-%m-%dT%H")
+    minutes = now_cst.hour * 60 + now_cst.minute
+    if _SHORT_START_MINUTES <= minutes < _SHORT_END_MINUTES:
+        slot = (minutes - _SHORT_START_MINUTES) // _SHORT_INTERVAL_MINUTES
+        slot_minutes = _SHORT_START_MINUTES + slot * _SHORT_INTERVAL_MINUTES
+        return f"{now_cst:%Y-%m-%d}T{slot_minutes // 60:02d}:{slot_minutes % 60:02d}"
+    return now_cst.strftime("%Y-%m-%dT%H:00")
 
 
 def _active_account_handles() -> list[str]:
@@ -329,8 +331,8 @@ def start_scheduler() -> None:
         _thread = threading.Thread(target=_loop, daemon=True, name="engagement-scheduler")
         _thread.start()
     logger.info(
-        "Engagement scheduler started (short-term: hourly; "
-        "daily: 7:00am fixed CST)"
+        "Engagement scheduler started (short-term: every 45min 6:15am-11:15pm CST; "
+        "hourly overnight; daily: 7:00am fixed CST)"
     )
 
 
