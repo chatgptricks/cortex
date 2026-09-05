@@ -20,6 +20,16 @@ services:
         value: "60"
       - key: R2_LOCAL_MIRROR_ENABLED
         value: "false"
+      - key: R2_MEDIA_ENABLED
+        value: "true"
+      - key: R2_ENDPOINT_URL
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
       - key: APIFY_TOKEN
         sync: false
       - key: SENTIENT_OCR_URL
