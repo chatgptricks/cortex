@@ -192,6 +192,12 @@ def _run_ocr_job() -> None:
     that arrived since the last tick become text-searchable on their own.
     """
     from .apify_sync import run_ocr_sweep
+    from .sentient_ocr import sentient_ocr_status
+
+    status = sentient_ocr_status()
+    if not status["configured"]:
+        logger.warning("Cover OCR sweep skipped: SENTIENT_OCR_URL is not configured")
+        return
 
     try:
         result = run_ocr_sweep(limit=_OCR_PER_TICK)
@@ -250,6 +256,7 @@ def _check_disk() -> None:
     from .slack_alerts import notify_disk_warning, slack_configured
 
     try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         usage = shutil.disk_usage(str(DATA_DIR))
     except Exception:
         logger.exception("Disk usage check failed")
