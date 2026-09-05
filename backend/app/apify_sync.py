@@ -1233,7 +1233,7 @@ _HOT_MIN_AGE_HOURS = 0.5
 # post ~5-10/day), so a lower cap just stops paying to re-fetch old posts.
 logger = logging.getLogger(__name__)
 
-_SHORT_LOOKBACK_HOURS = 12
+_SHORT_LOOKBACK_HOURS = 2
 # Per-account retries in the daily snapshot job. The job fires once a day and
 # its data can't be backfilled, so a transient Apify timeout on one profile
 # would otherwise cost that account a permanent hole in its history.
@@ -1241,7 +1241,7 @@ _SNAPSHOT_ATTEMPTS = 3
 _SNAPSHOT_RETRY_DELAY_SECONDS = 5.0
 _SHORT_RESULTS_LIMIT = 20
 
-# Short-term cycle: every 30min during posting hours, hourly overnight -- posts <=24h old
+# Short-term cycle: every 45min during posting hours, hourly overnight -- posts <=2h old.
 # ---------------------------------------------------------------------------
 
 
@@ -1257,12 +1257,13 @@ def _short_term_payload(
         # across accounts.
         "resultsLimit": results_limit,
         "skipPinnedPosts": True,
-        # 12h lookback, and this window is the single biggest driver of the
+        # 2h lookback, and this window is the single biggest driver of the
         # Apify bill: the actor is billed per result, and every cycle re-fetches
         # (and re-pays for) every post still inside the window. Widening it by
         # an hour costs an hour's worth of posts on every cycle, forever.
         #
-        # 12h is chosen because the two things this window feeds have very
+        # 2h is chosen because the 45-minute cadence gives multiple retries
+        # while avoiding repeated Apify charges for the same post.
         # different needs: the one-time HOT check only needs a post to be seen
         # once after it turns 0.5h old, and new-post discovery only needs the
         # window to exceed the cycle interval. Both are satisfied many times
@@ -1991,7 +1992,7 @@ def _refresh_cover_from_item(
 def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
     """Re-scrapes one post and updates its like/comment counts.
 
-    The scheduled cycle only touches posts inside its 12h lookback, so an
+    The scheduled cycle only touches posts inside its 2h lookback, so an
     older post's numbers stay frozen at whatever they were when it aged out.
     This is the manual escape hatch behind the card's "Reload" action.
 
