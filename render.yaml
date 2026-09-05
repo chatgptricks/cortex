@@ -23,7 +23,7 @@ services:
       - key: R2_MEDIA_ENABLED
         value: "true"
       - key: R2_ENDPOINT_URL
-        sync: false
+        value: https://740fd37c6a7741c5b502263b1f31f508.r2.cloudflarestorage.com
       - key: R2_ACCESS_KEY_ID
         sync: false
       - key: R2_SECRET_ACCESS_KEY
