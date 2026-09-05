@@ -2036,6 +2036,8 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
     )
     item = next((it for it in items if (it.get("shortCode") or "") == clean), items[0] if items else None)
     if not item:
+        with connect() as conn:
+            conn.execute(f"UPDATE {table} SET is_deleted = 1, updated_at = ? WHERE {where}", [utc_now(), *where_params])
         raise ApifySyncError("Instagram returned nothing for that post -- it may have been deleted.")
 
     cover_refreshed = _refresh_cover_from_item(table, handle, clean, row, item)
@@ -2044,7 +2046,7 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
     comments = item.get("commentsCount")
     comments = comments if isinstance(comments, int) and comments >= 0 else None
 
-    set_clauses = ["likes = ?", "updated_at = ?"]
+    set_clauses = ["likes = ?", "updated_at = ?", "is_deleted = 0"]
     params: list[Any] = [likes, utc_now()]
     if comments is not None:
         set_clauses.append("comments = ?")
