@@ -1036,6 +1036,12 @@ def _media_response(reference: str | Path | None, detail: str) -> Response:
     raise HTTPException(status_code=404, detail=detail)
 
 
+def _cover_response(reference: str | Path | None, detail: str) -> Response:
+    response = _media_response(reference, detail)
+    response.headers["Cache-Control"] = "public, max-age=604800, stale-while-revalidate=86400, stale-if-error=2592000"
+    return response
+
+
 @app.get("/api/dashboard/covers/{account}/{post_id}")
 def dashboard_cover(account: str, post_id: int) -> Response:
     """Serve a post cover for any account. Non-canonical accounts lazily
@@ -1052,7 +1058,7 @@ def dashboard_cover(account: str, post_id: int) -> Response:
             row = conn.execute("SELECT image_path FROM posts WHERE id = ?", (post_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Post cover not found.")
-        return _media_response(row["image_path"], "Post cover file is unavailable.")
+        return _cover_response(row["image_path"], "Post cover file is unavailable.")
 
     with connect() as conn:
         row = conn.execute(
@@ -1064,7 +1070,7 @@ def dashboard_cover(account: str, post_id: int) -> Response:
 
     if row["cover_image_path"]:
         try:
-            return _media_response(row["cover_image_path"], "Post cover file is unavailable.")
+            return _cover_response(row["cover_image_path"], "Post cover file is unavailable.")
         except HTTPException:
             # Preserve the existing lazy repair if a legacy cache disappeared
             # while Instagram's signed source URL is still fresh.
@@ -1099,7 +1105,7 @@ def dashboard_cover(account: str, post_id: int) -> Response:
             (new_reference, post_id),
         )
 
-    return _media_response(new_reference, "Post cover file is unavailable.")
+    return _cover_response(new_reference, "Post cover file is unavailable.")
 
 
 def _caller_email(request: Request) -> str:
