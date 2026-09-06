@@ -1061,15 +1061,28 @@ def dashboard_stack_members(account: str, shortcode: str) -> dict[str, Any]:
     # fresh process has not seen it yet; never reclassify the full catalog.
     clean_account = account.strip().lstrip('@').lower()
     clean_shortcode = shortcode.strip()
-    payload = _dashboard_posts_payload()
     post_key = f'{clean_account}:{clean_shortcode}'
     keys = set(stack_keys(post_key))
     if not keys:
-        source = next((post for post in payload['posts'] if f"{post.get('account')}:{post.get('shortcode')}" == post_key), None)
+        snapshot = _queue_v2_post_snapshot(clean_account, clean_shortcode)
+        source = {
+            'account': clean_account, 'shortcode': clean_shortcode,
+            'postDate': snapshot.get('publishedAt'), **snapshot,
+        } if snapshot else None
         if source:
             attach([source])
             keys = set(stack_keys(post_key))
-    posts = [post for post in payload['posts'] if f"{post.get('account')}:{post.get('shortcode')}" in keys]
+    pairs = [tuple(key.split(':', 1)) for key in keys if ':' in key]
+    with connect() as conn:
+        snapshots = _queue_v2_post_snapshot_cache(
+            conn,
+            [{'post_account': member_account, 'post_shortcode': member_shortcode} for member_account, member_shortcode in pairs],
+        )
+    posts = [
+        {'account': member_account, 'shortcode': member_shortcode, **snapshots[(member_account, member_shortcode)]}
+        for member_account, member_shortcode in pairs
+        if (member_account, member_shortcode) in snapshots
+    ]
     return {'posts': posts, 'stackSize': len(keys)}
 
 
