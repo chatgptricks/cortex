@@ -149,8 +149,25 @@ def merge(keys):
         lock(conn)
         placeholders = ','.join('?' for _ in keys)
         rows = conn.execute(f'SELECT post_key, stack_id FROM topic_stack_members WHERE post_key IN ({placeholders})', tuple(keys)).fetchall()
-        if len(rows) != len(keys):
-            raise ValueError('Some posts are no longer available. Refresh and try again.')
+        # Manual grouping must work for freshly imported posts before the
+        # automatic classifier has materialized their membership rows.
+        present = {row['post_key'] for row in rows}
+        missing = [item for item in keys if item not in present]
+        if missing:
+            valid = set()
+            for item in missing:
+                account, _, shortcode = item.partition(':')
+                try:
+                    if conn.execute('SELECT 1 FROM dashboard_posts WHERE account = ? AND shortcode = ? LIMIT 1', (account, shortcode)).fetchone() or conn.execute('SELECT 1 FROM posts WHERE shortcode = ? LIMIT 1', (shortcode,)).fetchone(): valid.add(item)
+                except Exception:
+                    pass
+            if len(valid) != len(missing):
+                raise ValueError('Some posts are no longer available. Refresh and try again.')
+            conn.executemany(
+                'INSERT INTO topic_stack_members (post_key, stack_id, words, posted_at) VALUES (?, ?, ?, 0)',
+                [(item, uuid.uuid4().hex, '[]') for item in missing],
+            )
+            rows = conn.execute(f'SELECT post_key, stack_id FROM topic_stack_members WHERE post_key IN ({placeholders})', tuple(keys)).fetchall()
         groups = sorted(set(row['stack_id'] for row in rows))
         destination = groups[0]
         marks = ','.join('?' for _ in groups)
