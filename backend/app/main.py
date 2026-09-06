@@ -979,9 +979,10 @@ def dashboard_posts() -> Response:
         if _DASHBOARD_POSTS_CACHE_CONTENT is not None and now < _DASHBOARD_POSTS_CACHE_EXPIRES_AT:
             content = _DASHBOARD_POSTS_CACHE_CONTENT
         else:
-            from .topic_stacks import attach
+            # Reading Research must never re-run topic matching. New posts are
+            # classified at ingestion and manual changes are written directly
+            # to topic_stack_members, so this endpoint only reads that state.
             payload = _dashboard_posts_payload()
-            attach(payload['posts'])
             content = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             _DASHBOARD_POSTS_CACHE_CONTENT = content
             _DASHBOARD_POSTS_CACHE_EXPIRES_AT = time.monotonic() + 20.0
