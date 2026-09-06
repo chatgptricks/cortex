@@ -6,8 +6,8 @@ def database(tmp_path, monkeypatch):
     monkeypatch.setattr(db, 'DATABASE_URL', '')
     monkeypatch.setattr(db, 'DB_PATH', tmp_path / 'stacks.sqlite')
 
-def post(key, caption, likes=1):
-    return dict(account='test', shortcode=key, caption=caption, postDate='2026-09-05T00:00:00Z', likes=likes)
+def post(key, caption, likes=1, date='2026-09-05T00:00:00Z'):
+    return dict(account='test', shortcode=key, caption=caption, postDate=date, likes=likes)
 
 CAPTION = 'Scientists discovered remarkable ancient dinosaur fossils underneath isolated volcanic mountains during research expedition'
 
@@ -73,3 +73,23 @@ def test_find_similar_merges_matching_existing_posts_only_when_requested():
     result = topic_stacks.find_similar('test:a')
     assert result['matchedCount'] == 1
     assert set(result['postKeys']) == {'test:a', 'test:b'}
+
+@pytest.mark.parametrize(('hours', 'shared', 'score', 'coverage'), [
+    (8, 3, .16, .20),
+    (24, 4, .22, .20),
+    (48, 4, .30, .20),
+    (72, 5, .40, .20),
+])
+def test_recent_posts_use_progressively_more_permissive_thresholds(hours, shared, score, coverage):
+    assert topic_stacks.automatic_match(shared, score, coverage, hours * 3600)
+
+def test_time_proximity_alone_does_not_group_unrelated_posts():
+    assert not topic_stacks.automatic_match(2, .15, .44, 60)
+
+def test_posts_with_three_topic_words_group_inside_eight_hours_only():
+    first = post('a', 'quantum robot mars research discovery', date='2026-09-05T00:00:00Z')
+    close = post('b', 'quantum robot mars video launch', date='2026-09-05T08:00:00Z')
+    later = post('c', 'quantum robot mars future update', date='2026-09-05T17:00:00Z')
+    topic_stacks.attach([first, close, later])
+    assert first['stackId'] == close['stackId']
+    assert later['stackId'] != first['stackId']
