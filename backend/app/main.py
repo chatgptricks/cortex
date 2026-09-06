@@ -1040,6 +1040,19 @@ def dashboard_stacks_find_similar(post_key: Annotated[str, Form()]) -> dict[str,
     return result
 
 
+@app.post('/api/admin/stacks/regroup-recent')
+def admin_stacks_regroup_recent() -> dict[str, Any]:
+    """Explicitly rebuild topic membership for posts from the last 72 hours."""
+    from .topic_stacks import regroup_recent
+    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
+    payload = _dashboard_posts_payload()
+    result = regroup_recent(payload['posts'], hours=72)
+    with _DASHBOARD_POSTS_CACHE_LOCK:
+        _DASHBOARD_POSTS_CACHE_CONTENT = None
+        _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0
+    return {'ok': True, **result}
+
+
 @app.get('/api/dashboard/stacks/{account}/{shortcode}')
 def dashboard_stack_members(account: str, shortcode: str) -> dict[str, Any]:
     """Load one persisted stack for Queue and other detail views on demand."""

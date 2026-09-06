@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from app import db, topic_stacks
 
@@ -93,3 +95,19 @@ def test_posts_with_three_topic_words_group_inside_eight_hours_only():
     topic_stacks.attach([first, close, later])
     assert first['stackId'] == close['stackId']
     assert later['stackId'] != first['stackId']
+
+def test_regroup_recent_rebuilds_only_last_72_hours():
+    now = datetime.now(timezone.utc)
+    recent_date = (now - timedelta(hours=2)).isoformat()
+    old_date = (now - timedelta(hours=80)).isoformat()
+    recent_a = post('recent-a', CAPTION, date=recent_date)
+    recent_b = post('recent-b', CAPTION, date=recent_date)
+    old = post('old', CAPTION, date=old_date)
+    topic_stacks.attach([recent_a, recent_b, old])
+    old_stack = old['stackId']
+    result = topic_stacks.regroup_recent([recent_a, recent_b, old])
+    assert result == {'hours': 72, 'postsProcessed': 2, 'stacks': 1, 'groupedPosts': 2}
+    fresh = [dict(recent_a), dict(recent_b), dict(old)]
+    topic_stacks.apply_memberships(fresh)
+    assert fresh[0]['stackId'] == fresh[1]['stackId']
+    assert fresh[2]['stackId'] == old_stack
