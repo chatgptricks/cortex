@@ -64,6 +64,7 @@ def test_scheduler_never_runs_paid_jobs_without_durable_claim(monkeypatch):
     jobs = []
     monkeypatch.setattr(db, "connect", unavailable)
     monkeypatch.setattr(scheduler, "_run_media_backfill", lambda now: None)
+    monkeypatch.setattr(scheduler, "_launch", lambda name, callback: callback())
     for name in ("_run_short_term_jobs", "_run_daily_jobs", "_run_ocr_job", "_run_account_snapshot_job"):
         monkeypatch.setattr(scheduler, name, lambda: jobs.append("ran"))
     with pytest.raises(RuntimeError):

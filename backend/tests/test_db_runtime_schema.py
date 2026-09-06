@@ -58,3 +58,15 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
     assert dict(row) == {"hidden_users": "[]", "row_order": "[]"}
 def test_gabo_is_not_an_internal_self_assignment_exception() -> None:
     assert not _has_internal_self_assign("gabo@sentientagency.io")
+
+
+def test_runtime_migration_adds_soft_delete_to_both_post_tables():
+    connection = sqlite3.connect(':memory:')
+    connection.row_factory = sqlite3.Row
+    for table in ('dashboard_users', 'accounts', 'posts', 'dashboard_posts'):
+        connection.execute(f'CREATE TABLE {table} (id INTEGER PRIMARY KEY)')
+    _ensure_runtime_schema_extensions(connection)
+    _ensure_runtime_schema_extensions(connection)
+    for table in ('posts', 'dashboard_posts'):
+        connection.execute(f'INSERT INTO {table} (id) VALUES (1)')
+        assert connection.execute(f'SELECT is_deleted FROM {table}').fetchone()[0] == 0

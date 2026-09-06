@@ -123,7 +123,7 @@ def _active_account_handles() -> list[str]:
         return [account["handle"] for account in list_accounts(active_only=True)]
     except Exception:
         logger.exception("Failed to load active accounts for scheduler tick")
-        return []
+        raise
 
 
 def _run_short_term_jobs() -> None:
@@ -136,13 +136,18 @@ def _run_short_term_jobs() -> None:
     # up-to-results_limit posts -- resultsLimit is a per-URL cap, not a
     # shared total) instead of one call per account, cutting per-run
     # overhead N-fold.
-    try:
-        results = run_short_term_cycle_batch(accounts)
-        logger.info("Short-term engagement cycle (batched, %d accounts): %s", len(accounts), results)
-    except ApifySyncError as exc:
-        logger.error("Short-term engagement cycle (batched) failed: %s", exc)
-    except Exception:
-        logger.exception("Short-term engagement cycle (batched) crashed")
+    from .ingestion_jobs import current, now
+    import math
+    journal = current()
+    since = journal.state.get("last_success_at") if journal else None
+    gap = (now() - datetime.fromisoformat(since)).total_seconds() / 3600 if since else 22
+    lookback = max(2, math.ceil(gap) + 2)
+    results = run_short_term_cycle_batch(accounts, lookback_hours=lookback,
+                                        results_limit=max(20, min(1000, lookback * 10)))
+    failures = {account: result for account, result in results.items() if result.get("error")}
+    if failures:
+        raise ApifySyncError(str(failures))
+    logger.info("Short-term engagement cycle: %s", results)
 
 
 def _run_daily_jobs() -> None:
@@ -280,24 +285,48 @@ def _check_disk() -> None:
         _state_set(_DISK_STATE_KEY, str(crossed))
 
 
+_jobs = {}
+_jobs_lock = threading.Lock()
+
+
+def _launch(name, callback):
+    # Daily detail scrapes can take hours; never block new-post collection.
+    with _jobs_lock:
+        if name in _jobs and _jobs[name].is_alive():
+            return
+        def guarded():
+            try:
+                callback()
+            except Exception:
+                logger.exception("Scheduled %s pass failed", name)
+        thread = threading.Thread(target=guarded, daemon=True, name=f"ingestion-{name}")
+        _jobs[name] = thread
+        thread.start()
+
+
 def _tick() -> None:
     now_cst = datetime.now(_CST)
 
     _run_media_backfill(now_cst)
 
     bucket = _bucket_key(now_cst)
-    if _claim_bucket(_SHORT_BUCKET_KEY, bucket):
-        # Claim the bucket *before* running so a crash mid-job doesn't leave
-        # it unclaimed and re-fire on the next 30s tick.
-        _check_disk()  # cheap (one statvfs) and runs before the jobs that write
-        _run_short_term_jobs()
-        _run_ocr_job()
+    from .ingestion_jobs import run
+    def short_pass():
+        if run("scheduled-posts", bucket, _run_short_term_jobs):
+            _check_disk()
+            _run_ocr_job()
+    _launch("short", short_pass)
 
     daily_trigger = now_cst.replace(hour=_DAILY_JOB_AT[0], minute=_DAILY_JOB_AT[1], second=0, microsecond=0)
     today = now_cst.strftime("%Y-%m-%d")
-    if now_cst >= daily_trigger and _claim_bucket(_DAILY_DATE_KEY, today):
-        _run_daily_jobs()
-        _run_account_snapshot_job()
+    if now_cst >= daily_trigger:
+        from .apify_sync import run_daily_cycle
+        def daily_pass():
+            for account in _active_account_handles():
+                run(f"daily:{account}", today, lambda account=account: run_daily_cycle(account))
+            if _claim_bucket(_DAILY_DATE_KEY, today):
+                _run_account_snapshot_job()
+        _launch("daily", daily_pass)
 
 
 def _loop() -> None:

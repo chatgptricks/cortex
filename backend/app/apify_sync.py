@@ -924,19 +924,65 @@ def _run_apify_actor_and_fetch(
         raise ApifySyncError("httpx is not installed in the backend environment.") from exc
     import time
 
+    from .ingestion_jobs import current
+    journal = current()
+    saved = journal.next_run(actor_id, payload) if journal else {}
+    if saved.get("items") is not None:
+        return saved["items"]
+    actor_id = saved.get("actor", actor_id)
+    payload = saved.get("payload", payload)
     _emit(on_progress, phase="starting_apify_run")
     start_url = f"https://api.apify.com/v2/acts/{actor_id}/runs"
-    try:
+    if journal and saved.get("starting_at") and not saved.get("run"):
+        # A lost POST response is ambiguous: find the already-paid run by
+        # its recorded input before considering another start.
         with httpx.Client(timeout=30.0) as client:
-            start_response = client.post(start_url, params={"token": token}, json=payload)
-            start_response.raise_for_status()
-            run = start_response.json().get("data", {})
-    except httpx.HTTPError as exc:
-        raise ApifySyncError(f"Failed to start Apify run: {exc}") from exc
-
-    run_id = run.get("id")
-    if not run_id:
-        raise ApifySyncError("Apify did not return a run id.")
+            response = client.get(start_url, params={"token": token, "desc": "true", "limit": 100})
+            response.raise_for_status()
+            candidates = response.json().get("data", {}).get("items", [])
+            for candidate in candidates:
+                if candidate.get("startedAt", "") < saved["starting_at"]:
+                    continue
+                store_id = candidate.get("defaultKeyValueStoreId")
+                if not store_id:
+                    continue
+                response = client.get(f"https://api.apify.com/v2/key-value-stores/{store_id}/records/INPUT", params={"token": token})
+                response.raise_for_status()
+                actual = response.json()
+                if all(actual.get(key) == value for key, value in payload.items()):
+                    saved["run"] = candidate
+                    journal.save()
+                    break
+        if not saved.get("run"):
+            age = (datetime.now(UTC) - datetime.fromisoformat(saved["starting_at"]).replace(tzinfo=UTC)).total_seconds()
+            covered = len(candidates) < 100 or candidates[-1].get("startedAt", "") < saved["starting_at"]
+            if age < 300 or not covered:
+                raise ApifySyncError("Unconfirmed Apify start; automatic reconciliation will retry.")
+            # The complete recent history confirms no run was created.
+            saved.pop("starting_at", None)
+            journal.save()
+    if saved.get("run"):
+        run = saved["run"]
+    else:
+        if journal:
+            saved["starting_at"] = (datetime.now(UTC) - timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%S")
+            journal.save()
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                start_response = client.post(start_url, params={"token": token}, json=payload)
+                start_response.raise_for_status()
+                run = start_response.json().get("data", {})
+        except httpx.HTTPError as exc:
+            if journal and isinstance(exc, httpx.HTTPStatusError) and 400 <= exc.response.status_code < 500 and exc.response.status_code != 408:
+                saved.pop("starting_at", None)
+                journal.save()
+            raise ApifySyncError(f"Failed to start Apify run: {exc}") from exc
+        if not run.get("id"):
+            raise ApifySyncError("Apify did not return a run id.")
+        if journal:
+            saved["run"] = run
+            journal.save()
+    run_id = run["id"]
 
     poll_started_at = time.monotonic()
     status_url = f"https://api.apify.com/v2/actor-runs/{run_id}"
@@ -950,7 +996,7 @@ def _run_apify_actor_and_fetch(
         run_status=status,
         elapsed_seconds=0,
     )
-    while status in ("READY", "RUNNING") and time.monotonic() < deadline:
+    while status in ("READY", "RUNNING", "TIMING-OUT", "ABORTING") and time.monotonic() < deadline:
         time.sleep(poll_interval)
         try:
             with httpx.Client(timeout=30.0) as client:
@@ -970,6 +1016,10 @@ def _run_apify_actor_and_fetch(
         )
 
     if status != "SUCCEEDED":
+        if journal and status in {"FAILED", "ABORTED", "TIMED-OUT"}:
+            saved.pop("run", None)
+            saved.pop("starting_at", None)
+            journal.save()
         raise ApifySyncError(f"Apify run did not finish successfully (status={status}).")
     if not dataset_id:
         raise ApifySyncError("Apify run succeeded but returned no dataset id.")
@@ -978,13 +1028,23 @@ def _run_apify_actor_and_fetch(
     items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
     try:
         with httpx.Client(timeout=60.0) as client:
-            items_response = client.get(items_url, params={"token": token, "format": "json"})
-            items_response.raise_for_status()
-            items = items_response.json()
+            items = []
+            while True:
+                items_response = client.get(items_url, params={"token": token, "format": "json", "offset": len(items), "limit": 1000})
+                items_response.raise_for_status()
+                page = items_response.json()
+                if not isinstance(page, list):
+                    raise ApifySyncError("Apify dataset returned an unexpected response shape.")
+                items.extend(page)
+                if len(page) < 1000:
+                    break
     except httpx.HTTPError as exc:
         raise ApifySyncError(f"Failed to fetch Apify dataset items: {exc}") from exc
     if not isinstance(items, list):
         raise ApifySyncError("Apify dataset returned an unexpected response shape.")
+    if journal:
+        saved["items"] = items
+        journal.save()
     _emit(on_progress, phase="dataset_ready", fetched=len(items))
     return items
 
@@ -1401,7 +1461,11 @@ def _collect_short_term_items(
         )
         post_owner_to_account = {cfg["handle"].lower(): account for account, cfg in post_configs.items()}
         for item in post_items:
+            if item.get("error"):
+                raise ApifySyncError(f"Apify returned an account error: {item.get('error')}")
             account = post_owner_to_account.get(_item_owner_username(item))
+            if _item_shortcode(item) and not account:
+                raise ApifySyncError("Apify returned a post without a matching account; dataset retained")
             if account and not _is_reel_item(item):
                 items_by_account[account].append(item)
 
@@ -1452,6 +1516,8 @@ def _process_short_term_items(
     new_items = [it for it in items if it.get("shortCode") and it["shortCode"] not in existing_shortcodes]
     new_items.sort(key=lambda it: it.get("timestamp") or "")
     insert_summary = _insert_new_posts(account, cfg, new_items)
+    if insert_summary.get("failed"):
+        raise ApifySyncError(f"{account}: {insert_summary['failed']} posts failed to persist")
     transcript_updates = _store_existing_reel_transcripts(account, cfg, items)
 
     # Re-read so freshly-inserted posts are also eligible for the engagement
@@ -1633,7 +1699,8 @@ def run_short_term_cycle_batch(
     if not accounts:
         return {}
 
-    now = datetime.now(UTC)
+    from .ingestion_jobs import now as ingestion_now
+    now = ingestion_now()
 
     configs: dict[str, dict[str, Any]] = {}
     results: dict[str, dict[str, Any]] = {}
@@ -1646,6 +1713,10 @@ def run_short_term_cycle_batch(
     if not configs:
         return results
 
+    from .ingestion_jobs import current
+    journal = current()
+    if journal:
+        configs = journal.frozen("configs", configs)
     items_by_account = _collect_short_term_items(
         configs, results_limit, now, include_reels=include_reels, lookback_hours=lookback_hours
     )
@@ -1681,7 +1752,8 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
     cfg = get_account_config(account)
     table = cfg["table"]
     scope_sql, scope_params = _account_scope(table, account)
-    now = datetime.now(UTC)
+    from .ingestion_jobs import now as ingestion_now
+    now = ingestion_now()
     has_permalink_column = table == "dashboard_posts"
 
     from .db import connect, utc_now
@@ -1714,6 +1786,10 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
         permalink = (row["permalink"] if has_permalink_column else None) or f"https://www.instagram.com/p/{shortcode}/"
         eligible[shortcode] = {"id": row["id"], "mark_30": mark_30, "mark_120": mark_120, "permalink": permalink}
 
+    from .ingestion_jobs import current
+    journal = current()
+    if journal:
+        eligible = journal.frozen("eligible", eligible)
     summary: dict[str, Any] = {"checked": len(eligible), "updated": 0, "unmatched": 0}
     if not eligible:
         return summary
