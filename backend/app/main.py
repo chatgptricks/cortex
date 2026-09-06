@@ -987,6 +987,12 @@ def dashboard_posts() -> Response:
             from .topic_stacks import apply_memberships
             apply_memberships(payload['posts'])
             content = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            # Release the temporary Python object graph before retaining the
+            # compact bytes cache; this matters when the full Research feed
+            # contains tens of thousands of posts.
+            del payload
+            import gc
+            gc.collect()
             _DASHBOARD_POSTS_CACHE_CONTENT = content
             _DASHBOARD_POSTS_CACHE_EXPIRES_AT = time.monotonic() + 20.0
     return Response(content=content, media_type="application/json")
