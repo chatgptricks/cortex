@@ -131,7 +131,9 @@ def _run_short_term_jobs() -> None:
 
     accounts = _active_account_handles()
     if not accounts:
+        logger.warning("Short-term engagement cycle skipped: no active accounts")
         return
+    logger.info("Short-term engagement cycle starting: %d accounts", len(accounts))
     # One Apify call for every active account (each still gets its own
     # up-to-results_limit posts -- resultsLimit is a per-URL cap, not a
     # shared total) instead of one call per account, cutting per-run
