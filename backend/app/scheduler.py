@@ -307,7 +307,9 @@ def _launch(name, callback):
 def _tick() -> None:
     now_cst = datetime.now(_CST)
 
-    _run_media_backfill(now_cst)
+    # Media migration is independent maintenance. Never let a slow R2 batch
+    # delay or suppress the time-sensitive Apify collection below.
+    _launch("media-backfill", lambda: _run_media_backfill(now_cst))
 
     bucket = _bucket_key(now_cst)
     from .ingestion_jobs import run
