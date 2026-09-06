@@ -1972,6 +1972,12 @@ def _queue_v2_fetch_source_preview(source_url: str) -> dict[str, str]:
                             raise HTTPException(status_code=422, detail="The source link redirects without a destination.")
                         current = _queue_v2_public_url(urljoin(current, location))
                         continue
+                    # Medium commonly blocks server-side preview requests with
+                    # Cloudflare 403. Jina's public reader returns the same
+                    # page as readable HTML/metadata, so retry only that case.
+                    if getattr(response, "status_code", 200) == 403 and not current.startswith("https://r.jina.ai/"):
+                        current = "https://r.jina.ai/http://" + current.removeprefix("https://").removeprefix("http://")
+                        continue
                     response.raise_for_status()
                     content_type = response.headers.get("content-type", "").lower()
                     content_length = response.headers.get("content-length")
