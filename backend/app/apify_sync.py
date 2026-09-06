@@ -1465,10 +1465,14 @@ def _collect_short_term_items(
                 continue  # A profile with no posts inside the window is valid.
             if item.get("error"):
                 raise ApifySyncError(f"Apify returned an account error: {item.get('error')}")
-            account = post_owner_to_account.get(_item_owner_username(item))
+            if _is_reel_item(item):
+                continue
+            source = re.fullmatch(r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9_.]+)/?(?:\?.*)?", str(item.get("inputUrl") or ""))
+            source_account = post_owner_to_account.get(source.group(1).lower()) if source else None
+            account = source_account or post_owner_to_account.get(_item_owner_username(item))
             if _item_shortcode(item) and not account:
                 raise ApifySyncError("Apify returned a post without a matching account; dataset retained")
-            if account and not _is_reel_item(item):
+            if account:
                 items_by_account[account].append(item)
 
     # The Reels actor is materially more expensive than the profile-posts

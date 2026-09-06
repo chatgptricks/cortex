@@ -98,3 +98,12 @@ def test_empty_profile_does_not_discard_other_accounts_paid_posts(monkeypatch):
     result = apify_sync._collect_short_term_items(configs, 20, datetime.now(UTC), include_reels=False)
     assert result['empty'] == []
     assert result['active'][0]['shortCode'] == 'saved'
+
+
+def test_collaborator_reel_does_not_block_posts_and_profile_attribution_is_preserved(monkeypatch):
+    monkeypatch.setattr(apify_sync, '_fetch_apify_items', lambda *a, **k: [
+        {'shortCode': 'reel', 'ownerUsername': 'collaborator', 'type': 'Video', 'productType': 'clips', 'inputUrl': 'https://www.instagram.com/active/'},
+        {'shortCode': 'shared', 'ownerUsername': 'collaborator', 'type': 'Image', 'inputUrl': 'https://www.instagram.com/active/'},
+    ])
+    result = apify_sync._collect_short_term_items({'active': {'handle': 'active', 'scrape_mode': 'posts'}}, 20, datetime.now(UTC), include_reels=False)
+    assert [item['shortCode'] for item in result['active']] == ['shared']
