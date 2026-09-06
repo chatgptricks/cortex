@@ -82,6 +82,29 @@ def attach(posts):
             post['stackId'] = group
             post['stackSize'] = counts[group]
 
+def apply_memberships(posts):
+    """Project persisted stack memberships onto an API payload.
+
+    This is deliberately read-only.  Ingestion calls :func:`attach` for a
+    newly saved post; dashboard reads must never classify, merge, or otherwise
+    alter an existing user's grouping just because somebody reloaded Research.
+    """
+    if not posts:
+        return
+    keys = [key(post) for post in posts]
+    with connect() as conn:
+        initialize(conn)
+        rows = conn.execute('SELECT post_key, stack_id FROM topic_stack_members').fetchall()
+    membership = {row['post_key']: row['stack_id'] for row in rows}
+    counts = Counter(membership.values())
+    for post, post_key in zip(posts, keys):
+        stack_id = membership.get(post_key)
+        # A legacy row that predates persistent stacks remains visibly usable
+        # as a one-card group. It is only classified when a real ingestion or
+        # explicit user action touches it.
+        post['stackId'] = stack_id or post_key
+        post['stackSize'] = counts.get(stack_id, 1)
+
 def merge(keys):
     keys = list(dict.fromkeys(keys))
     if not 2 <= len(keys) <= 500 or any(not isinstance(k, str) or len(k) > 300 for k in keys):

@@ -23,6 +23,18 @@ def test_persistent_membership_and_only_new_posts_classified(monkeypatch):
     topic_stacks.attach(posts)
     assert [p['stackId'] for p in reversed(posts)] == original
 
+def test_apply_memberships_projects_saved_groups_without_reclassification(monkeypatch):
+    posts = [post('a', CAPTION), post('b', CAPTION), post('legacy', 'unclassified')]
+    topic_stacks.attach(posts[:2])
+    topic_stacks.merge(['test:a', 'test:b'])
+    monkeypatch.setattr(topic_stacks, 'words', lambda _: pytest.fail('Read projection must not classify'))
+    fresh = [dict(item) for item in posts]
+    topic_stacks.apply_memberships(fresh)
+    assert fresh[0]['stackId'] == fresh[1]['stackId']
+    assert fresh[0]['stackSize'] == 2
+    assert fresh[2]['stackId'] == 'test:legacy'
+    assert fresh[2]['stackSize'] == 1
+
 def test_new_post_joins_existing_stack_without_moving_old_members():
     posts = [post('a', CAPTION), post('b', CAPTION)]
     topic_stacks.attach(posts)
