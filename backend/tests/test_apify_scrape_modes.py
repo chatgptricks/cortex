@@ -87,3 +87,14 @@ def test_dedupe_items_excludes_a_reel_returned_by_both_actor_shapes() -> None:
     ])
 
     assert [item["shortCode"] for item in items] == ["same-media", "url-only-media"]
+
+
+def test_empty_profile_does_not_discard_other_accounts_paid_posts(monkeypatch):
+    monkeypatch.setattr(apify_sync, '_fetch_apify_items', lambda *a, **k: [
+        {'error': 'no_items', 'inputUrl': 'https://www.instagram.com/empty/'},
+        {'shortCode': 'saved', 'ownerUsername': 'active', 'type': 'Image'},
+    ])
+    configs = {name: {'handle': name, 'scrape_mode': 'posts'} for name in ('empty', 'active')}
+    result = apify_sync._collect_short_term_items(configs, 20, datetime.now(UTC), include_reels=False)
+    assert result['empty'] == []
+    assert result['active'][0]['shortCode'] == 'saved'
