@@ -1461,6 +1461,8 @@ def _collect_short_term_items(
         )
         post_owner_to_account = {cfg["handle"].lower(): account for account, cfg in post_configs.items()}
         for item in post_items:
+            if item.get("error") == "no_items":
+                continue  # A profile with no posts inside the window is valid.
             if item.get("error"):
                 raise ApifySyncError(f"Apify returned an account error: {item.get('error')}")
             account = post_owner_to_account.get(_item_owner_username(item))
