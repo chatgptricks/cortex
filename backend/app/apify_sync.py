@@ -861,6 +861,19 @@ def _post_age_hours(published_at: str | None, now: datetime) -> float | None:
 def _fetch_apify_items(
     payload: dict[str, Any], timeout: float = 180.0, actor_id: str = APIFY_ACTOR_ID
 ) -> list[dict[str, Any]]:
+    """Run a short collection through durable start/poll/dataset requests.
+
+    ``run-sync-get-dataset-items`` can leave a successful Apify run with no
+    response at our worker when a connection is replaced.  That created the
+    exact failure mode where 45-minute runs were billed and marked successful
+    in Apify but their items never reached the database.
+    """
+    del timeout  # kept for callers; the durable path has bounded subrequests.
+    return _run_apify_actor_and_fetch(payload, max_wait_seconds=900.0, poll_interval=5.0, actor_id=actor_id)
+
+def _fetch_apify_items_legacy(
+    payload: dict[str, Any], timeout: float = 180.0, actor_id: str = APIFY_ACTOR_ID
+) -> list[dict[str, Any]]:
     token = os.getenv("APIFY_TOKEN", "").strip()
     if not token:
         raise ApifySyncError("APIFY_TOKEN is not configured on the server.")
