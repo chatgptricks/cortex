@@ -4,7 +4,7 @@ import re
 import unicodedata
 import uuid
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .db import connect
 
@@ -119,6 +119,27 @@ def apply_memberships(posts):
         # explicit user action touches it.
         post['stackId'] = stack_id or post_key
         post['stackSize'] = counts.get(stack_id, 1)
+
+def regroup_recent(posts, hours=72):
+    """Reclassify only posts published inside the requested recent window."""
+    if not 1 <= hours <= 168:
+        raise ValueError('Choose a window between 1 and 168 hours.')
+    cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
+    recent = [post for post in posts if timestamp(post) >= cutoff]
+    recent_keys = [key(post) for post in recent]
+    if not recent_keys:
+        return {'hours': hours, 'postsProcessed': 0, 'stacks': 0, 'groupedPosts': 0}
+    with connect() as conn:
+        lock(conn)
+        conn.executemany('DELETE FROM topic_stack_members WHERE post_key = ?', [(item,) for item in recent_keys])
+    attach(recent)
+    stacks = Counter(post['stackId'] for post in recent)
+    return {
+        'hours': hours,
+        'postsProcessed': len(recent),
+        'stacks': len(stacks),
+        'groupedPosts': sum(size for size in stacks.values() if size > 1),
+    }
 
 def merge(keys):
     keys = list(dict.fromkeys(keys))
