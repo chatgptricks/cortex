@@ -36,6 +36,21 @@ def timestamp(post):
     except (ValueError, TypeError):
         return 0
 
+def automatic_match(shared, score, coverage, age_seconds):
+    """Use time proximity as evidence that two captions describe one story."""
+    hours = age_seconds / 3600
+    if hours <= 8:
+        return shared >= 3 and (score >= .16 or coverage >= .45)
+    if hours <= 24:
+        return shared >= 4 and (score >= .22 or coverage >= .55)
+    if hours <= 48:
+        return shared >= 4 and (score >= .30 or coverage >= .65)
+    if hours <= 72:
+        return shared >= 5 and (score >= .40 or coverage >= .72)
+    if hours <= 14 * 24:
+        return shared >= 6 and (score >= .58 or coverage >= .85 and shared >= 10)
+    return shared >= 6 and score >= .90
+
 def attach(posts):
     """Check unseen keys only; likes, reloads and filters cannot alter membership."""
     with connect() as conn:
@@ -60,13 +75,13 @@ def attach(posts):
             additions = []
             for post, ws in docs:
                 ws = set(ws); date = timestamp(post); winner = None; best = 0
-                candidates = {group for word in sorted(ws, key=lambda w: (frequency[w], w))[:8] for group in index[word]} if len(ws) >= 6 else set()
+                candidates = {group for word in sorted(ws, key=lambda w: (frequency[w], w))[:8] for group in index[word]} if len(ws) >= 3 else set()
                 for group in sorted(candidates):
                     other, other_date = representatives[group]
                     shared = len(ws & other)
                     score = shared / len(ws | other) if ws | other else 0
                     coverage = shared / min(len(ws), len(other)) if ws and other else 0
-                    if shared >= 6 and (score >= .58 or coverage >= .85 and shared >= 10) and (abs(date - other_date) <= 14 * 86400 or score >= .9) and score > best:
+                    if automatic_match(shared, score, coverage, abs(date - other_date)) and score > best:
                         winner, best = group, score
                 if winner is None:
                     winner = uuid.uuid4().hex
