@@ -2002,11 +2002,19 @@ def _queue_v2_fetch_source_preview(source_url: str) -> dict[str, str]:
     platform = _queue_v2_source_platform(current)
     if content_type.startswith("image/"):
         return {"sourceUrl": current, "platform": platform, "title": platform, "description": "", "imageUrl": current}
-    if "html" not in content_type and "xml" not in content_type:
+    if "html" not in content_type and "xml" not in content_type and not current.startswith("https://r.jina.ai/"):
         raise HTTPException(status_code=422, detail="That link does not expose a previewable page.")
     parser = _QueueV2MetadataParser()
     parser.feed(raw.decode(response.encoding or "utf-8", errors="replace"))
     parser.close()
+    if current.startswith("https://r.jina.ai/") and not parser.title:
+        text = raw.decode(response.encoding or "utf-8", errors="replace")
+        first = re.search(r"^Title:\s*(.+)$", text, re.MULTILINE)
+        if first:
+            parser.title = first.group(1).strip()
+        if not parser.description:
+            body = re.search(r"Markdown Content:\s*\n\s*(.+)", text)
+            if body: parser.description = body.group(1).strip()
     title = _queue_v2_trim_source_text(
         parser.values.get("og:title") or parser.values.get("twitter:title") or parser.title,
         160,
