@@ -981,8 +981,11 @@ def dashboard_posts() -> Response:
         else:
             # Reading Research must never re-run topic matching. New posts are
             # classified at ingestion and manual changes are written directly
-            # to topic_stack_members, so this endpoint only reads that state.
+            # to topic_stack_members.  Project those persisted memberships so
+            # every client gets the same stacks without mutating them.
             payload = _dashboard_posts_payload()
+            from .topic_stacks import apply_memberships
+            apply_memberships(payload['posts'])
             content = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             _DASHBOARD_POSTS_CACHE_CONTENT = content
             _DASHBOARD_POSTS_CACHE_EXPIRES_AT = time.monotonic() + 20.0
@@ -6485,6 +6488,67 @@ def temp_import_run(handle: str, run_id: str, password: Annotated[str, Form()]) 
         "new": len(new_items),
         "result": result,
     }
+
+
+@app.post("/api/admin/apify/import-batch-run")
+def temp_import_batch_run(run_id: str, password: Annotated[str, Form()]) -> dict[str, Any]:
+    """Recover every active account represented in one completed batch run.
+
+    The 45-minute scheduler uses one actor run for the whole roster.  The old
+    recovery action could only replay its daytrading slice, leaving the other
+    owners in an already-paid dataset stranded after an interrupted worker.
+    """
+    _require_admin(password)
+    import httpx
+    from .apify_sync import _account_scope, _insert_new_posts
+
+    token = os.getenv("APIFY_TOKEN", "").strip()
+    with httpx.Client(timeout=60.0) as client:
+        run_response = client.get(f"https://api.apify.com/v2/actor-runs/{run_id}", params={"token": token})
+        run_response.raise_for_status()
+        run = run_response.json().get("data", {})
+        dataset_id = run.get("defaultDatasetId")
+        if not dataset_id:
+            raise HTTPException(status_code=404, detail="Run has no dataset.")
+        items_response = client.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}/items", params={"token": token, "format": "json"}
+        )
+        items_response.raise_for_status()
+        items = items_response.json()
+    if not isinstance(items, list):
+        raise HTTPException(status_code=502, detail="Unexpected dataset shape.")
+
+    configs = {account["handle"].lower(): get_account_config(account["handle"]) for account in list_accounts(active_only=True)}
+    by_account: dict[str, list[dict[str, Any]]] = {}
+    ignored = 0
+    for item in items:
+        if not isinstance(item, dict):
+            ignored += 1
+            continue
+        owner = str(item.get("ownerUsername") or "").strip().lower()
+        if not owner or owner not in configs or not item.get("shortCode"):
+            ignored += 1
+            continue
+        by_account.setdefault(owner, []).append(item)
+
+    recovered: dict[str, Any] = {}
+    total_added = 0
+    for owner, account_items in by_account.items():
+        cfg = configs[owner]
+        table = cfg["table"]
+        scope_sql, scope_params = _account_scope(table, owner)
+        with connect() as conn:
+            existing = {row["shortcode"] for row in conn.execute(f"SELECT shortcode FROM {table} WHERE 1=1{scope_sql}", scope_params).fetchall() if row["shortcode"]}
+        new_items = sorted((item for item in account_items if item["shortCode"] not in existing), key=lambda item: item.get("timestamp") or "")
+        result = _insert_new_posts(owner, cfg, new_items)
+        recovered[owner] = {"dataset_items": len(account_items), "new": len(new_items), "added": result.get("added", 0), "failed": result.get("failed", 0)}
+        total_added += int(result.get("added") or 0)
+
+    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
+    with _DASHBOARD_POSTS_CACHE_LOCK:
+        _DASHBOARD_POSTS_CACHE_CONTENT = None
+        _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0
+    return {"run_status": run.get("status"), "dataset_items": len(items), "ignored": ignored, "accounts": recovered, "added": total_added}
 
 
 @app.post("/api/admin/accounts/backfill-bg/{handle}")
