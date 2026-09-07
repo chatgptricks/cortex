@@ -36,3 +36,9 @@ def test_vague_commercial_language_with_brand_is_likely():
     result = detect_promo({"caption": "Built with @higgsfield — available now."})
     assert result["classification"] == "likely"
     assert result["client"] == "higgsfield"
+
+
+def test_narrative_send_information_is_not_an_automation_cta():
+    result = detect_promo({"caption": "and send information back to human operators"})
+    assert result["cta"] is None
+    assert result["classification"] == "not_promo"
