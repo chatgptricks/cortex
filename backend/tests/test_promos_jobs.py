@@ -53,3 +53,17 @@ def test_analyze_post_is_idempotent_and_keeps_review_override(monkeypatch):
     assert second["review_status"] == "reviewed"
     row = connection.execute("SELECT COUNT(*) FROM promo_opportunities").fetchone()
     assert row[0] == 1
+
+
+def test_reanalysis_removes_opportunity_when_signal_disappears(monkeypatch):
+    connection = _connection()
+
+    @contextmanager
+    def connect():
+        yield connection
+
+    monkeypatch.setattr(promos, "connect", connect)
+    base = {"account": "competitor", "shortcode": "gone1", "published_at": "2026-09-01T12:00:00+00:00"}
+    promos.analyze_post({**base, "caption": "Sponsored by @higgsfield"})
+    promos.analyze_post({**base, "caption": "A regular editorial update about technology"})
+    assert connection.execute("SELECT COUNT(*) FROM promo_opportunities").fetchone()[0] == 0
