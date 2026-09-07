@@ -12,6 +12,13 @@ from .db import connect, utc_now
 from .promos_detector import DETECTOR_VERSION, detect_promo
 
 
+def _initialize_topic_stacks(conn: Any) -> None:
+    """Keep Promos usable in older/local databases before stack migration."""
+    from .topic_stacks import initialize
+
+    initialize(conn)
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -24,7 +31,9 @@ def _hash_post(post: dict[str, Any]) -> str:
 def _row_item(row: dict[str, Any]) -> dict[str, Any]:
     analysis = json.loads(row.get("analysis_json") or "{}")
     override = json.loads(row["review_override_json"]) if row.get("review_override_json") else {}
-    result = {**analysis, "account": row["account"], "shortcode": row["shortcode"], "classification": row["classification"], "client": row.get("client"), "product": row.get("product"), "review_status": row.get("review_status") or "new", "published_at": row.get("published_at"), "first_detected_at": row.get("first_detected_at"), "last_analyzed_at": row.get("last_analyzed_at")}
+    stack_id = row.get("stack_id") or analysis.get("stack_id")
+    stack_size = row.get("stack_size") or analysis.get("stack_size") or 1
+    result = {**analysis, "account": row["account"], "shortcode": row["shortcode"], "classification": row["classification"], "client": row.get("client"), "product": row.get("product"), "review_status": row.get("review_status") or "new", "published_at": row.get("published_at"), "first_detected_at": row.get("first_detected_at"), "last_analyzed_at": row.get("last_analyzed_at"), "stack_id": stack_id, "stack_size": int(stack_size), "account_group": row.get("account_group"), "account_group_label": row.get("account_group_label")}
     if override:
         result["overrides"] = override
         result.update({key: value for key, value in override.items() if key in {"client", "product", "classification"} and value is not None})
@@ -39,6 +48,26 @@ def analyze_post(post: dict[str, Any]) -> dict[str, Any]:
     digest = _hash_post(post)
     analysis = detect_promo(post)
     with connect() as conn:
+        _initialize_topic_stacks(conn)
+        stack = _promo_stack_context(conn, account, shortcode)
+        analysis["stack_id"] = stack["stack_id"]
+        analysis["stack_size"] = stack["stack_size"]
+        analysis["stack_support_count"] = stack["support_count"]
+        # A stack is corroborating evidence only after the detector has found
+        # a real brand relationship. It can move a relationship-only signal
+        # from needs_review to likely when another post in the same stack is
+        # already a confirmed promotion; a generic topic match alone never
+        # creates a Promo opportunity.
+        if analysis["classification"] == "needs_review" and stack["support_count"]:
+            analysis["classification"] = "likely"
+            analysis["is_promo"] = True
+            analysis.setdefault("evidence", []).append({
+                "family": "stack",
+                "rule": "promo cluster support",
+                "source": "topic_stack",
+                "text": f"Another post in this {stack['stack_size']}-post stack is a confirmed promotion.",
+            })
+            analysis["signals"] = sorted(set(analysis.get("signals") or []) | {"promo cluster support"})
         existing = conn.execute("SELECT input_hash FROM promo_scans WHERE account = ? AND shortcode = ?", (account, shortcode)).fetchone()
         first = now
         conn.execute("""INSERT INTO promo_scans(account, shortcode, input_hash, detector_version, status, attempts, updated_at)
@@ -56,6 +85,46 @@ def analyze_post(post: dict[str, Any]) -> dict[str, Any]:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(account, shortcode) DO UPDATE SET classification = excluded.classification, client = excluded.client, product = excluded.product, analysis_json = excluded.analysis_json, published_at = excluded.published_at, last_analyzed_at = excluded.last_analyzed_at""", (account, shortcode, analysis["classification"], analysis.get("client"), analysis.get("product"), _json(analysis), review_status, override, post.get("published_at"), first, now))
     return {**analysis, "account": account, "shortcode": shortcode, "published_at": post.get("published_at"), "first_detected_at": first, "last_analyzed_at": now, "review_status": review_status}
+
+
+def _promo_stack_context(conn: Any, account: str, shortcode: str) -> dict[str, Any]:
+    """Return persisted stack metadata and confirmed promo corroboration."""
+    post_key = f"{account}:{shortcode}"
+    row = conn.execute("SELECT stack_id FROM topic_stack_members WHERE post_key = ?", (post_key,)).fetchone()
+    if not row:
+        return {"stack_id": None, "stack_size": 1, "support_count": 0}
+    stack_id = row["stack_id"]
+    members = conn.execute("SELECT post_key FROM topic_stack_members WHERE stack_id = ?", (stack_id,)).fetchall()
+    member_keys = [item["post_key"] for item in members]
+    if not member_keys:
+        return {"stack_id": stack_id, "stack_size": 1, "support_count": 0}
+    marks = ",".join("?" for _ in member_keys)
+    peer_rows = conn.execute(
+        f"SELECT classification, client FROM promo_opportunities WHERE account || ':' || shortcode IN ({marks}) AND NOT (account = ? AND shortcode = ?)",
+        (*member_keys, account, shortcode),
+    ).fetchall()
+    support_count = sum(1 for peer in peer_rows if peer["classification"] in {"disclosed", "likely"})
+    return {"stack_id": stack_id, "stack_size": len(member_keys), "support_count": support_count}
+
+
+def _opportunity_select(extra: str = "") -> str:
+    extra_select = f", {extra}" if extra else ""
+    return f"""SELECT o.*, p.id AS post_id, p.cover_image_path, p.cover_source_url, p.permalink{extra_select},
+                     sm.stack_id, COALESCE(sc.stack_size, 1) AS stack_size
+              FROM promo_opportunities o
+              LEFT JOIN dashboard_posts p ON p.account = o.account AND p.shortcode = o.shortcode
+              LEFT JOIN topic_stack_members sm ON sm.post_key = o.account || ':' || o.shortcode
+              LEFT JOIN (SELECT stack_id, COUNT(*) AS stack_size FROM topic_stack_members GROUP BY stack_id) sc ON sc.stack_id = sm.stack_id"""
+
+
+def _account_metadata(conn: Any, account: str) -> dict[str, Any]:
+    try:
+        row = conn.execute("SELECT group_name AS account_group, label AS account_group_label FROM accounts WHERE handle = ?", (account,)).fetchone()
+    except Exception:
+        # Lightweight promo unit tests and older local databases may not have
+        # the shared account catalog yet.
+        return {}
+    return dict(row) if row else {}
 
 
 def _post_rows(conn: Any, account: str | None = None, from_date: str | None = None, to_date: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
@@ -121,10 +190,13 @@ def list_opportunities(*, client: str | None = None, account: str | None = None,
         stamp, cur_account, cur_shortcode = (cursor.split("|", 2) + ["", ""])[:3]
         clauses.append("(o.first_detected_at, o.account, o.shortcode) < (?, ?, ?)"); params.extend([stamp, cur_account, cur_shortcode])
     with connect() as conn:
-        rows = conn.execute(f"SELECT o.*, p.id AS post_id, p.cover_image_path, p.cover_source_url, p.permalink FROM promo_opportunities o LEFT JOIN dashboard_posts p ON p.account = o.account AND p.shortcode = o.shortcode WHERE {' AND '.join(clauses)} ORDER BY o.first_detected_at DESC, o.account, o.shortcode LIMIT ?", (*params, max(1, min(limit, 100)))).fetchall()
+        _initialize_topic_stacks(conn)
+        rows = conn.execute(f"{_opportunity_select()} WHERE {' AND '.join(clauses)} ORDER BY o.first_detected_at DESC, o.account, o.shortcode LIMIT ?", (*params, max(1, min(limit, 100)))).fetchall()
+        account_metadata = {row["account"]: _account_metadata(conn, row["account"]) for row in rows}
     items = []
     for row in rows:
         row = dict(row)
+        row.update(account_metadata.get(row["account"], {}))
         item = _row_item(row); item["cover_image_path"] = row.get("cover_image_path"); item["cover_source_url"] = row.get("cover_source_url"); item["permalink"] = row.get("permalink"); item["cover_url"] = f"/api/dashboard/covers/{row['account']}/{row['post_id']}" if row.get("post_id") is not None else row.get("cover_source_url")
         items.append(item)
     next_cursor = None
@@ -135,9 +207,12 @@ def list_opportunities(*, client: str | None = None, account: str | None = None,
 
 def get_opportunity(account: str, shortcode: str) -> dict[str, Any] | None:
     with connect() as conn:
-        row = conn.execute("SELECT o.*, p.id AS post_id, p.cover_image_path, p.cover_source_url, p.permalink, p.caption, p.raw_json FROM promo_opportunities o LEFT JOIN dashboard_posts p ON p.account = o.account AND p.shortcode = o.shortcode WHERE o.account = ? AND o.shortcode = ?", (account, shortcode)).fetchone()
+        _initialize_topic_stacks(conn)
+        row = conn.execute(f"{_opportunity_select('p.caption, p.raw_json')} WHERE o.account = ? AND o.shortcode = ?", (account, shortcode)).fetchone()
+        account_metadata = _account_metadata(conn, account)
     if not row: return None
     row = dict(row)
+    row.update(account_metadata)
     caption = row.get("caption") or ""
     if not caption and row.get("raw_json"):
         try:

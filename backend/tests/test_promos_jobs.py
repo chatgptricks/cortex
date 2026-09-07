@@ -67,3 +67,52 @@ def test_reanalysis_removes_opportunity_when_signal_disappears(monkeypatch):
     promos.analyze_post({**base, "caption": "Sponsored by @higgsfield"})
     promos.analyze_post({**base, "caption": "A regular editorial update about technology"})
     assert connection.execute("SELECT COUNT(*) FROM promo_opportunities").fetchone()[0] == 0
+
+
+def test_stack_confirmation_boosts_relationship_signal_without_creating_one(monkeypatch):
+    connection = _connection()
+    connection.execute("CREATE TABLE topic_stack_members (post_key TEXT PRIMARY KEY, stack_id TEXT NOT NULL, words TEXT NOT NULL, posted_at REAL NOT NULL)")
+    connection.executemany(
+        "INSERT INTO topic_stack_members(post_key, stack_id, words, posted_at) VALUES (?, ?, '[]', 0)",
+        [("competitor:confirmed", "stack-a"), ("competitor:review", "stack-a")],
+    )
+    connection.execute(
+        "INSERT INTO promo_opportunities(account, shortcode, classification, client, analysis_json, review_status, first_detected_at, last_analyzed_at) VALUES ('competitor', 'confirmed', 'disclosed', 'Higgsfield', '{}', 'new', '2026-09-01', '2026-09-01')"
+    )
+
+    @contextmanager
+    def connect():
+        yield connection
+
+    monkeypatch.setattr(promos, "connect", connect)
+    result = promos.analyze_post({
+        "account": "competitor",
+        "shortcode": "review",
+        "caption": "Partner @higgsfield",
+        "published_at": "2026-09-01T12:00:00+00:00",
+    })
+    assert result["classification"] == "likely"
+    assert result["stack_size"] == 2
+    assert result["stack_support_count"] == 1
+    assert "promo cluster support" in result["signals"]
+
+
+def test_list_opportunities_exposes_stack_metadata(monkeypatch):
+    connection = _connection()
+    connection.execute("CREATE TABLE topic_stack_members (post_key TEXT PRIMARY KEY, stack_id TEXT NOT NULL, words TEXT NOT NULL, posted_at REAL NOT NULL)")
+    connection.executemany(
+        "INSERT INTO topic_stack_members(post_key, stack_id, words, posted_at) VALUES (?, ?, '[]', 0)",
+        [("competitor:one", "stack-b"), ("competitor:two", "stack-b")],
+    )
+    connection.execute(
+        "INSERT INTO promo_opportunities(account, shortcode, classification, client, analysis_json, review_status, first_detected_at, last_analyzed_at) VALUES ('competitor', 'one', 'disclosed', 'Higgsfield', '{}', 'new', '2026-09-01', '2026-09-01')"
+    )
+
+    @contextmanager
+    def connect():
+        yield connection
+
+    monkeypatch.setattr(promos, "connect", connect)
+    result = promos.list_opportunities()
+    assert result["items"][0]["stack_id"] == "stack-b"
+    assert result["items"][0]["stack_size"] == 2
