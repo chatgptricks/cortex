@@ -1392,13 +1392,7 @@ def _short_term_reels_payload(handles: list[str], results_limit: int, now: datet
 
 
 def _is_reel_item(item: dict[str, Any]) -> bool:
-    """Recognise a Reel in the general Instagram Scraper payload.
-
-    The profile feed can contain clips alongside ordinary posts, so filtering
-    here prevents the Posts-only choice from silently importing Reels. The
-    dedicated Reel actor needs no such filter because every one of its rows is
-    already a Reel.
-    """
+    """Recognise a Reel in either Instagram actor's payload."""
     product_type = str(item.get("productType") or "").lower()
     item_type = str(item.get("type") or "").lower()
     url = str(item.get("url") or "").lower()
@@ -1463,10 +1457,11 @@ def _collect_short_term_items(
 ) -> dict[str, list[dict[str, Any]]]:
     """Fetch each configured account surface in two batched, small runs.
 
-    `both` deliberately means the union of the Posts tab (with clips removed)
-    and the Reels tab, rather than trusting the feed actor to expose every
-    Reel. A single actor failure is still allowed to surface to the scheduler,
-    matching the pre-existing shared-fetch behaviour.
+    `posts` uses the normal profile scraper exactly as returned, including any
+    Reels that actor exposes in the profile feed. `both` adds the dedicated
+    Reels-tab actor to that feed and deduplicates the union. A single actor
+    failure is still allowed to surface to the scheduler, matching the
+    pre-existing shared-fetch behaviour.
     """
     items_by_account: dict[str, list[dict[str, Any]]] = {account: [] for account in configs}
 
@@ -1484,8 +1479,6 @@ def _collect_short_term_items(
                 continue  # A profile with no posts inside the window is valid.
             if item.get("error"):
                 raise ApifySyncError(f"Apify returned an account error: {item.get('error')}")
-            if _is_reel_item(item):
-                continue
             source = re.fullmatch(r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9_.]+)/?(?:\?.*)?", str(item.get("inputUrl") or ""))
             source_account = post_owner_to_account.get(source.group(1).lower()) if source else None
             account = source_account or post_owner_to_account.get(_item_owner_username(item))
@@ -1930,9 +1923,10 @@ def run_backfill(
         post_items = _run_apify_actor_and_fetch(
             post_payload, max_wait_seconds=1800.0, on_progress=on_progress
         )
-        # The feed actor also exposes some clips. The Posts choice represents
-        # the profile's non-Reel posts, so remove those rows before storing.
-        items.extend(item for item in post_items if not _is_reel_item(item))
+        # Keep the normal profile scraper's complete result set. That actor
+        # can return regular Reels alongside images and carousels; only the
+        # separate Reels-tab actor is optional and controlled by scrape_mode.
+        items.extend(post_items)
     if cfg["scrape_mode"] in {"reels", "both"}:
         reel_items = _run_apify_actor_and_fetch(
             reel_payload,
