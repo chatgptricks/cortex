@@ -132,10 +132,17 @@ def list_opportunities(*, client: str | None = None, account: str | None = None,
 
 def get_opportunity(account: str, shortcode: str) -> dict[str, Any] | None:
     with connect() as conn:
-        row = conn.execute("SELECT o.*, p.id AS post_id, p.cover_image_path, p.cover_source_url, p.permalink, p.caption FROM promo_opportunities o LEFT JOIN dashboard_posts p ON p.account = o.account AND p.shortcode = o.shortcode WHERE o.account = ? AND o.shortcode = ?", (account, shortcode)).fetchone()
+        row = conn.execute("SELECT o.*, p.id AS post_id, p.cover_image_path, p.cover_source_url, p.permalink, p.caption, p.raw_json FROM promo_opportunities o LEFT JOIN dashboard_posts p ON p.account = o.account AND p.shortcode = o.shortcode WHERE o.account = ? AND o.shortcode = ?", (account, shortcode)).fetchone()
     if not row: return None
     row = dict(row)
-    item = _row_item(row); item.update({"cover_image_path": row.get("cover_image_path"), "cover_source_url": row.get("cover_source_url"), "permalink": row.get("permalink"), "cover_url": f"/api/dashboard/covers/{row['account']}/{row['post_id']}" if row.get("post_id") is not None else row.get("cover_source_url"), "caption": row.get("caption") or ""})
+    caption = row.get("caption") or ""
+    if not caption and row.get("raw_json"):
+        try:
+            payload = json.loads(row["raw_json"])
+            caption = str(payload.get("caption") or "") if isinstance(payload, dict) else ""
+        except (TypeError, ValueError):
+            caption = ""
+    item = _row_item(row); item.update({"cover_image_path": row.get("cover_image_path"), "cover_source_url": row.get("cover_source_url"), "permalink": row.get("permalink"), "cover_url": f"/api/dashboard/covers/{row['account']}/{row['post_id']}" if row.get("post_id") is not None else row.get("cover_source_url"), "caption": caption})
     return item
 
 
