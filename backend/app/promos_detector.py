@@ -39,7 +39,7 @@ _URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+", re.I)
 _HASHTAG_RE = re.compile(r"(?<![\w])#([\wÀ-ÿ-]+)", re.UNICODE)
 _MENTION_RE = re.compile(r"(?<![\w])@([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)")
 _CTA_KEYWORD_RE = re.compile(r"\b(comment|comenta|reply|responde|dm|env[ií]a|send)\s+[\"'“”]?([A-Za-z0-9][A-Za-z0-9_-]{1,32})", re.I)
-_CODE_RE = re.compile(r"\b(?:use\s+)?(?:code|c[oó]digo)\s*[:#-]?\s*([A-Za-z0-9_-]{3,32})", re.I)
+_CODE_RE = re.compile(r"\b(?:use\s+(?:my\s+)?code|(?:discount|promo|referral)\s+code|c[oó]digo\s+de\s+descuento)\s*[:#-]?\s*([A-Za-z0-9_-]{3,32})", re.I)
 _GENERIC_CTA_WORDS = {"information", "info", "details", "detail", "data", "message", "messages", "link", "more", "questions", "replies", "reply", "response", "responses", "answer", "answers", "and", "in", "to", "back", "operators", "human"}
 
 

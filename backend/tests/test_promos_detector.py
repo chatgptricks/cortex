@@ -53,3 +53,9 @@ def test_narrative_replies_and_mentions_are_not_a_promo():
 def test_generic_cta_without_commercial_relationship_is_not_a_promo():
     result = detect_promo({"caption": "Comment below and tell us what you think."})
     assert result["classification"] == "not_promo"
+
+
+def test_editorial_code_phrase_is_not_a_promo_code():
+    result = detect_promo({"caption": "The code and model are publicly available."})
+    assert result["promo_code"] is None
+    assert result["classification"] == "not_promo"
