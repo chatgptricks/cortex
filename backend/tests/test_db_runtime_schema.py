@@ -30,6 +30,11 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
     _ensure_runtime_schema_extensions(connection)
     _ensure_runtime_schema_extensions(connection)
 
+    for table in ("promo_scans", "promo_opportunities", "promo_jobs"):
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+
     columns = {
         row["name"]: row
         for row in connection.execute("PRAGMA table_info(dashboard_users)").fetchall()

@@ -33,7 +33,7 @@ _CTA = [
 ]
 _URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+", re.I)
 _HASHTAG_RE = re.compile(r"(?<![\w])#([\wÀ-ÿ-]+)", re.UNICODE)
-_MENTION_RE = re.compile(r"(?<![\w])@([A-Za-z0-9._]+)")
+_MENTION_RE = re.compile(r"(?<![\w])@([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)")
 _CTA_KEYWORD_RE = re.compile(r"\b(?:comment|comenta|reply|responde|dm|env[ií]a|send)\s+[\"'“”]?([A-Za-z0-9][A-Za-z0-9_-]{1,32})", re.I)
 _CODE_RE = re.compile(r"\b(?:use\s+)?(?:code|c[oó]digo)\s*[:#-]?\s*([A-Za-z0-9_-]{3,32})", re.I)
 
@@ -83,24 +83,27 @@ def detect_promo(post: dict[str, Any]) -> dict[str, Any]:
     text = _normalize(caption)
     evidence: list[dict[str, str]] = []
     explicit = False
+    negated_explicit = False
     for name, pattern in _EXPLICIT:
         match = re.search(pattern, text, re.I)
         if match:
             snippet = caption[max(0, match.start() - 45): match.end() + 90]
-            negated = bool(re.search(r"(?:not|no|sin)\s+(?:a\s+)?(?:sponsored|paid|advertisement|publicidad)", text[max(0, match.start() - 18):match.start() + 5], re.I))
+            negated = bool(re.search(r"(?:not|no|sin)\s+(?:a\s+)?(?:sponsored|paid|advertisement|publicidad)", text[max(0, match.start() - 22):match.end() + 2], re.I))
             evidence.append(_evidence("explicit", name, snippet))
             explicit = explicit or not negated
+            negated_explicit = negated_explicit or negated
     for family, rules in (("relationship", _RELATION), ("affiliate", _AFFILIATE), ("cta", _CTA)):
         for name, pattern in rules:
             match = re.search(pattern, text, re.I)
             if match:
                 evidence.append(_evidence(family, name, caption[max(0, match.start() - 45): match.end() + 90]))
     hashtags += _HASHTAG_RE.findall(caption)
+    mentions += [value for value in _MENTION_RE.findall(caption) if value.casefold() not in {item.casefold() for item in mentions}]
     for tag in hashtags:
         low = tag.casefold()
         if any(low.endswith(suffix) and len(low) > len(suffix) + 2 for suffix in ("sponsored", "partner", "partnership", "collab", "affiliate")):
             evidence.append(_evidence("hashtag", "compound hashtag", f"#{tag}"))
-            explicit = explicit or low.endswith(("sponsored", "partnership"))
+            explicit = explicit or low.endswith(("sponsored", "partnership", "partner"))
     paid_meta = post.get("paid_partnership")
     if paid_meta is True or paid_meta == 1:
         evidence.append(_evidence("metadata", "paid partnership metadata", "paid_partnership=true", "metadata"))
@@ -111,11 +114,13 @@ def detect_promo(post: dict[str, Any]) -> dict[str, Any]:
     code = code_match.group(1) if code_match else None
     candidates = _candidate_names(caption, hashtags, mentions, urls)
     product = None
-    product_match = re.search(r"(?:try|check out|meet|conoce|presenting|introducing)\s+([A-Z][\w.-]{2,}(?:\s+[A-Z][\w.-]{2,}){0,3})", caption)
+    product_match = re.search(r"(?:try|check out|meet|conoce|presenting|introducing)\s+([A-Z][\w.-]{2,}(?:\s+[A-Z][\w.-]{2,}){0,3})", caption, re.I)
     if product_match:
         product = product_match.group(1).strip(" .,!?\n")
     if explicit:
         classification = "disclosed"
+    elif negated_explicit and not any(item["family"] != "explicit" for item in evidence):
+        classification = "not_promo"
     elif any(item["family"] == "affiliate" for item in evidence) and (candidates or urls or code):
         classification = "likely"
     elif len(evidence) >= 2 and (candidates or urls or cta or code):

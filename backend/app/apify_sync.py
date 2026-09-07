@@ -1246,6 +1246,25 @@ def _insert_new_dashboard_posts(
 
             summary["added"] += 1
             summary["items"].append({"shortcode": shortcode, "status": "added", "published_at": _published_at(item)})
+            # Promos analysis is a post-commit side effect: a failed detector
+            # must never roll back the paid Apify import. Keep it synchronous
+            # for the new post so the hidden workspace sees fresh signals
+            # immediately, while the durable backfill repairs older rows.
+            try:
+                with connect() as promo_conn:
+                    account_row = promo_conn.execute("SELECT group_name FROM accounts WHERE handle = ?", (account,)).fetchone()
+                if account_row and dict(account_row).get("group_name") == "competitors":
+                    from .promos import analyze_post
+                    analyze_post({
+                        "account": account, "shortcode": shortcode,
+                        "caption": caption, "first_comment": extracted.get("first_comment"),
+                        "hashtags": extracted.get("hashtags"), "mentions": extracted.get("mentions"),
+                        "paid_partnership": extracted.get("paid_partnership"),
+                        "permalink": permalink, "published_at": _published_at(item),
+                    })
+            except Exception:
+                logger = logging.getLogger(__name__)
+                logger.warning("Promo analysis failed for %s/%s", account, shortcode, exc_info=True)
             _emit(
                 on_progress,
                 phase="inserting",
