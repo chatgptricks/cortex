@@ -38,8 +38,22 @@ _COMMERCIAL = [
 _URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+", re.I)
 _HASHTAG_RE = re.compile(r"(?<![\w])#([\wÀ-ÿ-]+)", re.UNICODE)
 _MENTION_RE = re.compile(r"(?<![\w])@([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)")
-_CTA_KEYWORD_RE = re.compile(r"\b(?:comment|comenta|reply|responde|dm|env[ií]a|send)\s+[\"'“”]?([A-Za-z0-9][A-Za-z0-9_-]{1,32})", re.I)
+_CTA_KEYWORD_RE = re.compile(r"\b(comment|comenta|reply|responde|dm|env[ií]a|send)\s+[\"'“”]?([A-Za-z0-9][A-Za-z0-9_-]{1,32})", re.I)
 _CODE_RE = re.compile(r"\b(?:use\s+)?(?:code|c[oó]digo)\s*[:#-]?\s*([A-Za-z0-9_-]{3,32})", re.I)
+_GENERIC_CTA_WORDS = {"information", "info", "details", "detail", "data", "message", "messages", "link", "more", "questions"}
+
+
+def _extract_cta_keyword(caption: str) -> tuple[str, str] | None:
+    """Extract an intentional comment/DM keyword, excluding narrative prose."""
+    for match in _CTA_KEYWORD_RE.finditer(caption):
+        action, candidate = match.group(1), match.group(2)
+        if candidate.casefold() in _GENERIC_CTA_WORDS:
+            continue
+        # "send information back/to ..." describes data flow, not an audience CTA.
+        if action.casefold() == "send" and re.match(r"\s+(?:back|to|toward)\b", caption[match.end():], re.I):
+            continue
+        return action, candidate
+    return None
 
 
 def _normalize(value: str) -> str:
@@ -112,9 +126,9 @@ def detect_promo(post: dict[str, Any]) -> dict[str, Any]:
     if paid_meta is True or paid_meta == 1:
         evidence.append(_evidence("metadata", "paid partnership metadata", "paid_partnership=true", "metadata"))
         explicit = True
-    keyword_match = _CTA_KEYWORD_RE.search(caption)
+    keyword_match = _extract_cta_keyword(caption)
     code_match = _CODE_RE.search(caption)
-    cta = {"action": "comment_or_dm", "keyword": keyword_match.group(1)} if keyword_match else None
+    cta = {"action": "comment_or_dm", "keyword": keyword_match[1]} if keyword_match else None
     code = code_match.group(1) if code_match else None
     candidates = _candidate_names(caption, hashtags, mentions, urls)
     product = None
