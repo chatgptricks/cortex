@@ -44,6 +44,9 @@ def analyze_post(post: dict[str, Any]) -> dict[str, Any]:
         conn.execute("""INSERT INTO promo_scans(account, shortcode, input_hash, detector_version, status, attempts, updated_at)
                        VALUES (?, ?, ?, ?, 'done', 1, ?)
                        ON CONFLICT(account, shortcode) DO UPDATE SET input_hash = excluded.input_hash, detector_version = excluded.detector_version, status = 'done', attempts = promo_scans.attempts + 1, error = NULL, updated_at = excluded.updated_at""", (account, shortcode, digest, DETECTOR_VERSION, now))
+        if analysis["classification"] == "not_promo":
+            conn.execute("DELETE FROM promo_opportunities WHERE account = ? AND shortcode = ?", (account, shortcode))
+            return {**analysis, "account": account, "shortcode": shortcode, "published_at": post.get("published_at"), "first_detected_at": None, "last_analyzed_at": now, "review_status": "not_promo"}
         previous_row = conn.execute("SELECT first_detected_at, review_status, review_override_json FROM promo_opportunities WHERE account = ? AND shortcode = ?", (account, shortcode)).fetchone()
         previous = dict(previous_row) if previous_row else None
         first = previous["first_detected_at"] if previous and previous.get("first_detected_at") else first
