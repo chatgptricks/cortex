@@ -42,3 +42,14 @@ def test_narrative_send_information_is_not_an_automation_cta():
     result = detect_promo({"caption": "and send information back to human operators"})
     assert result["cta"] is None
     assert result["classification"] == "not_promo"
+
+
+def test_narrative_replies_and_mentions_are_not_a_promo():
+    result = detect_promo({"caption": "Send replies—all with ChatGPT on your Mac. Now available in ChatGPT Work."})
+    assert result["cta"] is None
+    assert result["classification"] == "not_promo"
+
+
+def test_generic_cta_without_commercial_relationship_is_not_a_promo():
+    result = detect_promo({"caption": "Comment below and tell us what you think."})
+    assert result["classification"] == "not_promo"
