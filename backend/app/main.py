@@ -5604,35 +5604,40 @@ def dashboard_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
 
 
 @app.post("/api/dashboard/posts/catch-up")
-def dashboard_posts_catch_up(password: Annotated[str, Form()]) -> dict[str, Any]:
+def dashboard_posts_catch_up(
+    password: Annotated[str, Form()],
+    lookback_hours: Annotated[int, Form()] = 24,
+) -> dict[str, Any]:
     """One-off recovery for an interrupted Dashboard post cycle.
 
     This intentionally uses one batched *posts* actor request across active
-    accounts. It reaches farther back than the inexpensive 12-hour cadence,
-    but never includes the separate Reels actor; Reels stay a deliberately
-    targeted, manual operation.
+    accounts. The caller can widen the recovery window up to one week, but it
+    still uses only the normal profile actor and the database keeps only
+    shortcodes that are missing. It never includes the separate Reels actor.
     """
     if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
         password.strip(), TRICKS_DASH_REFRESH_PASSWORD
     ):
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    if lookback_hours < 1 or lookback_hours > 168:
+        raise HTTPException(status_code=400, detail="lookback_hours must be between 1 and 168.")
 
     accounts = list_accounts(active_only=True)
     handles = [account["handle"] for account in accounts]
     try:
         results = run_short_term_cycle_batch(
             handles,
-            # This is a recovery pass, not the scheduled cadence. A larger
-            # per-profile cap makes a 24-hour gap recoverable in one run.
+            # This is a recovery pass, not the scheduled cadence. Keep the
+            # same per-profile result cap while widening only the time window.
             results_limit=50,
             include_reels=False,
-            lookback_hours=24,
+            lookback_hours=lookback_hours,
         )
     except ApifySyncError as exc:
         raise HTTPException(status_code=502, detail=f"Post catch-up failed: {exc}") from exc
 
     return {
-        "lookback_hours": 24,
+        "lookback_hours": lookback_hours,
         "accounts": handles,
         "results": results,
     }
