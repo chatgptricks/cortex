@@ -717,6 +717,7 @@ def init_db() -> None:
             """
         )
         stripped = conn.total_changes - before_strip
+        _ensure_runtime_schema_extensions(conn)
     if stripped:
         _vacuum(stripped)
 def _vacuum(stripped_rows: int) -> None:
@@ -785,6 +786,50 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
                updated_at TEXT NOT NULL
            )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS promo_scans (
+               account TEXT NOT NULL,
+               shortcode TEXT NOT NULL,
+               input_hash TEXT NOT NULL,
+               detector_version TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'pending',
+               attempts INTEGER NOT NULL DEFAULT 0,
+               error TEXT,
+               updated_at TEXT NOT NULL,
+               PRIMARY KEY(account, shortcode)
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS promo_opportunities (
+               account TEXT NOT NULL,
+               shortcode TEXT NOT NULL,
+               classification TEXT NOT NULL,
+               client TEXT,
+               product TEXT,
+               analysis_json TEXT NOT NULL DEFAULT '{}',
+               review_status TEXT NOT NULL DEFAULT 'new',
+               review_override_json TEXT,
+               published_at TEXT,
+               first_detected_at TEXT NOT NULL,
+               last_analyzed_at TEXT NOT NULL,
+               PRIMARY KEY(account, shortcode)
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS promo_jobs (
+               job_id TEXT PRIMARY KEY,
+               status TEXT NOT NULL,
+               requested_from TEXT,
+               requested_to TEXT,
+               processed INTEGER NOT NULL DEFAULT 0,
+               total INTEGER NOT NULL DEFAULT 0,
+               error TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+           )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_opportunities_date ON promo_opportunities(first_detected_at DESC, account, shortcode)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_scans_status ON promo_scans(status, updated_at)")
 
 
 # --- Sentient Dash users (Google sign-in allowlist + roles) ----------------

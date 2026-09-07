@@ -75,6 +75,7 @@ from .db import (
 )
 from .sentient_ocr import sentient_ocr_status
 from .scheduler import start_scheduler
+from .promos import create_backfill, get_job, get_opportunity, list_opportunities, update_opportunity
 from .queue_rules import (
     SCHEDULER_END,
     SCHEDULER_START,
@@ -5834,6 +5835,60 @@ def admin_list_accounts() -> dict[str, Any]:
         account["oldest_post_at"] = stat["oldest_post_at"] if stat else None
 
     return {"accounts": accounts}
+
+
+@app.get("/api/admin/promos")
+def admin_promos(
+    client: str | None = None,
+    account: str | None = None,
+    classification: str | None = None,
+    review: str | None = None,
+    limit: int = Query(40, ge=1, le=100),
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    return list_opportunities(client=client, account=account, classification=classification, review=review, limit=limit, cursor=cursor)
+
+
+@app.get("/api/admin/promos/jobs/{job_id}")
+def admin_promos_job(job_id: str) -> dict[str, Any]:
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Promo job not found")
+    return job
+
+
+@app.get("/api/admin/promos/{account}/{shortcode}")
+def admin_promo_detail(account: str, shortcode: str) -> dict[str, Any]:
+    item = get_opportunity(account, shortcode)
+    if not item:
+        raise HTTPException(status_code=404, detail="Promo opportunity not found")
+    return item
+
+
+@app.patch("/api/admin/promos/{account}/{shortcode}")
+async def admin_promo_update(account: str, shortcode: str, request: Request) -> dict[str, Any]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON object required")
+    item = update_opportunity(account, shortcode, payload, str(getattr(request.state, "user_email", "unknown")))
+    if not item:
+        raise HTTPException(status_code=404, detail="Promo opportunity not found")
+    return item
+
+
+@app.post("/api/admin/promos/backfill")
+async def admin_promos_backfill(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        payload = {}
+    limit = max(1, min(int(payload.get("limit", 500)), 2000))
+    job_id = create_backfill(
+        from_date=str(payload.get("from_date")) if payload.get("from_date") else None,
+        to_date=str(payload.get("to_date")) if payload.get("to_date") else None,
+        account=str(payload.get("account")) if payload.get("account") else None,
+        limit=limit,
+    )
+    return {"job_id": job_id, "status": "queued"}
 
 
 @app.get("/api/admin/users")
