@@ -114,9 +114,9 @@ def detect_promo(post: dict[str, Any]) -> dict[str, Any]:
     code = code_match.group(1) if code_match else None
     candidates = _candidate_names(caption, hashtags, mentions, urls)
     product = None
-    product_match = re.search(r"(?:try|check out|meet|conoce|presenting|introducing)\s+([A-Z][\w.-]{2,}(?:\s+[A-Z][\w.-]{2,}){0,3})", caption, re.I)
+    product_match = re.search(r"(?i:try|check out|meet|conoce|presenting|introducing)\s+([A-Z][\w.-]{2,}(?:\s+[A-Z][\w.-]{2,}){0,3})", caption)
     if product_match:
-        product = product_match.group(1).strip(" .,!?\n")
+        product = re.split(r"\s+(?:comment|reply|dm|for the link|link in bio)\b", product_match.group(1), maxsplit=1, flags=re.I)[0].strip(" .,!?\n")
     if explicit:
         classification = "disclosed"
     elif negated_explicit and not any(item["family"] != "explicit" for item in evidence):
