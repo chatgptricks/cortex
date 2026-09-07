@@ -118,11 +118,11 @@ def list_opportunities(*, client: str | None = None, account: str | None = None,
         stamp, cur_account, cur_shortcode = (cursor.split("|", 2) + ["", ""])[:3]
         clauses.append("(o.first_detected_at, o.account, o.shortcode) < (?, ?, ?)"); params.extend([stamp, cur_account, cur_shortcode])
     with connect() as conn:
-        rows = conn.execute(f"SELECT o.*, p.cover_image_path, p.cover_source_url, p.permalink FROM promo_opportunities o LEFT JOIN dashboard_posts p ON p.account = o.account AND p.shortcode = o.shortcode WHERE {' AND '.join(clauses)} ORDER BY o.first_detected_at DESC, o.account, o.shortcode LIMIT ?", (*params, max(1, min(limit, 100)))).fetchall()
+        rows = conn.execute(f"SELECT o.*, p.id AS post_id, p.cover_image_path, p.cover_source_url, p.permalink FROM promo_opportunities o LEFT JOIN dashboard_posts p ON p.account = o.account AND p.shortcode = o.shortcode WHERE {' AND '.join(clauses)} ORDER BY o.first_detected_at DESC, o.account, o.shortcode LIMIT ?", (*params, max(1, min(limit, 100)))).fetchall()
     items = []
     for row in rows:
         row = dict(row)
-        item = _row_item(row); item["cover_image_path"] = row.get("cover_image_path"); item["cover_source_url"] = row.get("cover_source_url"); item["permalink"] = row.get("permalink")
+        item = _row_item(row); item["cover_image_path"] = row.get("cover_image_path"); item["cover_source_url"] = row.get("cover_source_url"); item["permalink"] = row.get("permalink"); item["cover_url"] = f"/api/dashboard/covers/{row['account']}/{row['post_id']}" if row.get("post_id") is not None else row.get("cover_source_url")
         items.append(item)
     next_cursor = None
     if len(items) == min(limit, 100):
@@ -132,10 +132,10 @@ def list_opportunities(*, client: str | None = None, account: str | None = None,
 
 def get_opportunity(account: str, shortcode: str) -> dict[str, Any] | None:
     with connect() as conn:
-        row = conn.execute("SELECT o.*, p.cover_image_path, p.cover_source_url, p.permalink, p.caption FROM promo_opportunities o LEFT JOIN dashboard_posts p ON p.account = o.account AND p.shortcode = o.shortcode WHERE o.account = ? AND o.shortcode = ?", (account, shortcode)).fetchone()
+        row = conn.execute("SELECT o.*, p.id AS post_id, p.cover_image_path, p.cover_source_url, p.permalink, p.caption FROM promo_opportunities o LEFT JOIN dashboard_posts p ON p.account = o.account AND p.shortcode = o.shortcode WHERE o.account = ? AND o.shortcode = ?", (account, shortcode)).fetchone()
     if not row: return None
     row = dict(row)
-    item = _row_item(row); item.update({"cover_image_path": row.get("cover_image_path"), "cover_source_url": row.get("cover_source_url"), "permalink": row.get("permalink"), "caption": row.get("caption") or ""})
+    item = _row_item(row); item.update({"cover_image_path": row.get("cover_image_path"), "cover_source_url": row.get("cover_source_url"), "permalink": row.get("permalink"), "cover_url": f"/api/dashboard/covers/{row['account']}/{row['post_id']}" if row.get("post_id") is not None else row.get("cover_source_url"), "caption": row.get("caption") or ""})
     return item
 
 
