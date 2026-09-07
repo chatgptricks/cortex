@@ -30,3 +30,9 @@ def test_paid_metadata_without_caption_is_disclosed_unknown():
     assert result["classification"] == "disclosed"
     assert result["client"] is None
     assert result["product"] is None
+
+
+def test_vague_commercial_language_with_brand_is_likely():
+    result = detect_promo({"caption": "Built with @higgsfield — available now."})
+    assert result["classification"] == "likely"
+    assert result["client"] == "higgsfield"

@@ -31,6 +31,10 @@ _CTA = [
     ("link in bio", r"\blink\s+in\s+bio\b|\benlace\s+en\s+bio\b"),
     ("try", r"\b(?:try|check out|get access|sign up|prueba|reg[ií]strate)\b"),
 ]
+_COMMERCIAL = [
+    ("availability", r"\b(?:available|launching|now live|download|start using)\b"),
+    ("built with", r"\b(?:built|made|created)\s+(?:with|using)\b"),
+]
 _URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+", re.I)
 _HASHTAG_RE = re.compile(r"(?<![\w])#([\wÀ-ÿ-]+)", re.UNICODE)
 _MENTION_RE = re.compile(r"(?<![\w])@([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)")
@@ -92,7 +96,7 @@ def detect_promo(post: dict[str, Any]) -> dict[str, Any]:
             evidence.append(_evidence("explicit", name, snippet))
             explicit = explicit or not negated
             negated_explicit = negated_explicit or negated
-    for family, rules in (("relationship", _RELATION), ("affiliate", _AFFILIATE), ("cta", _CTA)):
+    for family, rules in (("relationship", _RELATION), ("affiliate", _AFFILIATE), ("cta", _CTA), ("commercial", _COMMERCIAL)):
         for name, pattern in rules:
             match = re.search(pattern, text, re.I)
             if match:
@@ -120,6 +124,8 @@ def detect_promo(post: dict[str, Any]) -> dict[str, Any]:
     if explicit:
         classification = "disclosed"
     elif negated_explicit and not any(item["family"] != "explicit" for item in evidence):
+        classification = "not_promo"
+    elif not candidates and not urls and not cta and not code and not any(item["family"] in {"relationship", "affiliate"} for item in evidence):
         classification = "not_promo"
     elif any(item["family"] == "affiliate" for item in evidence) and (candidates or urls or code):
         classification = "likely"
