@@ -30,7 +30,7 @@ def test_collect_short_term_items_uses_the_selected_profile_surface(monkeypatch)
 
     items = apify_sync._collect_short_term_items(configs, 20, datetime.now(UTC))
 
-    assert [item["shortCode"] for item in items["posts"]] == ["post-only"]
+    assert [item["shortCode"] for item in items["posts"]] == ["post-only", "feed-reel"]
     assert [item["shortCode"] for item in items["reels"]] == ["reel-only"]
     assert [item["shortCode"] for item in items["both"]] == ["both-post", "both-reel"]
     assert calls[0][0] == apify_sync.APIFY_ACTOR_ID
@@ -100,10 +100,10 @@ def test_empty_profile_does_not_discard_other_accounts_paid_posts(monkeypatch):
     assert result['active'][0]['shortCode'] == 'saved'
 
 
-def test_collaborator_reel_does_not_block_posts_and_profile_attribution_is_preserved(monkeypatch):
+def test_profile_feed_reel_is_kept_and_profile_attribution_is_preserved(monkeypatch):
     monkeypatch.setattr(apify_sync, '_fetch_apify_items', lambda *a, **k: [
         {'shortCode': 'reel', 'ownerUsername': 'collaborator', 'type': 'Video', 'productType': 'clips', 'inputUrl': 'https://www.instagram.com/active/'},
         {'shortCode': 'shared', 'ownerUsername': 'collaborator', 'type': 'Image', 'inputUrl': 'https://www.instagram.com/active/'},
     ])
     result = apify_sync._collect_short_term_items({'active': {'handle': 'active', 'scrape_mode': 'posts'}}, 20, datetime.now(UTC), include_reels=False)
-    assert [item['shortCode'] for item in result['active']] == ['shared']
+    assert [item['shortCode'] for item in result['active']] == ['reel', 'shared']
