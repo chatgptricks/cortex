@@ -1384,9 +1384,10 @@ def _short_term_reels_payload(handles: list[str], results_limit: int, now: datet
         "username": handles,
         "resultsLimit": results_limit,
         "skipPinnedPosts": True,
-        # Paid optional output from Apify's Reels actor. It is requested only
-        # for Reels, never for ordinary post-feed refreshes.
-        "includeTranscript": True,
+        # Keep the dedicated Reels actor transcript-free. Apify charges this
+        # add-on per started minute of audio, and transcripts are not needed
+        # by the current dashboard or Promos workflow.
+        "includeTranscript": False,
         "onlyPostsNewerThan": (now - timedelta(hours=_SHORT_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
@@ -1902,7 +1903,9 @@ def run_backfill(
     reel_payload: dict[str, Any] = {
         "username": [cfg["handle"]],
         "resultsLimit": results_limit,
-        "includeTranscript": True,
+        # Never pay for Apify's per-minute transcript add-on during a
+        # historical Reels import either.
+        "includeTranscript": False,
         # The Reels actor has its own pagination over the Reels tab. This is
         # intentionally not a /<handle>/reels URL passed to the profile actor:
         # that actor only accepts profile and individual-reel URLs.

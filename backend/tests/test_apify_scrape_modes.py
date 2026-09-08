@@ -40,7 +40,7 @@ def test_collect_short_term_items_uses_the_selected_profile_surface(monkeypatch)
     ]
     assert calls[1][0] == apify_sync.APIFY_REEL_ACTOR_ID
     assert calls[1][1]["username"] == ["reels", "both"]
-    assert calls[1][1]["includeTranscript"] is True
+    assert calls[1][1]["includeTranscript"] is False
 
 
 def test_automated_collection_never_starts_the_reels_actor(monkeypatch) -> None:
