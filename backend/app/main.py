@@ -804,7 +804,14 @@ def _dashboard_posts_payload(limit: int | None = None, offset: int = 0) -> dict[
         raise ValueError("Post page bounds must be positive.")
     accounts = list_accounts(active_only=True)
     group_by_handle = {a["handle"]: a["group"] for a in accounts}
-    canonical = next((a for a in accounts if a["is_canonical"]), None)
+    known_canonical = next((a for a in accounts if a["handle"] == "chatgptricks"), None)
+    # Production metadata is repaired during startup, but keep Research
+    # correct if a legacy account row is read during a rolling deploy before
+    # that repair has run. The canonical catalogue is always the `posts`
+    # table, regardless of the stale registry flag. Prefer the known handle
+    # even when another legacy row is incorrectly marked canonical.
+    canonical = ({**known_canonical, "is_canonical": True} if known_canonical else
+                 next((a for a in accounts if a["is_canonical"]), None))
 
     posts: list[dict[str, Any]] = []
 

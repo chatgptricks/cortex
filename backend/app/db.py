@@ -703,6 +703,22 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     # full bootstrap. Otherwise production would accept the UI form but fail
     # on its first account read after deployment.
     _ensure_column(conn, "accounts", "scrape_mode", "scrape_mode TEXT NOT NULL DEFAULT 'posts'")
+    # The original @chatgptricks catalogue lives in `posts`. A legacy account
+    # row created before the multi-account registry could retain the default
+    # `is_canonical = 0`, which silently made Research omit the entire
+    # historical catalogue after the Postgres cutover. Repair that metadata on
+    # every idempotent startup: chatgptricks is the one canonical account, and
+    # every other account belongs in dashboard_posts.
+    _ensure_column(conn, "accounts", "is_canonical", "is_canonical INTEGER NOT NULL DEFAULT 0")
+    account_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
+    }
+    if {"handle", "is_canonical"}.issubset(account_columns):
+        conn.execute(
+            "UPDATE accounts SET is_canonical = CASE WHEN handle = ? THEN 1 ELSE 0 END "
+            "WHERE handle = ? OR is_canonical = 1",
+            ("chatgptricks", "chatgptricks"),
+        )
     # Minimal runtime-schema fixtures may not include the optional generic
     # post table at all; production imports always create it before this
     # extension pass.
