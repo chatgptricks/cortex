@@ -789,6 +789,15 @@ _DASHBOARD_POSTS_CACHE_LOCK = threading.Lock()
 _DASHBOARD_POSTS_CACHE_CONTENT: bytes | None = None
 _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0.0
 
+# Queue opens the same HOT candidate list for every signed-in teammate. Keep
+# that read shared for a couple of seconds so a live refresh from several
+# browsers does not rescan both post tables at the same time. This cache is
+# deliberately tiny and short lived; Queue's durable live revision still
+# remains the source of truth for changes.
+_QUEUE_HOT_CACHE_LOCK = threading.Lock()
+_QUEUE_HOT_CACHE: list[dict[str, Any]] | None = None
+_QUEUE_HOT_CACHE_EXPIRES_AT = 0.0
+
 
 def _dashboard_posts_payload() -> dict[str, Any]:
     """Unified, public, read-only projection across every account. Each
@@ -2429,7 +2438,7 @@ def _queue_v2_existing_dashboard_post_from_url(source_url: str) -> dict[str, str
     return {"account": row["account"], "shortcode": shortcode} if row else None
 
 
-def _queue_v2_hot_source_rows(conn: Any, *, include_historic: bool = False) -> list[dict[str, Any]]:
+def _queue_v2_hot_source_rows_uncached(conn: Any, *, include_historic: bool = False) -> list[dict[str, Any]]:
     """Return source posts whose measured rate is strictly above 3x.
 
     The canonical account still lives in ``posts`` while all other accounts
@@ -2473,6 +2482,23 @@ def _queue_v2_hot_source_rows(conn: Any, *, include_historic: bool = False) -> l
     ).fetchall():
         rows.append(dict(row))
     return sorted(rows, key=lambda item: (-float(item.get("hot_rate_multiplier") or 0), str(item.get("account") or ""), str(item.get("shortcode") or "")))
+
+
+def _queue_v2_hot_source_rows(conn: Any, *, include_historic: bool = False) -> list[dict[str, Any]]:
+    """Return HOT source rows without making concurrent Queue reads rescan posts."""
+    if include_historic:
+        return _queue_v2_hot_source_rows_uncached(conn, include_historic=True)
+    global _QUEUE_HOT_CACHE, _QUEUE_HOT_CACHE_EXPIRES_AT
+    now = time.monotonic()
+    with _QUEUE_HOT_CACHE_LOCK:
+        if _QUEUE_HOT_CACHE is not None and now < _QUEUE_HOT_CACHE_EXPIRES_AT:
+            return [dict(item) for item in _QUEUE_HOT_CACHE]
+        # Keep the lock through the cold read so simultaneous Queue requests
+        # share one bounded scan instead of stampeding Postgres.
+        rows = _queue_v2_hot_source_rows_uncached(conn, include_historic=False)
+        _QUEUE_HOT_CACHE = [dict(item) for item in rows]
+        _QUEUE_HOT_CACHE_EXPIRES_AT = time.monotonic() + 2.0
+        return rows
 
 
 def _queue_v2_hot_pick_candidate(post: dict[str, Any]) -> dict[str, Any]:
@@ -2881,11 +2907,95 @@ def _queue_v2_reflow_all_schedules() -> int:
         return sum(_queue_v2_reflow_scheduled(conn, designer, "queue-system@sentientdash.app") for designer in designers)
 
 
-def _queue_v2_project(row: dict[str, Any], snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+_QUEUE_PUBLISHED_UNSET = object()
+
+
+def _queue_v2_published_dashboard_posts(
+    conn: Any,
+    rows: list[Any],
+) -> dict[int, dict[str, Any] | None]:
+    """Resolve closed Queue links in batches for one Queue response.
+
+    The old projection opened two new database connections per closed request
+    (one for the permalink lookup and one for the post snapshot). Admin Queue
+    responses repeat the same request in several arrays, so that multiplied
+    into a long serial wait. Resolve every shortcode once on the connection
+    already serving the response instead.
+    """
+    closed_rows = [row for row in rows if str(row.get("status") if isinstance(row, dict) else row["status"]) == "closed"]
+    if not closed_rows:
+        return {}
+    links_by_request: dict[int, list[dict[str, str]]] = {}
+    shortcodes: set[str] = set()
+    for row in closed_rows:
+        raw = dict(row)
+        links = _queue_v2_final_permalinks(raw)
+        links_by_request[int(raw["id"])] = links
+        for link in links:
+            match = re.match(r"^https?://(?:www\\.)?instagram\\.com/(?:p|reel)/([^/?#]+)", link["url"], re.I)
+            if match:
+                shortcodes.add(match.group(1))
+    if not shortcodes:
+        return {request_id: None for request_id in links_by_request}
+    marks = ",".join("?" for _ in shortcodes)
+    canonical = conn.execute(
+        f"""SELECT id, shortcode, caption, title, post_type_label, published_at, likes, comments
+            FROM posts WHERE shortcode IN ({marks})""",
+        tuple(sorted(shortcodes)),
+    ).fetchall()
+    canonical_row = conn.execute(
+        "SELECT handle FROM accounts WHERE is_canonical = 1 AND is_active = 1 LIMIT 1"
+    ).fetchone()
+    canonical_handle = str(canonical_row["handle"]).strip().lower() if canonical_row else "chatgptricks"
+    published_by_shortcode: dict[str, dict[str, Any]] = {}
+    for row in canonical:
+        item = dict(row)
+        published_by_shortcode[str(item["shortcode"])] = {
+            "id": item["id"], "account": canonical_handle, "shortcode": item["shortcode"],
+            "title": item.get("caption") or item.get("title") or "", "isCustom": False,
+            "permalink": f"https://www.instagram.com/p/{item['shortcode']}/",
+            "caption": item.get("caption") or item.get("title") or "",
+            "type": item.get("post_type_label") or "Image", "coverUrl": "",
+            "publishedAt": item.get("published_at"), "likes": item.get("likes"), "comments": item.get("comments"),
+        }
+    dashboard_rows = conn.execute(
+        f"""SELECT id, account, shortcode, caption, post_type_label, published_at, likes, comments, permalink
+            FROM dashboard_posts WHERE shortcode IN ({marks}) ORDER BY id DESC""",
+        tuple(sorted(shortcodes)),
+    ).fetchall()
+    for row in dashboard_rows:
+        item = dict(row)
+        shortcode = str(item["shortcode"])
+        # Keep the newest dashboard match when an old duplicate shortcode
+        # exists across imported account rows.
+        published_by_shortcode.setdefault(shortcode, {
+            "id": item["id"], "account": item.get("account") or "", "shortcode": shortcode,
+            "title": item.get("caption") or "", "isCustom": False,
+            "permalink": item.get("permalink") or f"https://www.instagram.com/p/{shortcode}/",
+            "caption": item.get("caption") or "", "type": item.get("post_type_label") or "Image", "coverUrl": "",
+            "publishedAt": item.get("published_at"), "likes": item.get("likes"), "comments": item.get("comments"),
+        })
+    result: dict[int, dict[str, Any] | None] = {}
+    for request_id, links in links_by_request.items():
+        result[request_id] = next(
+            (published_by_shortcode.get(match.group(1)) for link in links
+             if (match := re.match(r"^https?://(?:www\\.)?instagram\\.com/(?:p|reel)/([^/?#]+)", link["url"], re.I))
+             and published_by_shortcode.get(match.group(1))),
+            None,
+        )
+    return result
+
+
+def _queue_v2_project(
+    row: dict[str, Any],
+    snapshot: dict[str, Any] | None = None,
+    published_post: dict[str, Any] | None | object = _QUEUE_PUBLISHED_UNSET,
+) -> dict[str, Any]:
     pp = int(row["production_points"])
     minutes_per_pp = max(1, int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP))
     snapshot = snapshot if snapshot is not None else _queue_v2_post_snapshot(row["post_account"], row["post_shortcode"])
-    published_post = _queue_v2_published_dashboard_post(row)
+    if published_post is _QUEUE_PUBLISHED_UNSET:
+        published_post = _queue_v2_published_dashboard_post(row)
     return {
         "id": row["id"], "post": {
             "account": row["post_account"], "shortcode": row["post_shortcode"],
@@ -3368,12 +3478,20 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         scheduler_preferences = _queue_v2_scheduler_preferences(conn, caller)
         trainee_reviews = _queue_v2_trainee_reviews(conn)
         snapshot_cache = _queue_v2_post_snapshot_cache(conn, all_queue_rows)
+        projection_rows = [*rows, *pool_rows, *planning_rows, *assigned_rows, *recent_closed_rows]
+        published_posts = _queue_v2_published_dashboard_posts(conn, projection_rows)
+    projected_cache: dict[int, dict[str, Any]] = {}
     def project_with_ticket_flags(row: Any) -> dict[str, Any]:
         raw = dict(row)
+        request_id = int(raw["id"])
+        cached = projected_cache.get(request_id)
+        if cached is not None:
+            return cached
         snapshot = snapshot_cache.get((str(raw.get("post_account") or "").strip().lower(), str(raw.get("post_shortcode") or "").strip()))
-        item = _queue_v2_project(raw, snapshot)
+        item = _queue_v2_project(raw, snapshot, published_posts.get(request_id))
         item["pendingTickets"] = pending_tickets_by_request.get(int(item["id"]), [])
         item["traineeReview"] = trainee_reviews.get(int(item["id"]))
+        projected_cache[request_id] = item
         return item
 
     requests = [project_with_ticket_flags(row) for row in rows]
