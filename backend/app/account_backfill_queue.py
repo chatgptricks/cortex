@@ -352,31 +352,44 @@ def _run(task: dict[str, Any]) -> None:
         heartbeat_thread.join(timeout=1)
 
 
+def _recover_stale_jobs() -> int:
+    """Return abandoned running rows to the durable queue.
+
+    This runs repeatedly, not only at process boot, because a deployment can
+    leave the old worker alive briefly while the API process has already
+    restarted. Resetting the attempt counter gives the persisted ingestion
+    journal time to let its lease expire and resume the existing Apify run.
+    """
+    stale_before = (
+        datetime.now(UTC) - timedelta(seconds=_STALE_HEARTBEAT_SECONDS)
+    ).isoformat(timespec="seconds")
+    with db.connect() as conn:
+        _ensure_schema(conn)
+        return conn.execute(
+            """UPDATE account_backfill_jobs
+               SET status = 'queued', started_at = NULL,
+                   progress_json = ?, error = NULL, next_attempt_at = NULL,
+                   attempts = 0
+               WHERE status = 'running'
+                 AND (heartbeat_at IS NULL OR heartbeat_at < ?)""",
+            (json.dumps({"phase": "queued", "recovered": True}), stale_before),
+        ).rowcount
+
+
 def _worker_loop() -> None:
     # A process restart can leave a job marked running. Only recover jobs whose
     # heartbeat is genuinely stale; the web process also starts this loop when
     # the status endpoint is opened, so resetting every running row here would
     # interrupt a healthy job owned by the dedicated worker.
     try:
-        with db.connect() as conn:
-            _ensure_schema(conn)
-            stale_before = (
-                datetime.now(UTC) - timedelta(seconds=_STALE_HEARTBEAT_SECONDS)
-            ).isoformat(timespec="seconds")
-            conn.execute(
-                """UPDATE account_backfill_jobs
-                   SET status = 'queued', started_at = NULL,
-                       progress_json = ?, error = NULL, next_attempt_at = NULL
-                   WHERE status = 'running'
-                     AND (heartbeat_at IS NULL OR heartbeat_at < ?)""",
-                (json.dumps({"phase": "queued", "recovered": True}), stale_before),
-            )
+        _recover_stale_jobs()
     except Exception:
         logger.exception("Could not recover account backfill queue")
 
     while True:
         task = None
         try:
+            _recover_stale_jobs()
             task = _claim_next()
             if task:
                 _run(task)
