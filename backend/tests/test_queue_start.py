@@ -107,6 +107,10 @@ def test_multiple_active_requests_can_start_and_complete_independently(monkeypat
     assert all(row["status"] == "in_progress" for row in saved)
     assert all(row["actual_started_at"] for row in saved)
     assert saved[0]["actual_started_at"] == rows[0][7]
+    starts = [int(row["scheduled_start_minutes"]) for row in saved]
+    assert starts == sorted(starts)
+    assert starts[1] >= starts[0] + 3 * 10 + 10
+    assert starts[2] >= starts[1] + 3 * 10 + 10
     main.dashboard_queue_v2_complete(2, request)
     with isolated_connect() as check:
         assert [row["status"] for row in check.execute("SELECT * FROM queue_requests ORDER BY id")] == ["in_progress", "completed", "in_progress"]

@@ -92,7 +92,7 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
             "scheduledStartMinutes": 600, "recommendedAccounts": [],
         }])
     assert prepared[0]["date"] == future_date
-    assert prepared[0]["start"] == 570
+    assert prepared[0]["start"] == 580
     assert trainee[0]["minutesPerPP"] == 16
     assert trainee[0]["duration"] == 48
 

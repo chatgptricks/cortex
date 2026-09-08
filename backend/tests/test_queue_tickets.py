@@ -183,6 +183,36 @@ def test_pp_revision_and_cancellation_ticket_actions(monkeypatch, tmp_path):
         assert row["cancellation_reason"] == "Post no longer needed"
 
 
+def test_approved_pp_revision_reflows_following_work_with_buffer(monkeypatch, tmp_path):
+    database = tmp_path / "pp-reflow.sqlite3"
+    _ticket_database(database)
+    connect = _isolate(monkeypatch, database)
+    monkeypatch.setattr(main, "_queue_v2_slack_log", lambda **kwargs: True)
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO queue_requests VALUES (1, 3, 10, 'in_progress', 'pd@example.com', '2026-09-01', 600, 'chatgptricks', 'POST1', '', '')"
+        )
+        conn.execute(
+            "INSERT INTO queue_requests VALUES (2, 3, 10, 'scheduled', 'pd@example.com', '2026-09-01', 640, 'chatgptricks', 'POST2', '', '')"
+        )
+
+    pp = main.dashboard_queue_v2_request_pp_revision(
+        request=None,
+        request_id=1,
+        production_points=6,
+        reason="The current work expanded.",
+    )
+    main.dashboard_queue_v2_review_ticket(
+        ticket_id=pp["ticket"]["id"], request=None, action="approve", review_note=None,
+    )
+
+    with connect() as conn:
+        current = conn.execute("SELECT production_points FROM queue_requests WHERE id = 1").fetchone()
+        following = conn.execute("SELECT scheduled_start_minutes FROM queue_requests WHERE id = 2").fetchone()
+        assert current["production_points"] == 6
+        assert following["scheduled_start_minutes"] == 670
+
+
 def test_trainee_can_send_canva_design_and_vc_can_approve(monkeypatch, tmp_path):
     database = tmp_path / "trainee-review.sqlite3"
     _ticket_database(database)
