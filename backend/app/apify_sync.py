@@ -991,20 +991,48 @@ def _run_apify_actor_and_fetch(
 
     _emit(on_progress, phase="fetching_dataset")
     items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    try:
-        with httpx.Client(timeout=60.0) as client:
-            items = []
-            while True:
-                items_response = client.get(items_url, params={"token": token, "format": "json", "offset": len(items), "limit": 1000})
-                items_response.raise_for_status()
-                page = items_response.json()
-                if not isinstance(page, list):
-                    raise ApifySyncError("Apify dataset returned an unexpected response shape.")
-                items.extend(page)
-                if len(page) < 1000:
+    # Keep each response small enough that Render/Cloudflare does not reset a
+    # long-lived TLS response. A failed page is safe to retry: the dataset is
+    # immutable and the import is still deduplicated by shortcode.
+    page_limit = 250
+    fetch_attempts = 5
+    timeout = httpx.Timeout(connect=30.0, read=90.0, write=30.0, pool=30.0)
+    items: list[dict[str, Any]] = []
+    with httpx.Client(timeout=timeout) as client:
+        offset = 0
+        while True:
+            page: list[dict[str, Any]] | None = None
+            last_error: Exception | None = None
+            for attempt in range(fetch_attempts):
+                try:
+                    items_response = client.get(
+                        items_url,
+                        params={
+                            "token": token,
+                            "format": "json",
+                            "offset": offset,
+                            "limit": page_limit,
+                        },
+                    )
+                    items_response.raise_for_status()
+                    decoded = items_response.json()
+                    if not isinstance(decoded, list):
+                        raise ApifySyncError("Apify dataset returned an unexpected response shape.")
+                    page = decoded
                     break
-    except httpx.HTTPError as exc:
-        raise ApifySyncError(f"Failed to fetch Apify dataset items: {exc}") from exc
+                except (httpx.HTTPError, ValueError, ApifySyncError) as exc:
+                    last_error = exc
+                    if attempt + 1 < fetch_attempts:
+                        time.sleep(min(2 ** attempt, 8))
+            if page is None:
+                raise ApifySyncError(
+                    f"Failed to fetch Apify dataset items at offset {offset}: {last_error}"
+                ) from last_error
+            items.extend(page)
+            offset += len(page)
+            _emit(on_progress, phase="fetching_dataset", fetched=len(items), dataset_id=dataset_id)
+            if len(page) < page_limit:
+                break
     if not isinstance(items, list):
         raise ApifySyncError("Apify dataset returned an unexpected response shape.")
     if journal:
@@ -1126,10 +1154,7 @@ def _insert_new_dashboard_posts(
     """Generic insert used by every non-canonical account (Sentient or
     Competitors) into the shared dashboard_posts table, scoped by `account`.
     """
-    import httpx
-
     from .db import connect, utc_now
-    from .media_storage import store_uploaded_media
 
     summary: dict[str, Any] = {"added": 0, "failed": 0, "items": []}
     if not new_items:
@@ -1137,37 +1162,27 @@ def _insert_new_dashboard_posts(
 
     total = len(new_items)
 
-    with httpx.Client(timeout=60.0, headers={"User-Agent": "Mozilla/5.0"}) as image_client:
-        for index, item in enumerate(new_items):
-            shortcode = str(item["shortCode"]).strip()
-            image_url = item.get("displayUrl") or next(iter(item.get("images") or []), None)
-            cover_path: str | None = None
-            if image_url:
-                try:
-                    image_response = image_client.get(image_url)
-                    image_response.raise_for_status()
-                    image_bytes, suffix = _compress_cover(image_response.content)
-                    # Keyed by account+shortcode rather than random bytes so a
-                    # re-import overwrites its own cover instead of orphaning
-                    # the previous file on disk forever.
-                    cover_path = store_uploaded_media(f"dash-{account}-{shortcode}{suffix}", image_bytes)
-                except Exception:
-                    # Instagram CDN links and optional media storage can fail
-                    # independently of the dataset. Keep the post metadata
-                    # and let the normal cover refresh path try it later.
-                    cover_path = None
+    # History imports persist metadata first and leave covers to the existing
+    # lazy /api/dashboard/covers/{account}/{post_id} path. Downloading and
+    # uploading 1,500 images inline made a CDN/R2 hiccup look like a stuck
+    # import and could leave an account at zero even though the dataset was
+    # complete.
+    for index, item in enumerate(new_items):
+        shortcode = str(item["shortCode"]).strip()
+        image_url = item.get("displayUrl") or next(iter(item.get("images") or []), None)
+        cover_path: str | None = None
 
-            caption = _clean_text(item.get("caption"))
-            post_type_label, is_video = _post_type_label(item)
-            likes = _likes_or_none(item.get("likesCount"))
-            comments = item.get("commentsCount") or 0
-            permalink = item.get("url") or f"https://www.instagram.com/p/{shortcode}/"
-            extracted = extract_apify_fields(item)
-            now_iso = utc_now()
+        caption = _clean_text(item.get("caption"))
+        post_type_label, is_video = _post_type_label(item)
+        likes = _likes_or_none(item.get("likesCount"))
+        comments = item.get("commentsCount") or 0
+        permalink = item.get("url") or f"https://www.instagram.com/p/{shortcode}/"
+        extracted = extract_apify_fields(item)
+        now_iso = utc_now()
 
-            try:
-                with connect() as conn:
-                    conn.execute(
+        try:
+            with connect() as conn:
+                conn.execute(
                         """
                         INSERT INTO dashboard_posts (
                             account, shortcode, published_at, likes, comments, caption,
@@ -1195,43 +1210,11 @@ def _insert_new_dashboard_posts(
                             now_iso,
                             now_iso,
                             *(extracted[col] for col in _EXTRACT_COLUMNS),
-                        ),
-                    )
-            except Exception as exc:  # e.g. UNIQUE constraint on a race re-add
-                summary["failed"] += 1
-                summary["items"].append({"shortcode": shortcode, "status": "failed", "error": str(exc)})
-                _emit(
-                    on_progress,
-                    phase="inserting",
-                    done=index + 1,
-                    total=total,
-                    added=summary["added"],
-                    failed=summary["failed"],
-                    shortcode=shortcode,
+                    ),
                 )
-                continue
-
-            summary["added"] += 1
-            summary["items"].append({"shortcode": shortcode, "status": "added", "published_at": _published_at(item)})
-            # Promos analysis is a post-commit side effect: a failed detector
-            # must never roll back the paid Apify import. Keep it synchronous
-            # for the new post so the hidden workspace sees fresh signals
-            # immediately, while the durable backfill repairs older rows.
-            try:
-                with connect() as promo_conn:
-                    account_row = promo_conn.execute("SELECT group_name FROM accounts WHERE handle = ?", (account,)).fetchone()
-                if account_row and dict(account_row).get("group_name") == "competitors":
-                    from .promos import analyze_post
-                    analyze_post({
-                        "account": account, "shortcode": shortcode,
-                        "caption": caption, "first_comment": extracted.get("first_comment"),
-                        "hashtags": extracted.get("hashtags"), "mentions": extracted.get("mentions"),
-                        "paid_partnership": extracted.get("paid_partnership"),
-                        "permalink": permalink, "published_at": _published_at(item),
-                    })
-            except Exception:
-                logger = logging.getLogger(__name__)
-                logger.warning("Promo analysis failed for %s/%s", account, shortcode, exc_info=True)
+        except Exception as exc:  # e.g. UNIQUE constraint on a race re-add
+            summary["failed"] += 1
+            summary["items"].append({"shortcode": shortcode, "status": "failed", "error": str(exc)})
             _emit(
                 on_progress,
                 phase="inserting",
@@ -1241,6 +1224,38 @@ def _insert_new_dashboard_posts(
                 failed=summary["failed"],
                 shortcode=shortcode,
             )
+            continue
+
+        summary["added"] += 1
+        summary["items"].append({"shortcode": shortcode, "status": "added", "published_at": _published_at(item)})
+        # Promos analysis is a post-commit side effect: a failed detector
+        # must never roll back the paid Apify import. Keep it synchronous
+        # for the new post so the hidden workspace sees fresh signals
+        # immediately, while the durable backfill repairs older rows.
+        try:
+            with connect() as promo_conn:
+                account_row = promo_conn.execute("SELECT group_name FROM accounts WHERE handle = ?", (account,)).fetchone()
+            if account_row and dict(account_row).get("group_name") == "competitors":
+                from .promos import analyze_post
+                analyze_post({
+                    "account": account, "shortcode": shortcode,
+                    "caption": caption, "first_comment": extracted.get("first_comment"),
+                    "hashtags": extracted.get("hashtags"), "mentions": extracted.get("mentions"),
+                    "paid_partnership": extracted.get("paid_partnership"),
+                    "permalink": permalink, "published_at": _published_at(item),
+                })
+        except Exception:
+            logger = logging.getLogger(__name__)
+            logger.warning("Promo analysis failed for %s/%s", account, shortcode, exc_info=True)
+        _emit(
+            on_progress,
+            phase="inserting",
+            done=index + 1,
+            total=total,
+            added=summary["added"],
+            failed=summary["failed"],
+            shortcode=shortcode,
+        )
 
     return summary
 
