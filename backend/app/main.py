@@ -828,47 +828,80 @@ def _dashboard_posts_payload(limit: int | None = None, offset: int = 0) -> dict[
     posts: list[dict[str, Any]] = []
 
     with connect() as conn:
-        # Normalize both source tables into one SQL result before applying the
-        # page window.  Querying each table independently and merging Python
-        # lists would still materialize every historical post on each request.
-        post_sources: list[str] = []
+        # First order only the narrow source references.  The previous query
+        # sorted captions, OCR, transcripts and raw metadata for every row on
+        # every page; with ~70k posts that made page 2+ slow enough that the
+        # browser appeared to be stuck at its first 998 visible cards.  Fetch
+        # the wide row only after the page window is known.
+        ref_sources: list[str] = []
         if canonical:
-            post_sources.append(
-                """
-                SELECT 0 AS source_kind, id, CAST(NULL AS TEXT) AS account,
-                       shortcode, published_at, likes, comments, caption,
-                       post_type_label, is_animated, CAST(NULL AS TEXT) AS permalink,
-                       is_hot, hot_rate_multiplier, hook_text,
-                       CAST(NULL AS TEXT) AS music_song,
-                       CAST(NULL AS TEXT) AS music_artist,
-                       CAST(NULL AS TEXT) AS music_audio_id,
-                       CAST(NULL AS INTEGER) AS uses_original_audio,
-                       is_promo, hidden, is_deleted, CAST(NULL AS TEXT) AS transcript,
-                       title, source_row_number, section,
-                       CASE WHEN published_at IS NULL THEN 1 ELSE 0 END AS null_date
-                FROM posts
-                """
-            )
-        post_sources.append(
-            """
-            SELECT 1 AS source_kind, id, account, shortcode, published_at, likes,
-                   comments, caption, post_type_label, is_animated, permalink,
-                   is_hot, hot_rate_multiplier, hook_text, music_song, music_artist,
-                   music_audio_id, uses_original_audio, is_promo, hidden, is_deleted,
-                   transcript, CAST(NULL AS TEXT) AS title,
-                   CAST(NULL AS INTEGER) AS source_row_number, 'single' AS section,
-                   CASE WHEN published_at IS NULL THEN 1 ELSE 0 END AS null_date
-            FROM dashboard_posts
-            """
+            ref_sources.append("SELECT 0 AS source_kind, id, published_at FROM posts")
+        ref_sources.append("SELECT 1 AS source_kind, id, published_at FROM dashboard_posts")
+        refs_sql = (
+            "SELECT source_kind, id FROM ("
+            + " UNION ALL ".join(ref_sources)
+            + ") AS ordered_posts "
+              "ORDER BY CASE WHEN published_at IS NULL THEN 1 ELSE 0 END, published_at DESC, id DESC"
         )
-        posts_sql = " UNION ALL ".join(post_sources)
-        post_params: tuple[Any, ...] = ()
+        ref_params: tuple[Any, ...] = ()
         if limit is not None:
-            posts_sql += " ORDER BY null_date, published_at DESC, id DESC LIMIT ? OFFSET ?"
-            post_params = (limit, offset)
-        else:
-            posts_sql += " ORDER BY null_date, published_at DESC, id DESC"
-        post_rows = conn.execute(posts_sql, post_params).fetchall()
+            refs_sql += " LIMIT ? OFFSET ?"
+            ref_params = (limit, offset)
+        refs = conn.execute(refs_sql, ref_params).fetchall()
+
+        post_rows: list[dict[str, Any]] = []
+        ids_by_source = {0: [], 1: []}
+        for ref in refs:
+            ids_by_source[int(ref["source_kind"])].append(int(ref["id"]))
+
+        def _page_rows(table: str, source_kind: int, ids: list[int]) -> dict[tuple[int, int], dict[str, Any]]:
+            if not ids:
+                return {}
+            loaded: dict[tuple[int, int], dict[str, Any]] = {}
+            # Keep explicit maintenance payloads compatible with Postgres's
+            # bind-parameter limit as well as the normal 2k-page route.
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                marks = ",".join("?" for _ in chunk)
+                if source_kind == 0:
+                    sql = f"""
+                        SELECT 0 AS source_kind, id, CAST(NULL AS TEXT) AS account,
+                               shortcode, published_at, likes, comments, caption,
+                               post_type_label, is_animated, CAST(NULL AS TEXT) AS permalink,
+                               is_hot, hot_rate_multiplier, hook_text,
+                               CAST(NULL AS TEXT) AS music_song,
+                               CAST(NULL AS TEXT) AS music_artist,
+                               CAST(NULL AS TEXT) AS music_audio_id,
+                               CAST(NULL AS INTEGER) AS uses_original_audio,
+                               is_promo, hidden, is_deleted, CAST(NULL AS TEXT) AS transcript,
+                               title, source_row_number, section
+                        FROM {table} WHERE id IN ({marks})
+                    """
+                else:
+                    sql = f"""
+                        SELECT 1 AS source_kind, id, account, shortcode, published_at, likes,
+                               comments, caption, post_type_label, is_animated, permalink,
+                               is_hot, hot_rate_multiplier, hook_text, music_song, music_artist,
+                               music_audio_id, uses_original_audio, is_promo, hidden, is_deleted,
+                               transcript, CAST(NULL AS TEXT) AS title,
+                               CAST(NULL AS INTEGER) AS source_row_number, 'single' AS section
+                        FROM {table} WHERE id IN ({marks})
+                    """
+                loaded.update(
+                    {(source_kind, int(row["id"])): dict(row)
+                     for row in conn.execute(sql, tuple(chunk)).fetchall()}
+                )
+            return loaded
+
+        rows_by_id = {
+            **_page_rows("posts", 0, ids_by_source[0]),
+            **_page_rows("dashboard_posts", 1, ids_by_source[1]),
+        }
+        post_rows = [
+            rows_by_id[(int(ref["source_kind"]), int(ref["id"]))]
+            for ref in refs
+            if (int(ref["source_kind"]), int(ref["id"])) in rows_by_id
+        ]
 
         total_count = 0
         total_likes = 0
