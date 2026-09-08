@@ -82,18 +82,18 @@ def test_runtime_migration_repairs_canonical_account_registry():
     connection.row_factory = sqlite3.Row
     connection.execute("CREATE TABLE dashboard_users (email TEXT PRIMARY KEY, updated_at TEXT NOT NULL)")
     connection.execute(
-        "CREATE TABLE accounts (handle TEXT PRIMARY KEY, is_canonical INTEGER NOT NULL DEFAULT 0)"
+        "CREATE TABLE accounts (handle TEXT PRIMARY KEY, is_canonical INTEGER NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 1)"
     )
     connection.execute("CREATE TABLE queue_requests (id INTEGER PRIMARY KEY, updated_at TEXT NOT NULL)")
     connection.executemany(
-        "INSERT INTO accounts (handle, is_canonical) VALUES (?, ?)",
-        [('chatgptricks', 0), ('competitor', 1)],
+        "INSERT INTO accounts (handle, is_canonical, is_active) VALUES (?, ?, ?)",
+        [('chatgptricks', 0, 0), ('competitor', 1, 1)],
     )
 
     _ensure_runtime_schema_extensions(connection)
 
     rows = {
-        row['handle']: row['is_canonical']
-        for row in connection.execute('SELECT handle, is_canonical FROM accounts').fetchall()
+        row['handle']: (row['is_canonical'], row['is_active'])
+        for row in connection.execute('SELECT handle, is_canonical, is_active FROM accounts').fetchall()
     }
-    assert rows == {'chatgptricks': 1, 'competitor': 0}
+    assert rows == {'chatgptricks': (1, 1), 'competitor': (0, 1)}
