@@ -6478,7 +6478,7 @@ def temp_import_run(handle: str, run_id: str, password: Annotated[str, Form()]) 
     _require_admin(password)
     import httpx
 
-    from .apify_sync import _account_scope, _insert_new_posts, get_account_config
+    from .apify_sync import _account_scope, _filter_items_for_account, _insert_new_posts, get_account_config
 
     token = os.getenv("APIFY_TOKEN", "").strip()
     with httpx.Client(timeout=60.0) as client:
@@ -6509,17 +6509,11 @@ def temp_import_run(handle: str, run_id: str, password: Annotated[str, Form()]) 
 
     # Guard against importing the wrong run: everything gets stored under
     # `handle`, so a dataset belonging to another profile would silently
-    # corrupt this account's history. Only accept items whose ownerUsername
-    # matches (items without the field are kept -- some payloads omit it).
-    target = cfg["handle"].lower()
-    owners = {str(i.get("ownerUsername") or "").lower() for i in items if i.get("ownerUsername")}
-    foreign = {o for o in owners if o != target}
-    if owners and target not in owners:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Dataset belongs to {sorted(owners)}, not '{target}'. Refusing to import.",
-        )
-    items = [i for i in items if str(i.get("ownerUsername") or target).lower() == target]
+    # corrupt this account's history. Items without an owner field are kept.
+    try:
+        items, foreign = _filter_items_for_account(items, cfg["handle"])
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     new_items = [i for i in items if i.get("shortCode") and i["shortCode"] not in existing]
     new_items.sort(key=lambda i: i.get("timestamp") or "")
@@ -6593,6 +6587,63 @@ def temp_import_batch_run(run_id: str, password: Annotated[str, Form()]) -> dict
         _DASHBOARD_POSTS_CACHE_CONTENT = None
         _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0
     return {"run_status": run.get("status"), "dataset_items": len(items), "ignored": ignored, "accounts": recovered, "added": total_added}
+
+
+@app.post("/api/admin/accounts/repair-owner-scope")
+def admin_repair_owner_scope(
+    password: Annotated[str, Form()],
+    handles: Annotated[str, Form()] = "",
+) -> dict[str, Any]:
+    """Remove only dashboard rows whose stored Apify owner is another account.
+
+    This is intentionally narrow: rows with no owner field are preserved, and
+    canonical `posts` are never touched. It repairs legacy imports created
+    before backfills enforced the owner filter.
+    """
+    _require_admin(password)
+    from .apify_sync import _item_owner_username
+
+    requested = [part.strip().lstrip("@").lower() for part in handles.split(",") if part.strip()]
+    if not requested:
+        requested = [
+            str(account["handle"]).lower()
+            for account in list_accounts(active_only=False)
+            if not account.get("is_canonical")
+        ]
+    requested = sorted(set(requested))
+    if not requested:
+        return {"accounts": {}, "removed": 0}
+
+    placeholders = ", ".join("?" for _ in requested)
+    removed = 0
+    by_account: dict[str, dict[str, Any]] = {}
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT id, account, shortcode, raw_json FROM dashboard_posts WHERE account IN ({placeholders})",
+            tuple(requested),
+        ).fetchall()
+        for raw_row in rows:
+            row = dict(raw_row)
+            raw = row.get("raw_json")
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            owner = _item_owner_username(payload)
+            account = str(row.get("account") or "").strip().lower()
+            if not owner or owner == account:
+                continue
+            conn.execute("DELETE FROM dashboard_posts WHERE id = ? AND account = ?", (row["id"], account))
+            removed += 1
+            bucket = by_account.setdefault(account, {"removed": 0, "shortcodes": []})
+            bucket["removed"] += 1
+            if len(bucket["shortcodes"]) < 20:
+                bucket["shortcodes"].append({"shortcode": row.get("shortcode"), "owner": owner})
+    return {"accounts": by_account, "removed": removed}
 
 
 @app.post("/api/admin/accounts/backfill-bg/{handle}")
