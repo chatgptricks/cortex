@@ -5205,11 +5205,12 @@ def dashboard_queue_v2_batch_close(
     request: Request,
     request_ids: Annotated[str, Form()],
 ) -> dict[str, Any]:
-    """Close several completed requests from the admin Queue table.
+    """Force-close selected assigned requests from the admin Queue table.
 
-    Batch close is an operational cleanup action for Admins. It deliberately
-    does not require published Instagram links because the admin is closing
-    the production records after checking them elsewhere.
+    This is an operational cleanup action for Admins. It deliberately does
+    not require published Instagram links. Completed requests can always be
+    closed; scheduled or in-progress requests can also be force-closed when
+    they are assigned and their scheduled date is before today.
     """
     caller, is_admin, _ = _queue_v2_access(request)
     if not is_admin:
@@ -5228,6 +5229,7 @@ def dashboard_queue_v2_batch_close(
         raise HTTPException(status_code=400, detail="Request IDs must be positive integers.")
 
     now = utc_now()
+    today = datetime.now(SCHEDULER_TIMEZONE).date().isoformat()
     closed: list[int] = []
     skipped: list[dict[str, Any]] = []
     with connect() as conn:
@@ -5241,8 +5243,15 @@ def dashboard_queue_v2_batch_close(
             if row is None:
                 skipped.append({"id": request_id, "reason": "Request not found."})
                 continue
-            if row.get("status") != "completed":
-                skipped.append({"id": request_id, "reason": "Only completed requests can be batch closed.", "status": row.get("status")})
+            status = row.get("status")
+            overdue_assigned = bool(
+                row.get("designer_email")
+                and row.get("scheduled_date")
+                and str(row.get("scheduled_date")) < today
+                and status in {"scheduled", "in_progress"}
+            )
+            if status != "completed" and not overdue_assigned:
+                skipped.append({"id": request_id, "reason": "Only completed requests or assigned jobs scheduled before today can be force-closed.", "status": status})
                 continue
             conn.execute(
                 """UPDATE queue_requests
