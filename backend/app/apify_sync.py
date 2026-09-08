@@ -1099,17 +1099,16 @@ def _insert_new_chatgptricks_posts(
                 image_response = image_client.get(image_url)
                 image_response.raise_for_status()
                 image_bytes = image_response.content
-            except httpx.HTTPError as exc:
+                image_bytes, suffix = _compress_cover(image_bytes)
+                # Keyed by shortcode rather than random bytes: re-importing a
+                # post overwrites its own cover instead of orphaning the old
+                # file on disk with no way to ever find or clean it up.
+                image_path = store_uploaded_media(f"cover-{shortcode}{suffix}", image_bytes)
+            except Exception as exc:  # a bad cover must not abort the paid import
                 summary["failed"] += 1
                 summary["items"].append({"shortcode": shortcode, "status": "failed", "error": str(exc)})
                 _tick(index, shortcode)
                 continue
-
-            image_bytes, suffix = _compress_cover(image_bytes)
-            # Keyed by shortcode rather than random bytes: re-importing a post
-            # overwrites its own cover instead of orphaning the old file on
-            # disk with no way to ever find or clean it up.
-            image_path = store_uploaded_media(f"cover-{shortcode}{suffix}", image_bytes)
 
             caption = _clean_text(item.get("caption"))
             title = _title_from_caption(caption) or f"Instagram post {shortcode}"
@@ -1187,7 +1186,10 @@ def _insert_new_dashboard_posts(
                     # re-import overwrites its own cover instead of orphaning
                     # the previous file on disk forever.
                     cover_path = store_uploaded_media(f"dash-{account}-{shortcode}{suffix}", image_bytes)
-                except httpx.HTTPError:
+                except Exception:
+                    # Instagram CDN links and optional media storage can fail
+                    # independently of the dataset. Keep the post metadata
+                    # and let the normal cover refresh path try it later.
                     cover_path = None
 
             caption = _clean_text(item.get("caption"))

@@ -69,3 +69,37 @@ def test_status_exposes_active_queue_and_recent_results(monkeypatch):
     assert value["active"]["handle"] == "first"
     assert [item["handle"] for item in value["queue"]] == ["second"]
     assert {item["handle"] for item in value["tasks"]} == {"first", "second"}
+
+
+def test_failed_attempt_is_requeued_without_starting_a_second_apify_run(monkeypatch):
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+
+    @contextmanager
+    def connect():
+        yield connection
+
+    monkeypatch.setattr(queue.db, "connect", connect)
+    monkeypatch.setattr(queue, "start_worker", lambda: None)
+    monkeypatch.setattr(queue, "_wake_worker", lambda: None)
+    task = queue.enqueue("retry-account")
+    claimed = queue._claim_next()
+    connection.execute(
+        "CREATE TABLE ingestion_jobs (job_key TEXT PRIMARY KEY, status TEXT, error TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO ingestion_jobs(job_key, status, error) VALUES (?, 'retry', ?)",
+        (f"account-backfill:{task['job_id']}", "temporary cover failure"),
+    )
+    monkeypatch.setattr(queue.ingestion_jobs, "run", lambda *args, **kwargs: False)
+
+    queue._run(claimed)
+
+    row = connection.execute(
+        "SELECT status, progress_json, next_attempt_at, error FROM account_backfill_jobs WHERE job_id = ?",
+        (task["job_id"],),
+    ).fetchone()
+    assert row["status"] == "queued"
+    assert '"retrying"' in row["progress_json"]
+    assert row["next_attempt_at"]
+    assert row["error"] == "temporary cover failure"
