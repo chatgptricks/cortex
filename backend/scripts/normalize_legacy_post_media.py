@@ -17,7 +17,7 @@ from app.apify_sync import (
     store_avatar_from_url,
 )
 from app.db import connect
-from app.media_storage import upload_legacy_local_media
+from app.media_storage import upload_local_media_for_migration
 
 
 def _targets(source_prefix: str) -> list[Any]:
@@ -127,7 +127,7 @@ def normalize_chatgptricks_reels(results_limit: int) -> dict[str, int]:
         {
             "username": ["chatgptricks"],
             "resultsLimit": results_limit,
-            "includeTranscript": True,
+            "includeTranscript": False,
         },
         max_wait_seconds=2400.0,
         actor_id=APIFY_REEL_ACTOR_ID,
@@ -199,7 +199,7 @@ def normalize_local_only() -> dict[str, int]:
     result = {"targets": 0, "uploaded": 0, "failed": 0}
     for row in _local_only_targets():
         result["targets"] += 1
-        remote_ref = upload_legacy_local_media(str(row["image_path"]))
+        remote_ref = upload_local_media_for_migration(str(row["image_path"]))
         if not remote_ref:
             result["failed"] += 1
             continue

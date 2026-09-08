@@ -10,6 +10,7 @@ import signal
 import threading
 
 from .db import init_db
+from .account_backfill_queue import start_worker as start_account_backfill_worker
 from .scheduler import start_scheduler, stop_scheduler
 
 
@@ -17,6 +18,10 @@ def main() -> None:
     # Keep the worker compatible with Postgres schema additions just like the
     # web service, without booting FastAPI or opening a public listener.
     init_db()
+    # Account history imports are paid, long-running work. Keep their single
+    # durable queue in this dedicated worker process so the public API never
+    # starts an import thread on a request or web restart.
+    start_account_backfill_worker()
     stop_requested = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:

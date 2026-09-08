@@ -150,7 +150,9 @@ def enqueue(handle: str, results_limit: int = 2000, date_from: str | None = None
                 "finished_at": None,
                 "duplicate": False,
             }
-    start_worker()
+    # The dedicated Render worker owns the queue loop. This wake-up still makes
+    # local/test workers react immediately; production discovers the durable
+    # row on its short polling interval.
     _wake_worker()
     task["position"] = position(task["job_id"])
     return task
@@ -177,10 +179,9 @@ def position(job_id: str) -> int:
 
 def _claim_next() -> dict[str, Any] | None:
     with db.connect() as conn:
-        # The API process and the dedicated Render worker can both call
-        # start_worker(). Serialize the claim across processes before looking
-        # for work, otherwise each process can observe an empty running set
-        # and start a paid Apify run at the same time.
+        # Serialize the claim across processes before looking for work. This
+        # protects the dedicated worker during restarts and also keeps local
+        # operator/test workers from starting two paid Apify runs at once.
         if getattr(conn, "is_postgres", False):
             lock = conn.execute(
                 "SELECT pg_try_advisory_xact_lock(?) AS locked",
@@ -378,9 +379,8 @@ def _recover_stale_jobs() -> int:
 
 def _worker_loop() -> None:
     # A process restart can leave a job marked running. Only recover jobs whose
-    # heartbeat is genuinely stale; the web process also starts this loop when
-    # the status endpoint is opened, so resetting every running row here would
-    # interrupt a healthy job owned by the dedicated worker.
+    # heartbeat is genuinely stale, so a worker restart cannot interrupt a
+    # healthy job owned by another worker process.
     try:
         _recover_stale_jobs()
     except Exception:
@@ -410,7 +410,6 @@ def start_worker() -> None:
 
 
 def status() -> dict[str, Any]:
-    start_worker()
     with db.connect() as conn:
         _ensure_schema(conn)
         rows = conn.execute(

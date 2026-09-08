@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 
 from .db import connect, init_db
-from .media_storage import r2_enabled, upload_legacy_local_media
+from .media_storage import r2_enabled, upload_local_media_for_migration
 
 _SOURCES = (("dashboard_posts", "cover_image_path"), ("posts", "image_path"), ("accounts", "avatar_path"))
 
@@ -32,7 +32,7 @@ def backfill(limit: int, *, dry_run: bool) -> dict[str, int]:
                 result["skipped"] += 1
                 continue
             try:
-                remote_ref = upload_legacy_local_media(reference)
+                remote_ref = upload_local_media_for_migration(reference)
             except Exception:
                 result["failed"] += 1
                 continue

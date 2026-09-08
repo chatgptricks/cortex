@@ -306,7 +306,6 @@ def test_admin_reset_clears_queue_state_but_preserves_accounts(monkeypatch, tmp_
     _ticket_database(database)
     connect = _isolate(monkeypatch, database)
     monkeypatch.setattr(main, "_caller_email", lambda request: "admin@example.com")
-    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     with connect() as conn:
         conn.executescript(
             """
@@ -322,14 +321,9 @@ def test_admin_reset_clears_queue_state_but_preserves_accounts(monkeypatch, tmp_
         conn.execute("INSERT INTO queue_designer_accounts VALUES ('pd@example.com', 'chatgptricks', 'now')")
         conn.execute("INSERT INTO queue_user_account_onboarding VALUES ('pd@example.com', 'now', 'now')")
         conn.execute("INSERT INTO accounts VALUES ('chatgptricks', 'sentient', 1)")
-    attachment = tmp_path / "queue_attachments" / "1"
-    attachment.mkdir(parents=True)
-    (attachment / "file.txt").write_text("queue only")
-
     result = main.admin_queue_reset(request=None, confirmation="RESET_QUEUE")
     assert result["ok"] is True
     assert result["deleted"]["requests"] == 1
-    assert not (tmp_path / "queue_attachments").exists()
     with connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS c FROM queue_requests").fetchone()["c"] == 0
         assert conn.execute("SELECT COUNT(*) AS c FROM queue_tickets").fetchone()["c"] == 0

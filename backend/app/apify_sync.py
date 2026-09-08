@@ -32,11 +32,10 @@ def _emit(on_progress: ProgressFn, **fields: Any) -> None:
 
 VALID_GROUPS = ("sentient", "competitors")
 
-# The only canonical account is chatgptricks -- it lives in `posts`, the
-# table shared with Predict's prediction model. Every other account (self-
-# serve or seeded) lives in the generic `dashboard_posts` table, keyed by
-# `account`, and must never be merged into `posts` (explicit prior product
-# decision -- see README).
+# The only canonical account is chatgptricks -- it lives in the original
+# `posts` dataset. Every other account (self-serve or seeded) lives in the
+# generic `dashboard_posts` table, keyed by `account`, and must never be merged
+# into `posts` (explicit product decision -- see README).
 _CANONICAL_HANDLE = "chatgptricks"
 
 
@@ -226,12 +225,12 @@ def reset_stuck_ocr_claims() -> int:
     return int(a or 0) + int(b or 0)
 
 
-def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> tuple[str, Path] | None:
-    """Downloads + compresses a cover that was never cached locally (covers are
-    fetched lazily, so thousands of rows have a source URL but no file). Returns
-    the durable reference and local processing path, or None if there's no URL or the CDN link has expired --
-    Instagram's URLs are signed and die after a few days, so this fails often
-    for older posts and the caller should treat None as "give up on this row".
+def ensure_cover(cover_source_url: str | None, dest_stem: str) -> tuple[str, Path] | None:
+    """Download a cover into R2 and return a short-lived OCR path.
+
+    Covers are fetched lazily, so thousands of rows have a source URL but no
+    object yet. The returned processing path is a temp file, never a durable
+    persistent disk media cache.
     """
     if not cover_source_url:
         return None
@@ -249,7 +248,7 @@ def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> tuple[st
 
     try:
         reference = store_uploaded_media(f"{dest_stem}{suffix}", data)
-    except OSError:
+    except (OSError, RuntimeError):
         return None
     path = materialize_local_path(reference)
     return (reference, path) if path else None
@@ -258,9 +257,8 @@ def ensure_local_cover(cover_source_url: str | None, dest_stem: str) -> tuple[st
 def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
     """Fills in cover OCR text (hook_text) for posts that don't have it yet.
 
-    Scoped to dashboard_posts only. The canonical `posts` table is frozen -- it
-    belongs to Predict now and no longer receives Instagram posts -- so scanning
-    it on every tick was work on rows the dashboard never reads.
+    Scoped to dashboard_posts only. The canonical `posts` table is frozen, so
+    scanning it on every tick would process rows the dashboard never reads.
 
     Newest first, so freshly-arrived posts become text-searchable right away.
     Every row touched is marked checked, including blank results, so a cover with
@@ -268,7 +266,7 @@ def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
 
     Runs through Sentient Dash's own standalone OCR worker (sentient_ocr.py /
     workers/modal_ocr_worker.py) -- always the full cover image, no crop, no
-    GPU, and no dependency on Predict's shared tribev2 worker. See that
+    GPU. See that
     worker's module docstring for why (it replaced a setup that paid for an
     L40S GPU it never used, and a fixed crop that missed text sitting outside
     it on some accounts' cover templates).
@@ -297,8 +295,6 @@ def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
                     "UPDATE dashboard_posts SET ocr_checked = 2 WHERE id = ?",
                     [(int(r["id"]),) for r in dash],
                 )
-            # The frozen `posts` table is intentionally not scanned here.
-            canon: list = []
 
     with connect() as conn:
         summary["remaining"] = conn.execute(
@@ -316,7 +312,7 @@ def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
         path = materialize_local_path(row["cover_image_path"])
         if path is None:
             stem = f"dash-{row['account']}-{str(row['shortcode'] or row['id']).strip()}"
-            restored = ensure_local_cover(row["cover_source_url"], stem)
+            restored = ensure_cover(row["cover_source_url"], stem)
             if restored is None:
                 give_up.append(("dashboard_posts", int(row["id"])))
                 continue
@@ -326,13 +322,6 @@ def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
                     "UPDATE dashboard_posts SET cover_image_path = ? WHERE id = ?", (reference, int(row["id"]))
                 )
         jobs.append(("dashboard_posts", int(row["id"]), path))
-
-    for row in canon:
-        path = Path(str(row["image_path"]))
-        if not path.is_file():
-            give_up.append(("posts", int(row["id"])))
-            continue
-        jobs.append(("posts", int(row["id"]), path))
 
     # Rows we can never OCR (no file, dead CDN link) get marked so they don't
     # clog the queue forever. posts has no ocr_checked column, so a sentinel
@@ -635,9 +624,9 @@ def enrich_from_run(run_id: str) -> dict[str, Any]:
                 continue
             # Matched by shortcode alone, NOT by ownerUsername: several tracked
             # accounts repost each other, so the payload's owner is the original
-            # author rather than the account we filed it under (costarica reposts
-            # traselveloreal, for instance). The payload describes one real
-            # Instagram post, so every row holding that shortcode deserves it.
+            # author rather than the account we filed it under. The payload
+            # describes one real Instagram post, so every row holding that
+            # shortcode deserves it.
             extracted = extract_apify_fields(item)
             cursor = conn.execute(
                 f"UPDATE dashboard_posts SET {assignments}, enriched_at = ? "
@@ -870,30 +859,6 @@ def _fetch_apify_items(
     """
     del timeout  # kept for callers; the durable path has bounded subrequests.
     return _run_apify_actor_and_fetch(payload, max_wait_seconds=900.0, poll_interval=5.0, actor_id=actor_id)
-
-def _fetch_apify_items_legacy(
-    payload: dict[str, Any], timeout: float = 180.0, actor_id: str = APIFY_ACTOR_ID
-) -> list[dict[str, Any]]:
-    token = os.getenv("APIFY_TOKEN", "").strip()
-    if not token:
-        raise ApifySyncError("APIFY_TOKEN is not configured on the server.")
-    try:
-        import httpx
-    except ImportError as exc:
-        raise ApifySyncError("httpx is not installed in the backend environment.") from exc
-
-    url = f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items"
-    try:
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(url, params={"token": token}, json=payload)
-            response.raise_for_status()
-            items = response.json()
-    except httpx.HTTPError as exc:
-        raise ApifySyncError(f"Apify request failed: {exc}") from exc
-    if not isinstance(items, list):
-        raise ApifySyncError("Apify returned an unexpected response shape.")
-    return items
-
 
 def _run_apify_actor_and_fetch(
     payload: dict[str, Any],
@@ -1392,14 +1357,6 @@ def _short_term_reels_payload(handles: list[str], results_limit: int, now: datet
         "includeTranscript": False,
         "onlyPostsNewerThan": (now - timedelta(hours=_SHORT_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-
-
-def _is_reel_item(item: dict[str, Any]) -> bool:
-    """Recognise a Reel in either Instagram actor's payload."""
-    product_type = str(item.get("productType") or "").lower()
-    item_type = str(item.get("type") or "").lower()
-    url = str(item.get("url") or "").lower()
-    return product_type in {"clips", "reel", "reels"} or item_type in {"reel", "clips"} or "/reel/" in url
 
 
 def _item_owner_username(item: dict[str, Any]) -> str:
@@ -2020,8 +1977,8 @@ def fetch_profile_preview(handle: str) -> dict[str, Any]:
 
 
 def store_avatar_from_url(handle: str, image_url: str) -> str:
-    """Downloads a profile picture from a known URL into UPLOAD_DIR and
-    records it on the account. Instagram's CDN URLs (via Apify) are signed
+    """Downloads a profile picture from a known URL into R2 and records it on
+    the account. Instagram's CDN URLs (via Apify) are signed
     and expire within a day or two, so we keep our own copy and serve it
     through /api/dashboard/avatar/{handle} instead of the raw CDN URL.
     """
@@ -2067,8 +2024,8 @@ def _refresh_cover_from_item(
     Cover routes are deliberately lazy, so a signed Instagram URL can expire
     while the database row still exists. Reloading counts is an explicit,
     single-post repair action; use the same scrape result to replace the
-    stale/missing local cover instead of asking the browser to retry a dead
-    URL forever.
+    stale/missing R2 cover instead of asking the browser to retry a dead URL
+    forever.
     """
     image_url = item.get("displayUrl") or next(iter(item.get("images") or []), None)
     image_url = str(image_url or "").strip()

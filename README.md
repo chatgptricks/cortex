@@ -11,18 +11,12 @@ covers local setup. Also read **`APIFY_OPERATIONS_LEARNINGS.md`** before
 touching Apify, the scheduler, or the database — it's a list of hard-won,
 real-cost rules, not a nice-to-have.
 
-## This repo used to be a different app
+## Runtime storage
 
-This folder/repo is still named after **Predict**, an earlier, unrelated
-product: a TRIBE v2 (fMRI-style) cover-image analyzer with A/B testing and a
-likes-prediction model. That entire feature set has been deleted (source
-files removed; only stale `__pycache__` artifacts remain) and the repo was
-repurposed as the Sentient Dash backend. A few legacy names survive on
-purpose because renaming them would be a real migration for no functional
-benefit — notably the database file `predict.sqlite3` and the
-`PREDICT_DATA_DIR` / `PREDICT_ALLOWED_ORIGINS` env vars. If you see old
-references to TRIBE, calibration models, or Hugging Face weights anywhere,
-they're describing the dead product.
+Sentient Dash uses Postgres for production data and Cloudflare R2 for every
+uploaded cover, avatar, alert image, and Queue attachment. Runtime requests do
+not write persistent media to the Render filesystem. `SENTIENT_DATA_DIR` only
+supports the local SQLite fallback used during development.
 
 ## Local development
 
@@ -34,8 +28,9 @@ scripts/dev.sh
 - Backend: http://127.0.0.1:8000/api/health
 
 Requires a `.env` — copy `.env.example` and fill in what you need locally
-(Slack webhook, Apify token, Firebase service-account path, etc.). Without
-`PREDICT_DATA_DIR` set it defaults to `./data` relative to the repo root.
+(Slack webhook, Apify token, Firebase service-account path, R2 credentials,
+etc.). Without `SENTIENT_DATA_DIR` set it defaults to `./data` relative to the
+repo root.
 
 ## What it actually serves today
 
@@ -51,14 +46,13 @@ Requires a `.env` — copy `.env.example` and fill in what you need locally
   the several Sentient Dash subdomains/pages can share one signed-in
   session.
 
-Auth is Firebase ID tokens + an email allowlist
-(`_require_firebase_user` middleware), plus a legacy secondary password
-(`TRICKS_DASH_REFRESH_PASSWORD`) some admin routes still check.
+Auth is Firebase ID tokens plus an email allowlist enforced by the
+`_require_firebase_user` middleware. Some admin mutation routes also retain
+the server-side `TRICKS_DASH_REFRESH_PASSWORD` check.
 
 ## Deploying
 
-Render auto-deploys on push to `main` (see `render.yaml` — standard plan,
-2GB disk at `/var/data`). Confirm a deploy actually landed via
+Render auto-deploys on push to `main` (see `render.yaml`). Confirm a deploy actually landed via
 `GET /api/health`, which reports the live `commit` hash. **Never push to
 `main` while an account import/backfill is running** — a redeploy restarts
 the process and silently kills it. See `FOR_CODEX.md` for the full deploy
@@ -67,10 +61,7 @@ stale/dirty without anything being wrong.
 
 ## Remote GPU / OCR workers
 
-The old TRIBE v2 remote-GPU-worker setup (`REMOTE_TRIBE_URL`,
-`scripts/deploy_modal_worker.sh`) is dead along with the rest of Predict.
-The one Modal worker still in use is a **standalone, GPU-free cover-image
-OCR worker** (`workers/`, client in `backend/app/sentient_ocr.py`,
-configured via `SENTIENT_OCR_URL` / `SENTIENT_OCR_TOKEN`) — it reads text
-baked into Instagram cover images for search indexing and hook display. It
-shares no code or infrastructure with the deleted TRIBE pipeline.
+The active Modal worker is a **standalone, GPU-free cover-image OCR worker**
+(`workers/`, client in `backend/app/sentient_ocr.py`, configured via
+`SENTIENT_OCR_URL` / `SENTIENT_OCR_TOKEN`) — it reads text baked into
+Instagram cover images for search indexing and hook display.

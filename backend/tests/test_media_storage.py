@@ -1,25 +1,32 @@
 from contextlib import contextmanager
 
+import pytest
+
 from app import media_backfill, media_storage
 
 
-def test_local_write_remains_the_default_when_r2_is_off(tmp_path, monkeypatch):
-    upload_dir = tmp_path / "uploads"
-    monkeypatch.setattr(media_storage, "UPLOAD_DIR", upload_dir)
+def test_upload_requires_r2_when_local_media_is_disabled(monkeypatch):
     monkeypatch.setattr(media_storage, "r2_enabled", lambda: False)
-    reference = media_storage.store_uploaded_media("dash-sentient-post.jpg", b"image-bytes", content_type="image/jpeg")
-    assert reference == str(upload_dir / "dash-sentient-post.jpg")
-    assert (upload_dir / "dash-sentient-post.jpg").read_bytes() == b"image-bytes"
+    with pytest.raises(RuntimeError, match="local media fallback is disabled"):
+        media_storage.store_uploaded_media("dash-sentient-post.jpg", b"image-bytes", content_type="image/jpeg")
 
 
-def test_r2_reference_resolves_to_its_local_safety_copy(tmp_path, monkeypatch):
-    upload_dir = tmp_path / "uploads"
-    upload_dir.mkdir()
-    local = upload_dir / "avatar-sentient.jpg"
-    local.write_bytes(b"avatar")
-    monkeypatch.setattr(media_storage, "UPLOAD_DIR", upload_dir)
+def test_r2_reference_materializes_to_a_short_lived_temp_file(tmp_path, monkeypatch):
+    class FakeClient:
+        def download_file(self, bucket, key, filename):
+            assert bucket == "sentient-media"
+            assert key == "uploads/avatar-sentient.jpg"
+            tmp_path.joinpath(filename).write_bytes(b"avatar")
+
+    monkeypatch.setattr(media_storage, "R2_BUCKET", "sentient-media")
+    monkeypatch.setattr(media_storage, "r2_enabled", lambda: True)
+    monkeypatch.setattr(media_storage, "_client", lambda: FakeClient())
     assert media_storage.is_r2_reference("r2://uploads/avatar-sentient.jpg")
-    assert media_storage.materialize_local_path("r2://uploads/avatar-sentient.jpg") == local
+    path = media_storage.materialize_local_path("r2://uploads/avatar-sentient.jpg")
+    assert path is not None
+    assert path.read_bytes() == b"avatar"
+    media_storage.cleanup_materialized_path(path)
+    assert not path.exists()
 
 
 def test_r2_write_returns_a_durable_reference_without_a_local_mirror(tmp_path, monkeypatch):
@@ -30,21 +37,16 @@ def test_r2_write_returns_a_durable_reference_without_a_local_mirror(tmp_path, m
         def put_object(self, **kwargs):
             self.calls.append(kwargs)
 
-    upload_dir = tmp_path / "uploads"
     client = FakeClient()
-    monkeypatch.setattr(media_storage, "UPLOAD_DIR", upload_dir)
     monkeypatch.setattr(media_storage, "R2_BUCKET", "sentient-media")
-    monkeypatch.setattr(media_storage, "R2_LOCAL_MIRROR_ENABLED", False)
     monkeypatch.setattr(media_storage, "r2_enabled", lambda: True)
     monkeypatch.setattr(media_storage, "_client", lambda: client)
     reference = media_storage.store_uploaded_media("cover-post.webp", b"image", content_type="image/webp")
     assert reference == "r2://uploads/cover-post.webp"
-    assert not (upload_dir / "cover-post.webp").exists()
     assert client.calls[0]["Key"] == "uploads/cover-post.webp"
 
 
-def test_media_filename_cannot_escape_uploads(tmp_path, monkeypatch):
-    monkeypatch.setattr(media_storage, "UPLOAD_DIR", tmp_path / "uploads")
+def test_media_filename_cannot_escape_uploads(monkeypatch):
     monkeypatch.setattr(media_storage, "r2_enabled", lambda: False)
     try:
         media_storage.store_uploaded_media("../escape.jpg", b"nope")
@@ -84,7 +86,7 @@ def test_backfill_binds_the_r2_prefix_for_postgres_compatibility(monkeypatch):
     monkeypatch.setattr(media_backfill, "connect", fake_connect)
     monkeypatch.setattr(media_backfill, "init_db", lambda: None)
     monkeypatch.setattr(media_backfill, "r2_enabled", lambda: True)
-    monkeypatch.setattr(media_backfill, "upload_legacy_local_media", lambda path: "r2://uploads/cover.jpg")
+    monkeypatch.setattr(media_backfill, "upload_local_media_for_migration", lambda path: "r2://uploads/cover.jpg")
 
     assert media_backfill.backfill(1, dry_run=False) == {"scanned": 1, "uploaded": 1, "skipped": 0, "failed": 0}
     select_statement, select_params = connection.calls[0]
