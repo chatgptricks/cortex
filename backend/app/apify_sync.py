@@ -1398,6 +1398,23 @@ def _item_owner_username(item: dict[str, Any]) -> str:
     return str(item.get("ownerUsername") or nested or item.get("username") or "").strip().lstrip("@").lower()
 
 
+def _filter_items_for_account(items: list[dict[str, Any]], account: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Keep only dataset rows that belong to the requested account.
+
+    Apify datasets can occasionally contain a small number of rows from a
+    neighboring profile. Rows without an owner field remain usable because
+    some actor revisions omit it; an all-foreign dataset is rejected so a
+    completed run can never be filed under the wrong account.
+    """
+    target = str(account or "").strip().lstrip("@").lower()
+    owners = {_item_owner_username(item) for item in items if _item_owner_username(item)}
+    foreign = sorted(owner for owner in owners if owner != target)
+    if owners and target not in owners:
+        raise ApifySyncError(f"Dataset belongs to {foreign or sorted(owners)}, not '{target}'. Refusing to import.")
+    filtered = [item for item in items if not _item_owner_username(item) or _item_owner_username(item) == target]
+    return filtered, foreign
+
+
 _INSTAGRAM_CONTENT_URL = re.compile(r"instagram\.com/(?:p|reel|tv)/([^/?#]+)", re.IGNORECASE)
 
 
@@ -1925,6 +1942,8 @@ def run_backfill(
         items.extend(reel_items)
     items = _dedupe_items(items)
 
+    items, skipped_foreign = _filter_items_for_account(items, cfg["handle"])
+
     if date_to:
         try:
             upper_bound = datetime.fromisoformat(date_to).replace(tzinfo=UTC)
@@ -1943,7 +1962,7 @@ def run_backfill(
 
             items = [it for it in items if _within_upper_bound(it)]
 
-    _emit(on_progress, phase="matching", fetched=len(items))
+    _emit(on_progress, phase="matching", fetched=len(items), skipped_foreign=skipped_foreign)
     from .db import connect
 
     with connect() as conn:
@@ -1964,6 +1983,7 @@ def run_backfill(
     )
     summary = _insert_new_posts(account, cfg, new_items, on_progress=on_progress)
     summary["transcripts_updated"] = _store_existing_reel_transcripts(account, cfg, items)
+    summary["skipped_foreign"] = skipped_foreign
     return summary
 
 
