@@ -2811,8 +2811,8 @@ def _queue_v2_reflow_scheduled(conn: Any, designer: str, actor: str, priority_id
     """Remove every scheduled overlap for one designer without rejecting work.
 
     In-progress and finished blocks stay fixed. Scheduled blocks advance across
-    midnight as needed. A priority request is used by Start so the newly
-    requested job owns the first slot after active work and later jobs cascade.
+    midnight as needed. Explicit starts may overlap other active work; only
+    work that remains scheduled is moved to keep planned slots available.
     """
     rows = [dict(row) for row in conn.execute(
         """SELECT * FROM queue_requests
@@ -4734,37 +4734,6 @@ def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any
     designer = str(row["designer_email"] or "")
     with connect() as conn:
         conn.execute("DELETE FROM queue_schedule_drafts WHERE request_id = ?", (request_id,))
-        active_rows = [dict(item) for item in conn.execute(
-            """SELECT * FROM queue_requests
-               WHERE designer_email = ? AND status = 'in_progress' AND id != ?
-                 AND scheduled_date IS NOT NULL AND scheduled_start_minutes IS NOT NULL
-               ORDER BY scheduled_date, scheduled_start_minutes, id""",
-            (designer, request_id),
-        ).fetchall()]
-        if active_rows:
-            current_absolute = schedule_absolute(current_date, current_slot)
-            active_occupied = []
-            for active in active_rows:
-                active_absolute = schedule_absolute(active["scheduled_date"], int(active["scheduled_start_minutes"]))
-                active_duration = max(_queue_v2_duration(active), current_absolute + 10 - active_absolute)
-                active_occupied.append(_queue_v2_occupied(active, active_duration))
-            resolved_date, resolved_start = next_available_slot(
-                current_date, current_slot, _queue_v2_duration(row), active_occupied,
-            )
-            conn.execute(
-                """UPDATE queue_requests SET status = 'scheduled', scheduled_start_minutes = ?, scheduled_date = ?,
-                   actual_started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?""",
-                (resolved_start, resolved_date, now, request_id),
-            )
-            _queue_v2_reflow_scheduled(conn, designer, caller, priority_id=request_id)
-            updated = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
-            _queue_v2_log(conn, request_id, caller, "deferred_after_in_progress", {
-                "date": updated["scheduled_date"], "start": updated["scheduled_start_minutes"],
-                "activeRequestIds": [item["id"] for item in active_rows],
-            })
-            _queue_v2_reflow_drafts(conn, designer)
-            _queue_v2_publish(conn, "request_deferred", caller, [request_id])
-            return {"ok": True, "deferred": True, "scheduledDate": updated["scheduled_date"], "scheduledStartMinutes": updated["scheduled_start_minutes"]}
         conn.execute(
             """UPDATE queue_requests SET status = 'in_progress', scheduled_start_minutes = ?, scheduled_date = ?,
                actual_started_at = ?, completed_at = NULL, updated_at = ? WHERE id = ?""",
