@@ -5196,6 +5196,64 @@ def dashboard_queue_v2_close(
     return {"ok": True}
 
 
+@app.post("/api/dashboard/queue/v2/requests/batch-close")
+def dashboard_queue_v2_batch_close(
+    request: Request,
+    request_ids: Annotated[str, Form()],
+) -> dict[str, Any]:
+    """Close several completed requests from the admin Queue table.
+
+    Batch close is an operational cleanup action for Admins. It deliberately
+    does not require published Instagram links because the admin is closing
+    the production records after checking them elsewhere.
+    """
+    caller, is_admin, _ = _queue_v2_access(request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required to close requests in batch.")
+    try:
+        parsed = json.loads(request_ids)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Request IDs must be a JSON list.") from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise HTTPException(status_code=400, detail="Select at least one request to close.")
+    try:
+        ids = list(dict.fromkeys(int(value) for value in parsed))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Request IDs must be integers.") from exc
+    if any(value < 1 for value in ids):
+        raise HTTPException(status_code=400, detail="Request IDs must be positive integers.")
+
+    now = utc_now()
+    closed: list[int] = []
+    skipped: list[dict[str, Any]] = []
+    with connect() as conn:
+        placeholders = ",".join("?" for _ in ids)
+        rows = {
+            int(row["id"]): dict(row)
+            for row in conn.execute(f"SELECT * FROM queue_requests WHERE id IN ({placeholders})", ids).fetchall()
+        }
+        for request_id in ids:
+            row = rows.get(request_id)
+            if row is None:
+                skipped.append({"id": request_id, "reason": "Request not found."})
+                continue
+            if row.get("status") != "completed":
+                skipped.append({"id": request_id, "reason": "Only completed requests can be batch closed.", "status": row.get("status")})
+                continue
+            conn.execute(
+                """UPDATE queue_requests
+                   SET status = 'closed', final_permalink = NULL, final_permalinks = '[]',
+                       closed_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (now, now, request_id),
+            )
+            _queue_v2_log(conn, request_id, caller, "closed_by_admin_batch", {"finalPermalinks": []})
+            closed.append(request_id)
+        if closed:
+            _queue_v2_publish(conn, "requests_closed_by_admin_batch", caller, closed)
+    return {"ok": True, "closed": closed, "skipped": skipped}
+
+
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/cancel")
 def dashboard_queue_v2_cancel(request_id: int, request: Request, reason: Annotated[str | None, Form()] = None) -> dict[str, Any]:
     caller, _, _ = _queue_v2_access(request, coordinator=True)
