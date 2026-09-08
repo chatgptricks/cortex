@@ -175,6 +175,8 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_dashboard_posts_account_published
                 ON dashboard_posts(account, published_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_posts_published_id
+                ON dashboard_posts(published_at DESC, id DESC);
 
             /* Scheduler bookkeeping. Previously the "last run" markers lived
                only in module-level memory, so every redeploy reset them and
@@ -729,8 +731,19 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     if conn.execute("PRAGMA table_info(dashboard_posts)").fetchall():
         _ensure_column(conn, "dashboard_posts", "transcript", "transcript TEXT")
     for table in ("posts", "dashboard_posts"):
-        if conn.execute(f"PRAGMA table_info({table})").fetchall():
+        table_columns = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if table_columns:
             _ensure_column(conn, table, "is_deleted", "is_deleted INTEGER NOT NULL DEFAULT 0")
+            # Research pages order the two source tables together by date.
+            # Keep a narrow global index so selecting page references does not
+            # repeatedly sort the complete post payload.
+            if "published_at" in table_columns:
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_published_id "
+                    f"ON {table}(published_at DESC, id DESC)"
+                )
     # Queue closure now stores one Instagram permalink per destination. The
     # managed Postgres import predates this field, so omitting it makes the
     # post feed and Queue reads fail before they can return the existing data.
