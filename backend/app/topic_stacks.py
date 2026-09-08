@@ -109,9 +109,31 @@ def apply_memberships(posts):
     keys = [key(post) for post in posts]
     with connect() as conn:
         initialize(conn)
-        rows = conn.execute('SELECT post_key, stack_id FROM topic_stack_members').fetchall()
+        # Research is now served in bounded pages.  A full-table membership
+        # read for every page would recreate the same memory spike as the
+        # posts feed itself, so scope the projection to the page's keys.  Keep
+        # the old full scan only for explicit maintenance payloads that are
+        # intentionally larger than one API page.
+        if len(keys) <= 2000:
+            marks = ','.join('?' for _ in keys)
+            rows = conn.execute(
+                f'SELECT post_key, stack_id FROM topic_stack_members WHERE post_key IN ({marks})',
+                tuple(keys),
+            ).fetchall()
+        else:
+            rows = conn.execute('SELECT post_key, stack_id FROM topic_stack_members').fetchall()
     membership = {row['post_key']: row['stack_id'] for row in rows}
-    counts = Counter(membership.values())
+    stack_ids = sorted(set(membership.values()))
+    if stack_ids and len(keys) <= 2000:
+        marks = ','.join('?' for _ in stack_ids)
+        with connect() as conn:
+            count_rows = conn.execute(
+                f'SELECT stack_id, COUNT(*) AS count FROM topic_stack_members WHERE stack_id IN ({marks}) GROUP BY stack_id',
+                tuple(stack_ids),
+            ).fetchall()
+        counts = {row['stack_id']: int(row['count']) for row in count_rows}
+    else:
+        counts = Counter(membership.values())
     for post, post_key in zip(posts, keys):
         stack_id = membership.get(post_key)
         # A legacy row that predates persistent stacks remains visibly usable
