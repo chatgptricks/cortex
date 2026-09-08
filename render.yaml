@@ -8,6 +8,8 @@ services:
     envVars:
       - key: SENTIENT_DATA_DIR
         value: /tmp/sentient-worker-data
+      - key: SENTIENT_DISK_PATH
+        value: /tmp/sentient-worker-data
       - key: DATABASE_URL
         sync: false
       - key: SENTIENT_SCHEDULER_ENABLED
@@ -40,6 +42,8 @@ services:
         sync: false
       - key: SENTIENT_DATA_DIR
         value: /tmp/sentient-api-data
+      - key: SENTIENT_DISK_PATH
+        value: /var/data
       - key: SENTIENT_ALLOWED_ORIGINS
         sync: false # extra CORS origins, comma-separated
       - key: SENTIENT_WEB_RUN_SCHEDULER

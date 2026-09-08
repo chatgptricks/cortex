@@ -44,6 +44,7 @@ from .apify_sync import (
 from .post_media import PostMediaError, build_zip, collect_media, fetch_one
 from .config import (
     DATA_DIR,
+    disk_usage_path,
     EXTRA_CORS_ORIGINS,
     SCHEDULER_ENABLED,
     TRICKS_DASH_REFRESH_PASSWORD,
@@ -6931,13 +6932,15 @@ def admin_disk_status() -> dict[str, Any]:
     """
     import shutil
 
-    usage = shutil.disk_usage(str(DATA_DIR))
+    path = disk_usage_path()
+    usage = shutil.disk_usage(str(path))
     pct = (usage.used / usage.total * 100) if usage.total else 0.0
     return {
         "used_mb": round(usage.used / 1e6, 1),
         "total_mb": round(usage.total / 1e6, 1),
         "free_mb": round(usage.free / 1e6, 1),
         "pct_used": round(pct, 1),
+        "path": str(path),
     }
 
 

@@ -34,6 +34,11 @@ def _env_float(name: str, default: float) -> float:
 # shared Postgres database and stores every uploaded asset in R2.
 DATA_DIR = _path_from_env("SENTIENT_DATA_DIR", PROJECT_ROOT / "data")
 DB_PATH = DATA_DIR / "sentient.sqlite3"
+# Render mounts the service disk at /var/data. Keep disk monitoring separate
+# from DATA_DIR because production intentionally keeps the Postgres/R2 runtime
+# data directory under /tmp; measuring DATA_DIR reports the container root
+# filesystem instead of the attached service disk.
+DISK_USAGE_PATH = _path_from_env("SENTIENT_DISK_PATH", Path("/var/data"))
 # Set in production. Leaving it empty keeps the small SQLite fallback useful
 # for local development without making the deployed service depend on disk.
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -97,3 +102,13 @@ EXTRA_CORS_ORIGINS = _DEFAULT_CORS_ORIGINS + [
 
 def ensure_directories() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def disk_usage_path() -> Path:
+    """Return the mounted volume to use for disk alerts and diagnostics.
+
+    Local development and services without a Render disk fall back to the
+    application data directory. Production sets SENTIENT_DISK_PATH explicitly
+    so the metric cannot silently drift to the container root filesystem.
+    """
+    return DISK_USAGE_PATH if DISK_USAGE_PATH.exists() else DATA_DIR
