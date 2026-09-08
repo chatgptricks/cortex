@@ -55,8 +55,10 @@ def test_dashboard_posts_payload_pages_global_feed_without_loading_every_row(mon
         main,
         "list_accounts",
         lambda active_only=True: [
-            {"handle": "chatgptricks", "group": "sentient", "is_canonical": True},
-            {"handle": "competitor", "group": "competitors", "is_canonical": False},
+            # Simulate a legacy Postgres registry where chatgptricks retained
+            # the old default flag while another row is incorrectly marked.
+            {"handle": "chatgptricks", "group": "sentient", "is_canonical": False},
+            {"handle": "competitor", "group": "competitors", "is_canonical": True},
         ],
     )
 
@@ -69,4 +71,3 @@ def test_dashboard_posts_payload_pages_global_feed_without_loading_every_row(mon
     assert [post["shortcode"] for post in second["posts"]] == ["OLD"]
     assert second["pagination"]["hasMore"] is False
     assert second["pagination"]["nextOffset"] is None
-

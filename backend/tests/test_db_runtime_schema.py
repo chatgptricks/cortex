@@ -75,3 +75,25 @@ def test_runtime_migration_adds_soft_delete_to_both_post_tables():
     for table in ('posts', 'dashboard_posts'):
         connection.execute(f'INSERT INTO {table} (id) VALUES (1)')
         assert connection.execute(f'SELECT is_deleted FROM {table}').fetchone()[0] == 0
+
+
+def test_runtime_migration_repairs_canonical_account_registry():
+    connection = sqlite3.connect(':memory:')
+    connection.row_factory = sqlite3.Row
+    connection.execute("CREATE TABLE dashboard_users (email TEXT PRIMARY KEY, updated_at TEXT NOT NULL)")
+    connection.execute(
+        "CREATE TABLE accounts (handle TEXT PRIMARY KEY, is_canonical INTEGER NOT NULL DEFAULT 0)"
+    )
+    connection.execute("CREATE TABLE queue_requests (id INTEGER PRIMARY KEY, updated_at TEXT NOT NULL)")
+    connection.executemany(
+        "INSERT INTO accounts (handle, is_canonical) VALUES (?, ?)",
+        [('chatgptricks', 0), ('competitor', 1)],
+    )
+
+    _ensure_runtime_schema_extensions(connection)
+
+    rows = {
+        row['handle']: row['is_canonical']
+        for row in connection.execute('SELECT handle, is_canonical FROM accounts').fetchall()
+    }
+    assert rows == {'chatgptricks': 1, 'competitor': 0}
