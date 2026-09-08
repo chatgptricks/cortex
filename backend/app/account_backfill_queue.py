@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 _WORKER_LOCK = threading.Lock()
 _WORKER_STARTED = False
 _WAKE = threading.Event()
+_CLAIM_LOCK_KEY = 7042198361
+_STALE_HEARTBEAT_SECONDS = 300
 
 
 def _now() -> str:
@@ -175,7 +177,29 @@ def position(job_id: str) -> int:
 
 def _claim_next() -> dict[str, Any] | None:
     with db.connect() as conn:
+        # The API process and the dedicated Render worker can both call
+        # start_worker(). Serialize the claim across processes before looking
+        # for work, otherwise each process can observe an empty running set
+        # and start a paid Apify run at the same time.
+        if getattr(conn, "is_postgres", False):
+            lock = conn.execute(
+                "SELECT pg_try_advisory_xact_lock(?) AS locked",
+                (_CLAIM_LOCK_KEY,),
+            ).fetchone()
+            if not lock or not lock.get("locked"):
+                return None
+        else:
+            # A write transaction is SQLite's cross-process mutex. The commit
+            # also makes this work with the shared in-memory connection used
+            # by the queue tests.
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
         _ensure_schema(conn)
+        running = conn.execute(
+            "SELECT 1 FROM account_backfill_jobs WHERE status = 'running' LIMIT 1"
+        ).fetchone()
+        if running:
+            return None
         row = conn.execute(
             """SELECT * FROM account_backfill_jobs
                WHERE status = 'queued'
@@ -329,17 +353,23 @@ def _run(task: dict[str, Any]) -> None:
 
 
 def _worker_loop() -> None:
-    # A process restart can leave a job marked running. It is safe to retry it:
-    # run_backfill is idempotent and only inserts posts that are not present.
+    # A process restart can leave a job marked running. Only recover jobs whose
+    # heartbeat is genuinely stale; the web process also starts this loop when
+    # the status endpoint is opened, so resetting every running row here would
+    # interrupt a healthy job owned by the dedicated worker.
     try:
         with db.connect() as conn:
             _ensure_schema(conn)
+            stale_before = (
+                datetime.now(UTC) - timedelta(seconds=_STALE_HEARTBEAT_SECONDS)
+            ).isoformat(timespec="seconds")
             conn.execute(
                 """UPDATE account_backfill_jobs
                    SET status = 'queued', started_at = NULL,
                        progress_json = ?, error = NULL, next_attempt_at = NULL
-                   WHERE status = 'running'""",
-                (json.dumps({"phase": "queued", "recovered": True}),),
+                   WHERE status = 'running'
+                     AND (heartbeat_at IS NULL OR heartbeat_at < ?)""",
+                (json.dumps({"phase": "queued", "recovered": True}), stale_before),
             )
     except Exception:
         logger.exception("Could not recover account backfill queue")
