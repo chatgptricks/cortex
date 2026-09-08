@@ -15,7 +15,6 @@ def test_account_backfills_are_claimed_in_request_order_and_deduplicated(monkeyp
         yield connection
 
     monkeypatch.setattr(queue.db, "connect", connect)
-    monkeypatch.setattr(queue, "start_worker", lambda: None)
     monkeypatch.setattr(queue, "_wake_worker", lambda: None)
 
     first = queue.enqueue("@first", results_limit=10)
@@ -61,7 +60,6 @@ def test_status_exposes_active_queue_and_recent_results(monkeypatch):
         yield connection
 
     monkeypatch.setattr(queue.db, "connect", connect)
-    monkeypatch.setattr(queue, "start_worker", lambda: None)
     monkeypatch.setattr(queue, "_wake_worker", lambda: None)
     first = queue.enqueue("first")
     second = queue.enqueue("second")
@@ -83,7 +81,6 @@ def test_failed_attempt_is_requeued_without_starting_a_second_apify_run(monkeypa
         yield connection
 
     monkeypatch.setattr(queue.db, "connect", connect)
-    monkeypatch.setattr(queue, "start_worker", lambda: None)
     monkeypatch.setattr(queue, "_wake_worker", lambda: None)
     task = queue.enqueue("retry-account")
     claimed = queue._claim_next()

@@ -63,7 +63,6 @@ def test_scheduler_never_runs_paid_jobs_without_durable_claim(monkeypatch):
 
     jobs = []
     monkeypatch.setattr(db, "connect", unavailable)
-    monkeypatch.setattr(scheduler, "_run_media_backfill", lambda now: None)
     monkeypatch.setattr(scheduler, "_launch", lambda name, callback: callback())
     for name in ("_run_short_term_jobs", "_run_daily_jobs", "_run_ocr_job", "_run_account_snapshot_job"):
         monkeypatch.setattr(scheduler, name, lambda: jobs.append("ran"))
@@ -169,7 +168,7 @@ def test_backfill_preserves_concurrent_media_updates(monkeypatch, isolated_datab
         return "r2://uploads/old.jpg"
 
     monkeypatch.setattr(media_backfill, "r2_enabled", lambda: True)
-    monkeypatch.setattr(media_backfill, "upload_legacy_local_media", upload)
+    monkeypatch.setattr(media_backfill, "upload_local_media_for_migration", upload)
     monkeypatch.setattr(media_backfill, "init_db", lambda: pytest.fail("recurring batches must not run migrations"))
     result = media_backfill.backfill(1, dry_run=False)
     assert result == {"scanned": 1, "uploaded": 0, "skipped": 1, "failed": 0}
@@ -187,5 +186,5 @@ def test_backfill_continues_after_one_upload_fails(monkeypatch, isolated_databas
         return "r2://uploads/good.jpg"
 
     monkeypatch.setattr(media_backfill, "r2_enabled", lambda: True)
-    monkeypatch.setattr(media_backfill, "upload_legacy_local_media", upload)
+    monkeypatch.setattr(media_backfill, "upload_local_media_for_migration", upload)
     assert media_backfill.backfill(2, dry_run=False) == {"scanned": 2, "uploaded": 1, "skipped": 0, "failed": 1}

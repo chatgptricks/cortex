@@ -1,19 +1,8 @@
 """Standalone OCR worker for Sentient Dash cover images.
 
-Deliberately independent of workers/modal_tribe_worker.py (Predict's video
-worker, shared with the "Post DB" OCR feature at /api/post-db/ocr/*). That
-worker piggybacked Sentient Dash's cover-image OCR onto the exact same
-GPU-and-32GB-RAM function spec built for the tribev2 video model -- so every
-OCR call paid for an L40S GPU it never touched (PaddleOCR there installs the
-CPU build of paddlepaddle, not paddlepaddle-gpu) plus a multi-GB CUDA/torch
-image just to cold-start.
-
-This file has its own Modal App, its own image, its own secret, and its own
-endpoint label -- nothing here is shared with Predict. Measured on 30 real
-Sentient Dash covers: RapidOCR runs the full image in ~0.2s/image on plain
-CPU with zero crashes, versus PaddleOCR which segfaulted outright in a
-constrained container (a portability problem with its CPU wheel, independent
-of the GPU-waste issue). Hence RapidOCR here, not Paddle.
+This worker has its own Modal App, image, secret, and endpoint label. RapidOCR
+runs the full cover image on plain CPU, keeping OCR independent from the web
+process and avoiding GPU-only runtime dependencies.
 
 Always OCRs the FULL image, never a crop. A fixed "lower half" (or any other)
 crop region silently misses posts whose text sits outside it -- different

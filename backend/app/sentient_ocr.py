@@ -1,9 +1,7 @@
-"""HTTP client for Sentient Dash's own OCR worker (workers/modal_ocr_worker.py).
+"""HTTP client for Sentient Dash's own OCR worker.
 
-Deliberately separate from remote_ocr.py, which still serves Predict's
-"Post DB" OCR feature through the shared tribev2 GPU worker. This module
-talks to a different Modal app, with its own URL/token, and always requests
-OCR on the full cover image -- there is no crop-region concept here.
+This module talks to the standalone Modal app with its own URL/token and always
+requests OCR on the full cover image -- there is no crop-region concept here.
 """
 
 from __future__ import annotations

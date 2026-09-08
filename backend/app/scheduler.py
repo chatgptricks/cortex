@@ -41,7 +41,6 @@ _thread: threading.Thread | None = None
 
 _SHORT_BUCKET_KEY = "last_short_bucket"
 _DAILY_DATE_KEY = "last_daily_date"
-_MEDIA_BACKFILL_KEY = "last_r2_media_backfill_at"
 
 # Covers OCR'd per hourly tick. New posts arrive at a few per account per day,
 # so this keeps up easily while also chipping away at any backlog without
@@ -214,34 +213,6 @@ def _run_ocr_job() -> None:
         logger.exception("Cover OCR sweep crashed")
 
 
-def _run_media_backfill(now: datetime) -> None:
-    """Move a small, resumable media batch without contending with web requests.
-
-    The database reference changes only after its object exists in R2, and the
-    disk copy stays in place.  The persisted marker prevents a Render restart
-    from immediately running a second batch.
-    """
-    from .config import R2_BACKFILL_BATCH_SIZE, R2_BACKFILL_ENABLED, R2_BACKFILL_INTERVAL_SECONDS
-    from .media_backfill import backfill
-    from .media_storage import r2_enabled
-
-    if not R2_BACKFILL_ENABLED or not r2_enabled():
-        return
-    try:
-        last = int(_state_get(_MEDIA_BACKFILL_KEY) or "0")
-    except ValueError:
-        last = 0
-    now_epoch = int(now.timestamp())
-    if now_epoch - last < R2_BACKFILL_INTERVAL_SECONDS:
-        return
-    _state_set(_MEDIA_BACKFILL_KEY, str(now_epoch))
-    try:
-        result = backfill(limit=R2_BACKFILL_BATCH_SIZE, dry_run=False)
-        logger.info("R2 media backfill batch: %s", result)
-    except Exception:
-        logger.exception("R2 media backfill batch crashed")
-
-
 _DISK_THRESHOLDS = (85, 70)  # checked high-to-low; only the highest crossed one fires
 _DISK_STATE_KEY = "disk_alert_level"
 
@@ -308,10 +279,6 @@ def _launch(name, callback):
 
 def _tick() -> None:
     now_cst = datetime.now(_CST)
-
-    # Media migration is independent maintenance. Never let a slow R2 batch
-    # delay or suppress the time-sensitive Apify collection below.
-    _launch("media-backfill", lambda: _run_media_backfill(now_cst))
 
     bucket = _bucket_key(now_cst)
     from .ingestion_jobs import run

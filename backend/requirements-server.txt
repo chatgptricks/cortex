@@ -1,7 +1,5 @@
 # Server deployment requirements (Render/cloud).
-# Predict (tribev2 GPU analysis, LLM reports, calibration models) is archived
-# and fully removed from this backend -- this file now only lists what
-# Sentient Dash's API actually imports.
+# Sentient Dash's API and its R2 media client.
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
 python-multipart>=0.0.9,<1.0

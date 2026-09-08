@@ -10,7 +10,6 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import socket
 import threading
 import time
@@ -23,7 +22,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
@@ -48,10 +47,9 @@ from .config import (
     EXTRA_CORS_ORIGINS,
     SCHEDULER_ENABLED,
     TRICKS_DASH_REFRESH_PASSWORD,
-    UPLOAD_DIR,
     ensure_directories,
 )
-from .media_storage import materialize_local_path, redirect_url, store_uploaded_media
+from .media_storage import redirect_url, store_uploaded_media
 from .db import (
     delete_account_list,
     all_account_snapshots,
@@ -75,7 +73,7 @@ from .db import (
 )
 from .sentient_ocr import sentient_ocr_status
 from .scheduler import start_scheduler
-from .account_backfill_queue import enqueue as enqueue_account_backfill, start_worker as start_account_backfill_worker, status as account_backfill_status
+from .account_backfill_queue import enqueue as enqueue_account_backfill, status as account_backfill_status
 from .promos import create_backfill, get_job, get_opportunity, list_opportunities, update_opportunity
 from .queue_rules import (
     SCHEDULER_END,
@@ -319,10 +317,6 @@ def startup() -> None:
     else:
         _startup_ready.set()
         logging.getLogger(__name__).info("Web startup maintenance disabled; public API is request-only")
-    # Account backfills are serialized by a persisted queue. Starting this
-    # lightweight worker on every web boot also resumes queued accounts after
-    # a restart; it does not start an Apify run unless the queue has work.
-    start_account_backfill_worker()
 
 
 ensure_directories()
@@ -342,8 +336,6 @@ async def health() -> dict[str, Any]:
             "service": os.getenv("RENDER_SERVICE_NAME"),
         },
         # Sentient Dash's own cover-image OCR -- standalone, GPU-free worker.
-        # Predict (tribev2, LLM report, Post DB) is archived and fully
-        # disconnected -- nothing here reports on it anymore.
         "sentient_ocr": sentient_ocr_status(),
     }
 
@@ -1121,13 +1113,10 @@ def dashboard_post_transcript(account: str, shortcode: str) -> PlainTextResponse
 
 
 def _media_response(reference: str | Path | None, detail: str) -> Response:
-    """Serve legacy disk media or redirect durable R2 media without proxying it."""
+    """Redirect durable R2 media without proxying or caching it locally."""
     direct_url = redirect_url(reference)
     if direct_url:
         return RedirectResponse(direct_url, status_code=307)
-    path = materialize_local_path(reference)
-    if path:
-        return FileResponse(path)
     raise HTTPException(status_code=404, detail=detail)
 
 
@@ -3360,8 +3349,6 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         scheduler_preferences = _queue_v2_scheduler_preferences(conn, caller)
         trainee_reviews = _queue_v2_trainee_reviews(conn)
         snapshot_cache = _queue_v2_post_snapshot_cache(conn, all_queue_rows)
-    for request_id in expired_ids:
-        shutil.rmtree(DATA_DIR / "queue_attachments" / str(request_id), ignore_errors=True)
     def project_with_ticket_flags(row: Any) -> dict[str, Any]:
         raw = dict(row)
         snapshot = snapshot_cache.get((str(raw.get("post_account") or "").strip().lower(), str(raw.get("post_shortcode") or "").strip()))
@@ -4911,25 +4898,6 @@ def dashboard_queue_v2_duplicate(request_id: int, request: Request) -> dict[str,
     if not duplicate_row:
         raise HTTPException(status_code=409, detail="Could not create a duplicate request. Try again.")
 
-    # Attachments are stored outside SQLite under the request id. Copy the
-    # files as well as their metadata so every duplicate remains downloadable
-    # independently; a missing source file is harmless and simply leaves that
-    # attachment unavailable, matching normal Queue behavior.
-    if isinstance(source_attachments, list) and source_attachments:
-        source_dir = DATA_DIR / "queue_attachments" / str(request_id)
-        target_dir = DATA_DIR / "queue_attachments" / str(duplicate_row["id"])
-        for attachment in source_attachments:
-            attachment_id = str(attachment.get("id") or "").strip()
-            if not attachment_id or not re.fullmatch(r"[0-9a-f]{16}", attachment_id):
-                continue
-            matches = list(source_dir.glob(f"{attachment_id}.*")) + ([source_dir / attachment_id] if (source_dir / attachment_id).exists() else [])
-            if not matches:
-                continue
-            target_dir.mkdir(parents=True, exist_ok=True)
-            for source_file in matches:
-                if source_file.is_file():
-                    shutil.copy2(source_file, target_dir / source_file.name)
-
     _queue_v2_slack_log(
         event_type="duplicated", task_id=int(duplicate_row["id"]), actor_email=caller,
         account=duplicate_row.get("post_account"), shortcode=duplicate_row.get("post_shortcode"),
@@ -5101,30 +5069,6 @@ def dashboard_queue_v2_assign_multiple_accounts(
         created_ids = [int(row["id"]) for row in created_rows]
         _queue_v2_publish(conn, "requests_assigned_to_accounts", caller, [request_id, *created_ids])
 
-    # Copy attachment files after the DB transaction. A missing source file is
-    # harmless, and metadata remains available in every independent copy.
-    if isinstance(source_attachments, list) and source_attachments:
-        source_dir = DATA_DIR / "queue_attachments" / str(request_id)
-        for created in created_rows:
-            # The first assignment reuses the source row and therefore already
-            # points at this directory; only synthetic copies need file copies.
-            if int(created["id"]) == request_id:
-                continue
-            target_dir = DATA_DIR / "queue_attachments" / str(created["id"])
-            for attachment in source_attachments:
-                if not isinstance(attachment, dict):
-                    continue
-                attachment_id = str(attachment.get("id") or "").strip()
-                if not attachment_id or not re.fullmatch(r"[0-9a-f]{16}", attachment_id):
-                    continue
-                matches = list(source_dir.glob(f"{attachment_id}.*")) + ([source_dir / attachment_id] if (source_dir / attachment_id).exists() else [])
-                if not matches:
-                    continue
-                target_dir.mkdir(parents=True, exist_ok=True)
-                for source_file in matches:
-                    if source_file.is_file():
-                        shutil.copy2(source_file, target_dir / source_file.name)
-
     from .slack_alerts import notify_queue_assignment_result, slack_user_id_for_email
     notifications: list[dict[str, Any]] = []
     for created, assignment in zip(created_rows, assignments):
@@ -5202,11 +5146,7 @@ def dashboard_queue_v2_attachment(request_id: int, attachment_id: str, request: 
     direct_url = redirect_url(media_ref)
     if direct_url:
         return RedirectResponse(direct_url, status_code=307)
-    folder = DATA_DIR / "queue_attachments" / str(request_id)
-    matches = list(folder.glob(f"{attachment_id}.*")) + ([folder / attachment_id] if (folder / attachment_id).exists() else [])
-    if not matches or not matches[0].is_file():
-        raise HTTPException(status_code=404, detail="Queue attachment file not found.")
-    return FileResponse(matches[0], media_type=attachment.get("contentType") or "application/octet-stream", filename=attachment.get("name") or "attachment")
+    raise HTTPException(status_code=404, detail="Queue attachment is not available in R2.")
 
 
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/complete")
@@ -5743,11 +5683,6 @@ def admin_alert_image(filename: str) -> Response:
     path-traversal guard, not a real access check."""
     if not _ALERT_IMAGE_NAME_RE.match(filename):
         raise HTTPException(status_code=404, detail="Not found.")
-    # A failed R2 write intentionally leaves a local safety copy. Serve that
-    # copy first; successful R2-only writes have no disk file and redirect.
-    path = UPLOAD_DIR / filename
-    if path.is_file():
-        return FileResponse(path)
     direct_url = redirect_url(f"r2://uploads/{filename}")
     if direct_url:
         return RedirectResponse(direct_url, status_code=307)
@@ -6038,8 +5973,6 @@ def admin_queue_reset(
             # been created; its absence must not make a clean reset fail.
             pass
         revision = _queue_v2_publish(conn, "queue_reset", caller)
-    # Attachments are Queue-only and live in a fixed, non-user-derived path.
-    shutil.rmtree(DATA_DIR / "queue_attachments", ignore_errors=True)
     return {"ok": True, "deleted": deleted, "hotRoutingStart": now, "liveRevision": revision}
 
 
@@ -6752,8 +6685,8 @@ def temp_ocr_start(
 def temp_ocr_status() -> dict[str, Any]:
     """progress of the background OCR sweep."""
     with connect() as conn:
-        # Mirrors run_ocr_sweep's own queue: rows with no local cover file are
-        # no longer excluded (the sweep re-downloads them). Scoped to
+        # Mirrors run_ocr_sweep's own queue: rows with no R2 cover object are
+        # no longer excluded (the sweep re-downloads them to a temp file). Scoped to
         # dashboard_posts, matching the sweep: the frozen `posts` table is not
         # processed, so counting it would show a backlog that never drains.
         remaining = conn.execute(
@@ -6827,8 +6760,8 @@ def admin_create_account(
 ) -> dict[str, Any]:
     """Self-serve account creation: register a new IG handle under Sentient
     or Competitors, no code changes or redeploy required. Always
-    non-canonical -- writes into the generic dashboard_posts table, never
-    Predict's `posts`. Automatically picked up by the scheduler on its next
+    non-canonical -- writes into the generic dashboard_posts table, never the
+    canonical `posts` dataset. Automatically picked up by the scheduler on its next
     tick; call the backfill endpoint below afterward to seed initial history.
     """
     if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
