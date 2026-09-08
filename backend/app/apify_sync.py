@@ -1036,7 +1036,18 @@ def _run_apify_actor_and_fetch(
     if not isinstance(items, list):
         raise ApifySyncError("Apify dataset returned an unexpected response shape.")
     if journal:
-        saved["items"] = items
+        # Keep tiny test/preview datasets inline, but never write a full
+        # history payload (often tens of megabytes) into the Postgres journal.
+        # That oversized JSON was the second failure mode: the fetch reached
+        # the end, then the connection died while saving the journal, so the
+        # account stayed running at zero. Large datasets remain recoverable
+        # from the same immutable Apify run and are fetched again on retry.
+        if len(items) <= 50:
+            saved["items"] = items
+        else:
+            saved.pop("items", None)
+        saved["dataset_id"] = dataset_id
+        saved["dataset_count"] = len(items)
         journal.save()
     _emit(on_progress, phase="dataset_ready", fetched=len(items))
     return items
