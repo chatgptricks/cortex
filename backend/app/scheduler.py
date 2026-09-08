@@ -230,12 +230,13 @@ def _check_disk() -> None:
     """
     import shutil
 
-    from .config import DATA_DIR
+    from .config import disk_usage_path
     from .slack_alerts import notify_disk_warning, slack_configured
 
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        usage = shutil.disk_usage(str(DATA_DIR))
+        path = disk_usage_path()
+        path.mkdir(parents=True, exist_ok=True)
+        usage = shutil.disk_usage(str(path))
     except Exception:
         logger.exception("Disk usage check failed")
         return
