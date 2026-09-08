@@ -37,6 +37,9 @@ def test_account_backfills_are_claimed_in_request_order_and_deduplicated(monkeyp
 
     monkeypatch.setattr(queue, "run_backfill", fake_backfill)
     claimed_first = queue._claim_next()
+    # A second worker must not claim another account while the first import is
+    # still in progress.
+    assert queue._claim_next() is None
     queue._run(claimed_first)
     claimed_second = queue._claim_next()
     queue._run(claimed_second)
