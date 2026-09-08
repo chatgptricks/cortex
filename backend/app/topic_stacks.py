@@ -103,40 +103,15 @@ def apply_memberships(posts):
     This is deliberately read-only.  Ingestion calls :func:`attach` for a
     newly saved post; dashboard reads must never classify, merge, or otherwise
     alter an existing user's grouping just because somebody reloaded Research.
-    The groups live durably in ``topic_stack_members``; this function only
-    copies the already-saved group id and full group count onto the current
-    page of posts so a read does not rebuild groups in process memory.
     """
     if not posts:
         return
     keys = [key(post) for post in posts]
     with connect() as conn:
         initialize(conn)
-        # Research is now served in bounded pages.  A full-table membership
-        # read for every page would recreate the same memory spike as the
-        # posts feed itself, so scope the projection to the page's keys.  Keep
-        # the old full scan only for explicit maintenance payloads that are
-        # intentionally larger than one API page.
-        if len(keys) <= 2000:
-            marks = ','.join('?' for _ in keys)
-            rows = conn.execute(
-                f'SELECT post_key, stack_id FROM topic_stack_members WHERE post_key IN ({marks})',
-                tuple(keys),
-            ).fetchall()
-        else:
-            rows = conn.execute('SELECT post_key, stack_id FROM topic_stack_members').fetchall()
+        rows = conn.execute('SELECT post_key, stack_id FROM topic_stack_members').fetchall()
     membership = {row['post_key']: row['stack_id'] for row in rows}
-    stack_ids = sorted(set(membership.values()))
-    if stack_ids and len(keys) <= 2000:
-        marks = ','.join('?' for _ in stack_ids)
-        with connect() as conn:
-            count_rows = conn.execute(
-                f'SELECT stack_id, COUNT(*) AS count FROM topic_stack_members WHERE stack_id IN ({marks}) GROUP BY stack_id',
-                tuple(stack_ids),
-            ).fetchall()
-        counts = {row['stack_id']: int(row['count']) for row in count_rows}
-    else:
-        counts = Counter(membership.values())
+    counts = Counter(membership.values())
     for post, post_key in zip(posts, keys):
         stack_id = membership.get(post_key)
         # A legacy row that predates persistent stacks remains visibly usable
