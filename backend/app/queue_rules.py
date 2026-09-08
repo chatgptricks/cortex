@@ -7,7 +7,10 @@ from zoneinfo import ZoneInfo
 
 SCHEDULER_START = 0
 SCHEDULER_END = 24 * 60
-SCHEDULER_BUFFER_MINUTES = 0
+# Every scheduler block needs a short handoff buffer. Keep this rule in the
+# shared planner so assignments, personal time, move approvals, and reflows
+# all use the same collision boundary.
+SCHEDULER_BUFFER_MINUTES = 10
 SCHEDULER_TIMEZONE = ZoneInfo("America/Costa_Rica")
 
 
@@ -61,5 +64,8 @@ def next_available_slot(
         ]
         if not conflicts:
             return split_schedule_absolute(candidate)
-        candidate = max(other_start + other_duration for other_start, other_duration in conflicts)
+        candidate = max(
+            other_start + other_duration + SCHEDULER_BUFFER_MINUTES
+            for other_start, other_duration in conflicts
+        )
         candidate = ((candidate + 9) // 10) * 10
