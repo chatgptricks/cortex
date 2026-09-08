@@ -814,8 +814,16 @@ def _dashboard_posts_payload(limit: int | None = None, offset: int = 0) -> dict[
     # that repair has run. The canonical catalogue is always the `posts`
     # table, regardless of the stale registry flag. Prefer the known handle
     # even when another legacy row is incorrectly marked canonical.
-    canonical = ({**known_canonical, "is_canonical": True} if known_canonical else
-                 next((a for a in accounts if a["is_canonical"]), None))
+    # `posts` is the original ChatGPTricks catalogue, so its identity does not
+    # depend on an account row imported into the newer registry. Keep a
+    # synthetic canonical descriptor when that legacy row is missing entirely;
+    # otherwise a different stale `is_canonical` flag could relabel these rows
+    # as another account or omit them from the feed altogether.
+    canonical = ({**known_canonical, "is_canonical": True} if known_canonical else {
+        "handle": "chatgptricks",
+        "group": "sentient",
+        "is_canonical": True,
+    })
 
     posts: list[dict[str, Any]] = []
 
