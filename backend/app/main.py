@@ -803,8 +803,12 @@ def _dashboard_posts_payload(limit: int | None = None, offset: int = 0) -> dict[
     if limit is not None and (limit < 1 or offset < 0):
         raise ValueError("Post page bounds must be positive.")
     accounts = list_accounts(active_only=True)
-    group_by_handle = {a["handle"]: a["group"] for a in accounts}
-    known_canonical = next((a for a in accounts if a["handle"] == "chatgptricks"), None)
+    # Keep the canonical catalogue visible even if a legacy production row was
+    # accidentally deactivated. Startup repairs that flag, but the reader must
+    # stay correct during a rolling deploy and for already-open instances.
+    all_accounts = list_accounts(active_only=False)
+    group_by_handle = {a["handle"]: a["group"] for a in all_accounts}
+    known_canonical = next((a for a in all_accounts if a["handle"] == "chatgptricks"), None)
     # Production metadata is repaired during startup, but keep Research
     # correct if a legacy account row is read during a rolling deploy before
     # that repair has run. The canonical catalogue is always the `posts`

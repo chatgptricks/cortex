@@ -503,6 +503,7 @@ def init_db() -> None:
         # and serve our own copy instead of persisting the raw CDN URL.
         _ensure_column(conn, "accounts", "avatar_path", "avatar_path TEXT")
         _ensure_column(conn, "accounts", "scrape_mode", "scrape_mode TEXT NOT NULL DEFAULT 'posts'")
+        _ensure_column(conn, "accounts", "is_active", "is_active INTEGER NOT NULL DEFAULT 1")
         # OCR text extracted from the cover image, mirroring posts.hook_text.
         # Powers the dashboard's "includes cover text" search for every
         # non-canonical account (previously only chatgptricks had this).
@@ -703,6 +704,7 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     # full bootstrap. Otherwise production would accept the UI form but fail
     # on its first account read after deployment.
     _ensure_column(conn, "accounts", "scrape_mode", "scrape_mode TEXT NOT NULL DEFAULT 'posts'")
+    _ensure_column(conn, "accounts", "is_active", "is_active INTEGER NOT NULL DEFAULT 1")
     # The original @chatgptricks catalogue lives in `posts`. A legacy account
     # row created before the multi-account registry could retain the default
     # `is_canonical = 0`, which silently made Research omit the entire
@@ -715,9 +717,11 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     }
     if {"handle", "is_canonical"}.issubset(account_columns):
         conn.execute(
-            "UPDATE accounts SET is_canonical = CASE WHEN handle = ? THEN 1 ELSE 0 END "
+            "UPDATE accounts "
+            "SET is_canonical = CASE WHEN handle = ? THEN 1 ELSE 0 END, "
+            "    is_active = CASE WHEN handle = ? THEN 1 ELSE is_active END "
             "WHERE handle = ? OR is_canonical = 1",
-            ("chatgptricks", "chatgptricks"),
+            ("chatgptricks", "chatgptricks", "chatgptricks"),
         )
     # Minimal runtime-schema fixtures may not include the optional generic
     # post table at all; production imports always create it before this
