@@ -842,6 +842,9 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
                progress_json TEXT NOT NULL DEFAULT '{}',
                result_json TEXT NOT NULL DEFAULT '{}',
                error TEXT,
+               attempts INTEGER NOT NULL DEFAULT 0,
+               next_attempt_at TEXT,
+               heartbeat_at TEXT,
                requested_at TEXT NOT NULL,
                started_at TEXT,
                finished_at TEXT
@@ -851,6 +854,9 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_account_backfill_jobs_queue "
         "ON account_backfill_jobs(status, requested_at)"
     )
+    _ensure_column(conn, "account_backfill_jobs", "attempts", "attempts INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "account_backfill_jobs", "next_attempt_at", "next_attempt_at TEXT")
+    _ensure_column(conn, "account_backfill_jobs", "heartbeat_at", "heartbeat_at TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_opportunities_date ON promo_opportunities(first_detected_at DESC, account, shortcode)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_scans_status ON promo_scans(status, updated_at)")
 

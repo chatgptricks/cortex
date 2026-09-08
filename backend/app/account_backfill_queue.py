@@ -14,11 +14,12 @@ import logging
 import threading
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from . import db
 from .apify_sync import run_backfill
+from . import ingestion_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,9 @@ def _ensure_schema(conn: Any) -> None:
                progress_json TEXT NOT NULL DEFAULT '{}',
                result_json TEXT NOT NULL DEFAULT '{}',
                error TEXT,
+               attempts INTEGER NOT NULL DEFAULT 0,
+               next_attempt_at TEXT,
+               heartbeat_at TEXT,
                requested_at TEXT NOT NULL,
                started_at TEXT,
                finished_at TEXT
@@ -61,6 +65,11 @@ def _ensure_schema(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_account_backfill_jobs_queue "
         "ON account_backfill_jobs(status, requested_at)"
     )
+    # The table was introduced before retry/heartbeat support. Keep the queue
+    # self-healing when an older database receives the new worker first.
+    db._ensure_column(conn, "account_backfill_jobs", "attempts", "attempts INTEGER NOT NULL DEFAULT 0")
+    db._ensure_column(conn, "account_backfill_jobs", "next_attempt_at", "next_attempt_at TEXT")
+    db._ensure_column(conn, "account_backfill_jobs", "heartbeat_at", "heartbeat_at TEXT")
 
 
 def _task(row: Any) -> dict[str, Any]:
@@ -75,6 +84,9 @@ def _task(row: Any) -> dict[str, Any]:
         "progress": _json(row["progress_json"], {}),
         "result": _json(row["result_json"], {}),
         "error": row["error"],
+        "attempts": int(row["attempts"] or 0),
+        "next_attempt_at": row["next_attempt_at"],
+        "heartbeat_at": row["heartbeat_at"],
         "requested_at": row["requested_at"],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
@@ -128,6 +140,9 @@ def enqueue(handle: str, results_limit: int = 2000, date_from: str | None = None
                 "progress": {"phase": "queued"},
                 "result": {},
                 "error": None,
+                "attempts": 0,
+                "next_attempt_at": None,
+                "heartbeat_at": None,
                 "requested_at": now,
                 "started_at": None,
                 "finished_at": None,
@@ -162,16 +177,22 @@ def _claim_next() -> dict[str, Any] | None:
     with db.connect() as conn:
         _ensure_schema(conn)
         row = conn.execute(
-            "SELECT * FROM account_backfill_jobs WHERE status = 'queued' ORDER BY requested_at ASC LIMIT 1"
+            """SELECT * FROM account_backfill_jobs
+               WHERE status = 'queued'
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+               ORDER BY requested_at ASC LIMIT 1""",
+            (_now(),),
         ).fetchone()
         if not row:
             return None
         now = db.utc_now()
         changed = conn.execute(
             """UPDATE account_backfill_jobs
-               SET status = 'running', started_at = ?, progress_json = ?, error = NULL
+               SET status = 'running', started_at = ?, progress_json = ?,
+                   error = NULL, attempts = COALESCE(attempts, 0) + 1,
+                   heartbeat_at = ?, next_attempt_at = NULL
                WHERE job_id = ? AND status = 'queued'""",
-            (now, json.dumps({"phase": "preparing"}), row["job_id"]),
+            (now, json.dumps({"phase": "preparing"}), now, row["job_id"]),
         ).rowcount
         if changed != 1:
             return None
@@ -201,35 +222,110 @@ def _update(job_id: str, **fields: Any) -> None:
 
 def _run(task: dict[str, Any]) -> None:
     job_id = task["job_id"]
+    heartbeat_stop = threading.Event()
+
+    def heartbeat() -> None:
+        while not heartbeat_stop.wait(15):
+            _update(job_id, heartbeat_at=db.utc_now())
+
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True, name=f"backfill-heartbeat-{task['handle']}")
+    heartbeat_thread.start()
 
     def on_progress(progress: dict[str, Any]) -> None:
         _update(job_id, progress_json=json.dumps(progress, default=str))
 
     try:
-        result = run_backfill(
-            task["handle"],
-            results_limit=task["results_limit"],
-            date_from=task["date_from"] or None,
-            date_to=task["date_to"] or None,
-            on_progress=on_progress,
-        )
-    except Exception as exc:  # noqa: BLE001 - surfaced in the admin UI
-        _update(
-            job_id,
-            status="error",
-            error=str(exc)[:2000],
-            progress_json=json.dumps({"phase": "error"}),
-            finished_at=db.utc_now(),
-        )
-        return
-    _update(
-        job_id,
-        status="done",
-        result_json=json.dumps(result or {}, default=str),
-        error=None,
-        progress_json=json.dumps({"phase": "inserting", "done": 1, "total": 1}),
-        finished_at=db.utc_now(),
-    )
+        result_box: dict[str, Any] = {}
+
+        def work() -> None:
+            result_box["value"] = run_backfill(
+                task["handle"],
+                results_limit=task["results_limit"],
+                date_from=task["date_from"] or None,
+                date_to=task["date_to"] or None,
+                on_progress=on_progress,
+            )
+
+        completed = ingestion_jobs.run(f"account-backfill:{job_id}", "01", work)
+        if completed:
+            _update(
+                job_id,
+                status="done",
+                result_json=json.dumps(result_box.get("value") or {}, default=str),
+                error=None,
+                progress_json=json.dumps({"phase": "inserting", "done": 1, "total": 1}),
+                heartbeat_at=db.utc_now(),
+                finished_at=db.utc_now(),
+            )
+            return
+
+        # ingestion_jobs keeps the paid Apify run and fetched dataset in its
+        # journal. Retry the same queue item after the lease expires instead
+        # of launching a second paid scrape. Three attempts cover transient
+        # CDN/database failures while still surfacing a real persistent error.
+        attempt = int(task.get("attempts") or 1)
+        with db.connect() as conn:
+            journal = conn.execute(
+                "SELECT status, error FROM ingestion_jobs WHERE job_key = ?", (f"account-backfill:{job_id}",)
+            ).fetchone()
+        if journal and journal["status"] == "done":
+            # The paid run and its dataset were already journaled successfully,
+            # but the process may have died before the queue row got its final
+            # update. Do not scrape or charge again.
+            _update(
+                job_id,
+                status="done",
+                result_json=json.dumps({"recovered": True}),
+                error=None,
+                progress_json=json.dumps({"phase": "inserting", "done": 1, "total": 1}),
+                heartbeat_at=db.utc_now(),
+                finished_at=db.utc_now(),
+            )
+            return
+        error = (journal["error"] if journal else None) or "Import interrupted; retrying the saved dataset."
+        if attempt < 3:
+            retry_at = datetime.now(UTC) + timedelta(seconds=ingestion_jobs.RETRY_SECONDS + 5)
+            _update(
+                job_id,
+                status="queued",
+                error=str(error)[:2000],
+                progress_json=json.dumps({"phase": "retrying", "attempt": attempt}),
+                heartbeat_at=db.utc_now(),
+                next_attempt_at=retry_at.isoformat(timespec="seconds"),
+            )
+        else:
+            _update(
+                job_id,
+                status="error",
+                error=str(error)[:2000],
+                progress_json=json.dumps({"phase": "error", "attempt": attempt}),
+                heartbeat_at=db.utc_now(),
+                finished_at=db.utc_now(),
+            )
+    except Exception as exc:  # noqa: BLE001 - retry transient worker failures
+        attempt = int(task.get("attempts") or 1)
+        if attempt < 3:
+            retry_at = datetime.now(UTC) + timedelta(seconds=ingestion_jobs.RETRY_SECONDS + 5)
+            _update(
+                job_id,
+                status="queued",
+                error=str(exc)[:2000],
+                progress_json=json.dumps({"phase": "retrying", "attempt": attempt}),
+                heartbeat_at=db.utc_now(),
+                next_attempt_at=retry_at.isoformat(timespec="seconds"),
+            )
+        else:
+            _update(
+                job_id,
+                status="error",
+                error=str(exc)[:2000],
+                progress_json=json.dumps({"phase": "error", "attempt": attempt}),
+                heartbeat_at=db.utc_now(),
+                finished_at=db.utc_now(),
+            )
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1)
 
 
 def _worker_loop() -> None:
@@ -241,7 +337,7 @@ def _worker_loop() -> None:
             conn.execute(
                 """UPDATE account_backfill_jobs
                    SET status = 'queued', started_at = NULL,
-                       progress_json = ?, error = NULL
+                       progress_json = ?, error = NULL, next_attempt_at = NULL
                    WHERE status = 'running'""",
                 (json.dumps({"phase": "queued", "recovered": True}),),
             )
