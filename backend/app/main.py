@@ -75,6 +75,7 @@ from .db import (
 )
 from .sentient_ocr import sentient_ocr_status
 from .scheduler import start_scheduler
+from .account_backfill_queue import enqueue as enqueue_account_backfill, start_worker as start_account_backfill_worker, status as account_backfill_status
 from .promos import create_backfill, get_job, get_opportunity, list_opportunities, update_opportunity
 from .queue_rules import (
     SCHEDULER_END,
@@ -318,6 +319,10 @@ def startup() -> None:
     else:
         _startup_ready.set()
         logging.getLogger(__name__).info("Web startup maintenance disabled; public API is request-only")
+    # Account backfills are serialized by a persisted queue. Starting this
+    # lightweight worker on every web boot also resumes queued accounts after
+    # a restart; it does not start an Apify run unless the queue has work.
+    start_account_backfill_worker()
 
 
 ensure_directories()
@@ -6665,8 +6670,7 @@ def temp_backfill_bg(
     date_from: Annotated[str | None, Form()] = None,
     date_to: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
-    """Runs a backfill in a background thread so a client disconnect (or a slow
-    scrape) can't abort it.
+    """Queues an account backfill behind any import already in progress.
 
     This is the endpoint the add-account wizard uses. The synchronous one
     cannot survive a full history import: the scrape routinely runs for
@@ -6679,31 +6683,31 @@ def temp_backfill_bg(
     switched over.
     """
     _require_admin(password)
-    if _BACKFILL_RUN["running"]:
-        return {"already_running": True, **_BACKFILL_RUN}
-    _BACKFILL_RUN.update(
-        {
-            "running": True,
-            "handle": handle,
-            "result": None,
-            "error": None,
-            "progress": {"phase": "queued"},
-            "started_at": time.time(),
-        }
+    try:
+        get_account_config(handle)
+    except ApifySyncError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    task = enqueue_account_backfill(
+        handle,
+        results_limit=results_limit,
+        date_from=date_from or None,
+        date_to=date_to or None,
     )
-    threading.Thread(
-        target=_backfill_worker,
-        args=(handle, results_limit, date_from or None, date_to or None),
-        daemon=True,
-        name=f"backfill-{handle}",
-    ).start()
-    return {"started": True, "handle": handle, "results_limit": results_limit}
+    return {
+        "started": task["status"] == "running",
+        "queued": task["status"] == "queued",
+        "already_queued": bool(task.get("duplicate")),
+        "handle": task["handle"],
+        "job_id": task["job_id"],
+        "position": task.get("position", 0),
+        "results_limit": task["results_limit"],
+    }
 
 
 @app.get("/api/admin/accounts/backfill-status")
 def temp_backfill_status() -> dict[str, Any]:
-    """progress of the background backfill."""
-    return dict(_BACKFILL_RUN)
+    """Progress for the active import plus every queued account."""
+    return account_backfill_status()
 
 
 @app.post("/api/admin/ocr/start")
