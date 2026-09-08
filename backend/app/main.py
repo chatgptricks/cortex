@@ -788,37 +788,20 @@ def tracker_snapshot_now() -> dict[str, Any]:
 _DASHBOARD_POSTS_CACHE_LOCK = threading.Lock()
 _DASHBOARD_POSTS_CACHE_CONTENT: bytes | None = None
 _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0.0
-_DASHBOARD_POSTS_CACHE_PARAMS: tuple[int, int] | None = None
 
 
-def _dashboard_posts_payload(limit: int | None = None, offset: int = 0) -> dict[str, Any]:
+def _dashboard_posts_payload() -> dict[str, Any]:
     """Unified, public, read-only projection across every account. Each
     post is tagged with `account` and `group` (sentient/competitors) so the
     frontend can build the All/Sentient/Competitors tabs and per-tab account
-    filter from a single fetch.  Public requests use a bounded page so a
-    large Research catalogue never has to exist as one Python object graph.
-    ``limit=None`` is reserved for explicit maintenance operations that need
-    the complete catalogue.
+    filter from a single fetch.
     """
-    if limit is not None and (limit < 1 or offset < 0):
-        raise ValueError("Post page bounds must be positive.")
     accounts = list_accounts(active_only=True)
-    # Keep the canonical catalogue visible even if a legacy production row was
-    # accidentally deactivated. Startup repairs that flag, but the reader must
-    # stay correct during a rolling deploy and for already-open instances.
+    # Keep the legacy @chatgptricks catalogue visible during a rolling deploy
+    # even if its registry row still carries stale canonical/active metadata.
     all_accounts = list_accounts(active_only=False)
     group_by_handle = {a["handle"]: a["group"] for a in all_accounts}
     known_canonical = next((a for a in all_accounts if a["handle"] == "chatgptricks"), None)
-    # Production metadata is repaired during startup, but keep Research
-    # correct if a legacy account row is read during a rolling deploy before
-    # that repair has run. The canonical catalogue is always the `posts`
-    # table, regardless of the stale registry flag. Prefer the known handle
-    # even when another legacy row is incorrectly marked canonical.
-    # `posts` is the original ChatGPTricks catalogue, so its identity does not
-    # depend on an account row imported into the newer registry. Keep a
-    # synthetic canonical descriptor when that legacy row is missing entirely;
-    # otherwise a different stale `is_canonical` flag could relabel these rows
-    # as another account or omit them from the feed altogether.
     canonical = ({**known_canonical, "is_canonical": True} if known_canonical else {
         "handle": "chatgptricks",
         "group": "sentient",
@@ -828,107 +811,37 @@ def _dashboard_posts_payload(limit: int | None = None, offset: int = 0) -> dict[
     posts: list[dict[str, Any]] = []
 
     with connect() as conn:
-        # First order only the narrow source references.  The previous query
-        # sorted captions, OCR, transcripts and raw metadata for every row on
-        # every page; with ~70k posts that made page 2+ slow enough that the
-        # browser appeared to be stuck at its first 998 visible cards.  Fetch
-        # the wide row only after the page window is known.
-        ref_sources: list[str] = []
         if canonical:
-            ref_sources.append("SELECT 0 AS source_kind, id, published_at FROM posts")
-        ref_sources.append("SELECT 1 AS source_kind, id, published_at FROM dashboard_posts")
-        refs_sql = (
-            "SELECT source_kind, id FROM ("
-            + " UNION ALL ".join(ref_sources)
-            + ") AS ordered_posts "
-              "ORDER BY CASE WHEN published_at IS NULL THEN 1 ELSE 0 END, published_at DESC, id DESC"
-        )
-        ref_params: tuple[Any, ...] = ()
-        if limit is not None:
-            refs_sql += " LIMIT ? OFFSET ?"
-            ref_params = (limit, offset)
-        refs = conn.execute(refs_sql, ref_params).fetchall()
-
-        post_rows: list[dict[str, Any]] = []
-        ids_by_source = {0: [], 1: []}
-        for ref in refs:
-            ids_by_source[int(ref["source_kind"])].append(int(ref["id"]))
-
-        def _page_rows(table: str, source_kind: int, ids: list[int]) -> dict[tuple[int, int], dict[str, Any]]:
-            if not ids:
-                return {}
-            loaded: dict[tuple[int, int], dict[str, Any]] = {}
-            # Keep explicit maintenance payloads compatible with Postgres's
-            # bind-parameter limit as well as the normal 2k-page route.
-            for start in range(0, len(ids), 500):
-                chunk = ids[start:start + 500]
-                marks = ",".join("?" for _ in chunk)
-                if source_kind == 0:
-                    sql = f"""
-                        SELECT 0 AS source_kind, id, CAST(NULL AS TEXT) AS account,
-                               shortcode, published_at, likes, comments, caption,
-                               post_type_label, is_animated, CAST(NULL AS TEXT) AS permalink,
-                               is_hot, hot_rate_multiplier, hook_text,
-                               CAST(NULL AS TEXT) AS music_song,
-                               CAST(NULL AS TEXT) AS music_artist,
-                               CAST(NULL AS TEXT) AS music_audio_id,
-                               CAST(NULL AS INTEGER) AS uses_original_audio,
-                               is_promo, hidden, is_deleted, CAST(NULL AS TEXT) AS transcript,
-                               title, source_row_number, section
-                        FROM {table} WHERE id IN ({marks})
-                    """
-                else:
-                    sql = f"""
-                        SELECT 1 AS source_kind, id, account, shortcode, published_at, likes,
-                               comments, caption, post_type_label, is_animated, permalink,
-                               is_hot, hot_rate_multiplier, hook_text, music_song, music_artist,
-                               music_audio_id, uses_original_audio, is_promo, hidden, is_deleted,
-                               transcript, CAST(NULL AS TEXT) AS title,
-                               CAST(NULL AS INTEGER) AS source_row_number, 'single' AS section
-                        FROM {table} WHERE id IN ({marks})
-                    """
-                loaded.update(
-                    {(source_kind, int(row["id"])): dict(row)
-                     for row in conn.execute(sql, tuple(chunk)).fetchall()}
-                )
-            return loaded
-
-        rows_by_id = {
-            **_page_rows("posts", 0, ids_by_source[0]),
-            **_page_rows("dashboard_posts", 1, ids_by_source[1]),
-        }
-        post_rows = [
-            rows_by_id[(int(ref["source_kind"]), int(ref["id"]))]
-            for ref in refs
-            if (int(ref["source_kind"]), int(ref["id"])) in rows_by_id
-        ]
-
-        total_count = 0
-        total_likes = 0
-        known_likes = 0
-        if canonical:
-            aggregate = conn.execute(
-                "SELECT COUNT(*) AS total_count, COALESCE(SUM(likes), 0) AS total_likes, COUNT(likes) AS known_likes FROM posts"
-            ).fetchone()
-            total_count += int(aggregate["total_count"] or 0)
-            total_likes += int(aggregate["total_likes"] or 0)
-            known_likes += int(aggregate["known_likes"] or 0)
-        aggregate = conn.execute(
-            "SELECT COUNT(*) AS total_count, COALESCE(SUM(likes), 0) AS total_likes, COUNT(likes) AS known_likes FROM dashboard_posts"
-        ).fetchone()
-        total_count += int(aggregate["total_count"] or 0)
-        total_likes += int(aggregate["total_likes"] or 0)
-        known_likes += int(aggregate["known_likes"] or 0)
+            canonical_rows = conn.execute(
+                """
+                SELECT id, title, caption, hook_text, published_at, likes, comments,
+                       post_type_label, shortcode, image_path, is_animated,
+                       source_row_number, created_at, section, is_hot, hot_rate_multiplier,
+                       is_promo, hidden, is_deleted
+                FROM posts
+                """
+            ).fetchall()
+        else:
+            canonical_rows = []
+        dashboard_rows = conn.execute(
+            """
+            SELECT id, account, shortcode, published_at, likes, comments, caption,
+                   post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
+                   hook_text, music_song, music_artist, music_audio_id, uses_original_audio,
+                   is_promo, hidden, is_deleted, transcript
+            FROM dashboard_posts
+            """
+        ).fetchall()
         queue_rows = conn.execute(
             """SELECT id, post_account, post_shortcode, status, designer_email, coordinator_email,
                       production_points, actual_started_at, completed_at, final_permalink, final_permalinks
                FROM queue_requests"""
         ).fetchall()
 
-    handle = canonical["handle"] if canonical else ""
-    for row in post_rows:
-        post = dict(row)
-        if int(post.get("source_kind") or 0) == 0:
+    if canonical:
+        handle = canonical["handle"]
+        for row in canonical_rows:
+            post = dict(row)
             shortcode = str(post.get("shortcode") or "").strip()
             post_type = str(post.get("post_type_label") or "").strip() or "Image"
             has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
@@ -966,51 +879,54 @@ def _dashboard_posts_payload(limit: int | None = None, offset: int = 0) -> dict[
                     "musicUrl": None,
                 }
             )
-        else:
-            account = post.get("account")
-            shortcode = str(post.get("shortcode") or "").strip()
-            post_type = str(post.get("post_type_label") or "").strip() or "Image"
-            has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
-            posts.append(
-                {
-                    "rank": post["id"],
-                    "postDate": post.get("published_at"),
-                    "likes": _likes_or_null(post.get("likes")),
-                    "comments": int(post.get("comments") or 0),
-                    "type": post_type,
-                    "video": "Yes" if has_video else "No",
-                    "shortcode": shortcode,
-                    "permalink": post.get("permalink") or (f"https://www.instagram.com/p/{shortcode}/" if shortcode else ""),
-                    "caption": post.get("caption") or "",
-                    "excerpt": post.get("caption") or "",
-                    "section": "single",
-                    "ocrText": _clean_ocr_text(post.get("hook_text")),
-                    "coverUrl": f"/api/dashboard/covers/{account}/{post['id']}",
-                    "isHot": bool(post.get("is_hot")),
-                    "hotMultiplier": post.get("hot_rate_multiplier"),
-                    "isPromo": bool(post.get("is_promo")),
-                    "hidden": bool(post.get("hidden")),
-                    "isDeleted": bool(post.get("is_deleted")),
-                    "account": account,
-                    "group": group_by_handle.get(account, "competitors"),
-                    "musicSong": post.get("music_song"),
-                    "musicArtist": post.get("music_artist"),
-                    "usesOriginalAudio": bool(post.get("uses_original_audio")),
-                    # Instagram's own sound page -- not Spotify/Apple Music, Apify
-                    # doesn't supply a link to those. Links to every reel that used
-                    # this exact audio, including original-audio "songs".
-                    "musicUrl": (
-                        f"https://www.instagram.com/reels/audio/{post['music_audio_id']}/"
-                        if post.get("music_audio_id")
-                        else None
-                    ),
-                    # This remains hidden in the UI, but rides with the protected
-                    # data feed so the existing client-side search can index it.
-                    "transcript": str(post.get("transcript") or "").strip(),
-                    "transcriptAvailable": bool(str(post.get("transcript") or "").strip()),
-                }
-            )
 
+    for row in dashboard_rows:
+        post = dict(row)
+        account = post.get("account")
+        shortcode = str(post.get("shortcode") or "").strip()
+        post_type = str(post.get("post_type_label") or "").strip() or "Image"
+        has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
+        posts.append(
+            {
+                "rank": post["id"],
+                "postDate": post.get("published_at"),
+                "likes": _likes_or_null(post.get("likes")),
+                "comments": int(post.get("comments") or 0),
+                "type": post_type,
+                "video": "Yes" if has_video else "No",
+                "shortcode": shortcode,
+                "permalink": post.get("permalink") or (f"https://www.instagram.com/p/{shortcode}/" if shortcode else ""),
+                "caption": post.get("caption") or "",
+                "excerpt": post.get("caption") or "",
+                "section": "single",
+                "ocrText": _clean_ocr_text(post.get("hook_text")),
+                "coverUrl": f"/api/dashboard/covers/{account}/{post['id']}",
+                "isHot": bool(post.get("is_hot")),
+                "hotMultiplier": post.get("hot_rate_multiplier"),
+                "isPromo": bool(post.get("is_promo")),
+                "hidden": bool(post.get("hidden")),
+                "isDeleted": bool(post.get("is_deleted")),
+                "account": account,
+                "group": group_by_handle.get(account, "competitors"),
+                "musicSong": post.get("music_song"),
+                "musicArtist": post.get("music_artist"),
+                "usesOriginalAudio": bool(post.get("uses_original_audio")),
+                # Instagram's own sound page -- not Spotify/Apple Music, Apify
+                # doesn't supply a link to those. Links to every reel that used
+                # this exact audio, including original-audio "songs".
+                "musicUrl": (
+                    f"https://www.instagram.com/reels/audio/{post['music_audio_id']}/"
+                    if post.get("music_audio_id")
+                    else None
+                ),
+                # This remains hidden in the UI, but rides with the protected
+                # data feed so the existing client-side search can index it.
+                "transcript": str(post.get("transcript") or "").strip(),
+                "transcriptAvailable": bool(str(post.get("transcript") or "").strip()),
+            }
+        )
+
+    posts.sort(key=lambda p: p.get("postDate") or "", reverse=True)
     # Source-post workflow state is useful while a coordinator researches;
     # attribution is attached to the eventual published post by permalink.
     queue_by_source = {(row["post_account"], row["post_shortcode"]): dict(row) for row in queue_rows}
@@ -1040,59 +956,51 @@ def _dashboard_posts_payload(limit: int | None = None, offset: int = 0) -> dict[
                 "coordinatorEmail": closed["coordinator_email"], "productionPoints": closed["production_points"],
                 "actualStartedAt": closed["actual_started_at"], "completedAt": closed["completed_at"],
             }
-    result: dict[str, Any] = {
+    # Posts with an unknown like count are null now, so they're excluded from
+    # both the total and the average -- averaging them in as 0 would drag the
+    # figure down with data we simply don't have.
+    known_likes = [post["likes"] for post in posts if post["likes"] is not None]
+    total_likes = sum(known_likes)
+    return {
         "posts": posts,
         "summary": {
-            "Exported posts": total_count,
+            "Exported posts": len(posts),
             "Total likes": total_likes,
-            "Average likes": round(total_likes / known_likes) if known_likes else 0,
+            "Average likes": round(total_likes / len(known_likes)) if known_likes else 0,
         },
     }
-    if limit is not None:
-        result["pagination"] = {
-            "offset": offset,
-            "limit": limit,
-            "total": total_count,
-            "hasMore": offset + len(posts) < total_count,
-            "nextOffset": offset + len(posts) if offset + len(posts) < total_count else None,
-        }
-    return result
 
 
 @app.get("/api/dashboard/posts")
-def dashboard_posts(
-    limit: Annotated[int, Query(ge=1, le=2000)] = 1000,
-    offset: Annotated[int, Query(ge=0)] = 0,
-) -> Response:
-    """Serve bounded Research pages so one request cannot exhaust the web dyno.
+def dashboard_posts() -> Response:
+    """Serve one shared, short-lived Dashboard payload to concurrent users.
 
-    The frontend follows ``pagination.nextOffset`` until it has the complete
-    searchable catalogue.  Keeping the cache to one page also prevents the
-    old full-feed JSON byte string from retaining hundreds of megabytes in the
-    API process between requests.
+    The dashboard currently needs the complete searchable dataset. Rebuilding
+    and serializing 55k posts for every tab at the same time briefly used more
+    than this service's 2 GB memory limit. Keep one compact JSON representation
+    for a few seconds, guarded so a cold cache cannot stampede Postgres.
     """
-    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT, _DASHBOARD_POSTS_CACHE_PARAMS
-    cache_params = (limit, offset)
+    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
     now = time.monotonic()
     with _DASHBOARD_POSTS_CACHE_LOCK:
-        if (_DASHBOARD_POSTS_CACHE_CONTENT is not None
-                and _DASHBOARD_POSTS_CACHE_PARAMS == cache_params
-                and now < _DASHBOARD_POSTS_CACHE_EXPIRES_AT):
+        if _DASHBOARD_POSTS_CACHE_CONTENT is not None and now < _DASHBOARD_POSTS_CACHE_EXPIRES_AT:
             content = _DASHBOARD_POSTS_CACHE_CONTENT
         else:
             # Reading Research must never re-run topic matching. New posts are
             # classified at ingestion and manual changes are written directly
             # to topic_stack_members.  Project those persisted memberships so
             # every client gets the same stacks without mutating them.
-            payload = _dashboard_posts_payload(limit=limit, offset=offset)
+            payload = _dashboard_posts_payload()
             from .topic_stacks import apply_memberships
             apply_memberships(payload['posts'])
             content = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            # Release the temporary Python object graph before retaining the
+            # compact bytes cache; this matters when the full Research feed
+            # contains tens of thousands of posts.
             del payload
             import gc
             gc.collect()
             _DASHBOARD_POSTS_CACHE_CONTENT = content
-            _DASHBOARD_POSTS_CACHE_PARAMS = cache_params
             _DASHBOARD_POSTS_CACHE_EXPIRES_AT = time.monotonic() + 20.0
     return Response(content=content, media_type="application/json")
 
