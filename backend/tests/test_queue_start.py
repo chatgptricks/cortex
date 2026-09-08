@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import sqlite3
+import pytest
 from contextlib import contextmanager
 from datetime import datetime
 
 from starlette.requests import Request
 
 from app import main
-from app.queue_rules import SCHEDULER_TIMEZONE, intervals_conflict, schedule_absolute
+from app.queue_rules import SCHEDULER_TIMEZONE
 
 
-def test_starting_second_request_defers_and_cascades(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("role", ["pd", "sales", "vc", "trainee", "admin"])
+def test_multiple_active_requests_can_start_and_complete_independently(monkeypatch, tmp_path, role) -> None:
     database = tmp_path / "queue-start.sqlite3"
     conn = sqlite3.connect(database)
     conn.executescript(
@@ -70,6 +72,13 @@ def test_starting_second_request_defers_and_cascades(monkeypatch, tmp_path) -> N
         (3, 3, 10, "scheduled", "pd@example.com", local_now.date().isoformat(), current_slot + 10, None, None, ""),
     ]
     conn.executemany("INSERT INTO queue_requests VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    conn.executescript("""
+        ALTER TABLE queue_requests ADD COLUMN recommended_accounts TEXT DEFAULT '["chatgptips", "planet.ai_"]';
+        ALTER TABLE queue_requests ADD COLUMN final_permalink TEXT;
+        ALTER TABLE queue_requests ADD COLUMN final_permalinks TEXT;
+        ALTER TABLE queue_requests ADD COLUMN closed_at TEXT;
+        ALTER TABLE queue_tickets ADD COLUMN request_id INTEGER;
+    """)
     conn.commit()
     conn.close()
 
@@ -86,20 +95,39 @@ def test_starting_second_request_defers_and_cascades(monkeypatch, tmp_path) -> N
     monkeypatch.setattr(main, "connect", isolated_connect)
     request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
     request.state.user_email = "pd@example.com"
-    request.state.operating_roles = ["pd"]
-    request.state.is_admin = False
+    request.state.operating_roles = [role]
+    request.state.is_admin = role == "admin"
 
     result = main.dashboard_queue_v2_start(2, request)
     assert result["ok"] is True
-    assert result["deferred"] is True
-
+    assert result["deferred"] is False
+    assert main.dashboard_queue_v2_start(3, request)["deferred"] is False
     with isolated_connect() as check:
         saved = [dict(row) for row in check.execute("SELECT * FROM queue_requests ORDER BY id").fetchall()]
-    assert saved[0]["status"] == "in_progress"
-    assert saved[1]["status"] == "scheduled"
-    assert saved[1]["actual_started_at"] is None
-    target_start = schedule_absolute(saved[1]["scheduled_date"], saved[1]["scheduled_start_minutes"])
-    following_start = schedule_absolute(saved[2]["scheduled_date"], saved[2]["scheduled_start_minutes"])
-    assert target_start >= schedule_absolute(local_now.date().isoformat(), current_slot) + 10
-    assert following_start >= target_start + 30
-    assert not intervals_conflict(target_start, 30, following_start, 30)
+    assert all(row["status"] == "in_progress" for row in saved)
+    assert all(row["actual_started_at"] for row in saved)
+    assert saved[0]["actual_started_at"] == rows[0][7]
+    main.dashboard_queue_v2_complete(2, request)
+    with isolated_connect() as check:
+        assert [row["status"] for row in check.execute("SELECT * FROM queue_requests ORDER BY id")] == ["in_progress", "completed", "in_progress"]
+    assert main.dashboard_queue_v2_start(2, request)["deferred"] is False
+    main.dashboard_queue_v2_complete(2, request)
+    with pytest.raises(main.HTTPException) as missing_links:
+        main.dashboard_queue_v2_close(2, request, final_permalink="https://instagram.com/p/ONE/")
+    assert missing_links.value.status_code == 400
+    links = '[{"account":"chatgptips","url":"https://instagram.com/p/ONE/"},{"account":"planet.ai_","url":"https://instagram.com/reel/TWO/"}]'
+    if role == "trainee":
+        with pytest.raises(main.HTTPException) as approval:
+            main.dashboard_queue_v2_close(2, request, final_permalinks=links)
+        assert approval.value.status_code == 409
+        with isolated_connect() as check:
+            check.execute("INSERT INTO queue_tickets (id, ticket_type, request_id, status) VALUES (1, 'trainee_review', 2, 'approved')")
+    assert main.dashboard_queue_v2_close(2, request, final_permalinks=links)["ok"]
+    with isolated_connect() as check:
+        assert [row["status"] for row in check.execute("SELECT * FROM queue_requests ORDER BY id")] == ["in_progress", "closed", "in_progress"]
+    request.state.is_admin = False
+    request.state.user_email = "someone-else@example.com"
+    for action in (main.dashboard_queue_v2_start, main.dashboard_queue_v2_complete, main.dashboard_queue_v2_close):
+        with pytest.raises(main.HTTPException) as error:
+            action(2, request)
+        assert error.value.status_code == 403
