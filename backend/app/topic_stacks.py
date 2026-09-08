@@ -103,6 +103,9 @@ def apply_memberships(posts):
     This is deliberately read-only.  Ingestion calls :func:`attach` for a
     newly saved post; dashboard reads must never classify, merge, or otherwise
     alter an existing user's grouping just because somebody reloaded Research.
+    The groups live durably in ``topic_stack_members``; this function only
+    copies the already-saved group id and full group count onto the current
+    page of posts so a read does not rebuild groups in process memory.
     """
     if not posts:
         return
