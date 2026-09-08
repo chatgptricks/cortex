@@ -828,6 +828,29 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
                updated_at TEXT NOT NULL
            )"""
     )
+    # Initial account imports are serialized because each one can start a
+    # paid Apify run. Keeping the queue in the database lets several account
+    # additions wait safely across page reloads and web-process restarts.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS account_backfill_jobs (
+               job_id TEXT PRIMARY KEY,
+               handle TEXT NOT NULL,
+               results_limit INTEGER NOT NULL DEFAULT 2000,
+               date_from TEXT,
+               date_to TEXT,
+               status TEXT NOT NULL DEFAULT 'queued',
+               progress_json TEXT NOT NULL DEFAULT '{}',
+               result_json TEXT NOT NULL DEFAULT '{}',
+               error TEXT,
+               requested_at TEXT NOT NULL,
+               started_at TEXT,
+               finished_at TEXT
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_account_backfill_jobs_queue "
+        "ON account_backfill_jobs(status, requested_at)"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_opportunities_date ON promo_opportunities(first_detected_at DESC, account, shortcode)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_scans_status ON promo_scans(status, updated_at)")
 
