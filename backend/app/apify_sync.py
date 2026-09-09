@@ -2198,13 +2198,14 @@ def _snapshot_preview(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def snapshot_one_account(handle: str) -> dict[str, Any]:
+def snapshot_one_account(handle: str, *, force: bool = False) -> dict[str, Any]:
     """Records at most one profile reading per account per Costa Rica day.
 
-    The daily worker and the Tracker refresh buttons share this function. If
-    today's reading already exists, return it without spending another Apify
-    call. A process lock also prevents concurrent web requests from both
-    passing the check before the first one writes the row.
+    The daily worker and the Tracker refresh buttons share this function. The
+    daily worker reuses today's reading; an explicit Refresh action passes
+    ``force=True`` to obtain the current Instagram value and upsert that
+    day's single canonical row. A process lock prevents concurrent requests
+    from both passing the check before the first one writes the row.
 
     Retries transient failures (Apify read timeouts on individual profiles
     do happen) since a flaky request otherwise costs a full day of follower
@@ -2219,7 +2220,7 @@ def snapshot_one_account(handle: str) -> dict[str, Any]:
 
     with _SNAPSHOT_LOCK:
         existing = get_account_snapshot_for_day(clean)
-        if existing:
+        if existing and not force:
             return _snapshot_preview(existing)
 
         last_error: Exception | None = None
@@ -2253,7 +2254,7 @@ def snapshot_one_account(handle: str) -> dict[str, Any]:
     raise ApifySyncError(str(last_error) if last_error else "Snapshot failed.")
 
 
-def snapshot_all_accounts() -> dict[str, Any]:
+def snapshot_all_accounts(*, force: bool = False) -> dict[str, Any]:
     """Takes one Tracker-page snapshot (followers/posts count) per active
     account and records it. Shared by the scheduler's daily job, the admin
     "snapshot now" button, and the Tracker page's own overview "refresh all"
@@ -2265,7 +2266,7 @@ def snapshot_all_accounts() -> dict[str, Any]:
     for account in list_accounts(active_only=True):
         handle = account["handle"]
         try:
-            snapshot_one_account(handle)
+            snapshot_one_account(handle, force=force)
             ok.append(handle)
         except Exception as exc:  # noqa: BLE001 -- reported back, not raised
             failed[handle] = str(exc)

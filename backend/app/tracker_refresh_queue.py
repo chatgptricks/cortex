@@ -51,10 +51,12 @@ def enqueue(*, kind: str, handle: str | None, requested_by: str) -> dict[str, An
     clean_handle = (handle or "").strip().lstrip("@").lower() or None
     if kind == "account" and not clean_handle:
         raise ValueError("Account refresh requires a handle")
-    # One paid refresh per scope/day. Repeated clicks return the same durable
-    # job rather than launching another Apify run.
-    day = datetime.now(UTC).date().isoformat()
-    job_key = f"tracker:{kind}:{clean_handle or 'all'}:{day}"
+    # Deduplicate repeated clicks for 15 minutes, but do not turn an explicit
+    # refresh into a no-op for the rest of the day. The worker force-refreshes
+    # the profile and updates that day's one canonical snapshot row.
+    now_utc = datetime.now(UTC)
+    refresh_bucket = now_utc.strftime("%Y-%m-%dT%H:") + f"{now_utc.minute // 15 * 15:02d}"
+    job_key = f"tracker:{kind}:{clean_handle or 'all'}:{refresh_bucket}"
     now = _now()
     with db.connect() as conn:
         initialize(conn)
@@ -119,7 +121,7 @@ def _run(task: dict[str, Any]) -> None:
         result_box: dict[str, Any] = {}
         def work() -> None:
             from .apify_sync import snapshot_all_accounts, snapshot_one_account
-            result_box["value"] = snapshot_all_accounts() if task["kind"] == "all" else snapshot_one_account(task["handle"])
+            result_box["value"] = snapshot_all_accounts(force=True) if task["kind"] == "all" else snapshot_one_account(task["handle"], force=True)
         complete = ingestion_jobs.run(f"tracker-refresh:{task['job_key']}", datetime.now(UTC).date().isoformat(), work)
         now = _now()
         with db.connect() as conn:
