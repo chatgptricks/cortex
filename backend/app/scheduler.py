@@ -164,7 +164,7 @@ def _run_daily_jobs() -> None:
             logger.exception("Daily engagement cycle (%s) crashed", account)
 
 
-def _run_account_snapshot_job() -> None:
+def _run_account_snapshot_job() -> dict:
     """One row per active account per day into account_snapshots -- the
     Tracker page's entire follower-growth chart is built from this. A
     separate lightweight Apify 'details' scrape per account (the same call
@@ -186,10 +186,12 @@ def _run_account_snapshot_job() -> None:
                 notify_snapshot_failure(len(result["snapshotted"]), result["failed"])
         else:
             logger.info("Account snapshot job: %d accounts snapshotted", len(result["snapshotted"]))
+        return result
     except Exception:
         logger.exception("Account snapshot job crashed")
         if slack_configured():
             notify_snapshot_failure(0, {"*": "snapshot job crashed before it could run -- see Render logs"})
+        return {"snapshotted": [], "failed": {"*": "snapshot job crashed before it could run -- see Render logs"}}
 
 
 def _run_ocr_job() -> None:
@@ -296,8 +298,15 @@ def _tick() -> None:
         def daily_pass():
             for account in _active_account_handles():
                 run(f"daily:{account}", today, lambda account=account: run_daily_cycle(account))
-            if _claim_bucket(_DAILY_DATE_KEY, today):
-                _run_account_snapshot_job()
+            # Only mark the daily snapshot complete after every active account
+            # has a reading. If Apify times out for one account, the next
+            # scheduler tick retries that account instead of silently leaving
+            # a missing day in Tracker history. Successful accounts are reused
+            # from today's upserted row, so retries do not spend another call.
+            if _state_get(_DAILY_DATE_KEY) != today:
+                result = _run_account_snapshot_job()
+                if not result.get("failed"):
+                    _claim_bucket(_DAILY_DATE_KEY, today)
         _launch("daily", daily_pass)
 
 
