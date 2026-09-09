@@ -34,6 +34,9 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
         ).fetchone()
+    assert connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'queue_presence'"
+    ).fetchone()
 
     columns = {
         row["name"]: row

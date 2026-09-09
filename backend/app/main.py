@@ -1874,6 +1874,9 @@ QUEUE_V2_POOL_DRAFT_DESIGNER = "__queue_pool__"
 QUEUE_V2_POOL_DRAFT_DATE = "0000-00-00"
 QUEUE_V2_DEFAULT_MINUTES_PER_PP = 10
 QUEUE_V2_TRAINEE_MINUTES_PER_PP = 16
+# Queue presence is intentionally short-lived. A browser sends a heartbeat
+# every 30 seconds; after two minutes without one, a user is treated as away.
+QUEUE_PRESENCE_OFFLINE_AFTER_SECONDS = 120
 QUEUE_V2_SOURCE_MAX_BYTES = 1_500_000
 QUEUE_V2_SOURCE_REDIRECTS = 4
 
@@ -3170,6 +3173,61 @@ def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
     return result
 
 
+def _queue_v2_presence_status(status: Any, last_seen_at: Any, now: datetime | None = None) -> str:
+    """Return a safe, aged presence state for a Queue roster row."""
+    if not last_seen_at:
+        return "offline"
+    try:
+        seen = last_seen_at if isinstance(last_seen_at, datetime) else datetime.fromisoformat(str(last_seen_at).replace("Z", "+00:00"))
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=UTC)
+        current = now or datetime.now(UTC)
+        age = max(0.0, (current - seen).total_seconds())
+    except (TypeError, ValueError):
+        return "offline"
+    if age > QUEUE_PRESENCE_OFFLINE_AFTER_SECONDS:
+        return "offline"
+    clean = str(status or "offline").strip().lower()
+    return clean if clean in {"active", "idle", "offline"} else "offline"
+
+
+def _queue_v2_presence_snapshot(emails: list[str] | tuple[str, ...] | set[str] | None = None) -> dict[str, dict[str, Any]]:
+    """Read the current presence for the requested dashboard users.
+
+    Presence is a non-critical decoration. If an older local fixture has not
+    run the additive schema migration yet, return an all-offline snapshot so
+    the main Queue response remains usable.
+    """
+    normalized = list(dict.fromkeys(str(email or "").strip().lower() for email in (emails or []) if str(email or "").strip()))
+    if not normalized:
+        return {}
+    placeholders = ",".join("?" for _ in normalized)
+    try:
+        with connect() as conn:
+            rows = conn.execute(
+                f"SELECT email, status, last_seen_at FROM queue_presence WHERE email IN ({placeholders})",
+                normalized,
+            ).fetchall()
+    except Exception:
+        return {email: {"status": "offline", "lastSeenAt": None} for email in normalized}
+    by_email = {str(row["email"]).strip().lower(): row for row in rows}
+    now = datetime.now(UTC)
+    return {
+        email: {
+            "status": _queue_v2_presence_status(row["status"], row["last_seen_at"], now) if row else "offline",
+            "lastSeenAt": row["last_seen_at"] if row else None,
+        }
+        for email in normalized
+        for row in [by_email.get(email)]
+    }
+
+
+def _queue_v2_presence_emails(caller: str, is_admin: bool, roles: list[str]) -> list[str]:
+    if is_admin or "vc" in roles:
+        return [str(user.get("email") or "").strip().lower() for user in list_dashboard_users() if str(user.get("email") or "").strip()]
+    return [caller]
+
+
 def _queue_v2_account_onboarding_state(conn: Any, user_email: str) -> dict[str, Any]:
     """Return a durable first-use marker plus the user's account selection."""
     selected = [
@@ -3533,6 +3591,7 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
     scheduler_users = _queue_v2_scheduler_users() if (is_admin or "vc" in roles) else [
         user for user in _queue_v2_scheduler_users() if user["email"] == caller
     ]
+    presence = _queue_v2_presence_snapshot([user["email"] for user in scheduler_users])
     sentient_accounts = [
         {"handle": item["handle"], "label": item.get("label") or item["handle"]}
         for item in list_accounts(active_only=True)
@@ -3561,6 +3620,7 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         "timeBlocks": [_queue_v2_ticket(dict(row)) for row in time_block_rows], "pendingTicketCount": pending_ticket_count,
         "designers": _queue_v2_designers() if (is_admin or "vc" in roles) else [d for d in _queue_v2_designers() if d["email"] == caller],
         "schedulerUsers": scheduler_users,
+        "presence": presence,
         "schedulerPreferences": scheduler_preferences,
         "accounts": sentient_accounts,
         "accountOnboarding": account_onboarding,
@@ -3721,6 +3781,46 @@ def dashboard_queue_v2_pick(
         _queue_v2_publish(conn, "request_picked", caller, [request_id])
         result = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
     return {"ok": True, "request": _queue_v2_project(result)}
+
+
+def _queue_v2_presence_response(request: Request) -> dict[str, Any]:
+    caller, is_admin, roles = _queue_v2_access(request)
+    emails = _queue_v2_presence_emails(caller, is_admin, roles)
+    return {"presence": _queue_v2_presence_snapshot(emails)}
+
+
+@app.get("/api/dashboard/queue/v2/presence")
+def dashboard_queue_v2_presence(request: Request) -> dict[str, Any]:
+    """Return live Queue presence without reloading the full schedule."""
+    return _queue_v2_presence_response(request)
+
+
+@app.post("/api/dashboard/queue/v2/presence")
+def dashboard_queue_v2_presence_heartbeat(
+    request: Request,
+    status: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Record the caller's visible/active state and return the shared roster."""
+    caller, is_admin, roles = _queue_v2_access(request)
+    clean = str(status or "active").strip().lower()
+    if clean not in {"active", "idle", "offline"}:
+        raise HTTPException(status_code=400, detail="Presence status must be active, idle, or offline.")
+    now = utc_now()
+    try:
+        with connect() as conn:
+            conn.execute(
+                """INSERT INTO queue_presence(email, status, last_seen_at, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(email) DO UPDATE SET
+                     status = excluded.status,
+                     last_seen_at = excluded.last_seen_at,
+                     updated_at = excluded.updated_at""",
+                (caller, clean, now, now),
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Queue presence is temporarily unavailable.") from exc
+    emails = _queue_v2_presence_emails(caller, is_admin, roles)
+    return {"ok": True, "presence": _queue_v2_presence_snapshot(emails)}
 
 
 @app.get("/api/dashboard/queue/v2/live")

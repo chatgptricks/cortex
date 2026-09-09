@@ -410,6 +410,18 @@ def init_db() -> None:
                 request_ids TEXT NOT NULL DEFAULT '[]',
                 updated_at TEXT NOT NULL
             );
+            -- Short-lived Queue presence. The browser heartbeat owns the
+            -- active/idle state; readers age the row out to offline so a
+            -- closed tab or lost connection is never shown as online.
+            CREATE TABLE IF NOT EXISTS queue_presence (
+                email TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'offline'
+                    CHECK(status IN ('active','idle','offline')),
+                last_seen_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_queue_presence_seen
+                ON queue_presence(last_seen_at DESC);
 
             -- One row per authenticated request, logged from the Firebase
             -- middleware. Feeds the Users tab's usage heatmap (who's active,
@@ -471,9 +483,19 @@ def init_db() -> None:
                    viewer_email TEXT PRIMARY KEY,
                    hidden_users TEXT NOT NULL DEFAULT '[]',
                    row_order TEXT NOT NULL DEFAULT '[]',
+               updated_at TEXT NOT NULL
+               )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS queue_presence (
+                   email TEXT PRIMARY KEY,
+                   status TEXT NOT NULL DEFAULT 'offline'
+                       CHECK(status IN ('active','idle','offline')),
+                   last_seen_at TEXT NOT NULL,
                    updated_at TEXT NOT NULL
                )"""
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_presence_seen ON queue_presence(last_seen_at DESC)")
         _ensure_column(conn, "queue_requests", "priority", "priority TEXT NOT NULL DEFAULT 'medium'")
         _ensure_column(conn, "queue_requests", "post_title", "post_title TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "queue_requests", "is_custom", "is_custom INTEGER NOT NULL DEFAULT 0")
@@ -744,6 +766,16 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
            )"""
     )
     conn.execute(
+        """CREATE TABLE IF NOT EXISTS queue_presence (
+               email TEXT PRIMARY KEY,
+               status TEXT NOT NULL DEFAULT 'offline'
+                   CHECK(status IN ('active','idle','offline')),
+               last_seen_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+           )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_presence_seen ON queue_presence(last_seen_at DESC)")
+    conn.execute(
         """CREATE TABLE IF NOT EXISTS promo_scans (
                account TEXT NOT NULL,
                shortcode TEXT NOT NULL,
@@ -1000,6 +1032,7 @@ def _migrate_dashboard_user_email_aliases(conn: sqlite3.Connection) -> None:
         ("queue_tickets", "requester_email"),
         ("queue_tickets", "reviewer_email"),
         ("queue_live_state", "actor_email"),
+        ("queue_presence", "email"),
         ("usage_log", "email"),
     )
     for legacy_email, canonical_email in _DASHBOARD_EMAIL_ALIASES.items():
