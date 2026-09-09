@@ -99,6 +99,7 @@ def test_forced_snapshot_updates_today_reading(monkeypatch, tmp_path):
     refreshed = apify_sync.snapshot_one_account("chatgptricks", force=True)
 
     assert refreshed["followers_count"] == 125
+    assert refreshed["captured_at"] == "2026-09-09T12:00:00+00:00"
     with connect() as connection:
         rows = connection.execute("SELECT followers_count FROM account_snapshots").fetchall()
     assert [row["followers_count"] for row in rows] == [125]

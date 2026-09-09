@@ -2236,7 +2236,11 @@ def snapshot_one_account(handle: str, *, force: bool = False) -> dict[str, Any]:
                     private=bool(preview.get("private")),
                     following_count=preview.get("following_count"),
                 )
-                return preview
+                # The provider preview has no database timestamp. Return the
+                # persisted row so the UI can update both the real follower
+                # total and its "Last snapshot" label in one response.
+                saved = get_account_snapshot_for_day(clean)
+                return _snapshot_preview(saved) if saved else preview
             except Exception as exc:  # noqa: BLE001 -- reported back, not raised
                 last_error = exc
                 # A missing/renamed account fails identically on every attempt,
