@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -13,6 +13,19 @@ from .postgres import Connection as PostgresConnection
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+# Tracker's daily boundary is fixed to Costa Rica time, matching the
+# scheduler's 7:00am CST run. Keeping the day key explicit avoids UTC
+# midnight splitting one local day's reading across two rows.
+_TRACKER_TIME_ZONE = timezone(timedelta(hours=-6))
+
+
+def account_snapshot_day(value: datetime | None = None) -> str:
+    current = value or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    return current.astimezone(_TRACKER_TIME_ZONE).date().isoformat()
 
 
 @contextmanager
@@ -453,7 +466,8 @@ def init_db() -> None:
                 full_name TEXT,
                 verified INTEGER NOT NULL DEFAULT 0,
                 private INTEGER NOT NULL DEFAULT 0,
-                captured_at TEXT NOT NULL
+                captured_at TEXT NOT NULL,
+                snapshot_date TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_account_snapshots_handle ON account_snapshots(handle);
             CREATE INDEX IF NOT EXISTS idx_account_snapshots_captured_at ON account_snapshots(captured_at);
@@ -519,6 +533,7 @@ def init_db() -> None:
         # snapshots have NULL here; the Tracker's historical-stats table just
         # shows "--" for those rows instead of a delta.
         _ensure_column(conn, "account_snapshots", "following_count", "following_count INTEGER")
+        _ensure_account_snapshot_day_schema(conn)
         # Locally-cached profile picture path for each account -- Instagram's
         # own CDN URLs (via Apify) are signed and expire, so we download once
         # and serve our own copy instead of persisting the raw CDN URL.
@@ -704,6 +719,37 @@ def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: 
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
+def _ensure_account_snapshot_day_schema(conn: Any) -> None:
+    """Backfill and enforce one Tracker snapshot per account per local day.
+
+    The table predates ``snapshot_date`` and older manual refreshes could
+    create duplicate rows. Collapse those legacy duplicates before adding the
+    unique index so the migration is safe on both SQLite and Postgres.
+    """
+    if not conn.execute("PRAGMA table_info(account_snapshots)").fetchall():
+        return
+    _ensure_column(conn, "account_snapshots", "snapshot_date", "snapshot_date TEXT")
+    if getattr(conn, "is_postgres", False):
+        conn.execute(
+            "UPDATE account_snapshots SET snapshot_date = "
+            "((captured_at::timestamptz AT TIME ZONE 'America/Costa_Rica')::date)::text "
+            "WHERE snapshot_date IS NULL OR snapshot_date = ''"
+        )
+    else:
+        conn.execute(
+            "UPDATE account_snapshots SET snapshot_date = date(captured_at, '-6 hours') "
+            "WHERE snapshot_date IS NULL OR snapshot_date = ''"
+        )
+    conn.execute(
+        "DELETE FROM account_snapshots WHERE id NOT IN "
+        "(SELECT MAX(id) FROM account_snapshots GROUP BY handle, snapshot_date)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_account_snapshots_handle_day "
+        "ON account_snapshots(handle, snapshot_date)"
+    )
+
+
 def _ensure_runtime_schema_extensions(conn: Any) -> None:
     """Apply additive schema introduced after the managed-Postgres import.
 
@@ -720,6 +766,7 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
         "can_self_assign INTEGER NOT NULL DEFAULT 0",
     )
     _ensure_column(conn, "dashboard_users", "minutes_per_pp", "minutes_per_pp INTEGER")
+    _ensure_account_snapshot_day_schema(conn)
     # Accounts already existed when the managed Postgres database was first
     # imported, so this additive field must run here as well as in SQLite's
     # full bootstrap. Otherwise production would accept the UI form but fail
@@ -1451,12 +1498,26 @@ def insert_account_snapshot(
     private: bool,
     following_count: int | None = None,
 ) -> None:
+    captured_at = utc_now()
+    snapshot_date = account_snapshot_day(datetime.fromisoformat(captured_at))
     with connect() as conn:
+        # Small test/legacy databases can reach this function without the
+        # normal startup migration having run yet.
+        if conn.execute("PRAGMA table_info(account_snapshots)").fetchall():
+            _ensure_column(conn, "account_snapshots", "snapshot_date", "snapshot_date TEXT")
         conn.execute(
             """
             INSERT INTO account_snapshots
-                (handle, followers_count, posts_count, full_name, verified, private, following_count, captured_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (handle, followers_count, posts_count, full_name, verified, private, following_count, captured_at, snapshot_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(handle, snapshot_date) DO UPDATE SET
+                followers_count = excluded.followers_count,
+                posts_count = excluded.posts_count,
+                full_name = excluded.full_name,
+                verified = excluded.verified,
+                private = excluded.private,
+                following_count = excluded.following_count,
+                captured_at = excluded.captured_at
             """,
             (
                 handle.strip().lower(),
@@ -1466,9 +1527,25 @@ def insert_account_snapshot(
                 int(bool(verified)),
                 int(bool(private)),
                 following_count,
-                utc_now(),
+                captured_at,
+                snapshot_date,
             ),
         )
+
+
+def get_account_snapshot_for_day(handle: str, snapshot_date: str | None = None) -> dict[str, Any] | None:
+    """Return the one stored Tracker reading for an account's local day."""
+    day = snapshot_date or account_snapshot_day()
+    with connect() as conn:
+        if conn.execute("PRAGMA table_info(account_snapshots)").fetchall():
+            _ensure_column(conn, "account_snapshots", "snapshot_date", "snapshot_date TEXT")
+        row = conn.execute(
+            "SELECT handle, followers_count, posts_count, full_name, verified, private, following_count, captured_at, snapshot_date "
+            "FROM account_snapshots WHERE handle = ? AND snapshot_date = ? "
+            "ORDER BY captured_at DESC LIMIT 1",
+            (handle.strip().lower(), day),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def list_account_snapshots(handle: str) -> list[dict[str, Any]]:

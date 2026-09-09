@@ -767,7 +767,9 @@ def tracker_account_refresh(handle: str) -> dict[str, Any]:
         "full_name": preview.get("full_name"),
         "verified": bool(preview.get("verified")),
         "private": bool(preview.get("private")),
-        "captured_at": utc_now(),
+        # A same-day manual refresh reuses the stored daily reading instead
+        # of creating a second one; report the reading's actual timestamp.
+        "captured_at": preview.get("captured_at") or utc_now(),
     }
 
 
@@ -799,6 +801,49 @@ _QUEUE_HOT_CACHE: list[dict[str, Any]] | None = None
 _QUEUE_HOT_CACHE_EXPIRES_AT = 0.0
 
 
+def _dedupe_canonical_rows(rows: list[Any]) -> list[Any]:
+    """Project one Dashboard card per canonical Instagram shortcode.
+
+    The legacy ``posts`` table can contain both a historical row and an
+    un-published single row for the same shortcode. The SQL ordering used by
+    the payload puts the richer published row first; this pass keeps that row
+    and drops later duplicates without touching the underlying history.
+    """
+    seen: set[str] = set()
+    result: list[Any] = []
+    for row in rows:
+        raw_shortcode = row.get("shortcode") if isinstance(row, dict) else row["shortcode"]
+        shortcode = str(raw_shortcode or "").strip()
+        if shortcode:
+            if shortcode in seen:
+                continue
+            seen.add(shortcode)
+        result.append(row)
+    return result
+
+
+def _dedupe_projected_posts(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one Dashboard card per account and canonical shortcode.
+
+    This final projection guard covers both storage tables. Canonical rows
+    are already collapsed before projection, while the account-scoped table
+    has a database constraint on new writes; the guard also protects the feed
+    when it encounters legacy rows or a mixed-table import.
+    """
+    seen: set[tuple[str, str]] = set()
+    result: list[dict[str, Any]] = []
+    for post in posts:
+        shortcode = str(post.get("shortcode") or "").strip()
+        account = str(post.get("account") or "").strip().lower()
+        if shortcode:
+            key = (account, shortcode)
+            if key in seen:
+                continue
+            seen.add(key)
+        result.append(post)
+    return result
+
+
 def _dashboard_posts_payload() -> dict[str, Any]:
     """Unified, public, read-only projection across every account. Each
     post is tagged with `account` and `group` (sentient/competitors) so the
@@ -821,15 +866,17 @@ def _dashboard_posts_payload() -> dict[str, Any]:
 
     with connect() as conn:
         if canonical:
-            canonical_rows = conn.execute(
+            canonical_rows = _dedupe_canonical_rows(conn.execute(
                 """
                 SELECT id, title, caption, hook_text, published_at, likes, comments,
                        post_type_label, shortcode, image_path, is_animated,
                        source_row_number, created_at, section, is_hot, hot_rate_multiplier,
-                       is_promo, hidden, is_deleted
+                       is_promo, hidden, is_deleted, updated_at
                 FROM posts
+                ORDER BY CASE WHEN published_at IS NULL THEN 1 ELSE 0 END,
+                         published_at DESC, updated_at DESC, id DESC
                 """
-            ).fetchall()
+            ).fetchall())
         else:
             canonical_rows = []
         dashboard_rows = conn.execute(
@@ -839,6 +886,9 @@ def _dashboard_posts_payload() -> dict[str, Any]:
                    hook_text, music_song, music_artist, music_audio_id, uses_original_audio,
                    is_promo, hidden, is_deleted, transcript
             FROM dashboard_posts
+            ORDER BY account,
+                     CASE WHEN published_at IS NULL THEN 1 ELSE 0 END,
+                     published_at DESC, updated_at DESC, id DESC
             """
         ).fetchall()
         queue_rows = conn.execute(
@@ -935,6 +985,7 @@ def _dashboard_posts_payload() -> dict[str, Any]:
             }
         )
 
+    posts = _dedupe_projected_posts(posts)
     posts.sort(key=lambda p: p.get("postDate") or "", reverse=True)
     # Source-post workflow state is useful while a coordinator researches;
     # attribution is attached to the eventual published post by permalink.
