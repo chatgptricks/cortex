@@ -44,9 +44,13 @@ DISK_USAGE_PATH = _path_from_env("SENTIENT_DISK_PATH", Path("/var/data"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 POSTGRES_MIGRATION_URL = os.getenv("POSTGRES_MIGRATION_URL", "").strip()
 
-# Separate password gating Sentient Dash's various admin-write endpoints
-# (backfill, refresh, account settings, etc.) inside their own handlers.
-TRICKS_DASH_REFRESH_PASSWORD = os.getenv("TRICKS_DASH_REFRESH_PASSWORD", "").strip() or None
+# Firebase middleware is the authorization boundary for every write. A few
+# legacy handlers still accept a form field while clients migrate to the
+# role-only contract; it is a public compatibility marker, never a secret.
+# Do not restore an environment password here: shipping it to browsers made
+# the old check misleading and increased blast radius without adding access
+# control.
+TRICKS_DASH_REFRESH_PASSWORD = "authenticated"
 
 # Sentient Dash's own cover-image OCR worker (workers/modal_ocr_worker.py) --
 # a standalone, GPU-free Modal app with its own secret. Always OCRs the full
