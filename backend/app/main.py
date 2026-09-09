@@ -76,6 +76,7 @@ from .sentient_ocr import sentient_ocr_status
 from .scheduler import start_scheduler
 from .account_backfill_queue import enqueue as enqueue_account_backfill, status as account_backfill_status
 from .promos import create_backfill, get_job, get_opportunity, list_opportunities, update_opportunity
+from .tracker_refresh_queue import enqueue as enqueue_tracker_refresh, get as get_tracker_refresh
 from .queue_rules import (
     SCHEDULER_END,
     SCHEDULER_START,
@@ -742,49 +743,33 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
     }
 
 
-@app.post("/api/tracker/accounts/{handle}/refresh")
-def tracker_account_refresh(handle: str) -> dict[str, Any]:
-    """Manually re-scrapes one account's Instagram profile right now, for
-    the Tracker page's per-account refresh button. Open to any signed-in
-    user, same tier as the rest of /api/tracker/* -- one lightweight Apify
-    call (~$0.002), so there's no reason to gate it behind admin."""
-    from .apify_sync import ApifySyncError, snapshot_one_account
+@app.post("/api/tracker/accounts/{handle}/refresh", status_code=202)
+def tracker_account_refresh(handle: str, request: Request) -> dict[str, Any]:
+    """Queue one account snapshot; the worker owns paid Apify execution."""
 
     clean = handle.strip().lstrip("@").lower()
     known = {a["handle"] for a in list_accounts(active_only=True)}
     if clean not in known:
         raise HTTPException(status_code=404, detail=f"Unknown or inactive account '{clean}'.")
-    try:
-        preview = snapshot_one_account(clean)
-    except ApifySyncError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {
-        "ok": True,
-        "handle": clean,
-        "followers": preview.get("followers_count"),
-        "posts_count": preview.get("posts_count"),
-        "following_count": preview.get("following_count"),
-        "full_name": preview.get("full_name"),
-        "verified": bool(preview.get("verified")),
-        "private": bool(preview.get("private")),
-        # A same-day manual refresh reuses the stored daily reading instead
-        # of creating a second one; report the reading's actual timestamp.
-        "captured_at": preview.get("captured_at") or utc_now(),
-    }
+    if not (getattr(request.state, "is_admin", False) or getattr(request.state, "is_dev", False)):
+        raise HTTPException(status_code=403, detail="Admin or Dev access is required to run a paid Tracker refresh.")
+    return enqueue_tracker_refresh(kind="account", handle=clean, requested_by=str(request.state.user_email))
 
 
-@app.post("/api/tracker/snapshot-now")
-def tracker_snapshot_now() -> dict[str, Any]:
-    """Manually runs the same per-account Apify profile scrape the daily 7am
-    CST job runs, for the Tracker page's own overview "refresh all" button.
-    Open to any signed-in user, same tier as the rest of /api/tracker/*.
-    Mirrors /api/admin/tracker/snapshot-now (kept as-is for the admin panel's
-    System tab) rather than reusing it, so this one stays reachable without
-    admin rights. Costs one lightweight Apify call per active account."""
-    from .apify_sync import snapshot_all_accounts
+@app.post("/api/tracker/snapshot-now", status_code=202)
+def tracker_snapshot_now(request: Request) -> dict[str, Any]:
+    """Queue the all-account daily snapshot without blocking the API."""
+    if not (getattr(request.state, "is_admin", False) or getattr(request.state, "is_dev", False)):
+        raise HTTPException(status_code=403, detail="Admin or Dev access is required to run a paid Tracker refresh.")
+    return enqueue_tracker_refresh(kind="all", handle=None, requested_by=str(request.state.user_email))
 
-    result = snapshot_all_accounts()
-    return {"ok": True, **result}
+
+@app.get("/api/tracker/refresh-jobs/{job_id}")
+def tracker_refresh_job(job_id: str) -> dict[str, Any]:
+    job = get_tracker_refresh(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Tracker refresh job not found.")
+    return job
 
 
 _DASHBOARD_POSTS_CACHE_LOCK = threading.Lock()

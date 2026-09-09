@@ -5,10 +5,11 @@ import hashlib
 import json
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from .db import connect, utc_now
+from . import db, ingestion_jobs
 from .promos_detector import DETECTOR_VERSION, detect_promo
 
 
@@ -156,28 +157,95 @@ def process_posts(*, account: str | None = None, from_date: str | None = None, t
         processed += 1
         if job_id:
             with connect() as conn:
-                conn.execute("UPDATE promo_jobs SET processed = ?, updated_at = ? WHERE job_id = ?", (processed, utc_now(), job_id))
+                conn.execute("UPDATE promo_jobs SET processed = ?, heartbeat_at = ?, updated_at = ? WHERE job_id = ?", (processed, utc_now(), utc_now(), job_id))
     if job_id:
         with connect() as conn:
-            conn.execute("UPDATE promo_jobs SET status = 'done', total = ?, processed = ?, updated_at = ? WHERE job_id = ?", (len(posts), processed, utc_now(), job_id))
+            conn.execute("UPDATE promo_jobs SET status = 'done', total = ?, processed = ?, finished_at = ?, updated_at = ? WHERE job_id = ?", (len(posts), processed, utc_now(), utc_now(), job_id))
     return {"processed": processed, "total": len(posts)}
 
 
+_WAKE = threading.Event()
+_WORKER_LOCK = threading.Lock()
+_WORKER_STARTED = False
+
+
+def _ensure_jobs(conn: Any) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS promo_jobs (
+        job_id TEXT PRIMARY KEY, status TEXT NOT NULL, requested_from TEXT,
+        requested_to TEXT, processed INTEGER NOT NULL DEFAULT 0,
+        total INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL, account TEXT, row_limit INTEGER NOT NULL DEFAULT 500,
+        heartbeat_at TEXT, finished_at TEXT)""")
+    for name, definition in (("account", "account TEXT"), ("row_limit", "row_limit INTEGER NOT NULL DEFAULT 500"), ("heartbeat_at", "heartbeat_at TEXT"), ("finished_at", "finished_at TEXT")):
+        db._ensure_column(conn, "promo_jobs", name, definition)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_jobs_status ON promo_jobs(status, created_at)")
+
+
 def create_backfill(*, from_date: str | None = None, to_date: str | None = None, account: str | None = None, limit: int = 500) -> str:
-    job_id = uuid.uuid4().hex
     now = utc_now()
     with connect() as conn:
-        conn.execute("INSERT INTO promo_jobs(job_id, status, requested_from, requested_to, created_at, updated_at) VALUES (?, 'queued', ?, ?, ?, ?)", (job_id, from_date, to_date, now, now))
-    def run() -> None:
-        with connect() as conn:
-            conn.execute("UPDATE promo_jobs SET status = 'running', updated_at = ? WHERE job_id = ?", (utc_now(), job_id))
-        try:
-            process_posts(account=account, from_date=from_date, to_date=to_date, limit=limit, job_id=job_id)
-        except Exception as exc:
-            with connect() as conn:
-                conn.execute("UPDATE promo_jobs SET status = 'failed', error = ?, updated_at = ? WHERE job_id = ?", (str(exc)[:500], utc_now(), job_id))
-    threading.Thread(target=run, name=f"promos-{job_id[:8]}", daemon=True).start()
+        _ensure_jobs(conn)
+        existing = conn.execute("""SELECT job_id FROM promo_jobs WHERE status IN ('queued', 'running')
+            AND COALESCE(requested_from, '') = COALESCE(?, '') AND COALESCE(requested_to, '') = COALESCE(?, '')
+            AND COALESCE(account, '') = COALESCE(?, '') LIMIT 1""", (from_date, to_date, account)).fetchone()
+        if existing:
+            job_id = str(existing["job_id"])
+        else:
+            job_id = uuid.uuid4().hex
+            conn.execute("""INSERT INTO promo_jobs(job_id, status, requested_from, requested_to, account, row_limit, created_at, updated_at)
+                VALUES (?, 'queued', ?, ?, ?, ?, ?, ?)""", (job_id, from_date, to_date, account, max(1, min(limit, 2000)), now, now))
+    _WAKE.set()
     return job_id
+
+
+def _claim_next() -> dict[str, Any] | None:
+    with connect() as conn:
+        _ensure_jobs(conn)
+        # An API/worker replacement can only leave a job running until its
+        # persisted ingestion lease expires; return it to the queue afterwards.
+        stale_before = (datetime.now(timezone.utc) - timedelta(seconds=300)).isoformat(timespec="seconds")
+        conn.execute("UPDATE promo_jobs SET status = 'queued', updated_at = ? WHERE status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < ?)", (utc_now(), stale_before))
+        row = conn.execute("SELECT * FROM promo_jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1").fetchone()
+        if not row:
+            return None
+        changed = conn.execute("UPDATE promo_jobs SET status = 'running', heartbeat_at = ?, updated_at = ? WHERE job_id = ? AND status = 'queued'", (utc_now(), utc_now(), row["job_id"])).rowcount
+        return dict(row) if changed == 1 else None
+
+
+def _run_job(task: dict[str, Any]) -> None:
+    job_id = task["job_id"]
+    try:
+        def work() -> None:
+            process_posts(account=task.get("account"), from_date=task.get("requested_from"), to_date=task.get("requested_to"), limit=int(task.get("row_limit") or 500), job_id=job_id)
+        complete = ingestion_jobs.run(f"promo-backfill:{job_id}", "01", work)
+        if not complete:
+            raise RuntimeError("Promo processing lease failed; retained for retry")
+    except Exception as exc:
+        with connect() as conn:
+            _ensure_jobs(conn)
+            conn.execute("UPDATE promo_jobs SET status = 'failed', error = ?, finished_at = ?, updated_at = ? WHERE job_id = ?", (str(exc)[:500], utc_now(), utc_now(), job_id))
+
+
+def _worker_loop() -> None:
+    while True:
+        try:
+            task = _claim_next()
+            if task:
+                _run_job(task)
+                continue
+        except Exception:
+            pass
+        _WAKE.wait(2)
+        _WAKE.clear()
+
+
+def start_worker() -> None:
+    global _WORKER_STARTED
+    with _WORKER_LOCK:
+        if _WORKER_STARTED:
+            return
+        _WORKER_STARTED = True
+        threading.Thread(target=_worker_loop, daemon=True, name="promo-worker").start()
 
 
 def list_opportunities(*, client: str | None = None, account: str | None = None, classification: str | None = None, review: str | None = None, limit: int = 40, cursor: str | None = None) -> dict[str, Any]:
@@ -238,5 +306,6 @@ def update_opportunity(account: str, shortcode: str, payload: dict[str, Any], re
 
 def get_job(job_id: str) -> dict[str, Any] | None:
     with connect() as conn:
+        _ensure_jobs(conn)
         row = conn.execute("SELECT * FROM promo_jobs WHERE job_id = ?", (job_id,)).fetchone()
     return dict(row) if row else None
