@@ -4984,7 +4984,11 @@ def dashboard_queue_v2_review_ticket(
 
 
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/start")
-def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any]:
+def dashboard_queue_v2_start(
+    request_id: int,
+    request: Request,
+    move_to_now: Annotated[bool, Form()] = True,
+) -> dict[str, Any]:
     caller, is_admin, _ = _queue_v2_access(request)
     row = _queue_v2_request(request_id)
     if not is_admin and row["designer_email"] != caller:
@@ -4997,20 +5001,46 @@ def dashboard_queue_v2_start(request_id: int, request: Request) -> dict[str, Any
     current_date = local_now.date().isoformat()
     designer = str(row["designer_email"] or "")
     with connect() as conn:
-        duration = _queue_v2_duration(dict(row))
-        occupied = _queue_v2_time_occupied(conn, designer, None, exclude_request_id=request_id)
-        scheduled_date, scheduled_start = next_available_slot(current_date, current_slot, duration, occupied)
+        scheduled_date = str(row["scheduled_date"] or current_date)
+        scheduled_start = int(row["scheduled_start_minutes"] if row["scheduled_start_minutes"] is not None else current_slot)
+        if move_to_now:
+            duration = _queue_v2_duration(dict(row))
+            occupied = _queue_v2_time_occupied(conn, designer, None, exclude_request_id=request_id)
+            scheduled_date, scheduled_start = next_available_slot(current_date, current_slot, duration, occupied)
         conn.execute("DELETE FROM queue_schedule_drafts WHERE request_id = ?", (request_id,))
         conn.execute(
             """UPDATE queue_requests SET status = 'in_progress', scheduled_start_minutes = ?, scheduled_date = ?,
                actual_started_at = ?, completed_at = NULL, updated_at = ? WHERE id = ?""",
             (scheduled_start, scheduled_date, now, now, request_id),
         )
-        _queue_v2_reflow_scheduled(conn, designer, caller)
-        _queue_v2_log(conn, request_id, caller, "started", {"date": current_date, "actualStartMinutes": current_slot})
+        if move_to_now:
+            _queue_v2_reflow_scheduled(conn, designer, caller)
+        _queue_v2_log(conn, request_id, caller, "started", {"date": current_date, "actualStartMinutes": current_slot, "placement": "now" if move_to_now else "scheduled"})
         _queue_v2_reflow_drafts(conn, designer)
         _queue_v2_publish(conn, "request_started", caller, [request_id])
-    return {"ok": True, "deferred": False, "scheduledDate": scheduled_date, "scheduledStartMinutes": scheduled_start}
+    return {"ok": True, "deferred": False, "movedToNow": move_to_now, "scheduledDate": scheduled_date, "scheduledStartMinutes": scheduled_start}
+
+
+@app.post("/api/dashboard/queue/v2/requests/{request_id}/not-started")
+def dashboard_queue_v2_return_to_not_started(request_id: int, request: Request) -> dict[str, Any]:
+    """Return an active request to its scheduled, not-started state.
+
+    This is an operational correction, so only VC/Admin/Dev Queue access can
+    perform it; the original scheduled placement remains intact.
+    """
+    caller, _, _ = _queue_v2_access(request, coordinator=True)
+    row = _queue_v2_request(request_id)
+    if row["status"] != "in_progress":
+        raise HTTPException(status_code=409, detail="Only in-progress work can return to Not Started.")
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE queue_requests SET status = 'scheduled', actual_started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?",
+            (now, request_id),
+        )
+        _queue_v2_log(conn, request_id, caller, "returned_to_not_started")
+        _queue_v2_publish(conn, "request_returned_to_not_started", caller, [request_id])
+    return {"ok": True}
 
 
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/edit")
