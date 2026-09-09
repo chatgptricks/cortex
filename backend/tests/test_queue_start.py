@@ -11,7 +11,7 @@ from app import main
 from app.queue_rules import SCHEDULER_TIMEZONE
 
 
-@pytest.mark.parametrize("role", ["pd", "sales", "vc", "trainee", "admin"])
+@pytest.mark.parametrize("role", ["pd", "sales", "vc", "trainee", "admin", "dev"])
 def test_multiple_active_requests_can_start_and_complete_independently(monkeypatch, tmp_path, role) -> None:
     database = tmp_path / "queue-start.sqlite3"
     conn = sqlite3.connect(database)
@@ -97,6 +97,7 @@ def test_multiple_active_requests_can_start_and_complete_independently(monkeypat
     request.state.user_email = "pd@example.com"
     request.state.operating_roles = [role]
     request.state.is_admin = role == "admin"
+    request.state.is_dev = role == "dev"
 
     result = main.dashboard_queue_v2_start(2, request)
     assert result["ok"] is True
@@ -114,7 +115,11 @@ def test_multiple_active_requests_can_start_and_complete_independently(monkeypat
     main.dashboard_queue_v2_complete(2, request)
     with isolated_connect() as check:
         assert [row["status"] for row in check.execute("SELECT * FROM queue_requests ORDER BY id")] == ["in_progress", "completed", "in_progress"]
-    assert main.dashboard_queue_v2_start(2, request)["deferred"] is False
+        planned = dict(check.execute("SELECT scheduled_date, scheduled_start_minutes FROM queue_requests WHERE id = 2").fetchone())
+    restarted = main.dashboard_queue_v2_start(2, request, move_to_now=False)
+    assert restarted["deferred"] is False
+    assert restarted["movedToNow"] is False
+    assert (restarted["scheduledDate"], restarted["scheduledStartMinutes"]) == (planned["scheduled_date"], planned["scheduled_start_minutes"])
     main.dashboard_queue_v2_complete(2, request)
     with pytest.raises(main.HTTPException) as missing_links:
         main.dashboard_queue_v2_close(2, request, final_permalink="https://instagram.com/p/ONE/")
@@ -129,7 +134,17 @@ def test_multiple_active_requests_can_start_and_complete_independently(monkeypat
     assert main.dashboard_queue_v2_close(2, request, final_permalinks=links)["ok"]
     with isolated_connect() as check:
         assert [row["status"] for row in check.execute("SELECT * FROM queue_requests ORDER BY id")] == ["in_progress", "closed", "in_progress"]
+    if role in {"vc", "admin", "dev"}:
+        assert main.dashboard_queue_v2_return_to_not_started(3, request)["ok"]
+        with isolated_connect() as check:
+            returned = dict(check.execute("SELECT status, actual_started_at FROM queue_requests WHERE id = 3").fetchone())
+        assert returned == {"status": "scheduled", "actual_started_at": None}
+    else:
+        with pytest.raises(main.HTTPException) as return_denied:
+            main.dashboard_queue_v2_return_to_not_started(3, request)
+        assert return_denied.value.status_code == 403
     request.state.is_admin = False
+    request.state.is_dev = False
     request.state.user_email = "someone-else@example.com"
     for action in (main.dashboard_queue_v2_start, main.dashboard_queue_v2_complete, main.dashboard_queue_v2_close):
         with pytest.raises(main.HTTPException) as error:
