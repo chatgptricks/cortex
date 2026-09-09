@@ -1571,7 +1571,12 @@ def all_account_snapshots() -> dict[str, list[dict[str, Any]]]:
         ).fetchall()
     by_handle: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        by_handle.setdefault(row["handle"], []).append(dict(row))
+        # Tracker account handles are canonical lower-case values.  Some
+        # legacy rows were stored with Instagram's display casing, which
+        # otherwise creates a second dictionary key and makes the leaderboard
+        # show a dash even though that account has a perfectly valid history.
+        handle = str(row["handle"] or "").strip().lstrip("@").lower()
+        by_handle.setdefault(handle, []).append(dict(row))
     return by_handle
 
 

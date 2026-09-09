@@ -594,7 +594,10 @@ def tracker_summary() -> dict[str, Any]:
     for account in accounts:
         handle = account["handle"]
         snaps = snapshots_by_handle.get(handle, [])
-        latest = snaps[-1] if snaps else None
+        # A transient profile read may leave an incomplete newest row. Keep
+        # showing the newest *usable* follower count instead of masking an
+        # account whose prior/current snapshot is valid.
+        latest = next((snap for snap in reversed(snaps) if snap.get("followers_count") is not None), None)
         day_snaps = _collapse_to_last_per_day(snaps)
         eng = engagement_by_account.get(handle, {})
         avg30 = eng.get("avg_likes_30d")

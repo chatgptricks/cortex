@@ -84,6 +84,57 @@ def test_snapshot_one_account_reuses_today_without_second_apify_read(monkeypatch
     assert second["captured_at"] == "2026-09-09T12:00:00+00:00"
 
 
+def test_forced_snapshot_updates_today_reading(monkeypatch, tmp_path):
+    connect = _snapshot_connect(tmp_path / "snapshots.sqlite")
+    _create_snapshot_table(connect)
+    monkeypatch.setattr(db, "connect", connect)
+    readings = iter([100, 125])
+    monkeypatch.setattr(db, "utc_now", lambda: "2026-09-09T12:00:00+00:00")
+    monkeypatch.setattr(apify_sync, "fetch_profile_preview", lambda handle: {
+        "handle": handle, "followers_count": next(readings), "following_count": 20,
+        "posts_count": 5, "full_name": "ChatGPTricks", "verified": False, "private": False,
+    })
+
+    apify_sync.snapshot_one_account("chatgptricks")
+    refreshed = apify_sync.snapshot_one_account("chatgptricks", force=True)
+
+    assert refreshed["followers_count"] == 125
+    with connect() as connection:
+        rows = connection.execute("SELECT followers_count FROM account_snapshots").fetchall()
+    assert [row["followers_count"] for row in rows] == [125]
+
+
+def test_all_snapshots_normalizes_legacy_handle_casing(monkeypatch, tmp_path):
+    connect = _snapshot_connect(tmp_path / "snapshots.sqlite")
+    _create_snapshot_table(connect)
+    monkeypatch.setattr(db, "connect", connect)
+    with connect() as connection:
+        connection.execute(
+            "INSERT INTO account_snapshots (handle, followers_count, captured_at) VALUES (?, ?, ?)",
+            ("TrasElVeloReal", 2881480, "2026-09-09T12:00:00+00:00"),
+        )
+
+    snapshots = db.all_account_snapshots()
+    assert snapshots["traselveloreal"][0]["followers_count"] == 2881480
+
+
+def test_tracker_summary_uses_latest_usable_follower_reading(monkeypatch, tmp_path):
+    connect = _snapshot_connect(tmp_path / "summary.sqlite")
+    with connect() as connection:
+        connection.execute("CREATE TABLE dashboard_posts (account TEXT, published_at TEXT, likes INTEGER)")
+    monkeypatch.setattr(main, "connect", connect)
+    monkeypatch.setattr(main, "list_accounts", lambda active_only=True: [{"handle": "traselveloreal", "group": "sentient", "label": "Tras el Velo"}])
+    monkeypatch.setattr(main, "all_account_snapshots", lambda: {"traselveloreal": [
+        {"followers_count": 2881480, "posts_count": 2383, "captured_at": "2026-09-09T06:07:00+00:00", "full_name": "Tras el Velo", "verified": True, "private": False},
+        {"followers_count": None, "posts_count": None, "captured_at": "2026-09-09T12:07:00+00:00", "full_name": None, "verified": False, "private": False},
+    ]})
+
+    summary = main.tracker_summary()
+
+    assert summary["accounts"][0]["followers"] == 2881480
+    assert summary["accounts"][0]["captured_at"] == "2026-09-09T06:07:00+00:00"
+
+
 def test_dashboard_projection_drops_duplicate_canonical_shortcodes():
     rows = [
         {"id": 10, "shortcode": "NEWER"},
