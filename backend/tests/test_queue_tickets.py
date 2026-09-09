@@ -121,8 +121,23 @@ def test_personal_time_ticket_is_live_then_approved(monkeypatch, tmp_path):
     assert reviewed["ticket"]["status"] == "approved"
     assert reviewed["ticket"]["reviewerEmail"] == "vc@example.com"
 
+    # Approval locks the calendar hold for everyone else, not its owner. A
+    # PD must be able to drag it later or resize it without reopening a ticket.
+    updated = main.dashboard_queue_v2_update_time_block(
+        ticket_id=ticket_id,
+        request=None,
+        scheduled_start_minutes=660,
+        duration_minutes=50,
+    )
+    assert updated["ticket"]["status"] == "approved"
+    assert updated["ticket"]["scheduledStartMinutes"] == 660
+    assert updated["ticket"]["durationMinutes"] == 50
+
     with connect() as conn:
-        assert conn.execute("SELECT status FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone()["status"] == "approved"
+        saved = conn.execute("SELECT status, scheduled_start_minutes, duration_minutes FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone()
+        assert saved["status"] == "approved"
+        assert saved["scheduled_start_minutes"] == 660
+        assert saved["duration_minutes"] == 50
 
 
 def test_personal_time_cannot_overlap_queue_work(monkeypatch, tmp_path):

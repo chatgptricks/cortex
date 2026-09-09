@@ -4426,7 +4426,8 @@ def dashboard_queue_v2_update_time_block(
     note: Annotated[str | None, Form()] = None,
     delete: Annotated[bool, Form()] = False,
 ) -> dict[str, Any]:
-    """Edit or remove a personal-time block from the contextual scheduler UI."""
+    """Edit or remove personal time. Its owner may adjust it even after
+    approval; coordinators can still manage every user's block."""
     caller, is_admin, roles = _queue_v2_access(request)
     coordinator = is_admin or "vc" in roles
     with connect() as conn:
@@ -4434,8 +4435,8 @@ def dashboard_queue_v2_update_time_block(
         if not row or row["ticket_type"] != "time_block" or row["block_category"] in {"move", "account_request"}:
             raise HTTPException(status_code=404, detail="Personal time block not found.")
         block = dict(row)
-        if not coordinator and (block["requester_email"] != caller or block["status"] != "pending"):
-            raise HTTPException(status_code=403, detail="Only a VC/Admin can edit this time block.")
+        if not coordinator and block["requester_email"] != caller:
+            raise HTTPException(status_code=403, detail="You can only edit your own personal time.")
         if delete:
             conn.execute("DELETE FROM queue_tickets WHERE id = ?", (ticket_id,))
             _queue_v2_publish(conn, "time_block_deleted", caller)
