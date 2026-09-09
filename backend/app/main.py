@@ -5826,17 +5826,20 @@ def dashboard_post_media(
     )
 
 
+def _require_paid_refresh_access(request: Request) -> None:
+    """Manual ingestion has a monetary side effect, so Firebase roles—not a
+    browser-shipped compatibility marker—are the authorization boundary."""
+    if not (getattr(request.state, "is_admin", False) or getattr(request.state, "is_dev", False)):
+        raise HTTPException(status_code=403, detail="Admin or Dev access is required to run a paid refresh.")
+
+
 @app.post("/api/dashboard/refresh")
-def dashboard_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
-    """Password-gated manual override: runs the short-term (<=24h + HOT
+def dashboard_refresh(request: Request) -> dict[str, Any]:
+    """Role-gated manual override: runs the short-term (<=24h + HOT
     check) and daily (>24h-10day, 30d, 120d) engagement cycles for every
-    active account -- Sentient and Competitors alike. Gated because each
-    call costs Apify credits and writes to the live database.
+    active account -- Sentient and Competitors alike.
     """
-    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
-        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
-    ):
-        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    _require_paid_refresh_access(request)
 
     results: dict[str, Any] = {}
     for account in list_accounts(active_only=True):
@@ -5853,7 +5856,7 @@ def dashboard_refresh(password: Annotated[str, Form()]) -> dict[str, Any]:
 
 @app.post("/api/dashboard/posts/catch-up")
 def dashboard_posts_catch_up(
-    password: Annotated[str, Form()],
+    request: Request,
     lookback_hours: Annotated[int, Form()] = 24,
 ) -> dict[str, Any]:
     """One-off recovery for an interrupted Dashboard post cycle.
@@ -5863,10 +5866,7 @@ def dashboard_posts_catch_up(
     still uses only the normal profile actor and the database keeps only
     shortcodes that are missing. It never includes the separate Reels actor.
     """
-    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
-        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
-    ):
-        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    _require_paid_refresh_access(request)
     if lookback_hours < 1 or lookback_hours > 168:
         raise HTTPException(status_code=400, detail="lookback_hours must be between 1 and 168.")
 
