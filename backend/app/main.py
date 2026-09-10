@@ -1904,8 +1904,9 @@ QUEUE_V2_HOT_MULTIPLIER = 3.0
 # environment override makes a future reset explicit without another code
 # change; posts whose one-time HOT check predates this moment are ignored.
 QUEUE_V2_HOT_ROUTING_START = os.getenv("QUEUE_V2_HOT_ROUTING_START", "2026-08-29T23:47:40Z")
-QUEUE_V2_TICKET_TYPES = {"time_block", "pp_revision", "cancellation"}
+QUEUE_V2_TICKET_TYPES = {"time_block", "pp_revision", "cancellation", "trainee_review"}
 QUEUE_V2_TIME_CATEGORIES = {"meeting", "break", "promo", "focus", "other"}
+QUEUE_V2_NON_OCCUPYING_TIME_BLOCK_CATEGORIES = {"move", "account_request", "post_suggestion"}
 # queue_schedule_drafts predates pool return support and keeps its placement
 # columns NOT NULL. These private sentinels let a provisional unassignment be
 # shared live without changing the existing SQLite table shape.
@@ -2761,6 +2762,53 @@ def _queue_v2_occupied(row: dict[str, Any], duration: int | None = None) -> dict
     }
 
 
+def _queue_v2_personal_time_occupied(
+    conn: Any,
+    user_email: str,
+    scheduled_date: str | None = None,
+    *,
+    exclude_ticket_id: int | None = None,
+) -> list[dict[str, int | str]]:
+    """Return only real personal-time holds that reserve scheduler capacity.
+
+    Queue stores a few workflow requests in ``queue_tickets`` for historical
+    compatibility. They share ``ticket_type = 'time_block'`` but are not
+    calendar holds: account-access, post-suggestion, and move tickets often
+    have no placement or duration. Never coerce those nullable fields into a
+    scheduler interval.
+    """
+    clauses = [
+        "ticket_type = 'time_block'",
+        "status IN ('pending','approved')",
+        "requester_email = ?",
+        "scheduled_date IS NOT NULL",
+        "scheduled_start_minutes IS NOT NULL",
+        "duration_minutes IS NOT NULL",
+        "duration_minutes > 0",
+        "LOWER(COALESCE(block_category, '')) NOT IN ('move','account_request','post_suggestion')",
+    ]
+    params: list[Any] = [user_email]
+    if scheduled_date:
+        clauses.append("scheduled_date = ?")
+        params.append(scheduled_date)
+    if exclude_ticket_id is not None:
+        clauses.append("id != ?")
+        params.append(exclude_ticket_id)
+    rows = conn.execute(
+        "SELECT scheduled_date, scheduled_start_minutes, duration_minutes "
+        "FROM queue_tickets WHERE " + " AND ".join(clauses),
+        params,
+    ).fetchall()
+    return [
+        {
+            "date": str(row["scheduled_date"]),
+            "start": int(row["scheduled_start_minutes"]),
+            "duration": int(row["duration_minutes"]),
+        }
+        for row in rows
+    ]
+
+
 def _queue_v2_ticket(row: dict[str, Any]) -> dict[str, Any]:
     request_id = row.get("request_id")
     ticket_type = row.get("ticket_type")
@@ -2860,25 +2908,19 @@ def _queue_v2_time_occupied(
              AND status IN ('scheduled','in_progress','completed','closed')""",
         [user_email, *date_params],
     ).fetchall() if int(row["id"]) not in drafted_ids and (exclude_request_id is None or int(row["id"]) != int(exclude_request_id))]
-    ticket_date_scope = " AND scheduled_date = ?" if scheduled_date else ""
-    ticket_params: list[Any] = [user_email, *date_params]
-    ticket_scope = ""
-    if exclude_ticket_id is not None:
-        ticket_scope = " AND id != ?"
-        ticket_params.append(exclude_ticket_id)
-    blocks = [dict(row) for row in conn.execute(
-        f"""SELECT scheduled_date, scheduled_start_minutes, duration_minutes
-            FROM queue_tickets
-            WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
-              AND requester_email = ?{ticket_date_scope}{ticket_scope}""",
-        ticket_params,
-    ).fetchall()]
     occupied = [_queue_v2_occupied(row) for row in requests]
     occupied.extend({
         "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]),
         "duration": int(row["production_points"]) * int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP),
     } for row in drafts)
-    occupied.extend({"date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]), "duration": int(row["duration_minutes"])} for row in blocks)
+    occupied.extend(
+        _queue_v2_personal_time_occupied(
+            conn,
+            user_email,
+            scheduled_date,
+            exclude_ticket_id=exclude_ticket_id,
+        )
+    )
     return occupied
 
 
@@ -2906,14 +2948,7 @@ def _queue_v2_reflow_scheduled(conn: Any, designer: str, actor: str, priority_id
         (designer,),
     ).fetchall()]
     occupied = [_queue_v2_occupied(row) for row in rows if row["status"] in {"completed", "closed"}]
-    occupied.extend({
-        "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]), "duration": int(row["duration_minutes"]),
-    } for row in conn.execute(
-        """SELECT scheduled_date, scheduled_start_minutes, duration_minutes FROM queue_tickets
-           WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
-             AND requester_email = ? AND scheduled_date IS NOT NULL""",
-        (designer,),
-    ).fetchall())
+    occupied.extend(_queue_v2_personal_time_occupied(conn, designer))
     active_rows = [row for row in rows if row["status"] == "in_progress"]
     scheduled_rows = [row for row in rows if row["status"] == "scheduled"]
     active_rows.sort(key=lambda row: (row["id"] != priority_id, row["scheduled_date"], row["scheduled_start_minutes"], row["id"]))
@@ -3402,15 +3437,7 @@ def _queue_v2_prepare_schedule_changes(
             "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]),
             "duration": int(row["production_points"]) * int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP),
         } for row in other_drafts)
-        occupied_by_designer[designer].extend({
-            "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]),
-            "duration": int(row["duration_minutes"]),
-        } for row in conn.execute(
-            """SELECT scheduled_date, scheduled_start_minutes, duration_minutes FROM queue_tickets
-               WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
-                 AND requester_email = ? AND scheduled_date IS NOT NULL""",
-            (designer,),
-        ).fetchall())
+        occupied_by_designer[designer].extend(_queue_v2_personal_time_occupied(conn, designer))
 
     for item in sorted((value for value in prepared if value["designer"]), key=lambda value: (value["designer"], schedule_absolute(value["date"], value["start"]), value["id"])):
         item["date"], item["start"] = next_available_slot(
@@ -3442,14 +3469,7 @@ def _queue_v2_reflow_drafts(conn: Any, designer: str) -> int:
         (designer,),
     ).fetchall() if int(row["id"]) not in draft_ids]
     occupied = [_queue_v2_occupied(row) for row in committed]
-    occupied.extend({
-        "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]), "duration": int(row["duration_minutes"]),
-    } for row in conn.execute(
-        """SELECT scheduled_date, scheduled_start_minutes, duration_minutes FROM queue_tickets
-           WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
-             AND requester_email = ? AND scheduled_date IS NOT NULL""",
-        (designer,),
-    ).fetchall())
+    occupied.extend(_queue_v2_personal_time_occupied(conn, designer))
     moved = 0
     for row in drafts:
         duration = int(row["production_points"]) * int(row.get("minutes_per_pp") or QUEUE_V2_DEFAULT_MINUTES_PER_PP)
@@ -3543,7 +3563,7 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         time_block_rows = conn.execute(
             f"""SELECT * FROM queue_tickets
                 WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
-                  AND block_category != 'move'
+                  AND LOWER(COALESCE(block_category, '')) NOT IN ('move','account_request','post_suggestion')
                   AND scheduled_date = ?{block_scope}
                 ORDER BY scheduled_start_minutes, id""",
             block_params,
@@ -4435,7 +4455,11 @@ def dashboard_queue_v2_update_time_block(
     coordinator = is_admin or "vc" in roles
     with connect() as conn:
         row = conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone()
-        if not row or row["ticket_type"] != "time_block" or row["block_category"] in {"move", "account_request"}:
+        non_personal = bool(row) and (
+            str(row["block_category"] or "").lower()
+            in QUEUE_V2_NON_OCCUPYING_TIME_BLOCK_CATEGORIES
+        )
+        if not row or row["ticket_type"] != "time_block" or non_personal:
             raise HTTPException(status_code=404, detail="Personal time block not found.")
         block = dict(row)
         if not coordinator and block["requester_email"] != caller:
@@ -5009,7 +5033,22 @@ def dashboard_queue_v2_start(
         if move_to_now:
             duration = _queue_v2_duration(dict(row))
             occupied = _queue_v2_time_occupied(conn, designer, None, exclude_request_id=request_id)
-            scheduled_date, scheduled_start = next_available_slot(current_date, current_slot, duration, occupied)
+            next_date, next_start = next_available_slot(current_date, current_slot, duration, occupied)
+            if (next_date, next_start) != (current_date, current_slot):
+                # "Move to Now" is an explicit promise that work begins now.
+                # If an active block or a handoff buffer pushes it later, do
+                # not create a false in-progress state or discard its draft.
+                return {
+                    "ok": True,
+                    "deferred": True,
+                    "movedToNow": False,
+                    "scheduledDate": scheduled_date,
+                    "scheduledStartMinutes": scheduled_start,
+                    "nextAvailableDate": next_date,
+                    "nextAvailableStartMinutes": next_start,
+                    "detail": "Queue capacity is not free now; this request remains scheduled.",
+                }
+            scheduled_date, scheduled_start = next_date, next_start
         conn.execute("DELETE FROM queue_schedule_drafts WHERE request_id = ?", (request_id,))
         conn.execute(
             """UPDATE queue_requests SET status = 'in_progress', scheduled_start_minutes = ?, scheduled_date = ?,
@@ -5052,6 +5091,7 @@ def dashboard_queue_v2_edit(
     production_points: Annotated[int, Form()], priority: Annotated[str, Form()] = "normal",
     tags: Annotated[str | None, Form()] = None, brief: Annotated[str | None, Form()] = None,
     notes: Annotated[str | None, Form()] = None, references: Annotated[str | None, Form()] = None,
+    recommended_accounts: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
     """Coordinator-owned edits to a production request's specification.
 
@@ -5069,6 +5109,14 @@ def dashboard_queue_v2_edit(
     if not isinstance(refs, list):
         raise HTTPException(status_code=400, detail="Reference links must be a list.")
     clean_refs = [str(item).strip() for item in refs if str(item).strip()]
+    if recommended_accounts is None:
+        submitted_accounts = _queue_v2_json(row.get("recommended_accounts"), [])
+    else:
+        try:
+            submitted_accounts = json.loads(recommended_accounts)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="Recommended accounts must be a list.") from exc
+    selected_accounts = _queue_v2_clean_account_handles(submitted_accounts)
     now = utc_now()
     with connect() as conn:
         conn.execute(

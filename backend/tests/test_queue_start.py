@@ -50,7 +50,8 @@ def test_multiple_active_requests_can_start_and_complete_independently(monkeypat
         );
         CREATE TABLE queue_tickets (
             id INTEGER PRIMARY KEY, ticket_type TEXT, requester_email TEXT, status TEXT,
-            scheduled_date TEXT, scheduled_start_minutes INTEGER, duration_minutes INTEGER
+            block_category TEXT NOT NULL DEFAULT '', scheduled_date TEXT,
+            scheduled_start_minutes INTEGER, duration_minutes INTEGER
         );
         CREATE TABLE queue_live_state (
             id INTEGER PRIMARY KEY,
@@ -72,6 +73,12 @@ def test_multiple_active_requests_can_start_and_complete_independently(monkeypat
         (3, 3, 10, "scheduled", "pd@example.com", local_now.date().isoformat(), current_slot + 10, None, None, ""),
     ]
     conn.executemany("INSERT INTO queue_requests VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    conn.execute(
+        """INSERT INTO queue_schedule_drafts
+           (request_id, coordinator_email, designer_email, scheduled_date, scheduled_start_minutes, updated_at)
+           VALUES (2, 'vc@example.com', 'pd@example.com', ?, ?, '')""",
+        (local_now.date().isoformat(), current_slot),
+    )
     conn.executescript("""
         ALTER TABLE queue_requests ADD COLUMN recommended_accounts TEXT DEFAULT '["chatgptips", "planet.ai_"]';
         ALTER TABLE queue_requests ADD COLUMN final_permalink TEXT;
@@ -101,8 +108,27 @@ def test_multiple_active_requests_can_start_and_complete_independently(monkeypat
 
     result = main.dashboard_queue_v2_start(2, request)
     assert result["ok"] is True
-    assert result["deferred"] is False
-    assert main.dashboard_queue_v2_start(3, request)["deferred"] is False
+    assert result["deferred"] is True
+    assert result["movedToNow"] is False
+    assert (result["scheduledDate"], result["scheduledStartMinutes"]) == (rows[1][5], rows[1][6])
+    assert (result["nextAvailableDate"], result["nextAvailableStartMinutes"]) != (rows[1][5], rows[1][6])
+    with isolated_connect() as check:
+        deferred = dict(check.execute(
+            "SELECT status, scheduled_date, scheduled_start_minutes, actual_started_at FROM queue_requests WHERE id = 2"
+        ).fetchone())
+        draft = check.execute("SELECT request_id FROM queue_schedule_drafts WHERE request_id = 2").fetchone()
+    assert deferred == {
+        "status": "scheduled",
+        "scheduled_date": rows[1][5],
+        "scheduled_start_minutes": rows[1][6],
+        "actual_started_at": None,
+    }
+    assert draft["request_id"] == 2
+
+    # Keeping the existing placement is deliberate: the user accepts its
+    # scheduled position even when a Move-to-Now attempt could not fit.
+    assert main.dashboard_queue_v2_start(2, request, move_to_now=False)["deferred"] is False
+    assert main.dashboard_queue_v2_start(3, request, move_to_now=False)["deferred"] is False
     with isolated_connect() as check:
         saved = [dict(row) for row in check.execute("SELECT * FROM queue_requests ORDER BY id").fetchall()]
     assert all(row["status"] == "in_progress" for row in saved)
@@ -110,8 +136,6 @@ def test_multiple_active_requests_can_start_and_complete_independently(monkeypat
     assert saved[0]["actual_started_at"] == rows[0][7]
     starts = [int(row["scheduled_start_minutes"]) for row in saved]
     assert starts == sorted(starts)
-    assert starts[1] >= starts[0] + 3 * 10 + 10
-    assert starts[2] >= starts[1] + 3 * 10 + 10
     main.dashboard_queue_v2_complete(2, request)
     with isolated_connect() as check:
         assert [row["status"] for row in check.execute("SELECT * FROM queue_requests ORDER BY id")] == ["in_progress", "completed", "in_progress"]
