@@ -264,6 +264,37 @@ app.add_middleware(
 _startup_ready = threading.Event()
 _startup_started_at = time.monotonic()
 _startup_error = ""
+_schema_ready = threading.Event()
+_schema_error = ""
+
+
+def _finish_schema_extensions_in_background() -> None:
+    """Apply only additive database schema repairs after the web server binds.
+
+    Public API requests depend on recently added fields in Tracker, Queue and
+    Research.  Leaving all startup maintenance disabled also left those
+    additive fields unapplied after a managed-Postgres restore, which made
+    every authenticated tool fail independently.  This deliberately runs
+    just ``init_db``: no scheduler, ingestion, roster rewrite, or schedule
+    reflow is allowed in the web process.
+    """
+    global _schema_error
+    logger = logging.getLogger(__name__)
+    delays = (1, 3, 8, 15, 30)
+    attempt = 0
+    while True:
+        try:
+            init_db()
+            _schema_error = ""
+            _schema_ready.set()
+            logger.info("Sentient Dash runtime schema extensions are ready")
+            return
+        except Exception as exc:  # pragma: no cover - managed database handoff guard
+            attempt += 1
+            _schema_error = f"{type(exc).__name__}: {exc}"
+            delay = delays[min(attempt - 1, len(delays) - 1)]
+            logger.exception("Runtime schema extension attempt %s failed; retrying in %ss", attempt, delay)
+            time.sleep(delay)
 
 
 def _finish_startup_in_background() -> None:
@@ -275,13 +306,15 @@ def _finish_startup_in_background() -> None:
     healthy seconds later. Keep the web listener immediately available and
     retry the idempotent setup independently.
     """
-    global _startup_error
+    global _startup_error, _schema_error
     logger = logging.getLogger(__name__)
     delays = (1, 3, 8, 15, 30)
     attempt = 0
     while True:
         try:
             init_db()
+            _schema_error = ""
+            _schema_ready.set()
             seed_dashboard_users_from_env(_SEED_ALLOWED_EMAILS, _SEED_ADMIN_EMAILS)
             seed_queue_role_roster()
             repaired = _queue_v2_reflow_all_schedules()
@@ -320,6 +353,14 @@ def startup() -> None:
     if os.getenv("SENTIENT_WEB_RUN_STARTUP_MAINTENANCE", "false").strip().lower() in {"1", "true", "yes"}:
         threading.Thread(target=_finish_startup_in_background, daemon=True, name="sentient-startup").start()
     else:
+        # Schema extensions are the narrow exception to the request-only web
+        # process: they are additive and idempotent, while skipping them can
+        # turn one missing optional column into an outage across every tool.
+        threading.Thread(
+            target=_finish_schema_extensions_in_background,
+            daemon=True,
+            name="sentient-schema-extensions",
+        ).start()
         _startup_ready.set()
         logging.getLogger(__name__).info("Web startup maintenance disabled; public API is request-only")
 
@@ -335,6 +376,10 @@ async def health() -> dict[str, Any]:
         "startup": {
             "elapsed_seconds": round(time.monotonic() - _startup_started_at, 1),
             "last_error": _startup_error or None,
+        },
+        "schema": {
+            "ready": _schema_ready.is_set(),
+            "last_error": _schema_error or None,
         },
         "deployment": {
             "commit": os.getenv("RENDER_GIT_COMMIT"),
