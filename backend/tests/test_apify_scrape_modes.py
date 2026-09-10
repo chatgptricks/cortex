@@ -121,6 +121,24 @@ def test_empty_profile_does_not_discard_other_accounts_paid_posts(monkeypatch):
     assert result['active'][0]['shortCode'] == 'saved'
 
 
+def test_unavailable_profile_does_not_block_the_shared_scheduled_batch(monkeypatch, caplog):
+    monkeypatch.setattr(apify_sync, '_fetch_apify_items', lambda *a, **k: [
+        {
+            'url': 'https://www.instagram.com/missing/',
+            'username': 'missing',
+            'error': 'not_found',
+        },
+        {'shortCode': 'saved', 'ownerUsername': 'active', 'type': 'Image'},
+    ])
+    configs = {name: {'handle': name, 'scrape_mode': 'posts'} for name in ('missing', 'active')}
+
+    result = apify_sync._collect_short_term_items(configs, 20, datetime.now(UTC), include_reels=False)
+
+    assert result['missing'] == []
+    assert [item['shortCode'] for item in result['active']] == ['saved']
+    assert 'skipped unavailable profile missing: not_found' in caplog.text
+
+
 def test_profile_feed_reel_is_kept_and_profile_attribution_is_preserved(monkeypatch):
     monkeypatch.setattr(apify_sync, '_fetch_apify_items', lambda *a, **k: [
         {'shortCode': 'reel', 'ownerUsername': 'collaborator', 'type': 'Video', 'productType': 'clips', 'inputUrl': 'https://www.instagram.com/active/'},
