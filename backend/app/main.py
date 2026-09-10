@@ -16,6 +16,7 @@ import time
 from datetime import UTC, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
+from statistics import median
 from typing import Annotated, Any
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urljoin, urlsplit
@@ -502,6 +503,186 @@ def insights_posts() -> dict[str, Any]:
         }
         for a in accounts
     ]}
+
+
+def _insights_timestamp(value: Any) -> datetime | None:
+    """Return a timezone-aware timestamp without making malformed history fatal."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
+
+
+def _insights_percentile(values: list[float], percentile: float) -> float | None:
+    """Small dependency-free linear percentile for a bounded daily series."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = max(0.0, min(1.0, percentile)) * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def _follower_growth_insights(
+    accounts: list[dict[str, Any]],
+    snapshots_by_handle: dict[str, list[dict[str, Any]]],
+    post_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build evidence-bound follower-growth signals for Insights.
+
+    Instagram does not expose the individual post that caused a person to
+    follow. We therefore identify *time-aligned candidates* only: a post can
+    be a strong candidate when it is the sole post between two valid profile
+    reads, but it is never described as a confirmed conversion.
+    """
+    active_handles = {str(account.get("handle") or "").lower() for account in accounts}
+    posts_by_account: dict[str, list[tuple[datetime, dict[str, Any]]]] = {}
+    for raw in post_rows:
+        post = dict(raw)
+        handle = str(post.get("account") or "").strip().lstrip("@").lower()
+        published_at = _insights_timestamp(post.get("published_at"))
+        if handle not in active_handles or published_at is None:
+            continue
+        posts_by_account.setdefault(handle, []).append((published_at, post))
+    for posts in posts_by_account.values():
+        posts.sort(key=lambda item: item[0])
+
+    account_results: list[dict[str, Any]] = []
+    for account in accounts:
+        handle = str(account.get("handle") or "").lower()
+        # The tracker deliberately collapses to the final reading of a local
+        # day. Reusing that rule makes the follower delta and Tracker agree.
+        snapshots = _collapse_to_last_per_day(snapshots_by_handle.get(handle, []))
+        prior_deltas: list[float] = []
+        events: list[dict[str, Any]] = []
+        for previous, current in zip(snapshots, snapshots[1:]):
+            previous_followers = previous.get("followers_count")
+            current_followers = current.get("followers_count")
+            previous_at = _insights_timestamp(previous.get("captured_at"))
+            captured_at = _insights_timestamp(current.get("captured_at"))
+            if previous_followers is None or current_followers is None or previous_at is None or captured_at is None:
+                continue
+            try:
+                gained = int(current_followers) - int(previous_followers)
+            except (TypeError, ValueError):
+                continue
+            interval_hours = (captured_at - previous_at).total_seconds() / 3600
+            # A manual refresh or an outage can make the delta cover several
+            # days. Keep it visible, but never let it crown a daily peak.
+            valid_daily_interval = 12 <= interval_hours <= 36
+            baseline = prior_deltas[-28:]
+            baseline_median = float(median(baseline)) if baseline else None
+            baseline_p90 = _insights_percentile(baseline, 0.9)
+            baseline_mad = (
+                float(median([abs(value - baseline_median) for value in baseline]))
+                if baseline_median is not None and baseline
+                else None
+            )
+            minimum_threshold = (
+                max(
+                    baseline_p90 if baseline_p90 is not None else float("-inf"),
+                    (baseline_median or 0) + max(2.0, (baseline_mad or 0) * 3),
+                )
+                if len(baseline) >= 7
+                else None
+            )
+            peak = bool(
+                valid_daily_interval
+                and minimum_threshold is not None
+                and gained > 0
+                and gained >= minimum_threshold
+            )
+            candidates = [
+                post for published_at, post in posts_by_account.get(handle, [])
+                if previous_at < published_at <= captured_at
+            ]
+            events.append(
+                {
+                    "date": _snapshot_local_date(current).isoformat() if _snapshot_local_date(current) else current.get("captured_at"),
+                    "captured_at": current.get("captured_at"),
+                    "previous_captured_at": previous.get("captured_at"),
+                    "followers": int(current_followers),
+                    "followers_gained": gained,
+                    "growth_pct": round(gained / int(previous_followers) * 100, 4) if int(previous_followers) else None,
+                    "interval_hours": round(interval_hours, 1),
+                    "valid_daily_interval": valid_daily_interval,
+                    "baseline_days": len(baseline),
+                    "baseline_median": round(baseline_median, 2) if baseline_median is not None else None,
+                    "baseline_p90": round(baseline_p90, 2) if baseline_p90 is not None else None,
+                    "peak_threshold": round(minimum_threshold, 2) if minimum_threshold is not None else None,
+                    "is_peak": peak,
+                    "candidate_posts": [
+                        {
+                            "shortcode": post.get("shortcode"),
+                            "published_at": post.get("published_at"),
+                            "format": (post.get("post_type_label") or "Image").split(" (")[0],
+                            "likes": _likes_or_null(post.get("likes")),
+                            "views": post.get("video_views"),
+                            "permalink": post.get("permalink"),
+                            "cover_text": _clean_ocr_text(post.get("hook_text"))[:120],
+                        }
+                        for post in candidates
+                    ],
+                }
+            )
+            if valid_daily_interval:
+                prior_deltas.append(float(gained))
+
+        valid_events = [event for event in events if event["valid_daily_interval"]]
+        peaks = [event for event in events if event["is_peak"]]
+        single_post_peaks = [event for event in peaks if len(event["candidate_posts"]) == 1]
+        account_results.append(
+            {
+                "handle": handle,
+                "label": account.get("label"),
+                "group": account.get("group"),
+                "snapshot_days": len(snapshots),
+                "eligible_intervals": len(valid_events),
+                "baseline_ready_intervals": sum(1 for event in valid_events if event["baseline_days"] >= 7),
+                "peak_count": len(peaks),
+                "single_post_peak_count": len(single_post_peaks),
+                "multi_post_peak_count": sum(1 for event in peaks if len(event["candidate_posts"]) > 1),
+                "no_post_peak_count": sum(1 for event in peaks if not event["candidate_posts"]),
+                # Charts need a bounded time series. Peak rows are also kept
+                # separately so an older but important event remains visible.
+                "recent_events": events[-90:],
+                "peaks": list(reversed(peaks[-60:])),
+            }
+        )
+
+    return {
+        "generated_at": utc_now(),
+        "methodology": {
+            "minimum_baseline_days": 7,
+            "baseline_window_days": 28,
+            "valid_interval_hours": [12, 36],
+            "peak_rule": "above the trailing 90th percentile and robust median threshold",
+            "attribution": "posts are time-aligned candidates, not confirmed follower conversions",
+        },
+        "accounts": account_results,
+    }
+
+
+@app.get("/api/insights/follower-growth")
+def insights_follower_growth() -> dict[str, Any]:
+    """Follower peaks and time-aligned post candidates for strategic Insights."""
+    accounts = list_accounts(active_only=True)
+    with connect() as conn:
+        post_rows = conn.execute(
+            """
+            SELECT account, shortcode, published_at, likes, video_views,
+                   post_type_label, permalink, hook_text
+            FROM dashboard_posts
+            WHERE published_at IS NOT NULL AND published_at != ''
+            """
+        ).fetchall()
+    return _follower_growth_insights(accounts, all_account_snapshots(), [dict(row) for row in post_rows])
 
 
 # Same fixed offset the daily snapshot job runs on (see scheduler.py's

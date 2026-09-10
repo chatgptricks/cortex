@@ -158,3 +158,51 @@ def test_dashboard_projection_drops_duplicate_account_shortcodes():
     ]
     projected = main._dedupe_projected_posts(posts)
     assert [post["id"] for post in projected] == [1, 3, 4, 5]
+
+
+def test_follower_growth_insights_flags_peak_and_only_time_aligned_candidate():
+    snapshots = []
+    followers = 1000
+    for day in range(1, 10):
+        snapshots.append({
+            "handle": "chatgptricks",
+            "captured_at": f"2026-09-{day:02d}T12:00:00+00:00",
+            "followers_count": followers,
+        })
+        followers += 5
+    # The tenth reading is materially above the account's own eight prior
+    # daily deltas. The only post in that measured snapshot interval is the
+    # sole *candidate*, never a claimed causal conversion.
+    snapshots.append({
+        "handle": "chatgptricks",
+        "captured_at": "2026-09-10T12:00:00+00:00",
+        "followers_count": followers + 35,
+    })
+
+    result = main._follower_growth_insights(
+        [{"handle": "chatgptricks", "label": "ChatGPTricks", "group": "sentient"}],
+        {"chatgptricks": snapshots},
+        [
+            {
+                "account": "chatgptricks", "shortcode": "PEAKPOST",
+                "published_at": "2026-09-10T09:00:00+00:00", "likes": 400,
+                "video_views": 5000, "post_type_label": "Carousel",
+                "permalink": "https://instagram.com/p/PEAKPOST", "hook_text": "Peak candidate",
+            },
+            {
+                "account": "chatgptricks", "shortcode": "OUTSIDE",
+                "published_at": "2026-09-09T11:00:00+00:00", "likes": 999,
+                "video_views": 9999, "post_type_label": "Reel",
+                "permalink": "https://instagram.com/p/OUTSIDE", "hook_text": "Outside interval",
+            },
+        ],
+    )
+
+    account = result["accounts"][0]
+    assert account["peak_count"] == 1
+    assert account["single_post_peak_count"] == 1
+    peak = account["peaks"][0]
+    assert peak["followers_gained"] == 40
+    assert peak["baseline_days"] == 8
+    assert peak["is_peak"] is True
+    assert [post["shortcode"] for post in peak["candidate_posts"]] == ["PEAKPOST"]
