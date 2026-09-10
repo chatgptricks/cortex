@@ -247,7 +247,7 @@ def test_catalogue_pages_cover_every_source_row_without_full_feed_materializatio
     monkeypatch.setattr(main, "_dashboard_posts_payload", lambda: pytest.fail("Page API must not build the full payload."))
 
     manifest = main._dashboard_catalogue_manifest()
-    assert manifest["sources"] == [{"source": "canonical", "total": 3}, {"source": "dashboard", "total": 1}]
+    assert manifest["sources"] == [{"source": "canonical", "upperBound": 3}, {"source": "dashboard", "upperBound": 1}]
     first = json.loads(main.dashboard_posts_page("canonical", 0, 2, manifest["revision"]).body)
     second = json.loads(main.dashboard_posts_page("canonical", 2, 2, manifest["revision"]).body)
     competitor = json.loads(main.dashboard_posts_page("dashboard", 0, 2, manifest["revision"]).body)
@@ -255,6 +255,16 @@ def test_catalogue_pages_cover_every_source_row_without_full_feed_materializatio
     assert [post["shortcode"] for post in first["posts"]] == ["newest", "middle"]
     assert [post["shortcode"] for post in second["posts"]] == ["oldest"]
     assert [post["shortcode"] for post in competitor["posts"]] == ["other"]
+
+    cursor_first = json.loads(main.dashboard_posts_page(
+        "canonical", 0, 2, manifest["revision"], after_id=0, until_id=3,
+    ).body)
+    cursor_second = json.loads(main.dashboard_posts_page(
+        "canonical", 0, 2, manifest["revision"], after_id=cursor_first["nextCursor"], until_id=3,
+    ).body)
+    assert [post["shortcode"] for post in cursor_first["posts"]] == ["newest", "middle"]
+    assert [post["shortcode"] for post in cursor_second["posts"]] == ["oldest"]
+    assert cursor_second["done"] is True
 
 
 def test_backfill_preserves_concurrent_media_updates(monkeypatch, isolated_database):
