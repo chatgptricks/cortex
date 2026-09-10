@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app import apify_sync, db
+from app import apify_sync, db, main
 
 
 def test_collect_short_term_items_uses_the_selected_profile_surface(monkeypatch) -> None:
@@ -91,6 +91,23 @@ def test_dedupe_items_excludes_a_reel_returned_by_both_actor_shapes() -> None:
     ])
 
     assert [item["shortCode"] for item in items] == ["same-media", "url-only-media"]
+
+
+def test_completed_run_recovery_attributes_reels_and_profile_collaborations() -> None:
+    configs = {
+        "reels": {"handle": "reels"},
+        "profile": {"handle": "profile"},
+    }
+
+    assert main._recovery_account_for_item(
+        {"owner": {"username": "reels"}, "url": "https://www.instagram.com/reel/new-reel/"}, configs
+    ) == "reels"
+    assert main._recovery_account_for_item(
+        {"ownerUsername": "collaborator", "inputUrl": "https://www.instagram.com/profile/"}, configs
+    ) == "profile"
+    assert main._recovery_account_for_item(
+        {"owner": {"username": "untracked"}, "shortCode": "foreign"}, configs
+    ) is None
 
 
 def test_empty_profile_does_not_discard_other_accounts_paid_posts(monkeypatch):
