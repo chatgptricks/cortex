@@ -368,9 +368,28 @@ def startup() -> None:
 ensure_directories()
 
 
+def _runtime_data_readiness() -> dict[str, Any]:
+    """Exercise the read paths that power the three primary tools.
+
+    This is intentionally called only from an explicit health verification,
+    never from Render's ordinary probe.  It returns no user or post data, but
+    makes a post-restore schema mismatch actionable instead of surfacing to a
+    browser as a generic CORS/network failure.
+    """
+    try:
+        tracker_summary()
+        manifest = _dashboard_catalogue_manifest()
+        for source in manifest["sources"]:
+            if int(source["total"] or 0):
+                _dashboard_catalogue_page(str(source["source"]), 0, 1, manifest["revision"])
+        return {"ready": True, "error": None}
+    except Exception as exc:  # pragma: no cover - production diagnostic guard
+        return {"ready": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 @app.get("/api/health")
-async def health() -> dict[str, Any]:
-    return {
+async def health(verify: bool = False) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "ok": True,
         "ready": _startup_ready.is_set(),
         "startup": {
@@ -388,6 +407,9 @@ async def health() -> dict[str, Any]:
         # Sentient Dash's own cover-image OCR -- standalone, GPU-free worker.
         "sentient_ocr": sentient_ocr_status(),
     }
+    if verify:
+        result["data"] = await run_in_threadpool(_runtime_data_readiness)
+    return result
 
 
 @app.post("/api/auth/custom-token")
