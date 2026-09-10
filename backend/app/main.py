@@ -1210,6 +1210,14 @@ def _dashboard_catalogue_normal_permalink(value: str | None) -> str:
     return (value or "").strip().rstrip("/").split("?")[0]
 
 
+def _dashboard_catalogue_text_preview(value: Any, limit: int = 480) -> tuple[str, bool]:
+    """Keep the library index lightweight; the detail endpoint serves full copy."""
+    text = str(value or "")
+    if len(text) <= limit:
+        return text, False
+    return text[:limit].rstrip() + "…", True
+
+
 def _dashboard_catalogue_decoration(revision: str) -> dict[str, Any]:
     """Read shared Queue and stack indexes once for one catalogue revision.
 
@@ -1372,6 +1380,8 @@ def _dashboard_catalogue_page(
             shortcode = str(post.get("shortcode") or "").strip()
             post_type = str(post.get("post_type_label") or "").strip() or "Image"
             has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
+            caption, caption_truncated = _dashboard_catalogue_text_preview(post.get("caption") or post.get("title"))
+            ocr_text, _ = _dashboard_catalogue_text_preview(_clean_ocr_text(post.get("hook_text")), 360)
             posts.append({
                 "rank": post.get("source_row_number") or post["id"],
                 "postDate": post.get("published_at"),
@@ -1381,10 +1391,11 @@ def _dashboard_catalogue_page(
                 "video": "Yes" if has_video else "No",
                 "shortcode": shortcode or f"post-{post['id']}",
                 "permalink": f"https://www.instagram.com/p/{shortcode}/" if shortcode else "",
-                "caption": post.get("caption") or post.get("title") or "",
+                "caption": caption,
+                "captionTruncated": caption_truncated,
                 "excerpt": post.get("title") or "",
                 "section": post.get("section") or "",
-                "ocrText": _clean_ocr_text(post.get("hook_text")),
+                "ocrText": ocr_text,
                 "coverUrl": f"/api/dashboard/covers/{handle}/{post['id']}",
                 "isHot": bool(post.get("is_hot")),
                 "hotMultiplier": post.get("hot_rate_multiplier"),
@@ -1405,6 +1416,8 @@ def _dashboard_catalogue_page(
             shortcode = str(post.get("shortcode") or "").strip()
             post_type = str(post.get("post_type_label") or "").strip() or "Image"
             has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
+            caption, caption_truncated = _dashboard_catalogue_text_preview(post.get("caption"))
+            ocr_text, _ = _dashboard_catalogue_text_preview(_clean_ocr_text(post.get("hook_text")), 360)
             posts.append({
                 "rank": post["id"],
                 "postDate": post.get("published_at"),
@@ -1414,10 +1427,11 @@ def _dashboard_catalogue_page(
                 "video": "Yes" if has_video else "No",
                 "shortcode": shortcode,
                 "permalink": post.get("permalink") or (f"https://www.instagram.com/p/{shortcode}/" if shortcode else ""),
-                "caption": post.get("caption") or "",
-                "excerpt": post.get("caption") or "",
+                "caption": caption,
+                "captionTruncated": caption_truncated,
+                "excerpt": caption,
                 "section": "single",
-                "ocrText": _clean_ocr_text(post.get("hook_text")),
+                "ocrText": ocr_text,
                 "coverUrl": f"/api/dashboard/covers/{account}/{post['id']}",
                 "isHot": bool(post.get("is_hot")),
                 "hotMultiplier": post.get("hot_rate_multiplier"),
@@ -1888,6 +1902,41 @@ def dashboard_post_transcript(account: str, shortcode: str) -> PlainTextResponse
         transcript + "\n",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/api/dashboard/posts/{account}/{shortcode}/detail")
+def dashboard_post_detail(account: str, shortcode: str) -> dict[str, Any]:
+    """Return heavyweight text only for the one post a teammate opens."""
+    clean_account = account.strip().lstrip("@").lower()
+    clean_shortcode = shortcode.strip()
+    if not clean_account or not clean_shortcode:
+        raise HTTPException(status_code=404, detail="Post not found.")
+    _, canonical = _dashboard_catalogue_context()
+    with connect() as conn:
+        if clean_account == str(canonical["handle"]).lower():
+            row = conn.execute(
+                """SELECT caption, title, hook_text FROM posts
+                   WHERE shortcode = ? ORDER BY id DESC LIMIT 1""",
+                (clean_shortcode,),
+            ).fetchone()
+            values = dict(row) if row else {}
+            caption = values.get("caption") or values.get("title") or ""
+        else:
+            row = conn.execute(
+                """SELECT caption, hook_text FROM dashboard_posts
+                   WHERE LOWER(account) = ? AND shortcode = ? ORDER BY id DESC LIMIT 1""",
+                (clean_account, clean_shortcode),
+            ).fetchone()
+            values = dict(row) if row else {}
+            caption = values.get("caption") or ""
+    if not row:
+        raise HTTPException(status_code=404, detail="Post not found.")
+    return {
+        "account": clean_account,
+        "shortcode": clean_shortcode,
+        "caption": caption,
+        "ocrText": _clean_ocr_text(values.get("hook_text")),
+    }
 
 
 def _media_response(reference: str | Path | None, detail: str) -> Response:
