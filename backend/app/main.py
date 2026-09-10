@@ -1464,7 +1464,14 @@ def dashboard_posts_page(
     after_id: int | None = Query(None, ge=0),
     until_id: int | None = Query(None, ge=0),
 ) -> Response:
-    """Serve one bounded, authenticated page of the complete Research feed."""
+    """Serve one bounded, authenticated page of the complete Research feed.
+
+    Cursor callers pin each source to the ID high-water mark published by the
+    manifest. A new ingestion can advance today's manifest while a browser is
+    still reading yesterday's captured range; that does not invalidate any of
+    the requested rows. Accept that bounded snapshot instead of making a busy
+    scheduler keep Research on its loading screen forever.
+    """
     # Direct callers in the lightweight backend tests invoke the endpoint as
     # a normal function, where FastAPI's ``Query(None)`` default is still a
     # parameter object rather than ``None``. The ASGI path has already
@@ -1474,16 +1481,24 @@ def dashboard_posts_page(
     if not isinstance(until_id, int):
         until_id = None
     manifest = _dashboard_catalogue_manifest()
-    if revision and revision != manifest["revision"]:
-        raise HTTPException(status_code=409, detail="The catalogue changed while loading; restart from the manifest.")
     source_snapshot = next((item for item in manifest["sources"] if item["source"] == source), None)
     if source_snapshot is None:
         raise HTTPException(status_code=400, detail="Unknown catalogue source.")
+    requested_revision = revision or manifest["revision"]
+    is_stale_bounded_snapshot = bool(
+        revision
+        and revision != manifest["revision"]
+        and after_id is not None
+        and until_id is not None
+        and until_id <= int(source_snapshot["upperBound"])
+    )
+    if revision and revision != manifest["revision"] and not is_stale_bounded_snapshot:
+        raise HTTPException(status_code=409, detail="The catalogue changed while loading; restart from the manifest.")
     if after_id is not None:
-        if until_id is None or until_id != int(source_snapshot["upperBound"]):
+        if until_id is None or after_id > until_id or until_id > int(source_snapshot["upperBound"]):
             raise HTTPException(status_code=409, detail="The catalogue changed while loading; restart from the manifest.")
         posts, next_cursor = _dashboard_catalogue_page(
-            source, offset, limit, manifest["revision"], after_id=after_id,
+            source, offset, limit, requested_revision, after_id=after_id,
             until_id=until_id, cursor_metadata=True,
         )
         # IDs are intentionally not assumed to be dense. PostgreSQL sequences
@@ -1503,9 +1518,9 @@ def dashboard_posts_page(
                 "done": done,
                 "upperBound": until_id,
                 "posts": posts,
-                "revision": manifest["revision"],
+                "revision": requested_revision,
             },
-            headers={"ETag": f'"{manifest["revision"]}"', "Cache-Control": "private, max-age=0, must-revalidate", "Vary": "Authorization"},
+            headers={"ETag": f'"{requested_revision}"', "Cache-Control": "private, max-age=0, must-revalidate", "Vary": "Authorization"},
         )
     # Temporary compatibility for a browser holding the preceding static
     # deploy. New clients use the bounded cursor protocol above.
