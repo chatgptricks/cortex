@@ -265,6 +265,12 @@ def test_catalogue_pages_cover_every_source_row_without_full_feed_materializatio
     assert [post["shortcode"] for post in cursor_first["posts"]] == ["newest", "middle"]
     assert [post["shortcode"] for post in cursor_second["posts"]] == ["oldest"]
     assert cursor_second["done"] is True
+    cursor_end = json.loads(main.dashboard_posts_page(
+        "canonical", 0, 2, manifest["revision"], after_id=3, until_id=3,
+    ).body)
+    assert cursor_end["posts"] == []
+    assert cursor_end["done"] is True
+    assert cursor_end["nextCursor"] == 3
 
 
 def test_backfill_preserves_concurrent_media_updates(monkeypatch, isolated_database):
