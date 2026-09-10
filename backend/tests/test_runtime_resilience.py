@@ -272,6 +272,21 @@ def test_catalogue_pages_cover_every_source_row_without_full_feed_materializatio
     assert cursor_end["done"] is True
     assert cursor_end["nextCursor"] == 3
 
+    # A scheduler insert advances the live manifest, but it must not force a
+    # browser to abandon the already bounded canonical snapshot. The original
+    # `until_id=3` remains complete and safe to read even while newer rows land
+    # in the other source.
+    with connect() as connection:
+        connection.execute(
+            "INSERT INTO dashboard_posts VALUES (2, 'new-competitor', 'newer', '2026-09-05', 1, 0, 'Newer', 'Image', 0, '', 0, 0, '', '', '', '', 0, 0, 0, 0, '', '2026-09-05')"
+        )
+    assert main._dashboard_catalogue_manifest()["revision"] != manifest["revision"]
+    pinned = json.loads(main.dashboard_posts_page(
+        "canonical", 0, 2, manifest["revision"], after_id=0, until_id=3,
+    ).body)
+    assert pinned["revision"] == manifest["revision"]
+    assert [post["shortcode"] for post in pinned["posts"]] == ["newest", "middle"]
+
 
 def test_backfill_preserves_concurrent_media_updates(monkeypatch, isolated_database):
     with isolated_database() as connection:
