@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from statistics import median
-from typing import Annotated, Any
+from typing import Annotated, Any, Callable
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urljoin, urlsplit
 from zoneinfo import ZoneInfo
@@ -368,7 +368,7 @@ def startup() -> None:
 ensure_directories()
 
 
-def _runtime_data_readiness() -> dict[str, Any]:
+def _runtime_data_readiness(check: str = "all") -> dict[str, Any]:
     """Exercise the read paths that power the three primary tools.
 
     This is intentionally called only from an explicit health verification,
@@ -376,19 +376,40 @@ def _runtime_data_readiness() -> dict[str, Any]:
     makes a post-restore schema mismatch actionable instead of surfacing to a
     browser as a generic CORS/network failure.
     """
+    checks: dict[str, Callable[[], Any]] = {
+        "accounts": lambda: list_accounts(active_only=True),
+        "snapshots": all_account_snapshots,
+        "tracker": tracker_summary,
+        "manifest": _dashboard_catalogue_manifest,
+        "catalogue": lambda: _runtime_catalogue_page_check(),
+    }
+    requested = list(checks) if check == "all" else [item.strip().lower() for item in check.split(",") if item.strip()]
+    if not requested or any(item not in checks for item in requested):
+        return {"ready": False, "error": "Unknown readiness check.", "checks": []}
+    timings: list[dict[str, Any]] = []
     try:
-        tracker_summary()
-        manifest = _dashboard_catalogue_manifest()
-        for source in manifest["sources"]:
-            if int(source["total"] or 0):
-                _dashboard_catalogue_page(str(source["source"]), 0, 1, manifest["revision"])
-        return {"ready": True, "error": None}
+        for name in requested:
+            started = time.monotonic()
+            checks[name]()
+            timings.append({"name": name, "seconds": round(time.monotonic() - started, 3)})
+        return {"ready": True, "error": None, "checks": timings}
     except Exception as exc:  # pragma: no cover - production diagnostic guard
-        return {"ready": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "ready": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "checks": timings,
+        }
+
+
+def _runtime_catalogue_page_check() -> None:
+    manifest = _dashboard_catalogue_manifest()
+    for source in manifest["sources"]:
+        if int(source["total"] or 0):
+            _dashboard_catalogue_page(str(source["source"]), 0, 1, manifest["revision"])
 
 
 @app.get("/api/health")
-async def health(verify: bool = False) -> dict[str, Any]:
+async def health(verify: bool = False, check: str = "all") -> dict[str, Any]:
     result: dict[str, Any] = {
         "ok": True,
         "ready": _startup_ready.is_set(),
@@ -408,7 +429,7 @@ async def health(verify: bool = False) -> dict[str, Any]:
         "sentient_ocr": sentient_ocr_status(),
     }
     if verify:
-        result["data"] = await run_in_threadpool(_runtime_data_readiness)
+        result["data"] = await run_in_threadpool(_runtime_data_readiness, check)
     return result
 
 
