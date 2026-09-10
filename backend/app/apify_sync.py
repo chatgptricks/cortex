@@ -858,8 +858,19 @@ def _fetch_apify_items(
     exact failure mode where 45-minute runs were billed and marked successful
     in Apify but their items never reached the database.
     """
-    del timeout  # kept for callers; the durable path has bounded subrequests.
-    return _run_apify_actor_and_fetch(payload, max_wait_seconds=900.0, poll_interval=5.0, actor_id=actor_id)
+    # This helper is used by synchronous HTTP handlers as well as workers.
+    # Respect the caller's deadline: treating a 60–90 second UI request as a
+    # 15 minute worker job leaves the browser/proxy to time out first, while
+    # Apify continues working invisibly and "Reload counts" looks broken.
+    # Long backfills call `_run_apify_actor_and_fetch` directly with their own
+    # durable, recoverable 30-minute deadline.
+    max_wait_seconds = max(30.0, min(float(timeout), 900.0))
+    return _run_apify_actor_and_fetch(
+        payload,
+        max_wait_seconds=max_wait_seconds,
+        poll_interval=5.0,
+        actor_id=actor_id,
+    )
 
 def _run_apify_actor_and_fetch(
     payload: dict[str, Any],
@@ -2148,15 +2159,28 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
         raise ApifySyncError("Post not found.")
 
     url = (dict(row).get("permalink") or "").strip() or f"https://www.instagram.com/p/{clean}/"
+    # Direct post URLs are detail records, not a profile feed. The actor has
+    # intermittently returned an empty list when asked for `posts` here, which
+    # made the client wait until its proxy timed out and then incorrectly hid
+    # a perfectly live post. Prefer the documented detail shape and retain the
+    # old request only as a narrow compatibility fallback.
     items = _fetch_apify_items(
-        {"directUrls": [url], "resultsType": "posts", "resultsLimit": 1},
-        timeout=90.0,
+        {"directUrls": [url], "resultsType": "details"},
+        timeout=80.0,
     )
     item = next((it for it in items if (it.get("shortCode") or "") == clean), items[0] if items else None)
     if not item:
-        with connect() as conn:
-            conn.execute(f"UPDATE {table} SET is_deleted = 1, updated_at = ? WHERE {where}", [utc_now(), *where_params])
-        raise ApifySyncError("Instagram returned nothing for that post -- it may have been deleted.")
+        items = _fetch_apify_items(
+            {"directUrls": [url], "resultsType": "posts", "resultsLimit": 1},
+            timeout=80.0,
+        )
+        item = next((it for it in items if (it.get("shortCode") or "") == clean), items[0] if items else None)
+    if not item:
+        # A blank actor result can mean a temporary Instagram challenge or a
+        # short transport failure. Do not turn that into a destructive hidden
+        # state. A post is only marked deleted when a dedicated deletion check
+        # can prove it; this endpoint's contract is count refresh, not delete.
+        raise ApifySyncError("Instagram did not return counts for this post. The saved counts were kept; try again shortly.")
 
     cover_refreshed = _refresh_cover_from_item(table, handle, clean, row, item)
 

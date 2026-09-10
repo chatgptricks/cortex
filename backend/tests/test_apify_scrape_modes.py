@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import sqlite3
+from contextlib import contextmanager
 from datetime import UTC, datetime
 
-from app import apify_sync
+import pytest
+
+from app import apify_sync, db
 
 
 def test_collect_short_term_items_uses_the_selected_profile_surface(monkeypatch) -> None:
@@ -107,3 +111,53 @@ def test_profile_feed_reel_is_kept_and_profile_attribution_is_preserved(monkeypa
     ])
     result = apify_sync._collect_short_term_items({'active': {'handle': 'active', 'scrape_mode': 'posts'}}, 20, datetime.now(UTC), include_reels=False)
     assert [item['shortCode'] for item in result['active']] == ['reel', 'shared']
+
+
+def test_short_apify_call_respects_the_callers_deadline(monkeypatch):
+    captured = {}
+
+    def run(payload, max_wait_seconds, poll_interval, actor_id):
+        captured.update(payload=payload, max_wait_seconds=max_wait_seconds, poll_interval=poll_interval, actor_id=actor_id)
+        return []
+
+    monkeypatch.setattr(apify_sync, "_run_apify_actor_and_fetch", run)
+    apify_sync._fetch_apify_items({"directUrls": ["https://example.test/post"]}, timeout=80)
+
+    assert captured["max_wait_seconds"] == 80
+    assert captured["poll_interval"] == 5.0
+
+
+def test_reload_counts_falls_back_without_hiding_a_live_post(monkeypatch, tmp_path):
+    path = tmp_path / "reload.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE dashboard_posts (
+                id INTEGER PRIMARY KEY, account TEXT, shortcode TEXT, likes INTEGER, comments INTEGER,
+                permalink TEXT, cover_image_path TEXT, cover_source_url TEXT, is_deleted INTEGER, updated_at TEXT
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO dashboard_posts VALUES (1, 'account', 'post', 100, 10, '', '', '', 0, '2026-09-10')"
+        )
+
+    @contextmanager
+    def connect():
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    calls = []
+    monkeypatch.setattr(db, "connect", connect)
+    monkeypatch.setattr(apify_sync, "get_account_config", lambda _: {"table": "dashboard_posts"})
+    monkeypatch.setattr(apify_sync, "_fetch_apify_items", lambda payload, **_: calls.append(payload) or [])
+
+    with pytest.raises(apify_sync.ApifySyncError, match="saved counts were kept"):
+        apify_sync.refresh_single_post("account", "post")
+
+    assert [call["resultsType"] for call in calls] == ["details", "posts"]
+    with connect() as connection:
+        assert tuple(connection.execute("SELECT likes, comments, is_deleted FROM dashboard_posts").fetchone()) == (100, 10, 0)
