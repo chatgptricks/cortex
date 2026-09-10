@@ -1378,7 +1378,13 @@ def _short_term_payload(
     }
 
 
-def _short_term_reels_payload(handles: list[str], results_limit: int, now: datetime) -> dict[str, Any]:
+def _short_term_reels_payload(
+    handles: list[str],
+    results_limit: int,
+    now: datetime,
+    *,
+    lookback_hours: int = _SHORT_LOOKBACK_HOURS,
+) -> dict[str, Any]:
     """Equivalent small lookback request for the dedicated Reels actor.
 
     The general profile actor reads Instagram's post feed, while this actor
@@ -1394,7 +1400,7 @@ def _short_term_reels_payload(handles: list[str], results_limit: int, now: datet
         # add-on per started minute of audio, and transcripts are not needed
         # by the current dashboard or Promos workflow.
         "includeTranscript": False,
-        "onlyPostsNewerThan": (now - timedelta(hours=_SHORT_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "onlyPostsNewerThan": (now - timedelta(hours=lookback_hours)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 
@@ -1487,6 +1493,7 @@ def _collect_short_term_items(
     results_limit: int,
     now: datetime,
     *,
+    include_posts: bool = True,
     include_reels: bool = True,
     lookback_hours: int = _SHORT_LOOKBACK_HOURS,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -1502,7 +1509,7 @@ def _collect_short_term_items(
 
     post_configs = {
         account: cfg for account, cfg in configs.items() if cfg["scrape_mode"] in {"posts", "both"}
-    }
+    } if include_posts else {}
     if post_configs:
         post_handles = [cfg["handle"] for cfg in post_configs.values()]
         post_items = _fetch_apify_items(
@@ -1537,7 +1544,13 @@ def _collect_short_term_items(
     if reel_configs:
         reel_handles = [cfg["handle"] for cfg in reel_configs.values()]
         reel_items = _fetch_apify_items(
-            _short_term_reels_payload(reel_handles, results_limit, now), actor_id=APIFY_REEL_ACTOR_ID
+            _short_term_reels_payload(
+                reel_handles,
+                results_limit,
+                now,
+                lookback_hours=lookback_hours,
+            ),
+            actor_id=APIFY_REEL_ACTOR_ID,
         )
         reel_owner_to_account = {cfg["handle"].lower(): account for account, cfg in reel_configs.items()}
         for item in reel_items:
@@ -1739,6 +1752,7 @@ def run_short_term_cycle_batch(
     accounts: list[str],
     results_limit: int = _SHORT_RESULTS_LIMIT,
     *,
+    include_posts: bool = True,
     include_reels: bool = False,
     lookback_hours: int = _SHORT_LOOKBACK_HOURS,
 ) -> dict[str, dict[str, Any]]:
@@ -1777,7 +1791,12 @@ def run_short_term_cycle_batch(
     if journal:
         configs = journal.frozen("configs", configs)
     items_by_account = _collect_short_term_items(
-        configs, results_limit, now, include_reels=include_reels, lookback_hours=lookback_hours
+        configs,
+        results_limit,
+        now,
+        include_posts=include_posts,
+        include_reels=include_reels,
+        lookback_hours=lookback_hours,
     )
 
     for account, cfg in configs.items():
