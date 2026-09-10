@@ -246,6 +246,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["ETag"],
 )
 
 # Registered last on purpose. Starlette runs the most recently added
@@ -778,6 +779,24 @@ def tracker_refresh_job(job_id: str) -> dict[str, Any]:
 _DASHBOARD_POSTS_CACHE_LOCK = threading.Lock()
 _DASHBOARD_POSTS_CACHE_CONTENT: bytes | None = None
 _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0.0
+# Research sends one shared catalogue to every signed-in browser. The
+# scheduler's own cadence is much slower than the UI poll, so retain the
+# serialized projection briefly to coalesce concurrent visible-tab checks.
+# Every post/stack mutation below explicitly invalidates this cache.
+_DASHBOARD_POSTS_CACHE_TTL_SECONDS = 90.0
+
+
+def _invalidate_dashboard_posts_cache() -> None:
+    """Drop the shared Research projection after a data mutation.
+
+    Keep this in one place so a longer cache lifetime cannot accidentally
+    make a manual refresh, catch-up, curation flag, or single-post reload
+    appear to have done nothing.
+    """
+    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
+    with _DASHBOARD_POSTS_CACHE_LOCK:
+        _DASHBOARD_POSTS_CACHE_CONTENT = None
+        _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0.0
 
 # Queue opens the same HOT candidate list for every signed-in teammate. Keep
 # that read shared for a couple of seconds so a live refresh from several
@@ -966,9 +985,9 @@ def _dashboard_posts_payload() -> dict[str, Any]:
                     if post.get("music_audio_id")
                     else None
                 ),
-                # This remains hidden in the UI, but rides with the protected
-                # data feed so the existing client-side search can index it.
-                "transcript": str(post.get("transcript") or "").strip(),
+                # Reels transcripts can be very large. The feed only needs to
+                # know whether one is available; the authenticated download
+                # endpoint remains the on-demand source for the original text.
                 "transcriptAvailable": bool(str(post.get("transcript") or "").strip()),
             }
         )
@@ -1020,13 +1039,15 @@ def _dashboard_posts_payload() -> dict[str, Any]:
 
 
 @app.get("/api/dashboard/posts")
-def dashboard_posts() -> Response:
+def dashboard_posts(request: Request) -> Response:
     """Serve one shared, short-lived Dashboard payload to concurrent users.
 
     The dashboard currently needs the complete searchable dataset. Rebuilding
     and serializing 55k posts for every tab at the same time briefly used more
     than this service's 2 GB memory limit. Keep one compact JSON representation
-    for a few seconds, guarded so a cold cache cannot stampede Postgres.
+    briefly, guarded so a cold cache cannot stampede Postgres. Conditional
+    requests then avoid retransferring and reparsing unchanged data in each
+    browser.
     """
     global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
     now = time.monotonic()
@@ -1049,8 +1070,18 @@ def dashboard_posts() -> Response:
             import gc
             gc.collect()
             _DASHBOARD_POSTS_CACHE_CONTENT = content
-            _DASHBOARD_POSTS_CACHE_EXPIRES_AT = time.monotonic() + 20.0
-    return Response(content=content, media_type="application/json")
+            _DASHBOARD_POSTS_CACHE_EXPIRES_AT = time.monotonic() + _DASHBOARD_POSTS_CACHE_TTL_SECONDS
+    etag = f'"{hashlib.sha256(content).hexdigest()}"'
+    headers = {
+        "ETag": etag,
+        # Keep the browser authoritative cache conditional. The bytes live in
+        # the process cache; the browser still asks us on its normal cadence.
+        "Cache-Control": "private, max-age=0, must-revalidate",
+        "Vary": "Authorization",
+    }
+    if request.headers.get("if-none-match", "").strip() in {etag, "*"}:
+        return Response(status_code=304, headers=headers)
+    return Response(content=content, media_type="application/json", headers=headers)
 
 
 @app.post('/api/dashboard/stacks/merge')
@@ -5784,6 +5815,7 @@ def dashboard_post_flags(
             raise HTTPException(status_code=404, detail="Post not found.")
         row = conn.execute(f"SELECT is_promo, hidden FROM {table} WHERE {where}", where_params).fetchone()
 
+    _invalidate_dashboard_posts_cache()
     return {"account": account, "shortcode": shortcode, "is_promo": bool(row["is_promo"]), "hidden": bool(row["hidden"])}
 
 
@@ -5799,12 +5831,12 @@ def dashboard_post_reload(
     the escape hatch for "that count looks stale". One Apify result, ~$0.002.
     """
     try:
-        return refresh_single_post(account, shortcode)
+        result = refresh_single_post(account, shortcode)
+        _invalidate_dashboard_posts_cache()
+        return result
     except ApifySyncError as exc:
         if "may have been deleted" in str(exc):
-            global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
-            _DASHBOARD_POSTS_CACHE_CONTENT = None
-            _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0.0
+            _invalidate_dashboard_posts_cache()
             return {"account": account, "shortcode": shortcode, "deleted": True}
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -5933,6 +5965,7 @@ def dashboard_refresh(request: Request) -> dict[str, Any]:
             results[handle] = run_manual_refresh(handle, include_reels=False)
         except ApifySyncError as exc:
             results[handle] = {"error": str(exc)}
+    _invalidate_dashboard_posts_cache()
     return results
 
 
@@ -5966,6 +5999,7 @@ def dashboard_posts_catch_up(
     except ApifySyncError as exc:
         raise HTTPException(status_code=502, detail=f"Post catch-up failed: {exc}") from exc
 
+    _invalidate_dashboard_posts_cache()
     return {
         "lookback_hours": lookback_hours,
         "accounts": handles,
