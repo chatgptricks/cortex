@@ -21,6 +21,7 @@ VALID_SCRAPE_MODES = ("posts", "reels", "both")
 # ever updates an in-memory status dict, but a backfill that already paid
 # for an Apify run is worth far more than a progress update.
 ProgressFn = Callable[..., None] | None
+DatasetPageFn = Callable[[list[dict[str, Any]]], None] | None
 
 
 def _emit(on_progress: ProgressFn, **fields: Any) -> None:
@@ -878,6 +879,7 @@ def _run_apify_actor_and_fetch(
     poll_interval: float = 8.0,
     on_progress: ProgressFn = None,
     actor_id: str = APIFY_ACTOR_ID,
+    on_page: DatasetPageFn = None,
 ) -> list[dict[str, Any]]:
     """Starts the actor run and polls for completion with short, separate
     requests instead of holding one long-lived connection open for the
@@ -905,6 +907,12 @@ def _run_apify_actor_and_fetch(
     journal = current()
     saved = journal.next_run(actor_id, payload) if journal else {}
     if saved.get("items") is not None:
+        # Small datasets are retained in the journal.  A recovery can still
+        # consume that cached payload page-wise without materializing it with
+        # the rest of a large library import.
+        if on_page:
+            on_page(saved["items"])
+            return []
         return saved["items"]
     actor_id = saved.get("actor", actor_id)
     payload = saved.get("payload", payload)
@@ -1006,10 +1014,16 @@ def _run_apify_actor_and_fetch(
     # Keep each response small enough that Render/Cloudflare does not reset a
     # long-lived TLS response. A failed page is safe to retry: the dataset is
     # immutable and the import is still deduplicated by shortcode.
-    page_limit = 250
+    # Recovery hands each page to the database immediately; keep that page
+    # deliberately small because raw carousel payloads can be unexpectedly
+    # large even when their visible metadata is modest.
+    page_limit = 50 if on_page else 250
     fetch_attempts = 5
     timeout = httpx.Timeout(connect=30.0, read=90.0, write=30.0, pool=30.0)
+    # The normal callers need a list.  Full-library recovery passes `on_page`
+    # so a 1k+ dataset never lives in the 512MB worker all at once.
     items: list[dict[str, Any]] = []
+    fetched = 0
     with httpx.Client(timeout=timeout) as client:
         offset = 0
         while True:
@@ -1040,9 +1054,13 @@ def _run_apify_actor_and_fetch(
                 raise ApifySyncError(
                     f"Failed to fetch Apify dataset items at offset {offset}: {last_error}"
                 ) from last_error
-            items.extend(page)
+            fetched += len(page)
+            if on_page:
+                on_page(page)
+            else:
+                items.extend(page)
             offset += len(page)
-            _emit(on_progress, phase="fetching_dataset", fetched=len(items), dataset_id=dataset_id)
+            _emit(on_progress, phase="fetching_dataset", fetched=fetched, dataset_id=dataset_id)
             if len(page) < page_limit:
                 break
     if not isinstance(items, list):
@@ -1054,14 +1072,14 @@ def _run_apify_actor_and_fetch(
         # the end, then the connection died while saving the journal, so the
         # account stayed running at zero. Large datasets remain recoverable
         # from the same immutable Apify run and are fetched again on retry.
-        if len(items) <= 50:
+        if not on_page and len(items) <= 50:
             saved["items"] = items
         else:
             saved.pop("items", None)
         saved["dataset_id"] = dataset_id
-        saved["dataset_count"] = len(items)
+        saved["dataset_count"] = fetched
         journal.save()
-    _emit(on_progress, phase="dataset_ready", fetched=len(items))
+    _emit(on_progress, phase="dataset_ready", fetched=fetched)
     return items
 
 
@@ -1806,6 +1824,151 @@ def run_short_term_cycle_batch(
             )
         except Exception as exc:
             results[account] = {"error": f"processing failed: {exc}"}
+    return results
+
+
+def _recovery_result() -> dict[str, Any]:
+    """Compact result for a paged recovery.
+
+    Keeping every imported item's detail in the result quietly recreates the
+    same memory spike that page-wise fetching avoids.  The durable job only
+    needs account-level counts for its operator status.
+    """
+    return {
+        "new_posts": {"added": 0, "failed": 0},
+        "engagement": {"checked": 0, "updated": 0, "hot_marked": 0, "unmatched": 0},
+        "transcripts_updated": 0,
+    }
+
+
+def _merge_recovery_result(target: dict[str, Any], source: dict[str, Any]) -> None:
+    """Add one page's import outcome without retaining its item list."""
+    incoming_posts = source.get("new_posts") or {}
+    target_posts = target["new_posts"]
+    target_posts["added"] += int(incoming_posts.get("added") or 0)
+    target_posts["failed"] += int(incoming_posts.get("failed") or 0)
+    incoming_engagement = source.get("engagement") or {}
+    for key in target["engagement"]:
+        target["engagement"][key] += int(incoming_engagement.get(key) or 0)
+    target["transcripts_updated"] += int(source.get("transcripts_updated") or 0)
+
+
+def run_short_term_cycle_batch_paged(
+    accounts: list[str],
+    results_limit: int = _SHORT_RESULTS_LIMIT,
+    *,
+    include_posts: bool = True,
+    include_reels: bool = False,
+    lookback_hours: int = _SHORT_LOOKBACK_HOURS,
+) -> dict[str, dict[str, Any]]:
+    """Recover a large post window page by page, bounded for a Starter worker.
+
+    The scheduled two-hour cycle intentionally keeps its straightforward
+    in-memory path.  A seven-day recovery can return thousands of raw Apify
+    records, though, and storing the full response plus import summaries can
+    exceed Render's 512MB worker limit.  This variant processes each immutable
+    dataset page immediately.  Repeating a page after a crash is safe because
+    inserts are deduplicated by shortcode and the ingestion journal retains
+    the same paid Apify run IDs.
+    """
+    if not accounts:
+        return {}
+
+    from .ingestion_jobs import current, now as ingestion_now
+
+    now = ingestion_now()
+    configs: dict[str, dict[str, Any]] = {}
+    results: dict[str, dict[str, Any]] = {}
+    for account in accounts:
+        try:
+            configs[account] = get_account_config(account)
+        except Exception as exc:
+            results[account] = {"error": f"config lookup failed: {exc}"}
+    if not configs:
+        return results
+
+    journal = current()
+    if journal:
+        configs = journal.frozen("configs", configs)
+
+    for account in configs:
+        results.setdefault(account, _recovery_result())
+
+    def process_page(page: list[dict[str, Any]], *, source: str) -> None:
+        by_account: dict[str, list[dict[str, Any]]] = {}
+        if source == "posts":
+            owner_to_account = {
+                cfg["handle"].lower(): account
+                for account, cfg in configs.items()
+                if cfg["scrape_mode"] in {"posts", "both"}
+            }
+            for item in page:
+                requested = _item_requested_account(item, owner_to_account)
+                if item.get("error") == "no_items":
+                    continue
+                if item.get("error"):
+                    if requested:
+                        results[requested] = {"error": f"Apify account error: {item.get('error')}"}
+                        continue
+                    raise ApifySyncError(f"Apify returned an account error: {item.get('error')}")
+                account = requested or owner_to_account.get(_item_owner_username(item))
+                if _item_shortcode(item) and not account:
+                    raise ApifySyncError("Apify returned a post without a matching account; dataset retained")
+                if account and "error" not in results[account]:
+                    by_account.setdefault(account, []).append(item)
+        else:
+            owner_to_account = {
+                cfg["handle"].lower(): account
+                for account, cfg in configs.items()
+                if cfg["scrape_mode"] in {"reels", "both"}
+            }
+            for item in page:
+                account = owner_to_account.get(_item_owner_username(item))
+                if account and "error" not in results[account]:
+                    by_account.setdefault(account, []).append(item)
+
+        for account, batch in by_account.items():
+            try:
+                outcome = _process_short_term_items(
+                    account,
+                    configs[account],
+                    _dedupe_items(batch),
+                    now,
+                    lookback_hours=lookback_hours,
+                )
+                _merge_recovery_result(results[account], outcome)
+            except Exception as exc:
+                results[account] = {"error": f"processing failed: {exc}"}
+
+    post_configs = {
+        account: cfg for account, cfg in configs.items() if cfg["scrape_mode"] in {"posts", "both"}
+    } if include_posts else {}
+    if post_configs:
+        _run_apify_actor_and_fetch(
+            _short_term_payload(
+                [cfg["handle"] for cfg in post_configs.values()],
+                results_limit,
+                now,
+                lookback_hours=lookback_hours,
+            ),
+            on_page=lambda page: process_page(page, source="posts"),
+        )
+
+    reel_configs = {
+        account: cfg for account, cfg in configs.items() if cfg["scrape_mode"] in {"reels", "both"}
+    } if include_reels else {}
+    if reel_configs:
+        _run_apify_actor_and_fetch(
+            _short_term_reels_payload(
+                [cfg["handle"] for cfg in reel_configs.values()],
+                results_limit,
+                now,
+                lookback_hours=lookback_hours,
+            ),
+            actor_id=APIFY_REEL_ACTOR_ID,
+            on_page=lambda page: process_page(page, source="reels"),
+        )
+
     return results
 
 

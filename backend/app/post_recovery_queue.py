@@ -179,10 +179,10 @@ def _run(task: dict[str, Any]) -> None:
     result_box: dict[str, Any] = {}
     try:
         def work() -> None:
-            from .apify_sync import list_accounts, run_short_term_cycle_batch
+            from .apify_sync import list_accounts, run_short_term_cycle_batch_paged
 
             handles = [account["handle"] for account in list_accounts(active_only=True)]
-            result_box["results"] = run_short_term_cycle_batch(
+            result_box["results"] = run_short_term_cycle_batch_paged(
                 handles,
                 results_limit=50,
                 include_posts=bool(task["include_posts"]),
