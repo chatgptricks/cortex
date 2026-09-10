@@ -77,6 +77,7 @@ from .db import (
 from .sentient_ocr import sentient_ocr_status
 from .scheduler import start_scheduler
 from .account_backfill_queue import enqueue as enqueue_account_backfill, status as account_backfill_status
+from .post_recovery_queue import enqueue as enqueue_post_recovery, status as post_recovery_status
 from .promos import create_backfill, get_job, get_opportunity, list_opportunities, update_opportunity
 from .tracker_refresh_queue import enqueue as enqueue_tracker_refresh, get as get_tracker_refresh
 from .queue_rules import (
@@ -6643,37 +6644,45 @@ def dashboard_posts_catch_up(
     request: Request,
     lookback_hours: Annotated[int, Form()] = 24,
 ) -> dict[str, Any]:
-    """One-off recovery for an interrupted Dashboard post cycle.
-
-    This intentionally uses one batched *posts* actor request across active
-    accounts. The caller can widen the recovery window up to one week, but it
-    still uses only the normal profile actor and the database keeps only
-    shortcodes that are missing. It never includes the separate Reels actor.
-    """
+    """Queue normal-profile recovery in the durable worker, never an HTTP request."""
     _require_paid_refresh_access(request)
     if lookback_hours < 1 or lookback_hours > 168:
         raise HTTPException(status_code=400, detail="lookback_hours must be between 1 and 168.")
+    slot = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M")
+    return enqueue_post_recovery(
+        journal_key=f"dashboard-post-catch-up:{slot}",
+        slot=slot,
+        lookback_hours=lookback_hours,
+        include_posts=True,
+        include_reels=False,
+    )
 
-    accounts = list_accounts(active_only=True)
-    handles = [account["handle"] for account in accounts]
-    try:
-        results = run_short_term_cycle_batch(
-            handles,
-            # This is a recovery pass, not the scheduled cadence. Keep the
-            # same per-profile result cap while widening only the time window.
-            results_limit=50,
-            include_reels=False,
-            lookback_hours=lookback_hours,
-        )
-    except ApifySyncError as exc:
-        raise HTTPException(status_code=502, detail=f"Post catch-up failed: {exc}") from exc
 
-    _invalidate_dashboard_posts_cache()
-    return {
-        "lookback_hours": lookback_hours,
-        "accounts": handles,
-        "results": results,
-    }
+@app.post("/api/dashboard/posts/catch-up/full", status_code=202)
+def dashboard_posts_full_catch_up(request: Request) -> dict[str, Any]:
+    """Resume the comprehensive seven-day recovery, including Reels.
+
+    This operational endpoint is intentionally Dev/Admin-only. It reuses the
+    already-started normal-post run when one exists and adds only the dedicated
+    Reel surface needed to make a genuine full-library repair.
+    """
+    _require_paid_refresh_access(request)
+    return enqueue_post_recovery(
+        journal_key="manual-post-catchup",
+        slot="2026-09-10T1900",
+        lookback_hours=168,
+        include_posts=True,
+        include_reels=True,
+    )
+
+
+@app.get("/api/dashboard/posts/catch-up/{journal_key}")
+def dashboard_posts_catch_up_status(journal_key: str, request: Request) -> dict[str, Any]:
+    _require_paid_refresh_access(request)
+    job = post_recovery_status(journal_key)
+    if not job:
+        raise HTTPException(status_code=404, detail="Post recovery job not found.")
+    return job
 
 
 @app.post("/api/admin/slack-test")
