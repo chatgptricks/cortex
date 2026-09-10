@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import threading
 import time
@@ -181,6 +182,82 @@ def test_dashboard_posts_revalidates_an_unchanged_catalogue(monkeypatch):
     assert second.status_code == 304
     assert second.headers["etag"] == etag
     assert calls == 1
+
+
+def test_catalogue_pages_cover_every_source_row_without_full_feed_materialization(monkeypatch, tmp_path):
+    """Research can prove it retrieved every page without calling the old full-feed builder."""
+    path = tmp_path / "catalogue.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE posts (
+                id INTEGER PRIMARY KEY, title TEXT, caption TEXT, hook_text TEXT, published_at TEXT,
+                likes INTEGER, comments INTEGER, post_type_label TEXT, shortcode TEXT, image_path TEXT,
+                is_animated INTEGER, source_row_number INTEGER, created_at TEXT, section TEXT,
+                is_hot INTEGER, hot_rate_multiplier REAL, is_promo INTEGER, hidden INTEGER,
+                is_deleted INTEGER, updated_at TEXT
+            );
+            CREATE TABLE dashboard_posts (
+                id INTEGER PRIMARY KEY, account TEXT, shortcode TEXT, published_at TEXT, likes INTEGER,
+                comments INTEGER, caption TEXT, post_type_label TEXT, is_animated INTEGER, permalink TEXT,
+                is_hot INTEGER, hot_rate_multiplier REAL, hook_text TEXT, music_song TEXT,
+                music_artist TEXT, music_audio_id TEXT, uses_original_audio INTEGER, is_promo INTEGER,
+                hidden INTEGER, is_deleted INTEGER, transcript TEXT, updated_at TEXT
+            );
+            CREATE TABLE queue_requests (
+                id INTEGER PRIMARY KEY, post_account TEXT, post_shortcode TEXT, status TEXT,
+                designer_email TEXT, coordinator_email TEXT, production_points INTEGER,
+                actual_started_at TEXT, completed_at TEXT, final_permalink TEXT, final_permalinks TEXT,
+                updated_at TEXT
+            );
+            """
+        )
+        connection.executemany(
+            "INSERT INTO posts VALUES (?, ?, ?, '', ?, ?, 0, 'Image', ?, '', 0, ?, '', 'single', 0, 0, 0, 0, 0, ?)",
+            [
+                (1, "Newest", "Newest", "2026-09-03", 30, "newest", 3, "2026-09-03"),
+                (2, "Middle", "Middle", "2026-09-02", 20, "middle", 2, "2026-09-02"),
+                (3, "Oldest", "Oldest", "2026-09-01", 10, "oldest", 1, "2026-09-01"),
+            ],
+        )
+        connection.execute(
+            "INSERT INTO dashboard_posts VALUES (1, 'competitor', 'other', '2026-09-04', 40, 1, 'Other', 'Image', 0, '', 0, 0, '', '', '', '', 0, 0, 0, 0, '', '2026-09-04')"
+        )
+
+    @contextmanager
+    def connect():
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    from app import topic_stacks
+
+    def memberships(posts):
+        for post in posts:
+            post["stackId"] = f"{post['account']}:{post['shortcode']}"
+            post["stackSize"] = 1
+
+    monkeypatch.setattr(main, "connect", connect)
+    monkeypatch.setattr(main, "list_accounts", lambda active_only=False: [
+        {"handle": "chatgptricks", "group": "sentient", "is_canonical": True},
+        {"handle": "competitor", "group": "competitors", "is_canonical": False},
+    ])
+    monkeypatch.setattr(topic_stacks, "apply_memberships", memberships)
+    monkeypatch.setattr(main, "_dashboard_posts_payload", lambda: pytest.fail("Page API must not build the full payload."))
+
+    manifest = main._dashboard_catalogue_manifest()
+    assert manifest["sources"] == [{"source": "canonical", "total": 3}, {"source": "dashboard", "total": 1}]
+    first = json.loads(main.dashboard_posts_page("canonical", 0, 2, manifest["revision"]).body)
+    second = json.loads(main.dashboard_posts_page("canonical", 2, 2, manifest["revision"]).body)
+    competitor = json.loads(main.dashboard_posts_page("dashboard", 0, 2, manifest["revision"]).body)
+
+    assert [post["shortcode"] for post in first["posts"]] == ["newest", "middle"]
+    assert [post["shortcode"] for post in second["posts"]] == ["oldest"]
+    assert [post["shortcode"] for post in competitor["posts"]] == ["other"]
 
 
 def test_backfill_preserves_concurrent_media_updates(monkeypatch, isolated_database):

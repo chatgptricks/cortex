@@ -851,6 +851,261 @@ def _dedupe_projected_posts(posts: list[dict[str, Any]]) -> list[dict[str, Any]]
     return result
 
 
+_DASHBOARD_CATALOGUE_PAGE_SIZE = 1_000
+_DASHBOARD_CATALOGUE_MAX_PAGE_SIZE = 2_000
+
+
+def _dashboard_catalogue_context() -> tuple[dict[str, str], dict[str, Any]]:
+    """Return the immutable account metadata used by every Research page."""
+    all_accounts = list_accounts(active_only=False)
+    group_by_handle = {str(account["handle"]): str(account["group"]) for account in all_accounts}
+    known_canonical = next((account for account in all_accounts if account["handle"] == "chatgptricks"), None)
+    canonical = ({**known_canonical, "is_canonical": True} if known_canonical else {
+        "handle": "chatgptricks",
+        "group": "sentient",
+        "is_canonical": True,
+    })
+    return group_by_handle, canonical
+
+
+def _dashboard_catalogue_manifest() -> dict[str, Any]:
+    """Describe the complete Research catalogue without materialising it.
+
+    The old endpoint had to first build one Python list containing every card,
+    then encode another complete JSON representation of it. On the real 50k+
+    history that transient double allocation can make the API restart, after
+    which a browser quietly shows whichever smaller offline snapshot it had.
+    This manifest gives the client exact source totals so it can retrieve every
+    row in bounded pages and never present a partial response as the catalogue.
+    """
+    with connect() as conn:
+        canonical = conn.execute(
+            "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at, COALESCE(MAX(id), 0) AS max_id FROM posts"
+        ).fetchone()
+        dashboard = conn.execute(
+            "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at, COALESCE(MAX(id), 0) AS max_id FROM dashboard_posts"
+        ).fetchone()
+        queue = conn.execute(
+            "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at, COALESCE(MAX(id), 0) AS max_id FROM queue_requests"
+        ).fetchone()
+
+    sources = [
+        {"source": "canonical", "total": int(canonical["count"] or 0)},
+        {"source": "dashboard", "total": int(dashboard["count"] or 0)},
+    ]
+    fingerprint = {
+        "sources": sources,
+        "canonical": [canonical["updated_at"], int(canonical["max_id"] or 0)],
+        "dashboard": [dashboard["updated_at"], int(dashboard["max_id"] or 0)],
+        "queue": [queue["updated_at"], int(queue["max_id"] or 0)],
+    }
+    revision = hashlib.sha256(
+        json.dumps(fingerprint, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return {
+        "revision": revision,
+        "sources": sources,
+        # `rawTotal` is intentionally a transport-progress value. The final
+        # visible total is calculated after account+shortcode de-duplication.
+        "rawTotal": sum(source["total"] for source in sources),
+    }
+
+
+def _dashboard_catalogue_queue_rows() -> list[Any]:
+    with connect() as conn:
+        return conn.execute(
+            """SELECT id, post_account, post_shortcode, status, designer_email, coordinator_email,
+                      production_points, actual_started_at, completed_at, final_permalink, final_permalinks
+               FROM queue_requests"""
+        ).fetchall()
+
+
+def _annotate_dashboard_queue(posts: list[dict[str, Any]], queue_rows: list[Any]) -> None:
+    """Attach Queue state to one bounded catalogue page."""
+    queue_by_source = {(row["post_account"], row["post_shortcode"]): dict(row) for row in queue_rows}
+
+    def _normal_permalink(value: str | None) -> str:
+        return (value or "").strip().rstrip("/").split("?")[0]
+
+    queue_by_final: dict[str, dict[str, Any]] = {}
+    for queue_row in queue_rows:
+        item = dict(queue_row)
+        final_urls = [item.get("final_permalink")]
+        final_urls.extend(
+            link.get("url") for link in _queue_v2_json(item.get("final_permalinks"), [])
+            if isinstance(link, dict) and link.get("url")
+        )
+        for final_url in final_urls:
+            normalized = _normal_permalink(final_url)
+            if normalized:
+                queue_by_final[normalized] = item
+
+    for post in posts:
+        source = queue_by_source.get((post.get("account"), post.get("shortcode")))
+        if source:
+            post["queueState"] = source["status"]
+            post["queueRequestId"] = source["id"]
+        closed = queue_by_final.get(_normal_permalink(post.get("permalink")))
+        if closed:
+            post["queueAttribution"] = {
+                "requestId": closed["id"], "designerEmail": closed["designer_email"],
+                "coordinatorEmail": closed["coordinator_email"], "productionPoints": closed["production_points"],
+                "actualStartedAt": closed["actual_started_at"], "completedAt": closed["completed_at"],
+            }
+
+
+def _dashboard_catalogue_page(source: str, offset: int, limit: int) -> list[dict[str, Any]]:
+    """Project one source page without loading the rest of Research in RAM."""
+    group_by_handle, canonical = _dashboard_catalogue_context()
+    with connect() as conn:
+        if source == "canonical":
+            rows = conn.execute(
+                """
+                SELECT id, title, caption, hook_text, published_at, likes, comments,
+                       post_type_label, shortcode, image_path, is_animated,
+                       source_row_number, created_at, section, is_hot, hot_rate_multiplier,
+                       is_promo, hidden, is_deleted, updated_at
+                FROM posts
+                ORDER BY CASE WHEN published_at IS NULL THEN 1 ELSE 0 END,
+                         published_at DESC, updated_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+        elif source == "dashboard":
+            rows = conn.execute(
+                """
+                SELECT id, account, shortcode, published_at, likes, comments, caption,
+                       post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
+                       hook_text, music_song, music_artist, music_audio_id, uses_original_audio,
+                       is_promo, hidden, is_deleted, transcript
+                FROM dashboard_posts
+                ORDER BY account,
+                         CASE WHEN published_at IS NULL THEN 1 ELSE 0 END,
+                         published_at DESC, updated_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+        else:
+            raise ValueError("Unknown catalogue source.")
+
+    posts: list[dict[str, Any]] = []
+    if source == "canonical":
+        handle = canonical["handle"]
+        for row in rows:
+            post = dict(row)
+            shortcode = str(post.get("shortcode") or "").strip()
+            post_type = str(post.get("post_type_label") or "").strip() or "Image"
+            has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
+            posts.append({
+                "rank": post.get("source_row_number") or post["id"],
+                "postDate": post.get("published_at"),
+                "likes": _likes_or_null(post.get("likes")),
+                "comments": int(post.get("comments") or 0),
+                "type": post_type,
+                "video": "Yes" if has_video else "No",
+                "shortcode": shortcode or f"post-{post['id']}",
+                "permalink": f"https://www.instagram.com/p/{shortcode}/" if shortcode else "",
+                "caption": post.get("caption") or post.get("title") or "",
+                "excerpt": post.get("title") or "",
+                "section": post.get("section") or "",
+                "ocrText": _clean_ocr_text(post.get("hook_text")),
+                "coverUrl": f"/api/dashboard/covers/{handle}/{post['id']}",
+                "isHot": bool(post.get("is_hot")),
+                "hotMultiplier": post.get("hot_rate_multiplier"),
+                "isPromo": bool(post.get("is_promo")),
+                "hidden": bool(post.get("hidden")),
+                "isDeleted": bool(post.get("is_deleted")),
+                "account": handle,
+                "group": group_by_handle.get(handle, "sentient"),
+                "musicSong": None,
+                "musicArtist": None,
+                "usesOriginalAudio": None,
+                "musicUrl": None,
+            })
+    else:
+        for row in rows:
+            post = dict(row)
+            account = post.get("account")
+            shortcode = str(post.get("shortcode") or "").strip()
+            post_type = str(post.get("post_type_label") or "").strip() or "Image"
+            has_video = post_type.lower().startswith("video") or bool(post.get("is_animated"))
+            posts.append({
+                "rank": post["id"],
+                "postDate": post.get("published_at"),
+                "likes": _likes_or_null(post.get("likes")),
+                "comments": int(post.get("comments") or 0),
+                "type": post_type,
+                "video": "Yes" if has_video else "No",
+                "shortcode": shortcode,
+                "permalink": post.get("permalink") or (f"https://www.instagram.com/p/{shortcode}/" if shortcode else ""),
+                "caption": post.get("caption") or "",
+                "excerpt": post.get("caption") or "",
+                "section": "single",
+                "ocrText": _clean_ocr_text(post.get("hook_text")),
+                "coverUrl": f"/api/dashboard/covers/{account}/{post['id']}",
+                "isHot": bool(post.get("is_hot")),
+                "hotMultiplier": post.get("hot_rate_multiplier"),
+                "isPromo": bool(post.get("is_promo")),
+                "hidden": bool(post.get("hidden")),
+                "isDeleted": bool(post.get("is_deleted")),
+                "account": account,
+                "group": group_by_handle.get(account, "competitors"),
+                "musicSong": post.get("music_song"),
+                "musicArtist": post.get("music_artist"),
+                "usesOriginalAudio": bool(post.get("uses_original_audio")),
+                "musicUrl": (
+                    f"https://www.instagram.com/reels/audio/{post['music_audio_id']}/"
+                    if post.get("music_audio_id") else None
+                ),
+                "transcriptAvailable": bool(str(post.get("transcript") or "").strip()),
+            })
+
+    _annotate_dashboard_queue(posts, _dashboard_catalogue_queue_rows())
+    from .topic_stacks import apply_memberships
+    apply_memberships(posts)
+    return posts
+
+
+@app.get("/api/dashboard/posts/manifest")
+def dashboard_posts_manifest(request: Request) -> Response:
+    """Return exact source totals and a lightweight revision for Research."""
+    manifest = _dashboard_catalogue_manifest()
+    etag = f'"{manifest["revision"]}"'
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=0, must-revalidate", "Vary": "Authorization"}
+    if request.headers.get("if-none-match", "").strip() in {etag, "*"}:
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(manifest, headers=headers)
+
+
+@app.get("/api/dashboard/posts/page")
+def dashboard_posts_page(
+    source: str = Query(...),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(_DASHBOARD_CATALOGUE_PAGE_SIZE, ge=1, le=_DASHBOARD_CATALOGUE_MAX_PAGE_SIZE),
+    revision: str | None = Query(None),
+) -> Response:
+    """Serve one bounded, authenticated page of the complete Research feed."""
+    manifest = _dashboard_catalogue_manifest()
+    if revision and revision != manifest["revision"]:
+        raise HTTPException(status_code=409, detail="The catalogue changed while loading; restart from the manifest.")
+    source_total = next((int(item["total"]) for item in manifest["sources"] if item["source"] == source), None)
+    if source_total is None:
+        raise HTTPException(status_code=400, detail="Unknown catalogue source.")
+    posts = _dashboard_catalogue_page(source, offset, limit)
+    return JSONResponse(
+        {
+            "source": source,
+            "offset": offset,
+            "total": source_total,
+            "posts": posts,
+            "revision": manifest["revision"],
+        },
+        headers={"ETag": f'"{manifest["revision"]}"', "Cache-Control": "private, max-age=0, must-revalidate", "Vary": "Authorization"},
+    )
+
+
 def _dashboard_posts_payload() -> dict[str, Any]:
     """Unified, public, read-only projection across every account. Each
     post is tagged with `account` and `group` (sentient/competitors) so the
