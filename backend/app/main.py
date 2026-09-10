@@ -1138,8 +1138,13 @@ def _dedupe_projected_posts(posts: list[dict[str, Any]]) -> list[dict[str, Any]]
     return result
 
 
-_DASHBOARD_CATALOGUE_PAGE_SIZE = 1_000
-_DASHBOARD_CATALOGUE_MAX_PAGE_SIZE = 2_000
+# Research is a 67k-post library.  A 2k-page ceiling turned one fresh load
+# into more than thirty sequential API round-trips, leaving a signed-in user
+# on a skeleton long after the backend was healthy.  Six thousand rows keep a
+# compressed response comfortably bounded while cutting that transport work by
+# roughly two thirds.
+_DASHBOARD_CATALOGUE_PAGE_SIZE = 6_000
+_DASHBOARD_CATALOGUE_MAX_PAGE_SIZE = 6_000
 
 
 def _dashboard_catalogue_context() -> tuple[dict[str, str], dict[str, Any]]:
@@ -7207,6 +7212,32 @@ def _require_admin(password: str) -> None:
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
 
 
+def _recovery_account_for_item(item: dict[str, Any], configs: dict[str, dict[str, Any]]) -> str | None:
+    """Resolve an existing Apify dataset item to one active account.
+
+    Recovery must accept the same payload variations as normal ingestion.  In
+    particular, the Reels actor puts its owner under ``owner.username`` rather
+    than ``ownerUsername``; profile runs may also report the account we asked
+    for as ``inputUrl`` while the media owner is a collaborator.  The previous
+    recovery-only matcher handled neither, so valid completed runs appeared to
+    have zero accounts and their current posts never reached Research.
+    """
+    from .apify_sync import _item_owner_username
+
+    raw_input = str(item.get("inputUrl") or "").strip()
+    parsed = urlsplit(raw_input)
+    hostname = (parsed.hostname or "").lower().removeprefix("www.")
+    if hostname == "instagram.com":
+        parts = [part.strip().lower() for part in parsed.path.split("/") if part.strip()]
+        if parts:
+            source_handle = parts[0].lstrip("@")
+            if source_handle in configs:
+                return source_handle
+
+    owner = _item_owner_username(item)
+    return owner if owner in configs else None
+
+
 @app.get("/api/admin/apify/runs")
 def temp_runs(request: Request, limit: int = 15) -> dict[str, Any]:
     """recent Apify runs so a finished-but-unsaved one can be
@@ -7625,7 +7656,7 @@ def temp_import_batch_run(run_id: str, request: Request) -> dict[str, Any]:
     """
     _require_paid_refresh_access(request)
     import httpx
-    from .apify_sync import _account_scope, _insert_new_posts
+    from .apify_sync import _account_scope, _insert_new_posts, _item_shortcode
 
     token = os.getenv("APIFY_TOKEN", "").strip()
     with httpx.Client(timeout=60.0) as client:
@@ -7650,11 +7681,16 @@ def temp_import_batch_run(run_id: str, request: Request) -> dict[str, Any]:
         if not isinstance(item, dict):
             ignored += 1
             continue
-        owner = str(item.get("ownerUsername") or "").strip().lower()
-        if not owner or owner not in configs or not item.get("shortCode"):
+        owner = _recovery_account_for_item(item, configs)
+        shortcode = _item_shortcode(item)
+        if not owner or not shortcode:
             ignored += 1
             continue
-        by_account.setdefault(owner, []).append(item)
+        # `_insert_new_posts` consumes the canonical Apify key.  The Reels
+        # actor can supply only a URL, whose shortcode `_item_shortcode`
+        # safely derives, so normalize it once before both deduplication and
+        # insertion.
+        by_account.setdefault(owner, []).append({**item, "shortCode": shortcode})
 
     recovered: dict[str, Any] = {}
     total_added = 0
