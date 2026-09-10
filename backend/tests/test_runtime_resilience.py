@@ -158,6 +158,31 @@ def test_auth_database_and_usage_work_do_not_block_event_loop(monkeypatch):
     assert all(thread != main_thread for thread in calls)
 
 
+def test_dashboard_posts_revalidates_an_unchanged_catalogue(monkeypatch):
+    """A visible Research poll should not transfer or rebuild unchanged JSON."""
+    calls = 0
+
+    def payload():
+        nonlocal calls
+        calls += 1
+        return {"posts": [], "summary": {"Exported posts": 0}}
+
+    monkeypatch.setattr(main, "_DASHBOARD_POSTS_CACHE_CONTENT", None)
+    monkeypatch.setattr(main, "_DASHBOARD_POSTS_CACHE_EXPIRES_AT", 0.0)
+    monkeypatch.setattr(main, "_dashboard_posts_payload", payload)
+    first = main.dashboard_posts(Request({"type": "http", "method": "GET", "path": "/api/dashboard/posts", "headers": []}))
+    etag = first.headers["etag"]
+    second = main.dashboard_posts(Request({
+        "type": "http", "method": "GET", "path": "/api/dashboard/posts",
+        "headers": [(b"if-none-match", etag.encode("ascii"))],
+    }))
+
+    assert first.status_code == 200
+    assert second.status_code == 304
+    assert second.headers["etag"] == etag
+    assert calls == 1
+
+
 def test_backfill_preserves_concurrent_media_updates(monkeypatch, isolated_database):
     with isolated_database() as connection:
         connection.execute("INSERT INTO dashboard_posts VALUES (1, 'old.jpg')")
