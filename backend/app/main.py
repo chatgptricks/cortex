@@ -1480,12 +1480,21 @@ def dashboard_posts_page(
             source, offset, limit, manifest["revision"], after_id=after_id,
             until_id=until_id, cursor_metadata=True,
         )
+        # IDs are intentionally not assumed to be dense. PostgreSQL sequences
+        # advance for a conflicted upsert too, so a source can have a high
+        # watermark far beyond its last persisted row. A short keyset page
+        # proves there are no more rows below the captured bound; an empty
+        # terminal probe advances the cursor to the bound so clients cannot
+        # loop forever over an otherwise valid sparse snapshot.
+        done = len(posts) < limit or next_cursor >= until_id
+        if done and not posts:
+            next_cursor = until_id
         return JSONResponse(
             {
                 "source": source,
                 "afterId": after_id,
                 "nextCursor": next_cursor,
-                "done": next_cursor >= until_id,
+                "done": done,
                 "upperBound": until_id,
                 "posts": posts,
                 "revision": manifest["revision"],
