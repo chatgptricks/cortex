@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from starlette.concurrency import run_in_threadpool
 
 from .apify_sync import (
@@ -251,6 +252,12 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["ETag"],
 )
+
+# Research responses contain repeated field names and account metadata across
+# tens of thousands of posts. Compress them before they leave Render; browsers
+# transparently decompress the response and avoid repeatedly transferring a
+# multi-megabyte JSON catalogue over every cold load.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 # Registered last on purpose. Starlette runs the most recently added
 # middleware outermost, so this wraps the two auth middlewares below rather
@@ -1139,13 +1146,11 @@ def _dedupe_projected_posts(posts: list[dict[str, Any]]) -> list[dict[str, Any]]
     return result
 
 
-# Research is a 67k-post library.  A 2k-page ceiling turned one fresh load
-# into more than thirty sequential API round-trips, leaving a signed-in user
-# on a skeleton long after the backend was healthy.  Six thousand rows keep a
-# compressed response comfortably bounded while cutting that transport work by
-# roughly two thirds.
-_DASHBOARD_CATALOGUE_PAGE_SIZE = 6_000
-_DASHBOARD_CATALOGUE_MAX_PAGE_SIZE = 6_000
+# Research is a 67k-post library. Twelve-thousand-row pages combined with
+# client-side ID-range shards avoid the previous dozens of serial request / JSON
+# parse cycles, without returning an unbounded result that can exhaust memory.
+_DASHBOARD_CATALOGUE_PAGE_SIZE = 12_000
+_DASHBOARD_CATALOGUE_MAX_PAGE_SIZE = 12_000
 
 
 def _dashboard_catalogue_context() -> tuple[dict[str, str], dict[str, Any]]:
