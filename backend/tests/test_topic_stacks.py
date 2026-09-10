@@ -76,6 +76,19 @@ def test_find_similar_merges_matching_existing_posts_only_when_requested():
     assert result['matchedCount'] == 1
     assert set(result['postKeys']) == {'test:a', 'test:b'}
 
+def test_find_similar_bootstraps_a_visible_post_without_membership():
+    with db.connect() as connection:
+        connection.execute(
+            'CREATE TABLE dashboard_posts (account TEXT, shortcode TEXT, caption TEXT, published_at TEXT)'
+        )
+        connection.execute(
+            'INSERT INTO dashboard_posts VALUES (?, ?, ?, ?)',
+            ('test', 'legacy', CAPTION, '2026-09-05T00:00:00Z'),
+        )
+    result = topic_stacks.find_similar('test:legacy')
+    assert result['matchedCount'] == 0
+    assert result['members'][0]['postKey'] == 'test:legacy'
+
 @pytest.mark.parametrize(('hours', 'shared', 'score', 'coverage'), [
     (8, 3, .16, .20),
     (24, 4, .22, .20),

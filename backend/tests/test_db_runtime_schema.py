@@ -97,7 +97,7 @@ def test_legacy_profile_schema_cannot_break_authentication_access(monkeypatch, t
     assert access["operating_role"] == "sales"
     assert access["time_zone"] == "America/Costa_Rica"
     assert access["minutes_per_pp"] is None
-    assert access["can_access_promos"] is False
+    assert access["can_access_promos"] is True
 
     # The incoming browser clock is an optional preference, not a reason to
     # make every authenticated request fail while the old schema is upgraded.

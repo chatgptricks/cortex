@@ -38,7 +38,6 @@ from .apify_sync import (
     fetch_profile_preview,
     get_account_config,
     list_accounts,
-    refresh_single_post,
     run_backfill,
     run_manual_refresh,
     run_short_term_cycle_batch,
@@ -79,6 +78,7 @@ from .sentient_ocr import sentient_ocr_status
 from .scheduler import start_scheduler
 from .account_backfill_queue import enqueue as enqueue_account_backfill, status as account_backfill_status
 from .post_recovery_queue import enqueue as enqueue_post_recovery, status as post_recovery_status
+from .post_refresh_queue import enqueue as enqueue_post_refresh, get as get_post_refresh
 from .promos import create_backfill, get_job, get_opportunity, list_opportunities, update_opportunity
 from .tracker_refresh_queue import enqueue as enqueue_tracker_refresh, get as get_tracker_refresh
 from .queue_rules import (
@@ -230,10 +230,9 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     # requests, or assigned-work workflow.
     if "pd" not in request.state.operating_roles:
         request.state.operating_roles.append("pd")
-    is_promos_path = path == "/api/admin/promos" or path.startswith("/api/admin/promos/")
     if path.startswith("/api/admin/") and not (
         request.state.is_admin or request.state.is_dev or
-        (is_promos_path and request.state.can_access_promos)
+        (path == "/api/admin/promos" or path.startswith("/api/admin/promos/"))
     ):
         return JSONResponse({"detail": "Admin or Dev access required."}, status_code=403)
     request.state.user_uid = decoded.get("uid")
@@ -496,9 +495,10 @@ def dashboard_me(request: Request) -> dict[str, Any]:
         # unlocks the Queue creation flows that are internally approved for
         # the user, never the broader VC/Admin dashboard tools.
         "can_self_assign": bool(getattr(request.state, "can_self_assign", False)),
-        # Promos is granted as a standalone capability. It does not imply
-        # Settings, Queue coordination, Tracker, or Insights access.
-        "can_access_promos": bool(getattr(request.state, "can_access_promos", False)),
+        # Promos is available to every authenticated allowlisted user. This
+        # legacy field remains in the response for older clients, but it does
+        # not grant Settings, Queue coordination, Tracker, or Insights access.
+        "can_access_promos": True,
         "can_role_switch": bool(getattr(request.state, "can_role_switch", False)),
         "available_operating_roles": getattr(request.state, "available_operating_roles", [getattr(request.state, "operating_role", "sales")]),
     }
@@ -1834,11 +1834,13 @@ def dashboard_stacks_separate(keys: Annotated[str, Form()]) -> dict[str, Any]:
 def dashboard_stacks_find_similar(post_key: Annotated[str, Form()]) -> dict[str, Any]:
     from .topic_stacks import find_similar
     global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
+    try:
+        result = find_similar(post_key)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Do not hold the shared Research-cache lock during the full similarity
+    # scan. Only the tiny invalidation assignment needs synchronization.
     with _DASHBOARD_POSTS_CACHE_LOCK:
-        try:
-            result = find_similar(post_key)
-        except (ValueError, TypeError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         _DASHBOARD_POSTS_CACHE_CONTENT = None
         _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0
     return result
@@ -6566,26 +6568,24 @@ def dashboard_post_flags(
     return {"account": account, "shortcode": shortcode, "is_promo": bool(row["is_promo"]), "hidden": bool(row["hidden"])}
 
 
-@app.post("/api/dashboard/posts/reload")
+@app.post("/api/dashboard/posts/reload", status_code=202)
 def dashboard_post_reload(
     account: Annotated[str, Form()],
     shortcode: Annotated[str, Form()],
 ) -> dict[str, Any]:
-    """Re-scrapes one post's like/comment counts on demand.
-
-    The scheduled cycle only looks at posts inside its 12h window, so an older
-    post's numbers are frozen at whatever they were when it aged out. This is
-    the escape hatch for "that count looks stale". One Apify result, ~$0.002.
-    """
+    """Queue a count refresh so Apify never blocks the public HTTP request."""
     try:
-        result = refresh_single_post(account, shortcode)
-        _invalidate_dashboard_posts_cache()
-        return result
-    except ApifySyncError as exc:
-        if "may have been deleted" in str(exc):
-            _invalidate_dashboard_posts_cache()
-            return {"account": account, "shortcode": shortcode, "deleted": True}
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return enqueue_post_refresh(account=account, shortcode=shortcode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/dashboard/posts/reload-jobs/{job_id}")
+def dashboard_post_reload_job(job_id: str) -> dict[str, Any]:
+    job = get_post_refresh(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Reload job not found.")
+    return job
 
 
 @app.get("/api/dashboard/posts/media")
