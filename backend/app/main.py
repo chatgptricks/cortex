@@ -7208,10 +7208,14 @@ def _require_admin(password: str) -> None:
 
 
 @app.get("/api/admin/apify/runs")
-def temp_runs(password: str, limit: int = 15) -> dict[str, Any]:
+def temp_runs(request: Request, limit: int = 15) -> dict[str, Any]:
     """recent Apify runs so a finished-but-unsaved one can be
     reused instead of paying to scrape the same profile again."""
-    _require_admin(password)
+    # The Firebase Admin/Dev boundary is the authority for live dashboard
+    # operations.  Keeping a second browser-shipped password here made the
+    # recovery surface fail for the actual Dev user even though the request
+    # was already authenticated and authorized by the middleware.
+    _require_paid_refresh_access(request)
     import httpx
 
     from .apify_sync import APIFY_ACTOR_ID, APIFY_REEL_ACTOR_ID
@@ -7552,13 +7556,13 @@ def temp_enrich_status() -> dict[str, Any]:
 
 
 @app.post("/api/admin/apify/import-run/{handle}")
-def temp_import_run(handle: str, run_id: str, password: Annotated[str, Form()]) -> dict[str, Any]:
+def temp_import_run(handle: str, run_id: str, request: Request) -> dict[str, Any]:
     """import posts from an ALREADY-COMPLETED Apify run instead of
     re-scraping. Apify keeps each run's dataset, so when a scrape succeeded but
     our side never stored the results (a deploy restart killed the request),
     this recovers the data for free rather than paying for the same work twice.
     """
-    _require_admin(password)
+    _require_paid_refresh_access(request)
     import httpx
 
     from .apify_sync import _account_scope, _filter_items_for_account, _insert_new_posts, get_account_config
@@ -7612,14 +7616,14 @@ def temp_import_run(handle: str, run_id: str, password: Annotated[str, Form()]) 
 
 
 @app.post("/api/admin/apify/import-batch-run")
-def temp_import_batch_run(run_id: str, password: Annotated[str, Form()]) -> dict[str, Any]:
+def temp_import_batch_run(run_id: str, request: Request) -> dict[str, Any]:
     """Recover every active account represented in one completed batch run.
 
     The 45-minute scheduler uses one actor run for the whole roster.  The old
     recovery action could only replay its daytrading slice, leaving the other
     owners in an already-paid dataset stranded after an interrupted worker.
     """
-    _require_admin(password)
+    _require_paid_refresh_access(request)
     import httpx
     from .apify_sync import _account_scope, _insert_new_posts
 
