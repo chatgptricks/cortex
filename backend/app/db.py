@@ -22,7 +22,10 @@ _TRACKER_TIME_ZONE = timezone(timedelta(hours=-6))
 
 
 def account_snapshot_day(value: datetime | None = None) -> str:
-    current = value or datetime.now(UTC)
+    # Use the same clock as inserts.  Besides keeping a request on one local
+    # Tracker day, this prevents a read immediately after an insert from
+    # looking up a different day when the clock is overridden for a job/test.
+    current = value or datetime.fromisoformat(utc_now().replace("Z", "+00:00"))
     if current.tzinfo is None:
         current = current.replace(tzinfo=UTC)
     return current.astimezone(_TRACKER_TIME_ZONE).date().isoformat()
