@@ -1091,14 +1091,40 @@ def get_dashboard_user_role(email: str) -> str | None:
 
 
 def get_dashboard_user_access(email: str) -> dict[str, Any] | None:
+    """Return a safe access record even while a managed schema is catching up.
+
+    This function runs in authentication middleware, so selecting a newly
+    added optional profile column here used to make *every* protected tool
+    return a server error when an older production schema briefly lagged a
+    deploy.  Required identity and legacy role fields still decide access;
+    optional Queue preferences simply use their safe defaults until the
+    additive migration is present.
+    """
+    defaults: dict[str, Any] = {
+        "email": email.strip().lower(),
+        "operating_role": "sales",
+        "operating_roles": "[]",
+        "is_admin": 0,
+        "role": "viewer",
+        "time_zone": "America/Costa_Rica",
+        "can_self_assign": 0,
+        "minutes_per_pp": None,
+    }
     with connect() as conn:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(dashboard_users)").fetchall()
+        }
+        if "email" not in columns:
+            return None
+        selected = [column for column in defaults if column in columns]
         row = conn.execute(
-            "SELECT email, operating_role, operating_roles, is_admin, role, time_zone, can_self_assign, minutes_per_pp FROM dashboard_users WHERE email = ?",
+            f"SELECT {', '.join(selected)} FROM dashboard_users WHERE email = ?",
             (email.strip().lower(),),
         ).fetchone()
         if not row:
             return None
-        value = dict(row)
+        value = {**defaults, **dict(row)}
         # Existing databases only have the legacy role until init_db's
         # migration has run; honour it during that tiny transition window.
         value["is_admin"] = bool(value["is_admin"] or value["role"] == "admin")
@@ -1112,9 +1138,23 @@ def set_dashboard_user_time_zone(email: str, time_zone: str) -> None:
     if time_zone not in {"America/Costa_Rica", "America/Bogota"}:
         return
     with connect() as conn:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(dashboard_users)").fetchall()
+        }
+        # A profile preference must never prevent an otherwise allowlisted
+        # teammate from opening every tool while a rolling migration finishes.
+        if not {"email", "time_zone"}.issubset(columns):
+            return
+        fields = ["time_zone = ?"]
+        values: list[Any] = [time_zone]
+        if "updated_at" in columns:
+            fields.append("updated_at = ?")
+            values.append(utc_now())
+        values.append(email.strip().lower())
         conn.execute(
-            "UPDATE dashboard_users SET time_zone = ?, updated_at = ? WHERE email = ?",
-            (time_zone, utc_now(), email.strip().lower()),
+            f"UPDATE dashboard_users SET {', '.join(fields)} WHERE email = ?",
+            tuple(values),
         )
 
 

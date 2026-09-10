@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 
+from app import db
 from app.db import _ensure_runtime_schema_extensions, _has_internal_self_assign
 
 
@@ -66,6 +68,38 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
     assert dict(row) == {"hidden_users": "[]", "row_order": "[]"}
 def test_gabo_is_not_an_internal_self_assignment_exception() -> None:
     assert not _has_internal_self_assign("gabo@sentientagency.io")
+
+
+def test_legacy_profile_schema_cannot_break_authentication_access(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "legacy-dashboard-users.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE dashboard_users (email TEXT PRIMARY KEY, role TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO dashboard_users (email, role) VALUES (?, ?)",
+            ("esteban@sentientagency.io", "admin"),
+        )
+
+    @contextmanager
+    def connect():
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    monkeypatch.setattr(db, "connect", connect)
+    access = db.get_dashboard_user_access("esteban@sentientagency.io")
+    assert access is not None
+    assert access["is_admin"] is True
+    assert access["operating_role"] == "sales"
+    assert access["time_zone"] == "America/Costa_Rica"
+    assert access["minutes_per_pp"] is None
+
+    # The incoming browser clock is an optional preference, not a reason to
+    # make every authenticated request fail while the old schema is upgraded.
+    db.set_dashboard_user_time_zone("esteban@sentientagency.io", "America/Bogota")
 
 
 def test_runtime_migration_adds_soft_delete_to_both_post_tables():
