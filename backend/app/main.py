@@ -404,8 +404,12 @@ def _runtime_data_readiness(check: str = "all") -> dict[str, Any]:
 def _runtime_catalogue_page_check() -> None:
     manifest = _dashboard_catalogue_manifest()
     for source in manifest["sources"]:
-        if int(source["total"] or 0):
-            _dashboard_catalogue_page(str(source["source"]), 0, 1, manifest["revision"])
+        upper_bound = int(source["upperBound"] or 0)
+        if upper_bound:
+            _dashboard_catalogue_page(
+                str(source["source"]), 0, 1, manifest["revision"],
+                after_id=0, until_id=upper_bound,
+            )
 
 
 @app.get("/api/health")
@@ -1152,35 +1156,34 @@ def _dashboard_catalogue_context() -> tuple[dict[str, str], dict[str, Any]]:
 
 
 def _dashboard_catalogue_manifest() -> dict[str, Any]:
-    """Describe the complete Research catalogue without materialising it.
+    """Describe a stable, complete Research snapshot without table scans.
 
-    The old endpoint had to first build one Python list containing every card,
-    then encode another complete JSON representation of it. On the real 50k+
-    history that transient double allocation can make the API restart, after
-    which a browser quietly shows whichever smaller offline snapshot it had.
-    This manifest gives the client exact source totals so it can retrieve every
-    row in bounded pages and never present a partial response as the catalogue.
+    ``COUNT(*)`` and ``MAX(updated_at)`` were being recalculated for every
+    page request.  On the production history those aggregates were enough to
+    monopolize the database pool, so Tracker and Queue timed out while
+    Research was loading.  A primary-key high-water mark is index-backed and
+    lets the browser use keyset pagination: it receives every row that existed
+    at the beginning of its snapshot, without claiming a partial result is
+    complete or repeatedly scanning an entire source table.
     """
     with connect() as conn:
         canonical = conn.execute(
-            "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at, COALESCE(MAX(id), 0) AS max_id FROM posts"
+            "SELECT COALESCE(MAX(id), 0) AS max_id FROM posts"
         ).fetchone()
         dashboard = conn.execute(
-            "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at, COALESCE(MAX(id), 0) AS max_id FROM dashboard_posts"
+            "SELECT COALESCE(MAX(id), 0) AS max_id FROM dashboard_posts"
         ).fetchone()
         queue = conn.execute(
-            "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at, COALESCE(MAX(id), 0) AS max_id FROM queue_requests"
+            "SELECT COALESCE(MAX(id), 0) AS max_id FROM queue_requests"
         ).fetchone()
 
     sources = [
-        {"source": "canonical", "total": int(canonical["count"] or 0)},
-        {"source": "dashboard", "total": int(dashboard["count"] or 0)},
+        {"source": "canonical", "upperBound": int(canonical["max_id"] or 0)},
+        {"source": "dashboard", "upperBound": int(dashboard["max_id"] or 0)},
     ]
     fingerprint = {
         "sources": sources,
-        "canonical": [canonical["updated_at"], int(canonical["max_id"] or 0)],
-        "dashboard": [dashboard["updated_at"], int(dashboard["max_id"] or 0)],
-        "queue": [queue["updated_at"], int(queue["max_id"] or 0)],
+        "queue": int(queue["max_id"] or 0),
         "catalogue_generation": _DASHBOARD_CATALOGUE_GENERATION,
     }
     revision = hashlib.sha256(
@@ -1189,9 +1192,6 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
     return {
         "revision": revision,
         "sources": sources,
-        # `rawTotal` is intentionally a transport-progress value. The final
-        # visible total is calculated after account+shortcode de-duplication.
-        "rawTotal": sum(source["total"] for source in sources),
     }
 
 
@@ -1278,13 +1278,22 @@ def _annotate_dashboard_queue(
             }
 
 
-def _dashboard_catalogue_page(source: str, offset: int, limit: int, revision: str) -> list[dict[str, Any]]:
+def _dashboard_catalogue_page(
+    source: str,
+    offset: int,
+    limit: int,
+    revision: str,
+    *,
+    after_id: int | None = None,
+    until_id: int | None = None,
+    cursor_metadata: bool = False,
+) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], int]:
     """Project one source page without loading the rest of Research in RAM."""
     decoration = _dashboard_catalogue_decoration(revision)
     group_by_handle = decoration["group_by_handle"]
     canonical = decoration["canonical"]
     with connect() as conn:
-        if source == "canonical":
+        if source == "canonical" and after_id is None:
             rows = conn.execute(
                 """
                 SELECT id, title, caption, hook_text, published_at, likes, comments,
@@ -1298,7 +1307,7 @@ def _dashboard_catalogue_page(source: str, offset: int, limit: int, revision: st
                 """,
                 (limit, offset),
             ).fetchall()
-        elif source == "dashboard":
+        elif source == "dashboard" and after_id is None:
             rows = conn.execute(
                 """
                 SELECT id, account, shortcode, published_at, likes, comments, caption,
@@ -1312,6 +1321,34 @@ def _dashboard_catalogue_page(source: str, offset: int, limit: int, revision: st
                 LIMIT ? OFFSET ?
                 """,
                 (limit, offset),
+            ).fetchall()
+        elif source == "canonical":
+            rows = conn.execute(
+                """
+                SELECT id, title, caption, hook_text, published_at, likes, comments,
+                       post_type_label, shortcode, image_path, is_animated,
+                       source_row_number, created_at, section, is_hot, hot_rate_multiplier,
+                       is_promo, hidden, is_deleted, updated_at
+                FROM posts
+                WHERE id > ? AND id <= ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (after_id, until_id, limit),
+            ).fetchall()
+        elif source == "dashboard":
+            rows = conn.execute(
+                """
+                SELECT id, account, shortcode, published_at, likes, comments, caption,
+                       post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
+                       hook_text, music_song, music_artist, music_audio_id, uses_original_audio,
+                       is_promo, hidden, is_deleted, transcript
+                FROM dashboard_posts
+                WHERE id > ? AND id <= ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (after_id, until_id, limit),
             ).fetchall()
         else:
             raise ValueError("Unknown catalogue source.")
@@ -1396,6 +1433,8 @@ def _dashboard_catalogue_page(source: str, offset: int, limit: int, revision: st
         stack_id = stack_by_post.get(post_key)
         post["stackId"] = stack_id or post_key
         post["stackSize"] = stack_sizes.get(stack_id, 1)
+    if cursor_metadata:
+        return posts, int(rows[-1]["id"]) if rows else int(after_id or 0)
     return posts
 
 
@@ -1416,20 +1455,50 @@ def dashboard_posts_page(
     offset: int = Query(0, ge=0),
     limit: int = Query(_DASHBOARD_CATALOGUE_PAGE_SIZE, ge=1, le=_DASHBOARD_CATALOGUE_MAX_PAGE_SIZE),
     revision: str | None = Query(None),
+    after_id: int | None = Query(None, ge=0),
+    until_id: int | None = Query(None, ge=0),
 ) -> Response:
     """Serve one bounded, authenticated page of the complete Research feed."""
+    # Direct callers in the lightweight backend tests invoke the endpoint as
+    # a normal function, where FastAPI's ``Query(None)`` default is still a
+    # parameter object rather than ``None``. The ASGI path has already
+    # coerced it to an int/None. Normalize both surfaces here.
+    if not isinstance(after_id, int):
+        after_id = None
+    if not isinstance(until_id, int):
+        until_id = None
     manifest = _dashboard_catalogue_manifest()
     if revision and revision != manifest["revision"]:
         raise HTTPException(status_code=409, detail="The catalogue changed while loading; restart from the manifest.")
-    source_total = next((int(item["total"]) for item in manifest["sources"] if item["source"] == source), None)
-    if source_total is None:
+    source_snapshot = next((item for item in manifest["sources"] if item["source"] == source), None)
+    if source_snapshot is None:
         raise HTTPException(status_code=400, detail="Unknown catalogue source.")
+    if after_id is not None:
+        if until_id is None or until_id != int(source_snapshot["upperBound"]):
+            raise HTTPException(status_code=409, detail="The catalogue changed while loading; restart from the manifest.")
+        posts, next_cursor = _dashboard_catalogue_page(
+            source, offset, limit, manifest["revision"], after_id=after_id,
+            until_id=until_id, cursor_metadata=True,
+        )
+        return JSONResponse(
+            {
+                "source": source,
+                "afterId": after_id,
+                "nextCursor": next_cursor,
+                "done": next_cursor >= until_id,
+                "upperBound": until_id,
+                "posts": posts,
+                "revision": manifest["revision"],
+            },
+            headers={"ETag": f'"{manifest["revision"]}"', "Cache-Control": "private, max-age=0, must-revalidate", "Vary": "Authorization"},
+        )
+    # Temporary compatibility for a browser holding the preceding static
+    # deploy. New clients use the bounded cursor protocol above.
     posts = _dashboard_catalogue_page(source, offset, limit, manifest["revision"])
     return JSONResponse(
         {
             "source": source,
             "offset": offset,
-            "total": source_total,
             "posts": posts,
             "revision": manifest["revision"],
         },
