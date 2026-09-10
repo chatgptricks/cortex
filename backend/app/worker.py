@@ -11,6 +11,7 @@ import threading
 
 from .db import init_db
 from .account_backfill_queue import start_worker as start_account_backfill_worker
+from .post_recovery_queue import start_worker as start_post_recovery_worker
 from .tracker_refresh_queue import start_worker as start_tracker_refresh_worker
 from .promos import start_worker as start_promo_worker
 from .scheduler import start_scheduler, stop_scheduler
@@ -24,6 +25,7 @@ def main() -> None:
     # durable queue in this dedicated worker process so the public API never
     # starts an import thread on a request or web restart.
     start_account_backfill_worker()
+    start_post_recovery_worker()
     start_tracker_refresh_worker()
     start_promo_worker()
     stop_requested = threading.Event()
