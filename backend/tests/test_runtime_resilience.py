@@ -210,6 +210,9 @@ def test_catalogue_pages_cover_every_source_row_without_full_feed_materializatio
                 actual_started_at TEXT, completed_at TEXT, final_permalink TEXT, final_permalinks TEXT,
                 updated_at TEXT
             );
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY, updated_at TEXT
+            );
             """
         )
         connection.executemany(
@@ -234,19 +237,13 @@ def test_catalogue_pages_cover_every_source_row_without_full_feed_materializatio
         finally:
             connection.close()
 
-    from app import topic_stacks
-
-    def memberships(posts):
-        for post in posts:
-            post["stackId"] = f"{post['account']}:{post['shortcode']}"
-            post["stackSize"] = 1
-
     monkeypatch.setattr(main, "connect", connect)
+    monkeypatch.setattr(main, "_DASHBOARD_CATALOGUE_DECORATION_REVISION", "")
+    monkeypatch.setattr(main, "_DASHBOARD_CATALOGUE_DECORATION", None)
     monkeypatch.setattr(main, "list_accounts", lambda active_only=False: [
         {"handle": "chatgptricks", "group": "sentient", "is_canonical": True},
         {"handle": "competitor", "group": "competitors", "is_canonical": False},
     ])
-    monkeypatch.setattr(topic_stacks, "apply_memberships", memberships)
     monkeypatch.setattr(main, "_dashboard_posts_payload", lambda: pytest.fail("Page API must not build the full payload."))
 
     manifest = main._dashboard_catalogue_manifest()

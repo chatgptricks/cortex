@@ -13,6 +13,7 @@ import secrets
 import socket
 import threading
 import time
+from collections import Counter
 from datetime import UTC, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -960,6 +961,15 @@ def tracker_refresh_job(job_id: str) -> dict[str, Any]:
 _DASHBOARD_POSTS_CACHE_LOCK = threading.Lock()
 _DASHBOARD_POSTS_CACHE_CONTENT: bytes | None = None
 _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0.0
+_DASHBOARD_CATALOGUE_GENERATION = 0
+# A complete Research load is split into bounded pages.  Queue attribution and
+# durable topic memberships are shared by every one of those pages, so reading
+# either table for every page turns a 67k-post load into millions of duplicate
+# rows transferred from Postgres.  Keep one immutable decoration index for the
+# current catalogue revision instead.
+_DASHBOARD_CATALOGUE_DECORATION_LOCK = threading.Lock()
+_DASHBOARD_CATALOGUE_DECORATION_REVISION = ""
+_DASHBOARD_CATALOGUE_DECORATION: dict[str, Any] | None = None
 # Research sends one shared catalogue to every signed-in browser. The
 # scheduler's own cadence is much slower than the UI poll, so retain the
 # serialized projection briefly to coalesce concurrent visible-tab checks.
@@ -974,10 +984,14 @@ def _invalidate_dashboard_posts_cache() -> None:
     make a manual refresh, catch-up, curation flag, or single-post reload
     appear to have done nothing.
     """
-    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
+    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT, _DASHBOARD_CATALOGUE_GENERATION
     with _DASHBOARD_POSTS_CACHE_LOCK:
         _DASHBOARD_POSTS_CACHE_CONTENT = None
         _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0.0
+        # Stack operations do not change a source row's timestamp.  Advancing
+        # this generation makes the page manifest change too, so a browser
+        # cannot retain a page revision with stale stack membership.
+        _DASHBOARD_CATALOGUE_GENERATION += 1
 
 # Queue opens the same HOT candidate list for every signed-in teammate. Keep
 # that read shared for a couple of seconds so a live refresh from several
@@ -1069,6 +1083,9 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
         queue = conn.execute(
             "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at, COALESCE(MAX(id), 0) AS max_id FROM queue_requests"
         ).fetchone()
+        accounts = conn.execute(
+            "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at, COALESCE(MAX(id), 0) AS max_id FROM accounts"
+        ).fetchone()
 
     sources = [
         {"source": "canonical", "total": int(canonical["count"] or 0)},
@@ -1079,6 +1096,8 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
         "canonical": [canonical["updated_at"], int(canonical["max_id"] or 0)],
         "dashboard": [dashboard["updated_at"], int(dashboard["max_id"] or 0)],
         "queue": [queue["updated_at"], int(queue["max_id"] or 0)],
+        "accounts": [accounts["updated_at"], int(accounts["max_id"] or 0)],
+        "catalogue_generation": _DASHBOARD_CATALOGUE_GENERATION,
     }
     revision = hashlib.sha256(
         json.dumps(fingerprint, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -1092,41 +1111,81 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
     }
 
 
-def _dashboard_catalogue_queue_rows() -> list[Any]:
-    with connect() as conn:
-        return conn.execute(
-            """SELECT id, post_account, post_shortcode, status, designer_email, coordinator_email,
-                      production_points, actual_started_at, completed_at, final_permalink, final_permalinks
-               FROM queue_requests"""
-        ).fetchall()
+def _dashboard_catalogue_normal_permalink(value: str | None) -> str:
+    return (value or "").strip().rstrip("/").split("?")[0]
 
 
-def _annotate_dashboard_queue(posts: list[dict[str, Any]], queue_rows: list[Any]) -> None:
-    """Attach Queue state to one bounded catalogue page."""
-    queue_by_source = {(row["post_account"], row["post_shortcode"]): dict(row) for row in queue_rows}
+def _dashboard_catalogue_decoration(revision: str) -> dict[str, Any]:
+    """Read shared Queue and stack indexes once for one catalogue revision.
 
-    def _normal_permalink(value: str | None) -> str:
-        return (value or "").strip().rstrip("/").split("?")[0]
+    Requests arrive concurrently because the browser fetches pages in parallel.
+    The lock coalesces their first read, then the returned maps are immutable
+    for the revision and safe to share across request threads.
+    """
+    global _DASHBOARD_CATALOGUE_DECORATION_REVISION, _DASHBOARD_CATALOGUE_DECORATION
+    with _DASHBOARD_CATALOGUE_DECORATION_LOCK:
+        if _DASHBOARD_CATALOGUE_DECORATION_REVISION == revision and _DASHBOARD_CATALOGUE_DECORATION is not None:
+            return _DASHBOARD_CATALOGUE_DECORATION
 
-    queue_by_final: dict[str, dict[str, Any]] = {}
-    for queue_row in queue_rows:
-        item = dict(queue_row)
-        final_urls = [item.get("final_permalink")]
-        final_urls.extend(
-            link.get("url") for link in _queue_v2_json(item.get("final_permalinks"), [])
-            if isinstance(link, dict) and link.get("url")
-        )
-        for final_url in final_urls:
-            normalized = _normal_permalink(final_url)
-            if normalized:
-                queue_by_final[normalized] = item
+        group_by_handle, canonical = _dashboard_catalogue_context()
+        with connect() as conn:
+            queue_rows = [dict(row) for row in conn.execute(
+                """SELECT id, post_account, post_shortcode, status, designer_email, coordinator_email,
+                          production_points, actual_started_at, completed_at, final_permalink, final_permalinks
+                   FROM queue_requests"""
+            ).fetchall()]
+            # Production initialization creates this table.  Initializing here
+            # keeps a fresh local/test database compatible without allowing a
+            # read to classify or alter any post.
+            from .topic_stacks import initialize
+            initialize(conn)
+            membership_rows = conn.execute(
+                "SELECT post_key, stack_id FROM topic_stack_members"
+            ).fetchall()
 
+        queue_by_source = {
+            (row["post_account"], row["post_shortcode"]): row
+            for row in queue_rows
+        }
+        queue_by_final: dict[str, dict[str, Any]] = {}
+        for item in queue_rows:
+            final_urls = [item.get("final_permalink")]
+            final_urls.extend(
+                link.get("url") for link in _queue_v2_json(item.get("final_permalinks"), [])
+                if isinstance(link, dict) and link.get("url")
+            )
+            for final_url in final_urls:
+                normalized = _dashboard_catalogue_normal_permalink(final_url)
+                if normalized:
+                    queue_by_final[normalized] = item
+
+        stack_by_post = {row["post_key"]: row["stack_id"] for row in membership_rows}
+        stack_sizes = Counter(stack_by_post.values())
+        decoration = {
+            "group_by_handle": group_by_handle,
+            "canonical": canonical,
+            "queue_by_source": queue_by_source,
+            "queue_by_final": queue_by_final,
+            "stack_by_post": stack_by_post,
+            "stack_sizes": stack_sizes,
+        }
+        _DASHBOARD_CATALOGUE_DECORATION_REVISION = revision
+        _DASHBOARD_CATALOGUE_DECORATION = decoration
+        return decoration
+
+
+def _annotate_dashboard_queue(
+    posts: list[dict[str, Any]],
+    queue_by_source: dict[tuple[str, str], dict[str, Any]],
+    queue_by_final: dict[str, dict[str, Any]],
+) -> None:
+    """Attach Queue state to one bounded catalogue page from shared indexes."""
     for post in posts:
         source = queue_by_source.get((post.get("account"), post.get("shortcode")))
         if source:
             post["queueState"] = source["status"]
             post["queueRequestId"] = source["id"]
-        closed = queue_by_final.get(_normal_permalink(post.get("permalink")))
+        closed = queue_by_final.get(_dashboard_catalogue_normal_permalink(post.get("permalink")))
         if closed:
             post["queueAttribution"] = {
                 "requestId": closed["id"], "designerEmail": closed["designer_email"],
@@ -1135,9 +1194,11 @@ def _annotate_dashboard_queue(posts: list[dict[str, Any]], queue_rows: list[Any]
             }
 
 
-def _dashboard_catalogue_page(source: str, offset: int, limit: int) -> list[dict[str, Any]]:
+def _dashboard_catalogue_page(source: str, offset: int, limit: int, revision: str) -> list[dict[str, Any]]:
     """Project one source page without loading the rest of Research in RAM."""
-    group_by_handle, canonical = _dashboard_catalogue_context()
+    decoration = _dashboard_catalogue_decoration(revision)
+    group_by_handle = decoration["group_by_handle"]
+    canonical = decoration["canonical"]
     with connect() as conn:
         if source == "canonical":
             rows = conn.execute(
@@ -1243,9 +1304,14 @@ def _dashboard_catalogue_page(source: str, offset: int, limit: int) -> list[dict
                 "transcriptAvailable": bool(str(post.get("transcript") or "").strip()),
             })
 
-    _annotate_dashboard_queue(posts, _dashboard_catalogue_queue_rows())
-    from .topic_stacks import apply_memberships
-    apply_memberships(posts)
+    _annotate_dashboard_queue(posts, decoration["queue_by_source"], decoration["queue_by_final"])
+    stack_by_post = decoration["stack_by_post"]
+    stack_sizes = decoration["stack_sizes"]
+    for post in posts:
+        post_key = f"{post.get('account', '')}:{post.get('shortcode') or post.get('rank', '')}"
+        stack_id = stack_by_post.get(post_key)
+        post["stackId"] = stack_id or post_key
+        post["stackSize"] = stack_sizes.get(stack_id, 1)
     return posts
 
 
@@ -1274,7 +1340,7 @@ def dashboard_posts_page(
     source_total = next((int(item["total"]) for item in manifest["sources"] if item["source"] == source), None)
     if source_total is None:
         raise HTTPException(status_code=400, detail="Unknown catalogue source.")
-    posts = _dashboard_catalogue_page(source, offset, limit)
+    posts = _dashboard_catalogue_page(source, offset, limit, manifest["revision"])
     return JSONResponse(
         {
             "source": source,
