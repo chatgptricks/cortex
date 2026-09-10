@@ -1429,6 +1429,25 @@ def _filter_items_for_account(items: list[dict[str, Any]], account: str) -> tupl
 
 
 _INSTAGRAM_CONTENT_URL = re.compile(r"instagram\.com/(?:p|reel|tv)/([^/?#]+)", re.IGNORECASE)
+_INSTAGRAM_PROFILE_URL = re.compile(
+    r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9_.]+)/?(?:\?.*)?",
+    re.IGNORECASE,
+)
+
+
+def _item_requested_account(item: dict[str, Any], handle_to_account: dict[str, str]) -> str | None:
+    """Attribute an actor response to the requested profile, if it names one.
+
+    Normal rows carry ``inputUrl``, but an actor-side profile error can instead
+    put the requested URL in ``url``. Treating that error as global made one
+    deleted/renamed account prevent every other account in the shared batch
+    from being saved.
+    """
+    for field in ("inputUrl", "url"):
+        match = _INSTAGRAM_PROFILE_URL.fullmatch(str(item.get(field) or "").strip())
+        if match:
+            return handle_to_account.get(match.group(1).lower())
+    return None
 
 
 def _item_shortcode(item: dict[str, Any]) -> str | None:
@@ -1475,9 +1494,9 @@ def _collect_short_term_items(
 
     `posts` uses the normal profile scraper exactly as returned, including any
     Reels that actor exposes in the profile feed. `both` adds the dedicated
-    Reels-tab actor to that feed and deduplicates the union. A single actor
-    failure is still allowed to surface to the scheduler, matching the
-    pre-existing shared-fetch behaviour.
+    Reels-tab actor to that feed and deduplicates the union. An unavailable
+    profile is isolated from the rest of the shared batch; an un-attributable
+    actor/dataset failure still surfaces rather than being silently ignored.
     """
     items_by_account: dict[str, list[dict[str, Any]]] = {account: [] for account in configs}
 
@@ -1491,12 +1510,18 @@ def _collect_short_term_items(
         )
         post_owner_to_account = {cfg["handle"].lower(): account for account, cfg in post_configs.items()}
         for item in post_items:
+            source_account = _item_requested_account(item, post_owner_to_account)
             if item.get("error") == "no_items":
                 continue  # A profile with no posts inside the window is valid.
             if item.get("error"):
+                if source_account:
+                    logger.warning(
+                        "Short-term collection skipped unavailable profile %s: %s",
+                        source_account,
+                        item.get("error"),
+                    )
+                    continue
                 raise ApifySyncError(f"Apify returned an account error: {item.get('error')}")
-            source = re.fullmatch(r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9_.]+)/?(?:\?.*)?", str(item.get("inputUrl") or ""))
-            source_account = post_owner_to_account.get(source.group(1).lower()) if source else None
             account = source_account or post_owner_to_account.get(_item_owner_username(item))
             if _item_shortcode(item) and not account:
                 raise ApifySyncError("Apify returned a post without a matching account; dataset retained")
