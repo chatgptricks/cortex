@@ -200,7 +200,7 @@ def memberships(conn, keys):
         return {'members': []}
     marks = ','.join('?' for _ in keys)
     rows = conn.execute(f'SELECT post_key, stack_id FROM topic_stack_members WHERE post_key IN ({marks})', tuple(keys)).fetchall()
-    counts = Counter(row['stack_id'] for row in conn.execute('SELECT stack_id FROM topic_stack_members').fetchall())
+    counts = Counter(row['stack_id'] for row in conn.execute('SELECT stack_id FROM topic_stack_members'))
     return {'members': [{'postKey': row['post_key'], 'stackId': row['stack_id'], 'stackSize': counts[row['stack_id']]} for row in rows]}
 
 def find_similar(post_key):
@@ -208,16 +208,72 @@ def find_similar(post_key):
     if not isinstance(post_key, str) or not post_key or len(post_key) > 300:
         raise ValueError('Choose a valid post.')
     with connect() as conn:
-        lock(conn)
+        initialize(conn)
         reference = conn.execute('SELECT stack_id, words FROM topic_stack_members WHERE post_key = ?', (post_key,)).fetchone()
         if not reference:
-            raise ValueError('This post is no longer available. Refresh and try again.')
-        reference_words = set(json.loads(reference['words']))
+            # Research deliberately renders a singleton fallback for legacy or
+            # freshly imported rows whose durable membership has not arrived
+            # yet. Materialize that one row here so the visible card and this
+            # action share the same source of truth.
+            account, separator, shortcode = post_key.partition(':')
+            source = None
+            if separator and account and shortcode:
+                try:
+                    source = conn.execute(
+                        'SELECT caption, published_at FROM dashboard_posts WHERE account = ? AND shortcode = ? LIMIT 1',
+                        (account, shortcode),
+                    ).fetchone()
+                except Exception:  # pragma: no cover - old schema without source tables
+                    pass
+                if source is None:
+                    try:
+                        source = conn.execute(
+                            'SELECT caption, published_at FROM posts WHERE shortcode = ? LIMIT 1',
+                            (shortcode,),
+                        ).fetchone()
+                    except Exception:  # pragma: no cover - old schema without source tables
+                        source = None
+            if source is None:
+                raise ValueError('This post is no longer available. Refresh and try again.')
+            lock(conn)
+            conn.execute(
+                """INSERT INTO topic_stack_members(post_key, stack_id, words, posted_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(post_key) DO NOTHING""",
+                (post_key, uuid.uuid4().hex, json.dumps(words({
+                    'caption': source['caption'],
+                    'postDate': source['published_at'],
+                })), timestamp({'postDate': source['published_at']})),
+            )
+            reference = conn.execute('SELECT stack_id, words FROM topic_stack_members WHERE post_key = ?', (post_key,)).fetchone()
+            if not reference:
+                raise ValueError('This post is no longer available. Refresh and try again.')
+        try:
+            reference_words = set(json.loads(reference['words']))
+        except (TypeError, ValueError):
+            reference_words = set()
         matching_groups = set()
-        for row in conn.execute('SELECT post_key, stack_id, words FROM topic_stack_members WHERE post_key != ?', (post_key,)).fetchall():
+        # Words are stored as a JSON array. Filter candidates in SQL first so
+        # the Python side does not materialize/parse every unrelated post in
+        # the catalogue. The final Jaccard/coverage calculation below remains
+        # unchanged, preserving the existing grouping semantics.
+        if reference_words:
+            clauses = ' OR '.join('words LIKE ?' for _ in reference_words)
+            params = (post_key, *(f'%"{word}"%' for word in sorted(reference_words)))
+            candidate_rows = conn.execute(
+                f'SELECT post_key, stack_id, words FROM topic_stack_members '
+                f'WHERE post_key != ? AND ({clauses})',
+                params,
+            )
+        else:
+            candidate_rows = ()
+        for row in candidate_rows:
             if row['stack_id'] == reference['stack_id']:
                 continue
-            other = set(json.loads(row['words']))
+            try:
+                other = set(json.loads(row['words']))
+            except (TypeError, ValueError):
+                continue
             shared = len(reference_words & other)
             score = shared / len(reference_words | other) if reference_words | other else 0
             coverage = shared / min(len(reference_words), len(other)) if reference_words and other else 0
@@ -228,6 +284,10 @@ def find_similar(post_key):
             result['matchedCount'] = 0
             return result
         matching_groups.add(reference['stack_id'])
+        # The expensive candidate scan is read-only. Serialize only the
+        # short final merge, so a Find Similar request no longer blocks a cold
+        # Research catalogue rebuild for its entire duration.
+        lock(conn)
         marks = ','.join('?' for _ in matching_groups)
         destination = sorted(matching_groups)[0]
         conn.execute(f'UPDATE topic_stack_members SET stack_id = ? WHERE stack_id IN ({marks})', (destination, *sorted(matching_groups)))

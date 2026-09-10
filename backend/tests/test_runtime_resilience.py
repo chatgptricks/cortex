@@ -159,6 +159,26 @@ def test_auth_database_and_usage_work_do_not_block_event_loop(monkeypatch):
     assert all(thread != main_thread for thread in calls)
 
 
+def test_authenticated_promos_access_does_not_require_legacy_capability(monkeypatch):
+    monkeypatch.setattr(main, "FIREBASE_APP", object())
+    monkeypatch.setattr(main.firebase_auth, "verify_id_token", lambda token: {"email": "pd@example.com", "uid": "test"})
+    monkeypatch.setattr(main, "get_dashboard_user_access", lambda email: {
+        "is_admin": False, "operating_role": "pd", "operating_roles": '["pd"]',
+        "time_zone": "America/Costa_Rica", "can_access_promos": False,
+    })
+    monkeypatch.setattr(main, "log_usage_event", lambda *args: None)
+    request = Request({
+        "type": "http", "method": "GET", "path": "/api/admin/promos",
+        "headers": [(b"authorization", b"Bearer test")],
+    })
+
+    async def call_next(request):
+        return Response(status_code=200)
+
+    response = asyncio.run(main._require_firebase_user(request, call_next))
+    assert response.status_code == 200
+
+
 def test_dashboard_posts_revalidates_an_unchanged_catalogue(monkeypatch):
     """A visible Research poll should not transfer or rebuild unchanged JSON."""
     calls = 0
