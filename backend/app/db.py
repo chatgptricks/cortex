@@ -495,6 +495,10 @@ def init_db() -> None:
         # not another operating role.
         _ensure_column(conn, "dashboard_users", "can_self_assign", "can_self_assign INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "dashboard_users", "minutes_per_pp", "minutes_per_pp INTEGER")
+        # Promos is a standalone operational tool. Keep its access as an
+        # explicit capability so a teammate can use Promos without inheriting
+        # the broader Admin/Dev surface behind /api/admin/*.
+        _ensure_column(conn, "dashboard_users", "can_access_promos", "can_access_promos INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS queue_scheduler_preferences (
                    viewer_email TEXT PRIMARY KEY,
@@ -912,6 +916,12 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
         "can_self_assign INTEGER NOT NULL DEFAULT 0",
     )
     _ensure_column(conn, "dashboard_users", "minutes_per_pp", "minutes_per_pp INTEGER")
+    _ensure_column(
+        conn,
+        "dashboard_users",
+        "can_access_promos",
+        "can_access_promos INTEGER NOT NULL DEFAULT 0",
+    )
     _ensure_account_snapshot_day_schema(conn)
     # Accounts already existed when the managed Postgres database was first
     # imported, so this additive field must run here as well as in SQLite's
@@ -1058,6 +1068,10 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
 # persisted operating role rather than this bypass.
 INTERNAL_SELF_ASSIGN_EMAILS = frozenset()
 
+# Promos is intentionally narrower than Admin/Dev access. This list is kept
+# server-side so granting the tool cannot be spoofed by a client-side role.
+PROMOS_ACCESS_EMAILS = frozenset({"victor@sentientagency.io"})
+
 
 def _has_internal_self_assign(email: str) -> bool:
     return email.strip().lower() in INTERNAL_SELF_ASSIGN_EMAILS
@@ -1072,7 +1086,7 @@ def list_dashboard_users() -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
             """SELECT email, display_name, role, operating_role, operating_roles, is_admin, slack_user_id,
-                      time_zone, can_self_assign, minutes_per_pp, created_at, updated_at
+                      time_zone, can_self_assign, can_access_promos, minutes_per_pp, created_at, updated_at
                FROM dashboard_users
                ORDER BY is_admin DESC, operating_role ASC, email ASC"""
         ).fetchall()
@@ -1108,6 +1122,7 @@ def get_dashboard_user_access(email: str) -> dict[str, Any] | None:
         "role": "viewer",
         "time_zone": "America/Costa_Rica",
         "can_self_assign": 0,
+        "can_access_promos": 0,
         "minutes_per_pp": None,
     }
     with connect() as conn:
@@ -1130,6 +1145,7 @@ def get_dashboard_user_access(email: str) -> dict[str, Any] | None:
         value["is_admin"] = bool(value["is_admin"] or value["role"] == "admin")
         value["operating_role"] = value["operating_role"] or "sales"
         value["can_self_assign"] = _has_internal_self_assign(email)
+        value["can_access_promos"] = bool(value.get("can_access_promos"))
         return value
 
 
@@ -1362,6 +1378,14 @@ def seed_queue_role_roster() -> None:
     }
     now = utc_now()
     with connect() as conn:
+        # Additive, idempotent grant for the reviewed Promos roster. Existing
+        # role/admin capabilities are untouched, and no account is created if
+        # the person is not already in the Firebase allowlist.
+        for email in PROMOS_ACCESS_EMAILS:
+            conn.execute(
+                "UPDATE dashboard_users SET can_access_promos = 1, updated_at = ? WHERE email = ?",
+                (now, email),
+            )
         for email, display_name in display_names.items():
             slack_user_id = slack_user_ids.get(email, "")
             conn.execute(

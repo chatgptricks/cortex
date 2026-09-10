@@ -4,7 +4,7 @@ import sqlite3
 from contextlib import contextmanager
 
 from app import db
-from app.db import _ensure_runtime_schema_extensions, _has_internal_self_assign
+from app.db import _ensure_runtime_schema_extensions, _has_internal_self_assign, seed_queue_role_roster
 
 
 def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> None:
@@ -46,6 +46,7 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
     }
     assert columns["time_zone"]["dflt_value"] == "''"
     assert columns["can_self_assign"]["dflt_value"] == "0"
+    assert columns["can_access_promos"]["dflt_value"] == "0"
     assert "minutes_per_pp" in columns
     account_columns = {
         row["name"]: row
@@ -96,10 +97,59 @@ def test_legacy_profile_schema_cannot_break_authentication_access(monkeypatch, t
     assert access["operating_role"] == "sales"
     assert access["time_zone"] == "America/Costa_Rica"
     assert access["minutes_per_pp"] is None
+    assert access["can_access_promos"] is False
 
     # The incoming browser clock is an optional preference, not a reason to
     # make every authenticated request fail while the old schema is upgraded.
     db.set_dashboard_user_time_zone("esteban@sentientagency.io", "America/Bogota")
+
+
+def test_victor_receives_promos_without_admin_access(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "promos-access.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE dashboard_users (
+                email TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT 'viewer',
+                operating_role TEXT NOT NULL DEFAULT 'sales',
+                operating_roles TEXT NOT NULL DEFAULT '[]',
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                slack_user_id TEXT NOT NULL DEFAULT '',
+                can_self_assign INTEGER NOT NULL DEFAULT 0,
+                can_access_promos INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE scheduler_state (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+            CREATE TABLE queue_designer_accounts (
+                designer_email TEXT NOT NULL,
+                account_handle TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (designer_email, account_handle)
+            );
+            INSERT INTO dashboard_users (email, created_at, updated_at)
+            VALUES ('victor@sentientagency.io', 'now', 'now');
+            """
+        )
+
+    @contextmanager
+    def connect():
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    monkeypatch.setattr(db, "connect", connect)
+    seed_queue_role_roster()
+    access = db.get_dashboard_user_access("victor@sentientagency.io")
+    assert access is not None
+    assert access["can_access_promos"] is True
+    assert access["is_admin"] is False
 
 
 def test_runtime_migration_adds_soft_delete_to_both_post_tables():

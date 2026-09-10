@@ -198,6 +198,7 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     request.state.is_admin = is_admin
     request.state.time_zone = access.get("time_zone") or "America/Costa_Rica"
     request.state.can_self_assign = bool(access.get("can_self_assign"))
+    request.state.can_access_promos = bool(access.get("can_access_promos"))
     request.state.minutes_per_pp = access.get("minutes_per_pp")
     request.state.operating_role = access["operating_role"]
     try:
@@ -229,7 +230,11 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     # requests, or assigned-work workflow.
     if "pd" not in request.state.operating_roles:
         request.state.operating_roles.append("pd")
-    if path.startswith("/api/admin/") and not (request.state.is_admin or request.state.is_dev):
+    is_promos_path = path == "/api/admin/promos" or path.startswith("/api/admin/promos/")
+    if path.startswith("/api/admin/") and not (
+        request.state.is_admin or request.state.is_dev or
+        (is_promos_path and request.state.can_access_promos)
+    ):
         return JSONResponse({"detail": "Admin or Dev access required."}, status_code=403)
     request.state.user_uid = decoded.get("uid")
     try:
@@ -491,6 +496,9 @@ def dashboard_me(request: Request) -> dict[str, Any]:
         # unlocks the Queue creation flows that are internally approved for
         # the user, never the broader VC/Admin dashboard tools.
         "can_self_assign": bool(getattr(request.state, "can_self_assign", False)),
+        # Promos is granted as a standalone capability. It does not imply
+        # Settings, Queue coordination, Tracker, or Insights access.
+        "can_access_promos": bool(getattr(request.state, "can_access_promos", False)),
         "can_role_switch": bool(getattr(request.state, "can_role_switch", False)),
         "available_operating_roles": getattr(request.state, "available_operating_roles", [getattr(request.state, "operating_role", "sales")]),
     }
