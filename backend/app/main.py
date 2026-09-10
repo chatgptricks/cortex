@@ -1083,9 +1083,6 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
         queue = conn.execute(
             "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at, COALESCE(MAX(id), 0) AS max_id FROM queue_requests"
         ).fetchone()
-        accounts = conn.execute(
-            "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at, COALESCE(MAX(id), 0) AS max_id FROM accounts"
-        ).fetchone()
 
     sources = [
         {"source": "canonical", "total": int(canonical["count"] or 0)},
@@ -1096,7 +1093,6 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
         "canonical": [canonical["updated_at"], int(canonical["max_id"] or 0)],
         "dashboard": [dashboard["updated_at"], int(dashboard["max_id"] or 0)],
         "queue": [queue["updated_at"], int(queue["max_id"] or 0)],
-        "accounts": [accounts["updated_at"], int(accounts["max_id"] or 0)],
         "catalogue_generation": _DASHBOARD_CATALOGUE_GENERATION,
     }
     revision = hashlib.sha256(
