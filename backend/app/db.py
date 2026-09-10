@@ -385,7 +385,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS queue_tickets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticket_type TEXT NOT NULL
-                    CHECK(ticket_type IN ('time_block','pp_revision','cancellation')),
+                    CHECK(ticket_type IN ('time_block','pp_revision','cancellation','trainee_review')),
                 requester_email TEXT NOT NULL,
                 request_id INTEGER,
                 status TEXT NOT NULL DEFAULT 'pending'
@@ -719,6 +719,149 @@ def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: 
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
+_QUEUE_TICKET_COLUMNS = (
+    "id",
+    "ticket_type",
+    "requester_email",
+    "request_id",
+    "status",
+    "block_category",
+    "title",
+    "scheduled_date",
+    "scheduled_start_minutes",
+    "duration_minutes",
+    "requested_production_points",
+    "requested_accounts",
+    "reason",
+    "reviewer_email",
+    "review_note",
+    "reviewed_at",
+    "created_at",
+    "updated_at",
+)
+
+
+def _queue_ticket_columns(conn: Any) -> set[str]:
+    """Return Queue ticket columns on either supported database engine."""
+    return {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(queue_tickets)").fetchall()
+    }
+
+
+def _create_queue_tickets_table(conn: Any) -> None:
+    """Create the canonical Queue ticket table for a SQLite table rebuild."""
+    conn.execute(
+        """CREATE TABLE queue_tickets (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               ticket_type TEXT NOT NULL
+                   CHECK(ticket_type IN ('time_block','pp_revision','cancellation','trainee_review')),
+               requester_email TEXT NOT NULL,
+               request_id INTEGER,
+               status TEXT NOT NULL DEFAULT 'pending'
+                   CHECK(status IN ('pending','approved','rejected')),
+               block_category TEXT NOT NULL DEFAULT '',
+               title TEXT NOT NULL DEFAULT '',
+               scheduled_date TEXT,
+               scheduled_start_minutes INTEGER,
+               duration_minutes INTEGER,
+               requested_production_points INTEGER,
+               requested_accounts TEXT NOT NULL DEFAULT '[]',
+               reason TEXT NOT NULL DEFAULT '',
+               reviewer_email TEXT,
+               review_note TEXT NOT NULL DEFAULT '',
+               reviewed_at TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               FOREIGN KEY(request_id) REFERENCES queue_requests(id) ON DELETE CASCADE
+           )"""
+    )
+
+
+def _create_queue_ticket_indexes(conn: Any) -> None:
+    """Restore Queue ticket indexes after a SQLite table rebuild."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_queue_tickets_status "
+        "ON queue_tickets(status, created_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_queue_tickets_user_day "
+        "ON queue_tickets(requester_email, scheduled_date, scheduled_start_minutes)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_tickets_pending_request "
+        "ON queue_tickets(ticket_type, request_id) "
+        "WHERE status = 'pending' AND request_id IS NOT NULL"
+    )
+
+
+def _ensure_queue_ticket_type_schema(conn: Any) -> None:
+    """Allow trainee-review tickets in fresh and pre-existing Queue schemas.
+
+    The original Queue V2 check constraint predated the trainee review flow.
+    SQLite cannot alter a CHECK constraint in place, so legacy local stores
+    are rebuilt transactionally while retaining every known ticket field.
+    Managed Postgres can replace just the affected constraint.
+    """
+    columns = _queue_ticket_columns(conn)
+    if not columns:
+        return
+    if getattr(conn, "is_postgres", False):
+        constraints = conn.execute(
+            """SELECT c.conname, pg_get_constraintdef(c.oid) AS definition
+               FROM pg_constraint c
+               JOIN pg_class table_ref ON table_ref.oid = c.conrelid
+               JOIN pg_namespace namespace_ref ON namespace_ref.oid = table_ref.relnamespace
+               WHERE table_ref.relname = ? AND namespace_ref.nspname = current_schema()
+                 AND c.contype = 'c'""",
+            ("queue_tickets",),
+        ).fetchall()
+        ticket_type_constraints = [
+            str(item["conname"])
+            for item in constraints
+            if "ticket_type" in str(item["definition"] or "").lower()
+        ]
+        if ticket_type_constraints and all(
+            "trainee_review" in str(item["definition"] or "").lower()
+            for item in constraints
+            if "ticket_type" in str(item["definition"] or "").lower()
+        ):
+            return
+        for name in ticket_type_constraints:
+            # Constraint names come from PostgreSQL's catalog, not from a
+            # request. Quote them because generated names can contain caps.
+            quoted_name = '"' + name.replace('"', '""') + '"'
+            conn.execute(f"ALTER TABLE queue_tickets DROP CONSTRAINT {quoted_name}")
+        conn.execute(
+            """ALTER TABLE queue_tickets
+               ADD CONSTRAINT queue_tickets_ticket_type_v2_check
+               CHECK(ticket_type IN ('time_block','pp_revision','cancellation','trainee_review'))"""
+        )
+        return
+
+    schema_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'queue_tickets'"
+    ).fetchone()
+    schema = str(schema_row["sql"] or "").lower() if schema_row else ""
+    if "trainee_review" in schema:
+        return
+
+    # SQLite rebuilds the table inside init_db's transaction. This keeps the
+    # existing IDs/events valid and makes an interrupted deploy roll back as
+    # one unit rather than leaving a half-migrated Queue table behind.
+    legacy_table = "queue_tickets_legacy_pre_trainee_review"
+    conn.execute(f"ALTER TABLE queue_tickets RENAME TO {legacy_table}")
+    _create_queue_tickets_table(conn)
+    copy_columns = [column for column in _QUEUE_TICKET_COLUMNS if column in columns]
+    if copy_columns:
+        selected = ", ".join(copy_columns)
+        conn.execute(
+            f"INSERT INTO queue_tickets ({selected}) SELECT {selected} FROM {legacy_table}"
+        )
+    conn.execute(f"DROP TABLE {legacy_table}")
+    _create_queue_ticket_indexes(conn)
+
+
 def _ensure_account_snapshot_day_schema(conn: Any) -> None:
     """Backfill and enforce one Tracker snapshot per account per local day.
 
@@ -804,6 +947,13 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     # post feed and Queue reads fail before they can return the existing data.
     if conn.execute("PRAGMA table_info(queue_requests)").fetchall():
         _ensure_column(conn, "queue_requests", "final_permalinks", "final_permalinks TEXT NOT NULL DEFAULT '[]'")
+    # The first Queue V2 schema shipped before trainee Canva review requests.
+    # Keep both the additive fields and its constrained ticket type current
+    # on managed Postgres and any existing SQLite development database.
+    if _queue_ticket_columns(conn):
+        _ensure_column(conn, "queue_tickets", "block_category", "block_category TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "queue_tickets", "requested_accounts", "requested_accounts TEXT NOT NULL DEFAULT '[]'")
+        _ensure_queue_ticket_type_schema(conn)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS queue_scheduler_preferences (
                viewer_email TEXT PRIMARY KEY,

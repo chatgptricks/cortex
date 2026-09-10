@@ -57,7 +57,8 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
         );
         CREATE TABLE queue_tickets (
             id INTEGER PRIMARY KEY, ticket_type TEXT, requester_email TEXT, status TEXT,
-            scheduled_date TEXT, scheduled_start_minutes INTEGER, duration_minutes INTEGER
+            block_category TEXT NOT NULL DEFAULT '', scheduled_date TEXT,
+            scheduled_start_minutes INTEGER, duration_minutes INTEGER
         );
         """
     )
