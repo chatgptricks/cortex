@@ -82,12 +82,14 @@ from .post_refresh_queue import enqueue as enqueue_post_refresh, get as get_post
 from .promos import create_backfill, get_job, get_opportunity, list_opportunities, update_opportunity
 from .tracker_refresh_queue import enqueue as enqueue_tracker_refresh, get as get_tracker_refresh
 from .queue_rules import (
+    SCHEDULER_BUFFER_MINUTES,
     SCHEDULER_END,
     SCHEDULER_START,
     SCHEDULER_TIMEZONE,
     intervals_conflict,
     next_available_slot,
     schedule_absolute,
+    split_schedule_absolute,
 )
 
 
@@ -3753,6 +3755,77 @@ def _queue_v2_reflow_scheduled(conn: Any, designer: str, actor: str, priority_id
     return moved
 
 
+def _queue_v2_compact_after_completion(conn: Any, designer: str, completed_id: int, actor: str) -> int:
+    """Pull the next scheduled jobs into an early-finished job's free space.
+
+    A normal collision reflow only moves work forward. Completion is different:
+    the finished block's measured duration can shrink, so the following chain
+    should close the newly available gap while preserving every ten-minute
+    handoff buffer and every fixed personal-time/active block.
+    """
+    rows = [dict(row) for row in conn.execute(
+        """SELECT * FROM queue_requests
+           WHERE designer_email = ? AND status IN ('scheduled','in_progress','completed','closed')
+             AND scheduled_date IS NOT NULL AND scheduled_start_minutes IS NOT NULL
+           ORDER BY scheduled_date, scheduled_start_minutes, id""",
+        (designer,),
+    ).fetchall()]
+    completed = next((row for row in rows if int(row["id"]) == int(completed_id)), None)
+    if not completed or completed.get("status") not in {"completed", "closed"}:
+        return 0
+    completed_start = schedule_absolute(str(completed["scheduled_date"]), int(completed["scheduled_start_minutes"]))
+    fixed = [
+        {
+            "date": row["scheduled_date"],
+            "start": int(row["scheduled_start_minutes"]),
+            "duration": _queue_v2_duration(row),
+        }
+        for row in rows
+        if row["status"] in {"in_progress", "completed", "closed"}
+    ]
+    fixed.extend(_queue_v2_personal_time_occupied(conn, designer))
+    scheduled_rows = sorted(
+        (row for row in rows if row["status"] == "scheduled"),
+        key=lambda row: (schedule_absolute(str(row["scheduled_date"]), int(row["scheduled_start_minutes"])), int(row["id"])),
+    )
+    placed: list[dict[str, Any]] = []
+    cursor = completed_start + _queue_v2_duration(completed) + SCHEDULER_BUFFER_MINUTES
+    moved = 0
+    for row in scheduled_rows:
+        original_start = schedule_absolute(str(row["scheduled_date"]), int(row["scheduled_start_minutes"]))
+        if original_start <= completed_start:
+            placed.append(_queue_v2_occupied(row))
+            continue
+        # Do not pull a job across a fixed block that was already between it
+        # and the completed job (for example a personal meeting).
+        barriers = [
+            schedule_absolute(str(item["date"]), int(item["start"])) + max(10, int(item["duration"])) + SCHEDULER_BUFFER_MINUTES
+            for item in fixed
+            if schedule_absolute(str(item["date"]), int(item["start"])) < original_start
+        ]
+        desired = max(cursor, max(barriers, default=0))
+        resolved_date, resolved_start = next_available_slot(
+            *split_schedule_absolute(desired),
+            _queue_v2_duration(row),
+            [*fixed, *placed],
+        )
+        if resolved_date != row["scheduled_date"] or resolved_start != int(row["scheduled_start_minutes"]):
+            conn.execute(
+                "UPDATE queue_requests SET scheduled_date = ?, scheduled_start_minutes = ?, updated_at = ? WHERE id = ?",
+                (resolved_date, resolved_start, utc_now(), row["id"]),
+            )
+            _queue_v2_log(conn, row["id"], actor, "auto_reflowed", {
+                "fromDate": row["scheduled_date"], "fromStart": row["scheduled_start_minutes"],
+                "date": resolved_date, "start": resolved_start, "reason": "early_completion",
+            })
+            moved += 1
+        row["scheduled_date"], row["scheduled_start_minutes"] = resolved_date, resolved_start
+        duration = _queue_v2_duration(row)
+        placed.append({"date": resolved_date, "start": resolved_start, "duration": duration})
+        cursor = schedule_absolute(resolved_date, resolved_start) + duration + SCHEDULER_BUFFER_MINUTES
+    return moved
+
+
 def _queue_v2_reflow_all_schedules() -> int:
     """One startup pass repairs overlaps saved by older Queue releases."""
     with connect() as conn:
@@ -6258,9 +6331,12 @@ def dashboard_queue_v2_complete(request_id: int, request: Request) -> dict[str, 
     now = utc_now()
     with connect() as conn:
         conn.execute("UPDATE queue_requests SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?", (now, now, request_id))
+        row["status"] = "completed"
+        row["completed_at"] = now
+        moved = _queue_v2_compact_after_completion(conn, str(row.get("designer_email") or ""), request_id, caller)
         _queue_v2_log(conn, request_id, caller, "completed")
         _queue_v2_publish(conn, "request_completed", caller, [request_id])
-    return {"ok": True}
+    return {"ok": True, "reflowed": moved}
 
 
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/close")
