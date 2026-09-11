@@ -198,6 +198,38 @@ def test_non_personal_time_block_tickets_never_reserve_or_break_scheduler_capaci
     assert scheduled == 600
 
 
+def test_early_completion_compacts_following_jobs_with_buffer(monkeypatch, tmp_path):
+    database = tmp_path / "early-completion.sqlite3"
+    _ticket_database(database)
+    connect = _isolate(monkeypatch, database)
+    monkeypatch.setattr(main, "_queue_v2_log", lambda *args, **kwargs: None)
+    with connect() as conn:
+        conn.executescript("""
+            ALTER TABLE queue_requests ADD COLUMN actual_started_at TEXT;
+            ALTER TABLE queue_requests ADD COLUMN completed_at TEXT;
+        """)
+        conn.executemany(
+            """INSERT INTO queue_requests
+               (id, production_points, minutes_per_pp, status, designer_email,
+                scheduled_date, scheduled_start_minutes, updated_at,
+                actual_started_at, completed_at)
+               VALUES (?, ?, 10, ?, 'pd@example.com', '2026-09-01', ?, '', ?, ?)""",
+            [
+                (1, 3, "completed", 600, "2026-09-01T10:00:00+00:00", "2026-09-01T10:20:00+00:00"),
+                (2, 3, "scheduled", 640, None, None),
+                (3, 2, "scheduled", 680, None, None),
+            ],
+        )
+        moved = main._queue_v2_compact_after_completion(conn, "pd@example.com", 1, "vc@example.com")
+        starts = [row["scheduled_start_minutes"] for row in conn.execute(
+            "SELECT id, scheduled_start_minutes FROM queue_requests ORDER BY id"
+        ).fetchall()]
+    assert moved == 2
+    # 20 minutes actual + the normal 10-minute handoff, then each following
+    # job occupies its own planned duration plus the same buffer.
+    assert starts == [600, 630, 670]
+
+
 def test_pp_revision_and_cancellation_ticket_actions(monkeypatch, tmp_path):
     database = tmp_path / "request-tickets.sqlite3"
     _ticket_database(database)
