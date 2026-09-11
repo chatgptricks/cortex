@@ -6613,6 +6613,11 @@ def dashboard_post_flags(
     against data that costs money to re-scrape, isn't worth the convenience.
     """
     table = _resolve_post_table(account)
+    if is_promo is not None and not any(
+        item.get('handle') == account and item.get('group') == 'sentient'
+        for item in list_accounts(active_only=False)
+    ):
+        raise HTTPException(status_code=403, detail="Promo is only available for Ours accounts.")
     updates: list[str] = []
     params: list[Any] = []
     if is_promo is not None:
