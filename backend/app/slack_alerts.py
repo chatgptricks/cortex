@@ -478,6 +478,47 @@ def notify_queue_assignment_result(**assignment: Any) -> dict[str, Any]:
         return {"sent": False}
 
 
+def notify_new_account_request(*, ticket_id: int, handle: str, requester: str, reason: str) -> bool:
+    """Notify only Dev; Queue retains the request even if Slack is unavailable."""
+    token = os.getenv("SLACK_BOT_TOKEN", "").strip()
+    recipient = slack_user_id_for_email("esteban@sentientagency.io")
+    if not token or not recipient:
+        return False
+    try:
+        import httpx
+        with httpx.Client(timeout=15.0) as client:
+            headers = {"Authorization": f"Bearer {token}"}
+            opened = client.post("https://slack.com/api/conversations.open", headers=headers, json={"users": recipient})
+            opened.raise_for_status()
+            data = opened.json()
+            channel = (data.get("channel") or {}).get("id")
+            if not data.get("ok") or not channel:
+                return False
+            inspected = client.get("https://slack.com/api/conversations.info", headers=headers, params={"channel": channel})
+            inspected.raise_for_status()
+            info = inspected.json()
+            conversation = info.get("channel") or {}
+            if not info.get("ok") or not conversation.get("is_im") or conversation.get("user") != recipient:
+                return False
+            result = client.post("https://slack.com/api/chat.postMessage", headers=headers, json={
+                "channel": channel,
+                "text": f"New account request #{ticket_id}: @{handle} from {requester}",
+                "blocks": [
+                    {"type": "section", "text": {"type": "plain_text", "text": f"New account request #{ticket_id}\n@{handle}\nRequested by {requester}\n{reason}"}},
+                    {"type": "actions", "elements": [
+                        {"type": "button", "text": {"type": "plain_text", "text": "Open Requests"}, "url": "https://sentientdash.app/queue.html?inbox=1"},
+                        {"type": "button", "text": {"type": "plain_text", "text": "Add in Settings"}, "url": "https://sentientdash.app/settings.html?tab=accounts"},
+                    ]},
+                ],
+                "unfurl_links": False,
+            })
+            result.raise_for_status()
+            return bool(result.json().get("ok"))
+    except Exception:
+        logger.exception("New account request notification failed for ticket %s", ticket_id)
+        return False
+
+
 def notify_queue_assignment(**assignment: Any) -> bool:
     """Backward-compatible bool wrapper used by legacy Queue endpoints."""
     return bool(notify_queue_assignment_result(**assignment).get("sent"))

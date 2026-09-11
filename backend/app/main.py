@@ -2688,7 +2688,7 @@ QUEUE_V2_HOT_MULTIPLIER = 3.0
 QUEUE_V2_HOT_ROUTING_START = os.getenv("QUEUE_V2_HOT_ROUTING_START", "2026-08-29T23:47:40Z")
 QUEUE_V2_TICKET_TYPES = {"time_block", "pp_revision", "cancellation", "trainee_review"}
 QUEUE_V2_TIME_CATEGORIES = {"meeting", "break", "promo", "focus", "other"}
-QUEUE_V2_NON_OCCUPYING_TIME_BLOCK_CATEGORIES = {"move", "account_request", "post_suggestion"}
+QUEUE_V2_NON_OCCUPYING_TIME_BLOCK_CATEGORIES = {"move", "account_request", "post_suggestion", "new_account"}
 # queue_schedule_drafts predates pool return support and keeps its placement
 # columns NOT NULL. These private sentinels let a provisional unassignment be
 # shared live without changing the existing SQLite table shape.
@@ -3466,7 +3466,7 @@ def _queue_v2_purge_expired(conn: Any) -> list[int]:
     # Queue operational data too, so do not let reviewed (or abandoned)
     # tickets become an unbounded hidden history beside the 14-day post log.
     conn.execute(
-        "DELETE FROM queue_tickets WHERE request_id IS NULL AND created_at < ?",
+        "DELETE FROM queue_tickets WHERE request_id IS NULL AND created_at < ? AND NOT (COALESCE(block_category, '') = 'new_account' AND status = 'pending')",
         (cutoff,),
     )
     if not ids:
@@ -3567,7 +3567,7 @@ def _queue_v2_personal_time_occupied(
         "scheduled_start_minutes IS NOT NULL",
         "duration_minutes IS NOT NULL",
         "duration_minutes > 0",
-        "LOWER(COALESCE(block_category, '')) NOT IN ('move','account_request','post_suggestion')",
+        "LOWER(COALESCE(block_category, '')) NOT IN ('move','account_request','post_suggestion','new_account')",
     ]
     params: list[Any] = [user_email]
     if scheduled_date:
@@ -3600,6 +3600,8 @@ def _queue_v2_ticket(row: dict[str, Any]) -> dict[str, Any]:
         ticket_type = "account_access"
     elif ticket_type == "time_block" and row.get("block_category") == "post_suggestion":
         ticket_type = "post_suggestion"
+    elif ticket_type == "time_block" and row.get("block_category") == "new_account":
+        ticket_type = "new_account"
     request_summary = None
     if request_id is not None:
         request_summary = {
@@ -4416,7 +4418,7 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         time_block_rows = conn.execute(
             f"""SELECT * FROM queue_tickets
                 WHERE ticket_type = 'time_block' AND status IN ('pending','approved')
-                  AND LOWER(COALESCE(block_category, '')) NOT IN ('move','account_request','post_suggestion')
+                  AND LOWER(COALESCE(block_category, '')) NOT IN ('move','account_request','post_suggestion','new_account')
                   AND scheduled_date = ?{block_scope}
                 ORDER BY scheduled_start_minutes, id""",
             block_params,
@@ -5347,6 +5349,42 @@ def dashboard_queue_v2_update_time_block(
     return {"ok": True, "ticket": _queue_v2_ticket(updated)}
 
 
+@app.post("/api/admin/account-requests")
+def admin_request_new_account(
+    request: Request,
+    handle: Annotated[str, Form()],
+    group: Annotated[str, Form()] = "competitors",
+    reason: Annotated[str, Form()] = "",
+) -> dict[str, Any]:
+    if not (getattr(request.state, "is_admin", False) or getattr(request.state, "is_dev", False)):
+        raise HTTPException(status_code=403, detail="Only admins can request new accounts.")
+    caller = _caller_email(request)
+    clean = handle.strip().lstrip("@").lower()
+    if not re.fullmatch(r"[a-z0-9_.]{1,30}", clean):
+        raise HTTPException(status_code=400, detail="Enter a valid Instagram username, not a URL.")
+    if group not in {"sentient", "competitors"}:
+        raise HTTPException(status_code=400, detail="Choose Sentient or Competitors.")
+    description = f"Group: {group}\n{reason.strip()[:1000]}"
+    now = utc_now()
+    with connect() as conn:
+        if conn.execute("SELECT 1 FROM accounts WHERE handle = ?", (clean,)).fetchone():
+            raise HTTPException(status_code=409, detail="This account already exists. Ask Dev to review its settings.")
+        if conn.execute("SELECT 1 FROM queue_tickets WHERE block_category = 'new_account' AND title = ? AND status = 'pending'", (clean,)).fetchone():
+            raise HTTPException(status_code=409, detail="A request for this account is already pending with Dev.")
+        cursor = conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, status, block_category, title, requested_accounts, reason, created_at, updated_at)
+               VALUES ('time_block', ?, 'pending', 'new_account', ?, ?, ?, ?, ?)""",
+            (caller, clean, json.dumps([clean]), description, now, now),
+        )
+        ticket_id = int(cursor.lastrowid)
+        _queue_v2_publish(conn, "ticket_created", caller)
+        row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    from .slack_alerts import notify_new_account_request
+    delivered = notify_new_account_request(ticket_id=ticket_id, handle=clean, requester=caller, reason=description)
+    return {"ok": True, "ticket": _queue_v2_ticket(row), "slackDelivered": delivered}
+
+
 @app.post("/api/dashboard/queue/v2/tickets/account-access")
 def dashboard_queue_v2_request_account_access(
     request: Request,
@@ -5729,6 +5767,13 @@ def dashboard_queue_v2_review_ticket(
         if not ticket_row:
             raise HTTPException(status_code=404, detail="Queue ticket not found.")
         ticket = dict(ticket_row)
+        if ticket.get("block_category") == "new_account":
+            if not getattr(request.state, "is_dev", False):
+                raise HTTPException(status_code=403, detail="Only Dev can review new account requests.")
+            if clean_action == "approve":
+                handles = _queue_v2_json(ticket.get("requested_accounts"), [])
+                if not handles or not conn.execute("SELECT 1 FROM accounts WHERE handle = ? AND is_active = 1", (handles[0],)).fetchone():
+                    raise HTTPException(status_code=409, detail="Add the account in Settings first, then mark this request as added.")
         if ticket["status"] != "pending":
             raise HTTPException(status_code=409, detail="This ticket has already been reviewed.")
         if clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "account_request":
@@ -5778,6 +5823,8 @@ def dashboard_queue_v2_review_ticket(
             # The VC/Admin uses its populated Create Post form next, which is
             # the only operation that can create a Pool item.
             queue_change_event = "post_suggestion_approved"
+        elif clean_action == "approve" and ticket.get("block_category") == "new_account":
+            queue_change_event = "new_account_added"
         elif clean_action == "approve" and ticket["ticket_type"] == "time_block":
             _queue_v2_assert_time_available(
                 conn, ticket["requester_email"], ticket["scheduled_date"],
@@ -8092,6 +8139,7 @@ def admin_preview_account(handle: str) -> dict[str, Any]:
 
 @app.post("/api/admin/accounts")
 def admin_create_account(
+    request: Request,
     password: Annotated[str, Form()],
     handle: Annotated[str, Form()],
     label: Annotated[str, Form()] = "",
@@ -8105,6 +8153,8 @@ def admin_create_account(
     canonical `posts` dataset. Automatically picked up by the scheduler on its next
     tick; call the backfill endpoint below afterward to seed initial history.
     """
+    if not getattr(request.state, "is_dev", False):
+        raise HTTPException(status_code=403, detail="Only Dev can add new accounts. Submit an account request instead.")
     if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
         password.strip(), TRICKS_DASH_REFRESH_PASSWORD
     ):
