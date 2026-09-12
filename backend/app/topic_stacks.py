@@ -200,7 +200,10 @@ def memberships(conn, keys):
         return {'members': []}
     marks = ','.join('?' for _ in keys)
     rows = conn.execute(f'SELECT post_key, stack_id FROM topic_stack_members WHERE post_key IN ({marks})', tuple(keys)).fetchall()
-    counts = Counter(row['stack_id'] for row in conn.execute('SELECT stack_id FROM topic_stack_members'))
+    counts = Counter(
+        row['stack_id']
+        for row in conn.execute('SELECT stack_id FROM topic_stack_members').fetchall()
+    )
     return {'members': [{'postKey': row['post_key'], 'stackId': row['stack_id'], 'stackSize': counts[row['stack_id']]} for row in rows]}
 
 def find_similar(post_key):
@@ -264,7 +267,7 @@ def find_similar(post_key):
                 f'SELECT post_key, stack_id, words FROM topic_stack_members '
                 f'WHERE post_key != ? AND ({clauses})',
                 params,
-            )
+            ).fetchall()
         else:
             candidate_rows = ()
         for row in candidate_rows:
