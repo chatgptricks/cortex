@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -12,6 +13,36 @@ def post(key, caption, likes=1, date='2026-09-05T00:00:00Z'):
     return dict(account='test', shortcode=key, caption=caption, postDate=date, likes=likes)
 
 CAPTION = 'Scientists discovered remarkable ancient dinosaur fossils underneath isolated volcanic mountains during research expedition'
+
+
+class NonIterableCursor:
+    """Match the production Postgres cursor, which requires explicit fetches."""
+
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    def fetchone(self):
+        return self.cursor.fetchone()
+
+    def fetchall(self):
+        return self.cursor.fetchall()
+
+
+class NonIterableConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, statement, params=()):
+        return NonIterableCursor(self.connection.execute(statement, params))
+
+    def executemany(self, statement, params):
+        return NonIterableCursor(self.connection.executemany(statement, params))
+
+
+@contextmanager
+def production_style_connect():
+    with db.connect() as connection:
+        yield NonIterableConnection(connection)
 
 def test_persistent_membership_and_only_new_posts_classified(monkeypatch):
     posts = [post('a', CAPTION), post('b', CAPTION), post('c', 'Different story')]
@@ -75,6 +106,21 @@ def test_find_similar_merges_matching_existing_posts_only_when_requested():
     result = topic_stacks.find_similar('test:a')
     assert result['matchedCount'] == 1
     assert set(result['postKeys']) == {'test:a', 'test:b'}
+
+
+def test_find_similar_supports_non_iterable_production_cursor(monkeypatch):
+    posts = [post('a', CAPTION), post('b', CAPTION), post('c', 'Different story')]
+    topic_stacks.attach(posts)
+    topic_stacks.separate(['test:a', 'test:b'])
+    monkeypatch.setattr(topic_stacks, 'connect', production_style_connect)
+
+    matched = topic_stacks.find_similar('test:a')
+    unmatched = topic_stacks.find_similar('test:c')
+
+    assert matched['matchedCount'] == 1
+    assert set(matched['postKeys']) == {'test:a', 'test:b'}
+    assert unmatched['matchedCount'] == 0
+    assert unmatched['members'][0]['postKey'] == 'test:c'
 
 def test_find_similar_bootstraps_a_visible_post_without_membership():
     with db.connect() as connection:
