@@ -64,3 +64,7 @@ services:
         sync: false
       - key: SENTIENT_OCR_TOKEN
         sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_CAPTION_MODEL
+        value: gpt-5-mini
