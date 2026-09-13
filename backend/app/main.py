@@ -2696,6 +2696,7 @@ QUEUE_V2_POOL_DRAFT_DESIGNER = "__queue_pool__"
 QUEUE_V2_POOL_DRAFT_DATE = "0000-00-00"
 QUEUE_V2_DEFAULT_MINUTES_PER_PP = 10
 QUEUE_V2_TRAINEE_MINUTES_PER_PP = 16
+QUEUE_V2_RETENTION_DAYS = 10
 # Queue presence is intentionally short-lived. A browser sends a heartbeat
 # every 30 seconds; after two minutes without one, a user is treated as away.
 QUEUE_PRESENCE_OFFLINE_AFTER_SECONDS = 120
@@ -3439,13 +3440,13 @@ def _queue_v2_log(conn: Any, request_id: int, actor: str, event_type: str, detai
 
 
 def _queue_v2_purge_expired(conn: Any) -> list[int]:
-    """Enforce Queue's 14-day operational retention window.
+    """Enforce Queue's 10-day operational retention window.
 
     Open work is never purged. Once a request is closed or cancelled, its
     request row, detailed event history and attachments are operational data
-    and expire together after fourteen days.
+    and expire together after ten days.
     """
-    cutoff = (datetime.now(UTC) - timedelta(days=14)).isoformat(timespec="seconds")
+    cutoff = (datetime.now(UTC) - timedelta(days=QUEUE_V2_RETENTION_DAYS)).isoformat(timespec="seconds")
     try:
         rows = conn.execute(
             """SELECT id FROM queue_requests
@@ -3464,7 +3465,7 @@ def _queue_v2_purge_expired(conn: Any) -> list[int]:
     ids = [int(row["id"]) for row in rows]
     # Suggestions and personal-time tickets have no request id. They are
     # Queue operational data too, so do not let reviewed (or abandoned)
-    # tickets become an unbounded hidden history beside the 14-day post log.
+    # tickets become an unbounded hidden history beside the 10-day post log.
     conn.execute(
         "DELETE FROM queue_tickets WHERE request_id IS NULL AND created_at < ? AND NOT (COALESCE(block_category, '') = 'new_account' AND status = 'pending')",
         (cutoff,),
