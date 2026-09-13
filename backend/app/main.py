@@ -3587,6 +3587,7 @@ def _queue_v2_personal_time_occupied(
             "date": str(row["scheduled_date"]),
             "start": int(row["scheduled_start_minutes"]),
             "duration": int(row["duration_minutes"]),
+            "buffer_minutes": 0,
         }
         for row in rows
     ]
@@ -3713,7 +3714,11 @@ def _queue_v2_assert_time_available(
     conn: Any, user_email: str, scheduled_date: str, start: int, duration: int, *, exclude_ticket_id: int | None = None,
 ) -> None:
     occupied = _queue_v2_time_occupied(conn, user_email, scheduled_date, exclude_ticket_id=exclude_ticket_id)
-    if any(intervals_conflict(start, duration, int(item["start"]), int(item["duration"])) for item in occupied):
+    if any(intervals_conflict(
+        start, duration, int(item["start"]), int(item["duration"]),
+        buffer_minutes=0,
+        other_buffer_minutes=int(item.get("buffer_minutes", SCHEDULER_BUFFER_MINUTES)),
+    ) for item in occupied):
         raise HTTPException(status_code=409, detail="That time overlaps another Queue block.")
 
 
@@ -3802,7 +3807,9 @@ def _queue_v2_compact_after_completion(conn: Any, designer: str, completed_id: i
         # Do not pull a job across a fixed block that was already between it
         # and the completed job (for example a personal meeting).
         barriers = [
-            schedule_absolute(str(item["date"]), int(item["start"])) + max(10, int(item["duration"])) + SCHEDULER_BUFFER_MINUTES
+            schedule_absolute(str(item["date"]), int(item["start"]))
+            + max(10, int(item["duration"]))
+            + int(item.get("buffer_minutes", SCHEDULER_BUFFER_MINUTES))
             for item in fixed
             if schedule_absolute(str(item["date"]), int(item["start"])) < original_start
         ]
@@ -5807,7 +5814,11 @@ def dashboard_queue_v2_review_ticket(
                 and int(item["start"]) == current_start
                 and int(item["duration"]) == current_duration
             )]
-            if any(intervals_conflict(int(ticket["scheduled_start_minutes"]), current_duration, int(item["start"]), int(item["duration"])) for item in occupied):
+            if any(intervals_conflict(
+                int(ticket["scheduled_start_minutes"]), current_duration,
+                int(item["start"]), int(item["duration"]),
+                other_buffer_minutes=int(item.get("buffer_minutes", SCHEDULER_BUFFER_MINUTES)),
+            ) for item in occupied):
                 raise HTTPException(status_code=409, detail="The requested move overlaps another Queue block.")
             conn.execute(
                 "UPDATE queue_requests SET scheduled_date = ?, scheduled_start_minutes = ?, updated_at = ? WHERE id = ?",
