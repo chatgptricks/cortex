@@ -6,6 +6,20 @@ def test_adjacent_blocks_do_not_overlap() -> None:
     assert intervals_conflict(8 * 60, 30, 8 * 60 + 30, 20)
 
 
+def test_personal_time_can_be_adjacent_without_a_buffer() -> None:
+    assert not intervals_conflict(
+        8 * 60, 30, 8 * 60 + 30, 20,
+        buffer_minutes=0, other_buffer_minutes=0,
+    )
+
+
+def test_post_buffer_still_blocks_time_immediately_after_the_post() -> None:
+    assert intervals_conflict(
+        8 * 60 + 30, 20, 8 * 60, 30,
+        buffer_minutes=0, other_buffer_minutes=10,
+    )
+
+
 def test_new_work_advances_after_an_active_block() -> None:
     date_value, start = next_available_slot(
         "2026-09-01",

@@ -163,6 +163,58 @@ def test_personal_time_cannot_overlap_queue_work(monkeypatch, tmp_path):
     assert error.value.status_code == 409
 
 
+def test_personal_time_blocks_can_touch_without_reserving_a_buffer(monkeypatch, tmp_path):
+    database = tmp_path / "adjacent-personal-time.sqlite3"
+    _ticket_database(database)
+    connect = _isolate(monkeypatch, database)
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, status, block_category, title,
+                scheduled_date, scheduled_start_minutes, duration_minutes,
+                created_at, updated_at)
+               VALUES ('time_block', 'pd@example.com', 'approved', 'meeting',
+                       'First block', '2026-09-01', 720, 30, 'now', 'now')"""
+        )
+
+    created = main.dashboard_queue_v2_create_time_block(
+        request=None,
+        category="focus",
+        scheduled_date="2026-09-01",
+        scheduled_start_minutes=750,
+        duration_minutes=30,
+        title=None,
+        note=None,
+    )
+
+    assert created["ticket"]["scheduledStartMinutes"] == 750
+
+
+def test_post_can_start_when_personal_time_ends(monkeypatch, tmp_path):
+    database = tmp_path / "post-after-personal-time.sqlite3"
+    _ticket_database(database)
+    connect = _isolate(monkeypatch, database)
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO queue_requests VALUES (1, 3, 10, 'scheduled', 'pd@example.com', '2026-09-01', 750, 'chatgptricks', 'POST1', '', '')"
+        )
+        conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, status, block_category, title,
+                scheduled_date, scheduled_start_minutes, duration_minutes,
+                created_at, updated_at)
+               VALUES ('time_block', 'pd@example.com', 'approved', 'meeting',
+                       'Manual block', '2026-09-01', 720, 30, 'now', 'now')"""
+        )
+        moved = main._queue_v2_reflow_scheduled(conn, "pd@example.com", "vc@example.com")
+        scheduled = conn.execute(
+            "SELECT scheduled_start_minutes FROM queue_requests WHERE id = 1"
+        ).fetchone()["scheduled_start_minutes"]
+
+    assert moved == 0
+    assert scheduled == 750
+
+
 def test_non_personal_time_block_tickets_never_reserve_or_break_scheduler_capacity(monkeypatch, tmp_path):
     database = tmp_path / "non-personal-tickets.sqlite3"
     _ticket_database(database)
@@ -191,10 +243,10 @@ def test_non_personal_time_block_tickets_never_reserve_or_break_scheduler_capaci
             "SELECT scheduled_start_minutes FROM queue_requests WHERE id = 1"
         ).fetchone()["scheduled_start_minutes"]
 
-    assert {tuple(item.values()) for item in occupied} == {
-        ("2026-09-01", 600, 30),
-        ("2026-09-01", 720, 30),
-    }
+    assert occupied == [
+        {"date": "2026-09-01", "start": 600, "duration": 30},
+        {"date": "2026-09-01", "start": 720, "duration": 30, "buffer_minutes": 0},
+    ]
     assert moved == 0
     assert scheduled == 600
 
