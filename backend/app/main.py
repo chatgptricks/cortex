@@ -2682,6 +2682,7 @@ QUEUE_V2_TAGS = ["content", "design", "copy", "research", "review", "repurpose",
 QUEUE_V2_PRIORITIES = ["normal", "urgent"]
 QUEUE_V2_POST_TYPES = ["Image", "Carousel", "Reel", "Promo", "Story", "Other"]
 QUEUE_V2_HOT_MULTIPLIER = 3.0
+QUEUE_V2_HOT_MAX_AGE_HOURS = 24
 # HOT routing starts at the reset moment that cleared the first batch. The
 # environment override makes a future reset explicit without another code
 # change; posts whose one-time HOT check predates this moment are ignored.
@@ -3265,11 +3266,13 @@ def _queue_v2_existing_dashboard_post_from_url(source_url: str) -> dict[str, str
 
 
 def _queue_v2_hot_source_rows_uncached(conn: Any, *, include_historic: bool = False) -> list[dict[str, Any]]:
-    """Return source posts whose measured rate is strictly above 3x.
+    """Return recent source posts whose measured rate is strictly above 3x.
 
     The canonical account still lives in ``posts`` while all other accounts
     are in ``dashboard_posts``. Keeping the source query here means HOT
-    routing works for both storage shapes and remains idempotent.
+    routing works for both storage shapes and remains idempotent. Publication
+    age is an unconditional safety boundary: a legacy HOT label or a late
+    import must never put an old post in Pool or Pick.
     """
     rows: list[dict[str, Any]] = []
     # Older migration fixtures may not have the timestamp column yet. The
@@ -3278,6 +3281,7 @@ def _queue_v2_hot_source_rows_uncached(conn: Any, *, include_historic: bool = Fa
     post_columns = {row["name"] for row in conn.execute("PRAGMA table_info(posts)").fetchall()}
     dashboard_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dashboard_posts)").fetchall()}
     routing_start = _queue_v2_hot_routing_start(conn)
+    published_cutoff = (datetime.now(UTC) - timedelta(hours=QUEUE_V2_HOT_MAX_AGE_HOURS)).isoformat(timespec="seconds")
     post_cutoff = "" if include_historic else (" AND hot_marked_at >= ?" if "hot_marked_at" in post_columns else "")
     dashboard_cutoff = "" if include_historic else (" AND dp.hot_marked_at >= ?" if "hot_marked_at" in dashboard_columns else "")
     canonical = conn.execute(
@@ -3289,8 +3293,10 @@ def _queue_v2_hot_source_rows_uncached(conn: Any, *, include_historic: bool = Fa
                       likes, comments, is_hot, hot_rate_multiplier
                FROM posts
                WHERE is_hot = 1 AND hot_rate_multiplier > ?
+                 AND published_at IS NOT NULL AND published_at >= ?
                  AND shortcode IS NOT NULL AND shortcode != ''{post_cutoff}""",
-            (QUEUE_V2_HOT_MULTIPLIER, routing_start) if post_cutoff else (QUEUE_V2_HOT_MULTIPLIER,),
+            (QUEUE_V2_HOT_MULTIPLIER, published_cutoff, routing_start)
+            if post_cutoff else (QUEUE_V2_HOT_MULTIPLIER, published_cutoff),
         ).fetchall():
             item = dict(row)
             item["account"] = canonical["handle"]
@@ -3303,8 +3309,10 @@ def _queue_v2_hot_source_rows_uncached(conn: Any, *, include_historic: bool = Fa
            FROM dashboard_posts dp
            JOIN accounts a ON a.handle = dp.account
            WHERE a.is_active = 1 AND dp.is_hot = 1 AND dp.hot_rate_multiplier > ?
+             AND dp.published_at IS NOT NULL AND dp.published_at >= ?
              AND dp.shortcode IS NOT NULL AND dp.shortcode != ''{dashboard_cutoff}""",
-        (QUEUE_V2_HOT_MULTIPLIER, routing_start) if dashboard_cutoff else (QUEUE_V2_HOT_MULTIPLIER,),
+        (QUEUE_V2_HOT_MULTIPLIER, published_cutoff, routing_start)
+        if dashboard_cutoff else (QUEUE_V2_HOT_MULTIPLIER, published_cutoff),
     ).fetchall():
         rows.append(dict(row))
     return sorted(rows, key=lambda item: (-float(item.get("hot_rate_multiplier") or 0), str(item.get("account") or ""), str(item.get("shortcode") or "")))
@@ -3361,10 +3369,10 @@ def _queue_v2_hot_pick_candidate(post: dict[str, Any]) -> dict[str, Any]:
 def _queue_v2_auto_pool_hot(conn: Any) -> list[int]:
     """Materialize every new >3x HOT post as an urgent pool request.
 
-    This is safe to call from both the engagement worker and the Queue GET
-    endpoint: the unique post key and the existing-status check make it
-    idempotent, while cancelled requests stay cancelled instead of being
-    resurrected on every refresh.
+    The unique post key and the existing-status check make this idempotent,
+    while cancelled requests stay cancelled instead of being resurrected on
+    every refresh. System-created HOT rows age out of Pool with their source;
+    assigned or manually-created work is never touched.
     """
     now = utc_now()
     hot_posts = _queue_v2_hot_source_rows(conn)
@@ -3430,6 +3438,26 @@ def _queue_v2_auto_pool_hot(conn: Any) -> list[int]:
     if created:
         _queue_v2_publish(conn, "hot_auto_pooled", "system@sentientdash.app", created)
     return created
+
+
+def _queue_v2_hide_stale_hot_pool_rows(rows: list[Any], hot_keys: set[tuple[str, str]]) -> list[Any]:
+    """Keep aged-out system HOT work out of Queue responses before pruning runs."""
+    visible: list[Any] = []
+    for row in rows:
+        item = dict(row)
+        key = (
+            str(item.get("post_account") or "").strip().lower(),
+            str(item.get("post_shortcode") or "").strip(),
+        )
+        is_stale_system_hot = (
+            item.get("status") == "pool"
+            and str(item.get("coordinator_email") or "").strip().lower() == "system@sentientdash.app"
+            and "hot" in _queue_v2_json(item.get("tags"), [])
+            and key not in hot_keys
+        )
+        if not is_stale_system_hot:
+            visible.append(row)
+    return visible
 
 
 def _queue_v2_log(conn: Any, request_id: int, actor: str, event_type: str, details: dict[str, Any] | None = None) -> None:
@@ -4373,6 +4401,10 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         # enough CPU and DB connections to take down every user. The dedicated
         # ingestion worker owns that idempotent action instead.
         hot_source_rows = _queue_v2_hot_source_rows(conn, include_historic=False)
+        hot_source_keys = {
+            (str(post.get("account") or "").strip().lower(), str(post.get("shortcode") or "").strip())
+            for post in hot_source_rows
+        }
         all_queue_rows = conn.execute("SELECT * FROM queue_requests").fetchall()
         pool_rows = conn.execute(
             """SELECT * FROM queue_requests
@@ -4385,6 +4417,11 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
                  ORDER BY CASE priority WHEN 'urgent' THEN 0 ELSE 1 END, id""",
             params,
         ).fetchall()
+        # The worker owns physical cleanup, but an aged-out automatic HOT row
+        # must disappear from the user-facing Pool immediately after this
+        # release, even before the next ingestion cycle.
+        pool_rows = _queue_v2_hide_stale_hot_pool_rows(pool_rows, hot_source_keys)
+        rows = _queue_v2_hide_stale_hot_pool_rows(rows, hot_source_keys)
         planning_params: list[Any] = []
         planning_scope = ""
         if not (is_admin or "vc" in roles):
@@ -4652,7 +4689,7 @@ def dashboard_queue_v2_pick(
         if request_id is None:
             account = str(hot_account or "").strip().lstrip("@").lower()
             shortcode = str(hot_shortcode or "").strip()
-            source = next((post for post in _queue_v2_hot_source_rows(conn, include_historic=True)
+            source = next((post for post in _queue_v2_hot_source_rows(conn, include_historic=False)
                            if str(post.get("account") or "").strip().lower() == account and str(post.get("shortcode") or "").strip() == shortcode), None)
             if source is None:
                 raise HTTPException(status_code=409, detail="That HOT post is no longer available for Pick.")
