@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 
 from app import main
 
@@ -155,12 +156,12 @@ def test_hot_posts_above_three_x_are_auto_pooled_once(tmp_path):
         CREATE TABLE posts (
             id INTEGER PRIMARY KEY, shortcode TEXT, caption TEXT, title TEXT,
             post_type_label TEXT, published_at TEXT, likes INTEGER, comments INTEGER,
-            is_hot INTEGER, hot_rate_multiplier REAL
+            is_hot INTEGER, hot_rate_multiplier REAL, hot_marked_at TEXT
         );
         CREATE TABLE dashboard_posts (
             id INTEGER PRIMARY KEY, account TEXT, shortcode TEXT, caption TEXT,
             post_type_label TEXT, published_at TEXT, likes INTEGER, comments INTEGER,
-            permalink TEXT, is_hot INTEGER, hot_rate_multiplier REAL
+            permalink TEXT, is_hot INTEGER, hot_rate_multiplier REAL, hot_marked_at TEXT
         );
         CREATE TABLE queue_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT, post_account TEXT NOT NULL,
@@ -176,6 +177,9 @@ def test_hot_posts_above_three_x_are_auto_pooled_once(tmp_path):
             id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, actor_email TEXT,
             event_type TEXT, details TEXT, created_at TEXT
         );
+        CREATE TABLE queue_schedule_drafts (
+            request_id INTEGER PRIMARY KEY
+        );
         CREATE TABLE queue_live_state (
             id INTEGER PRIMARY KEY, revision INTEGER, event_type TEXT,
             actor_email TEXT, request_ids TEXT, updated_at TEXT
@@ -183,16 +187,35 @@ def test_hot_posts_above_three_x_are_auto_pooled_once(tmp_path):
         INSERT INTO queue_live_state VALUES (1, 0, '', '', '[]', '');
         """
     )
+    now = datetime.now(UTC)
+    recent = (now - timedelta(hours=2)).isoformat(timespec="seconds")
+    old = (now - timedelta(days=5)).isoformat(timespec="seconds")
+    marked_now = now.isoformat(timespec="seconds")
     conn.execute("INSERT INTO accounts VALUES ('chatgptricks', 1, 1)")
     conn.execute("INSERT INTO accounts VALUES ('competitor', 0, 1)")
-    conn.execute("INSERT INTO posts VALUES (1, 'HOT1', 'caption', 'title', 'Image', '2026', 10, 1, 1, 3.4)")
-    conn.execute("INSERT INTO posts VALUES (2, 'EDGE', 'caption', 'title', 'Image', '2026', 10, 1, 1, 3.0)")
-    conn.execute("INSERT INTO dashboard_posts VALUES (3, 'competitor', 'HOT2', 'caption', 'Video', '2026', 10, 1, 'https://instagram.com/p/HOT2', 1, 4.2)")
+    conn.execute("INSERT INTO posts VALUES (1, 'HOT1', 'caption', 'title', 'Image', ?, 10, 1, 1, 3.4, ?)", (recent, marked_now))
+    conn.execute("INSERT INTO posts VALUES (2, 'EDGE', 'caption', 'title', 'Image', ?, 10, 1, 1, 3.0, ?)", (recent, marked_now))
+    conn.execute("INSERT INTO dashboard_posts VALUES (3, 'competitor', 'HOT2', 'caption', 'Video', ?, 10, 1, 'https://instagram.com/p/HOT2', 1, 4.2, ?)", (recent, marked_now))
+    # A recent HOT mark must not revive an old publication.
+    conn.execute("INSERT INTO dashboard_posts VALUES (4, 'competitor', 'OLDHOT', 'old', 'Image', ?, 10, 1, 'https://instagram.com/p/OLDHOT', 1, 9.0, ?)", (old, marked_now))
     conn.commit()
 
     assert main._queue_v2_auto_pool_hot(conn) == [1, 2]
     rows = conn.execute("SELECT post_account, post_shortcode, priority, production_points, tags FROM queue_requests ORDER BY id").fetchall()
     assert [(row["post_account"], row["post_shortcode"]) for row in rows] == [("competitor", "HOT2"), ("chatgptricks", "HOT1")]
     assert all(row["priority"] == "urgent" and row["production_points"] == 3 and row["tags"] == '["hot"]' for row in rows)
+    conn.execute(
+        """INSERT INTO queue_requests (
+               post_account, post_shortcode, post_permalink, post_caption,
+               post_type, cover_url, production_points, priority, deadline_at,
+               tags, brief, notes, reference_links, coordinator_email,
+               created_at, updated_at
+           ) VALUES ('competitor', 'OLDHOT', '', 'old', 'Image', '', 3,
+                     'urgent', '', '["hot"]', '', '', '[]',
+                     'system@sentientdash.app', ?, ?)""",
+        (marked_now, marked_now),
+    )
+    conn.commit()
     assert main._queue_v2_auto_pool_hot(conn) == []
+    assert conn.execute("SELECT 1 FROM queue_requests WHERE post_shortcode = 'OLDHOT'").fetchone() is None
     conn.close()

@@ -1712,20 +1712,6 @@ def _process_short_term_items(
             conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE id = ?", params)
         engagement_summary["updated"] += 1
 
-    # Materialize freshly detected >3x posts immediately. The helper is
-    # imported lazily because main.py imports this module during app startup;
-    # by the time the scheduled worker reaches this point the app module is
-    # fully initialized. A Queue GET also runs the same idempotent helper as a
-    # backfill safety net, so a routing hiccup never loses a HOT request.
-    if engagement_summary["hot_marked"]:
-        try:
-            from .main import _queue_v2_auto_pool_hot
-
-            with connect() as conn:
-                _queue_v2_auto_pool_hot(conn)
-        except Exception:
-            logger.exception("Could not auto-add HOT posts to the Queue pool")
-
     if pending_alerts:
         from .slack_alerts import cover_url_for, notify_hot_post, slack_configured
 
@@ -1738,6 +1724,18 @@ def _process_short_term_items(
             engagement_summary["slack_alerts_sent"] = sent
 
     return {"new_posts": insert_summary, "engagement": engagement_summary, "transcripts_updated": transcript_updates}
+
+
+def _reconcile_queue_hot() -> None:
+    """Route fresh HOT posts and prune aged ones once per ingestion job."""
+    try:
+        # Imported lazily because main.py imports this module during startup.
+        from .main import _queue_v2_auto_pool_hot
+
+        with connect() as conn:
+            _queue_v2_auto_pool_hot(conn)
+    except Exception:
+        logger.exception("Could not reconcile HOT posts in the Queue pool")
 
 
 def run_short_term_cycle(
@@ -1763,7 +1761,9 @@ def run_short_term_cycle(
     items = _collect_short_term_items(
         {account: cfg}, results_limit, now, include_reels=include_reels, lookback_hours=lookback_hours
     )[account]
-    return _process_short_term_items(account, cfg, items, now, lookback_hours=lookback_hours)
+    result = _process_short_term_items(account, cfg, items, now, lookback_hours=lookback_hours)
+    _reconcile_queue_hot()
+    return result
 
 
 def run_short_term_cycle_batch(
@@ -1824,6 +1824,7 @@ def run_short_term_cycle_batch(
             )
         except Exception as exc:
             results[account] = {"error": f"processing failed: {exc}"}
+    _reconcile_queue_hot()
     return results
 
 
@@ -1969,6 +1970,7 @@ def run_short_term_cycle_batch_paged(
             on_page=lambda page: process_page(page, source="reels"),
         )
 
+    _reconcile_queue_hot()
     return results
 
 
