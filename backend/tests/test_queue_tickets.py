@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 import sqlite3
 
 import pytest
@@ -412,6 +413,70 @@ def test_queue_retention_removes_old_non_request_tickets(monkeypatch, tmp_path):
         assert main._queue_v2_purge_expired(conn) == []
     with connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS count FROM queue_tickets").fetchone()["count"] == 0
+
+
+def test_queue_retention_hard_deletes_closed_history_after_ten_days(monkeypatch, tmp_path):
+    database = tmp_path / "request-retention.sqlite3"
+    _ticket_database(database)
+    connect = _isolate(monkeypatch, database)
+    old = (datetime.now(UTC) - timedelta(days=11)).isoformat(timespec="seconds")
+    recent = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
+    with connect() as conn:
+        conn.executescript(
+            """
+            ALTER TABLE queue_requests ADD COLUMN closed_at TEXT;
+            CREATE TABLE queue_request_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL,
+                actor_email TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        rows = [
+            (1, "closed", old, old),
+            (2, "cancelled", old, old),
+            (3, "closed", recent, recent),
+            (4, "completed", old, old),
+            (5, "scheduled", old, old),
+        ]
+        for request_id, status, closed_at, updated_at in rows:
+            conn.execute(
+                """INSERT INTO queue_requests
+                   (id, production_points, minutes_per_pp, status, post_account,
+                    post_shortcode, updated_at, closed_at)
+                   VALUES (?, 3, 10, ?, 'chatgptricks', ?, ?, ?)""",
+                (request_id, status, f"POST{request_id}", updated_at, closed_at),
+            )
+            conn.execute(
+                """INSERT INTO queue_schedule_drafts
+                   (request_id, coordinator_email, designer_email, scheduled_date,
+                    scheduled_start_minutes, recommended_accounts, updated_at)
+                   VALUES (?, 'vc@example.com', 'pd@example.com', '2026-09-01', 600, '[]', ?)""",
+                (request_id, updated_at),
+            )
+            conn.execute(
+                """INSERT INTO queue_tickets
+                   (ticket_type, requester_email, request_id, status, created_at, updated_at)
+                   VALUES ('cancellation', 'pd@example.com', ?, 'approved', ?, ?)""",
+                (request_id, updated_at, updated_at),
+            )
+            conn.execute(
+                """INSERT INTO queue_request_events
+                   (request_id, actor_email, event_type, created_at)
+                   VALUES (?, 'vc@example.com', 'created', ?)""",
+                (request_id, updated_at),
+            )
+
+        assert set(main._queue_v2_purge_expired(conn)) == {1, 2}
+
+    with connect() as conn:
+        assert [row["id"] for row in conn.execute("SELECT id FROM queue_requests ORDER BY id")] == [3, 4, 5]
+        for table in ("queue_schedule_drafts", "queue_tickets", "queue_request_events"):
+            request_ids = [row["request_id"] for row in conn.execute(f"SELECT request_id FROM {table} ORDER BY request_id")]
+            assert request_ids == [3, 4, 5]
 
 
 def test_admin_reset_clears_queue_state_but_preserves_accounts(monkeypatch, tmp_path):
