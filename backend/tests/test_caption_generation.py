@@ -81,11 +81,16 @@ def test_caption_generation_requires_server_key(monkeypatch):
 
 def test_caption_endpoint_returns_editable_result(monkeypatch):
     context = {"target_account": "ours"}
+    generated = {}
     monkeypatch.setattr(main, "_caption_generation_context", lambda *_: context)
-    monkeypatch.setattr(main, "_openai_caption_text", lambda value: ("A genuinely new caption", "gpt-5-mini"))
+    monkeypatch.setattr(
+        main,
+        "_openai_caption_text",
+        lambda value, **options: (generated.update(options) or ("A genuinely new caption", "gpt-5-mini")),
+    )
     request = SimpleNamespace(state=SimpleNamespace(user_email="writer@example.com"))
 
-    result = main.dashboard_generate_caption(request, "source", "SRC1", "ours")
+    result = main.dashboard_generate_caption(request, "source", "SRC1", "ours", True)
 
     assert result == {
         "caption": "A genuinely new caption",
@@ -93,6 +98,7 @@ def test_caption_endpoint_returns_editable_result(monkeypatch):
         "model": "gpt-5-mini",
         "generatedBy": "writer@example.com",
     }
+    assert generated == {"remove_manychat_automation": True}
 
 
 def test_openai_caption_request_is_stateless_and_parses_output(monkeypatch):
@@ -137,4 +143,66 @@ def test_openai_caption_request_is_stateless_and_parses_output(monkeypatch):
     assert captured["url"] == "https://api.openai.com/v1/responses"
     assert captured["json"]["store"] is False
     assert captured["json"]["input"].find("Original caption") >= 0
+    assert captured["json"]["input"].find('"REMOVE_MANYCHAT_AUTOMATION": false') >= 0
     assert captured["headers"]["Authorization"] == "Bearer test-secret"
+
+
+def test_caption_policy_rejects_foreign_follow_cta_and_requested_manychat():
+    caption = 'Comment "GUIDE" and I will send the link. Follow @source for more.'
+
+    violations = main._caption_policy_violations(caption, "ours", True)
+
+    assert len(violations) == 2
+    assert "@source" in violations[0]
+    assert "comment/DM" in violations[1]
+
+
+def test_caption_policy_accepts_selected_account_cta_without_manychat():
+    caption = "Save this for later. Follow @ours for more practical AI tips."
+
+    assert main._caption_policy_violations(caption, "ours", True) == []
+
+
+def test_openai_repairs_foreign_promotional_cta(monkeypatch):
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"output": [{"type": "message", "content": [{"type": "output_text", "text": self.text}]}]}
+
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def post(self, _url, **kwargs):
+            calls.append(kwargs["json"])
+            return Response("Follow @source for more." if len(calls) == 1 else "Follow @ours for more.")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-secret")
+    monkeypatch.setattr(httpx, "Client", Client)
+    context = {
+        "target_account": "ours",
+        "target_label": "Our Brand",
+        "source_caption": "Original caption. Follow @source for more.",
+        "style_examples": ["Our recent voice"],
+    }
+
+    caption, _ = main._openai_caption_text(context)
+
+    assert caption == "Follow @ours for more."
+    assert len(calls) == 2
+    assert "POLICY_VIOLATIONS" in calls[1]["input"]
