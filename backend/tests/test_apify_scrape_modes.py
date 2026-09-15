@@ -74,6 +74,33 @@ def test_manual_post_catch_up_can_extend_the_normal_posts_window() -> None:
     assert payload["onlyPostsNewerThan"] == "2026-09-03T18:00:00Z"
 
 
+def test_current_day_engagement_uses_cst_midnight_and_never_inserts(monkeypatch) -> None:
+    now = datetime(2026, 9, 5, 15, 0, tzinfo=UTC)  # 09:00 CST
+    captured: dict = {}
+
+    monkeypatch.setattr(apify_sync, "get_account_config", lambda account: {
+        "handle": account,
+        "scrape_mode": "reels",
+        "table": "dashboard_posts",
+    })
+    monkeypatch.setattr(apify_sync, "_collect_short_term_items", lambda configs, limit, current, **kwargs: (
+        captured.update(configs=configs, limit=limit, now=current, kwargs=kwargs) or {"account": []}
+    ))
+    monkeypatch.setattr(apify_sync, "_process_short_term_items", lambda account, cfg, items, current, **kwargs: (
+        captured.update(process_kwargs=kwargs) or {"engagement": {"updated": 0}}
+    ))
+    monkeypatch.setattr(apify_sync, "_reconcile_queue_hot", lambda: None)
+    monkeypatch.setattr("app.ingestion_jobs.now", lambda: now)
+
+    result = apify_sync.run_day_engagement_cycle_batch(["account"])
+
+    assert result["account"]["engagement"]["updated"] == 0
+    assert captured["configs"]["account"]["scrape_mode"] == "posts"
+    assert captured["kwargs"]["include_reels"] is False
+    assert captured["kwargs"]["lookback_hours"] == 9
+    assert captured["process_kwargs"]["insert_new"] is False
+
+
 def test_manual_reel_catch_up_can_extend_the_reels_window() -> None:
     now = datetime(2026, 9, 4, 18, 0, tzinfo=UTC)
 
