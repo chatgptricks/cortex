@@ -33,6 +33,8 @@ _DAILY_JOB_AT = (7, 0)  # 7:00am CST
 _SHORT_START_MINUTES = 6 * 60 + 15
 _SHORT_END_MINUTES = 24 * 60
 _SHORT_INTERVAL_MINUTES = 45
+_DISCOVERY_OVERLAP_MINUTES = 5
+_DAY_ENGAGEMENT_INTERVAL_HOURS = 3
 
 _started = False
 _lock = threading.Lock()
@@ -111,6 +113,12 @@ def _bucket_key(now_cst: datetime) -> str:
     return now_cst.strftime("%Y-%m-%dT%H:00")
 
 
+def _engagement_bucket_key(now_cst: datetime) -> str:
+    """Three-hour CST slot used by the current-day count refresh."""
+    slot_hour = (now_cst.hour // _DAY_ENGAGEMENT_INTERVAL_HOURS) * _DAY_ENGAGEMENT_INTERVAL_HOURS
+    return f"{now_cst:%Y-%m-%d}T{slot_hour:02d}:00"
+
+
 def _active_account_handles() -> list[str]:
     """Pulled fresh from the DB on every run (not cached) so a new account
     added via the self-serve /api/admin/accounts endpoint is automatically
@@ -141,14 +149,33 @@ def _run_short_term_jobs() -> None:
     import math
     journal = current()
     since = journal.state.get("last_success_at") if journal else None
-    gap = (now() - datetime.fromisoformat(since)).total_seconds() / 3600 if since else 22
-    lookback = max(2, math.ceil(gap) + 2)
+    gap = max(0.0, (now() - datetime.fromisoformat(since)).total_seconds() / 3600) if since else 22
+    # The discovery window begins just before the last successful scan. This
+    # gives Instagram/Apify five minutes of timestamp overlap without paying
+    # to fetch the same two hours of posts on every cycle. After an outage the
+    # durable last-success watermark naturally widens the next run to recover
+    # everything missed.
+    lookback = gap + (_DISCOVERY_OVERLAP_MINUTES / 60)
     results = run_short_term_cycle_batch(accounts, lookback_hours=lookback,
-                                        results_limit=max(20, min(1000, lookback * 10)))
+                                        results_limit=max(10, min(100, math.ceil(lookback * 10))))
     failures = {account: result for account, result in results.items() if result.get("error")}
     if failures:
         raise ApifySyncError(str(failures))
     logger.info("Short-term engagement cycle: %s", results)
+
+
+def _run_day_engagement_jobs() -> None:
+    from .apify_sync import ApifySyncError, run_day_engagement_cycle_batch
+
+    accounts = _active_account_handles()
+    if not accounts:
+        logger.warning("Current-day engagement cycle skipped: no active accounts")
+        return
+    results = run_day_engagement_cycle_batch(accounts)
+    failures = {account: result for account, result in results.items() if result.get("error")}
+    if failures:
+        raise ApifySyncError(str(failures))
+    logger.info("Current-day engagement cycle: %s", results)
 
 
 def _run_daily_jobs() -> None:
@@ -291,6 +318,12 @@ def _tick() -> None:
             _run_ocr_job()
     _launch("short", short_pass)
 
+    engagement_bucket = _engagement_bucket_key(now_cst)
+    _launch(
+        "day-engagement",
+        lambda: run("scheduled-day-engagement", engagement_bucket, _run_day_engagement_jobs),
+    )
+
     daily_trigger = now_cst.replace(hour=_DAILY_JOB_AT[0], minute=_DAILY_JOB_AT[1], second=0, microsecond=0)
     today = now_cst.strftime("%Y-%m-%d")
     if now_cst >= daily_trigger:
@@ -349,7 +382,7 @@ def start_scheduler() -> None:
         _thread.start()
     logger.info(
         "Engagement scheduler started (short-term: every 45min 6:15am-11:15pm CST; "
-        "hourly overnight; daily: 7:00am fixed CST)"
+        "hourly overnight; current-day counts: every 3h; daily: 7:00am fixed CST)"
     )
 
 

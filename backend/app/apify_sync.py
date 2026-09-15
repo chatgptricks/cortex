@@ -5,7 +5,7 @@ import os
 import re
 import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1368,7 +1368,7 @@ _SNAPSHOT_LOCK = threading.Lock()
 
 
 def _short_term_payload(
-    handles: list[str], results_limit: int, now: datetime, *, lookback_hours: int = _SHORT_LOOKBACK_HOURS
+    handles: list[str], results_limit: int, now: datetime, *, lookback_hours: float = _SHORT_LOOKBACK_HOURS
 ) -> dict[str, Any]:
     return {
         "directUrls": [f"https://www.instagram.com/{handle}/" for handle in handles],
@@ -1401,7 +1401,7 @@ def _short_term_reels_payload(
     results_limit: int,
     now: datetime,
     *,
-    lookback_hours: int = _SHORT_LOOKBACK_HOURS,
+    lookback_hours: float = _SHORT_LOOKBACK_HOURS,
 ) -> dict[str, Any]:
     """Equivalent small lookback request for the dedicated Reels actor.
 
@@ -1513,7 +1513,7 @@ def _collect_short_term_items(
     *,
     include_posts: bool = True,
     include_reels: bool = True,
-    lookback_hours: int = _SHORT_LOOKBACK_HOURS,
+    lookback_hours: float = _SHORT_LOOKBACK_HOURS,
 ) -> dict[str, list[dict[str, Any]]]:
     """Fetch each configured account surface in two batched, small runs.
 
@@ -1585,7 +1585,8 @@ def _process_short_term_items(
     items: list[dict[str, Any]],
     now: datetime,
     *,
-    lookback_hours: int = _SHORT_LOOKBACK_HOURS,
+    lookback_hours: float = _SHORT_LOOKBACK_HOURS,
+    insert_new: bool = True,
 ) -> dict[str, Any]:
     """Shared per-account logic: insert brand-new posts from `items`, then
     refresh likes/comments (and do the one-time HOT check) on every existing
@@ -1605,10 +1606,10 @@ def _process_short_term_items(
 
     new_items = [it for it in items if it.get("shortCode") and it["shortCode"] not in existing_shortcodes]
     new_items.sort(key=lambda it: it.get("timestamp") or "")
-    insert_summary = _insert_new_posts(account, cfg, new_items)
+    insert_summary = _insert_new_posts(account, cfg, new_items) if insert_new else {"added": 0, "failed": 0}
     if insert_summary.get("failed"):
         raise ApifySyncError(f"{account}: {insert_summary['failed']} posts failed to persist")
-    transcript_updates = _store_existing_reel_transcripts(account, cfg, items)
+    transcript_updates = _store_existing_reel_transcripts(account, cfg, items) if insert_new else 0
 
     # Re-read so freshly-inserted posts are also eligible for the engagement
     # pass below (a post that's brand new is, by definition, well within the
@@ -1743,7 +1744,7 @@ def run_short_term_cycle(
     results_limit: int = _SHORT_RESULTS_LIMIT,
     *,
     include_reels: bool = True,
-    lookback_hours: int = _SHORT_LOOKBACK_HOURS,
+    lookback_hours: float = _SHORT_LOOKBACK_HOURS,
 ) -> dict[str, Any]:
     """Single-account entry point: (1) pulls the last ~30h of posts and
     inserts any brand-new ones, and (2) refreshes likes/comments on all
@@ -1772,7 +1773,7 @@ def run_short_term_cycle_batch(
     *,
     include_posts: bool = True,
     include_reels: bool = False,
-    lookback_hours: int = _SHORT_LOOKBACK_HOURS,
+    lookback_hours: float = _SHORT_LOOKBACK_HOURS,
 ) -> dict[str, dict[str, Any]]:
     """Same job as run_short_term_cycle, but for every account in one Apify
     call: a single actor run scrapes all accounts' profile URLs at once
@@ -1821,6 +1822,72 @@ def run_short_term_cycle_batch(
         try:
             results[account] = _process_short_term_items(
                 account, cfg, items_by_account[account], now, lookback_hours=lookback_hours
+            )
+        except Exception as exc:
+            results[account] = {"error": f"processing failed: {exc}"}
+    _reconcile_queue_hot()
+    return results
+
+
+def run_day_engagement_cycle_batch(
+    accounts: list[str],
+    results_limit: int = 100,
+) -> dict[str, dict[str, Any]]:
+    """Refresh likes/comments for posts published since midnight CST.
+
+    This deliberately uses the inexpensive profile-posts actor for every
+    account, including reel-only accounts, but never inserts results. It only
+    updates shortcodes already stored in the database, preserving each
+    account's configured discovery surface while avoiding the Reel actor's
+    transcript-priced endpoint.
+    """
+    if not accounts:
+        return {}
+
+    from .ingestion_jobs import current, now as ingestion_now
+
+    now = ingestion_now()
+    cst = timezone(timedelta(hours=-6))
+    midnight_cst = now.astimezone(cst).replace(hour=0, minute=0, second=0, microsecond=0)
+    lookback_hours = max(
+        1 / 60,
+        (now - midnight_cst.astimezone(UTC)).total_seconds() / 3600,
+    )
+
+    configs: dict[str, dict[str, Any]] = {}
+    results: dict[str, dict[str, Any]] = {}
+    for account in accounts:
+        try:
+            configs[account] = get_account_config(account)
+        except Exception as exc:
+            results[account] = {"error": f"config lookup failed: {exc}"}
+    if not configs:
+        return results
+
+    journal = current()
+    if journal:
+        configs = journal.frozen("configs", configs)
+    collection_configs = {
+        account: {**cfg, "scrape_mode": "posts"}
+        for account, cfg in configs.items()
+    }
+    items_by_account = _collect_short_term_items(
+        collection_configs,
+        results_limit,
+        now,
+        include_posts=True,
+        include_reels=False,
+        lookback_hours=lookback_hours,
+    )
+    for account, cfg in configs.items():
+        try:
+            results[account] = _process_short_term_items(
+                account,
+                cfg,
+                items_by_account[account],
+                now,
+                lookback_hours=lookback_hours,
+                insert_new=False,
             )
         except Exception as exc:
             results[account] = {"error": f"processing failed: {exc}"}

@@ -3,6 +3,7 @@ import sqlite3
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from datetime import UTC, datetime
 import pytest
 from app import db, ingestion_jobs as jobs, apify_sync, scheduler
 
@@ -80,6 +81,25 @@ def test_partial_batch_failure_is_not_success(monkeypatch):
     monkeypatch.setattr(apify_sync, 'run_short_term_cycle_batch', lambda *a, **k: {'a': {'error': 'insert failed'}})
     with pytest.raises(apify_sync.ApifySyncError):
         scheduler._run_short_term_jobs()
+
+
+def test_discovery_resumes_from_last_success_with_small_overlap(monkeypatch):
+    class Journal:
+        state = {"last_success_at": "2026-09-15T12:15:00+00:00"}
+
+    captured = {}
+    monkeypatch.setattr(scheduler, "_active_account_handles", lambda: ["a"])
+    monkeypatch.setattr(jobs, "current", lambda: Journal())
+    monkeypatch.setattr(jobs, "now", lambda: datetime(2026, 9, 15, 13, 0, tzinfo=UTC))
+    monkeypatch.setattr(apify_sync, "run_short_term_cycle_batch", lambda accounts, **kwargs: (
+        captured.update(accounts=accounts, **kwargs) or {"a": {}}
+    ))
+
+    scheduler._run_short_term_jobs()
+
+    assert captured["accounts"] == ["a"]
+    assert captured["lookback_hours"] == pytest.approx(50 / 60)
+    assert captured["results_limit"] == 10
 
 
 def test_restart_after_poll_failure_resumes_run(database, monkeypatch):
