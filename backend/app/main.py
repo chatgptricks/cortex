@@ -2014,7 +2014,10 @@ def _caption_generation_context(source_account: str, shortcode: str, target_acco
     ][:6]
     return {
         "source_account": clean_source,
-        "source_caption": source_caption[:8_000],
+        # Instagram captions are normally far below this size, but the
+        # generator must receive the complete stored source rather than a
+        # silently truncated version.
+        "source_caption": source_caption,
         "target_account": clean_target,
         "target_label": str(target_config.get("label") or clean_target),
         "style_examples": examples,
@@ -2061,6 +2064,7 @@ def _caption_policy_violations(caption: str, target_account: str, remove_manycha
 def _openai_caption_text(
     context: dict[str, Any],
     remove_manychat_automation: bool = False,
+    previous_caption: str = "",
 ) -> tuple[str, str]:
     """Generate one adapted caption through OpenAI's stateless Responses API."""
     import httpx
@@ -2080,6 +2084,7 @@ Preserve a genuine editorial source, photo, video, or creator credit only when t
 Rebuild every promotional CTA for TARGET_ACCOUNT. A follow or subscribe CTA may mention only TARGET_ACCOUNT; never preserve or promote the source account or any other account from SOURCE_CAPTION.
 When REMOVE_MANYCHAT_AUTOMATION is true, completely remove comment-keyword, DM-keyword, and "I will send you" automations, including the keyword and delivery promise. Do not replace them with another engagement automation.
 When REMOVE_MANYCHAT_AUTOMATION is false, you may retain the automation mechanic and keyword when it is central to the source, but it must be written for TARGET_ACCOUNT and must not direct users to another account.
+When PREVIOUS_CAPTION is present, this is a regeneration. Produce a meaningfully different alternative: use a different opening, sentence structure, and CTA wording while preserving the source's supported facts.
 Match the target examples' usual language, length, paragraph rhythm, emoji, CTA, and hashtag habits when the examples make them clear; otherwise keep the source language.
 Do not mention this task, the source account, imitation, rewriting, or AI. Return only the finished caption with no label, quotation marks, or Markdown fence."""
     request_context = {
@@ -2089,6 +2094,9 @@ Do not mention this task, the source account, imitation, rewriting, or AI. Retur
         "SOURCE_CAPTION": context["source_caption"],
         "STYLE_EXAMPLES": context["style_examples"],
     }
+    clean_previous_caption = previous_caption.strip()
+    if clean_previous_caption:
+        request_context["PREVIOUS_CAPTION"] = clean_previous_caption
 
     def request_caption(input_payload: dict[str, Any], request_instructions: str) -> str:
         input_text = json.dumps(input_payload, ensure_ascii=False)
@@ -2149,6 +2157,25 @@ Do not mention this task, the source account, imitation, rewriting, or AI. Retur
     caption_words = re.sub(r"\s+", " ", caption).strip().casefold()
     if caption_words == source_words:
         raise HTTPException(status_code=502, detail="The AI repeated the original caption. Generate another version.")
+    previous_words = re.sub(r"\s+", " ", clean_previous_caption).strip().casefold()
+    if previous_words and caption_words == previous_words:
+        caption = request_caption(
+            {
+                **request_context,
+                "DRAFT_TO_REPLACE": caption,
+            },
+            instructions
+            + "\n\n# Regeneration\nDRAFT_TO_REPLACE repeated PREVIOUS_CAPTION. Write a clearly different alternative and return only that new caption.",
+        )
+        caption_words = re.sub(r"\s+", " ", caption).strip().casefold()
+        retry_violations = _caption_policy_violations(caption, context["target_account"], remove_manychat_automation)
+        if not caption or caption_words in {previous_words, source_words} or retry_violations:
+            logging.getLogger(__name__).error(
+                "OpenAI caption regeneration failed validation: repeated=%s violations=%s",
+                caption_words in {previous_words, source_words},
+                retry_violations,
+            )
+            raise HTTPException(status_code=502, detail="The AI could not produce a valid new caption. Regenerate again.")
     return caption[:12_000], model
 
 
@@ -2159,10 +2186,15 @@ def dashboard_generate_caption(
     shortcode: Annotated[str, Form()],
     target_account: Annotated[str, Form()],
     remove_manychat_automation: Annotated[bool, Form()] = False,
+    previous_caption: Annotated[str, Form()] = "",
 ) -> dict[str, Any]:
     """Generate an editable, account-adapted alternative to a source caption."""
     context = _caption_generation_context(source_account, shortcode, target_account)
-    caption, model = _openai_caption_text(context, remove_manychat_automation=remove_manychat_automation)
+    caption, model = _openai_caption_text(
+        context,
+        remove_manychat_automation=remove_manychat_automation,
+        previous_caption=previous_caption,
+    )
     return {
         "caption": caption,
         "targetAccount": context["target_account"],

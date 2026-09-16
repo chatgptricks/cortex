@@ -60,6 +60,23 @@ def test_caption_context_uses_owned_account_voice(monkeypatch, tmp_path):
     assert context["style_examples"] == ["Our recent voice"]
 
 
+def test_caption_context_keeps_the_complete_source(monkeypatch, tmp_path):
+    connect = _caption_db(tmp_path)
+    complete_caption = "Start " + ("complete source text " * 500) + "End"
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dashboard_posts SET caption = ? WHERE account = 'source' AND shortcode = 'SRC1'",
+            (complete_caption,),
+        )
+    monkeypatch.setattr(main, "connect", connect)
+
+    context = main._caption_generation_context("source", "SRC1", "ours")
+
+    assert len(complete_caption) > 8_000
+    assert context["source_caption"] == complete_caption
+    assert context["source_caption"].endswith("End")
+
+
 def test_caption_context_rejects_competitor_destination(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "connect", _caption_db(tmp_path))
 
@@ -90,7 +107,7 @@ def test_caption_endpoint_returns_editable_result(monkeypatch):
     )
     request = SimpleNamespace(state=SimpleNamespace(user_email="writer@example.com"))
 
-    result = main.dashboard_generate_caption(request, "source", "SRC1", "ours", True)
+    result = main.dashboard_generate_caption(request, "source", "SRC1", "ours", True, "Earlier draft")
 
     assert result == {
         "caption": "A genuinely new caption",
@@ -98,7 +115,7 @@ def test_caption_endpoint_returns_editable_result(monkeypatch):
         "model": "gpt-5-mini",
         "generatedBy": "writer@example.com",
     }
-    assert generated == {"remove_manychat_automation": True}
+    assert generated == {"remove_manychat_automation": True, "previous_caption": "Earlier draft"}
 
 
 def test_openai_caption_request_is_stateless_and_parses_output(monkeypatch):
@@ -206,3 +223,49 @@ def test_openai_repairs_foreign_promotional_cta(monkeypatch):
     assert caption == "Follow @ours for more."
     assert len(calls) == 2
     assert "POLICY_VIOLATIONS" in calls[1]["input"]
+
+
+def test_regenerate_sends_previous_caption_and_retries_an_identical_result(monkeypatch):
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"output": [{"type": "message", "content": [{"type": "output_text", "text": self.text}]}]}
+
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def post(self, _url, **kwargs):
+            calls.append(kwargs["json"])
+            return Response("Earlier draft" if len(calls) == 1 else "A clearly different caption")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-secret")
+    monkeypatch.setattr(httpx, "Client", Client)
+    context = {
+        "target_account": "ours",
+        "target_label": "Our Brand",
+        "source_caption": "Complete original source caption",
+        "style_examples": ["Our recent voice"],
+    }
+
+    caption, _ = main._openai_caption_text(context, previous_caption="Earlier draft")
+
+    assert caption == "A clearly different caption"
+    assert len(calls) == 2
+    assert '"PREVIOUS_CAPTION": "Earlier draft"' in calls[0]["input"]
+    assert "DRAFT_TO_REPLACE" in calls[1]["input"]
