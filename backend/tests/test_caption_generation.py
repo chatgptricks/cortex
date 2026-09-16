@@ -107,15 +107,20 @@ def test_caption_endpoint_returns_editable_result(monkeypatch):
     )
     request = SimpleNamespace(state=SimpleNamespace(user_email="writer@example.com"))
 
-    result = main.dashboard_generate_caption(request, "source", "SRC1", "ours", True, "Earlier draft")
+    result = main.dashboard_generate_caption(request, "source", "SRC1", "ours", True, "Earlier draft", "es")
 
     assert result == {
         "caption": "A genuinely new caption",
         "targetAccount": "ours",
+        "outputLanguage": "es",
         "model": "gpt-5-mini",
         "generatedBy": "writer@example.com",
     }
-    assert generated == {"remove_manychat_automation": True, "previous_caption": "Earlier draft"}
+    assert generated == {
+        "remove_manychat_automation": True,
+        "previous_caption": "Earlier draft",
+        "output_language": "es",
+    }
 
 
 def test_openai_caption_request_is_stateless_and_parses_output(monkeypatch):
@@ -161,6 +166,7 @@ def test_openai_caption_request_is_stateless_and_parses_output(monkeypatch):
     assert captured["json"]["store"] is False
     assert captured["json"]["input"].find("Original caption") >= 0
     assert captured["json"]["input"].find('"REMOVE_MANYCHAT_AUTOMATION": false') >= 0
+    assert captured["json"]["input"].find('"OUTPUT_LANGUAGE": "the same language as SOURCE_CAPTION"') >= 0
     assert captured["headers"]["Authorization"] == "Bearer test-secret"
 
 
@@ -172,6 +178,56 @@ def test_caption_policy_rejects_foreign_follow_cta_and_requested_manychat():
     assert len(violations) == 2
     assert "@source" in violations[0]
     assert "comment/DM" in violations[1]
+
+
+def test_caption_generation_sends_explicit_output_language(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "Caption en español"}]}]}
+
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def post(self, _url, **kwargs):
+            captured.update(kwargs)
+            return Response()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-secret")
+    monkeypatch.setattr(httpx, "Client", Client)
+    context = {
+        "target_account": "ours",
+        "target_label": "Our Brand",
+        "source_caption": "Original caption",
+        "style_examples": ["Our recent voice"],
+    }
+
+    caption, _ = main._openai_caption_text(context, output_language="es")
+
+    assert caption == "Caption en español"
+    assert '"OUTPUT_LANGUAGE": "Spanish"' in captured["json"]["input"]
+
+
+def test_caption_generation_rejects_unknown_output_language(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-secret")
+
+    with pytest.raises(HTTPException) as error:
+        main._openai_caption_text({}, output_language="klingon")
+
+    assert error.value.status_code == 400
 
 
 def test_caption_policy_accepts_selected_account_cta_without_manychat():
