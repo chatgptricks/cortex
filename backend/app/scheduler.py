@@ -114,7 +114,7 @@ def _bucket_key(now_cst: datetime) -> str:
 
 
 def _engagement_bucket_key(now_cst: datetime) -> str:
-    """Three-hour CST slot used by the current-day count refresh."""
+    """Three-hour CST slot used by the rolling first-eight-hours refresh."""
     slot_hour = (now_cst.hour // _DAY_ENGAGEMENT_INTERVAL_HOURS) * _DAY_ENGAGEMENT_INTERVAL_HOURS
     return f"{now_cst:%Y-%m-%d}T{slot_hour:02d}:00"
 
@@ -169,13 +169,13 @@ def _run_day_engagement_jobs() -> None:
 
     accounts = _active_account_handles()
     if not accounts:
-        logger.warning("Current-day engagement cycle skipped: no active accounts")
+        logger.warning("Eight-hour engagement cycle skipped: no active accounts")
         return
     results = run_day_engagement_cycle_batch(accounts)
     failures = {account: result for account, result in results.items() if result.get("error")}
     if failures:
         raise ApifySyncError(str(failures))
-    logger.info("Current-day engagement cycle: %s", results)
+    logger.info("Eight-hour engagement cycle: %s", results)
 
 
 def _run_daily_jobs() -> None:
@@ -382,7 +382,7 @@ def start_scheduler() -> None:
         _thread.start()
     logger.info(
         "Engagement scheduler started (short-term: every 45min 6:15am-11:15pm CST; "
-        "hourly overnight; current-day counts: every 3h; daily: 7:00am fixed CST)"
+        "hourly overnight; first-eight-hour counts: every 3h; daily: 7:00am fixed CST)"
     )
 
 

@@ -58,7 +58,7 @@ def test_scheduler_uses_requested_45_minute_window():
     assert scheduler._bucket_key(datetime(2026, 9, 5, 6, 14, tzinfo=cst)) == "2026-09-05T06:00"
 
 
-def test_scheduler_refreshes_current_day_engagement_every_three_hours():
+def test_scheduler_refreshes_first_eight_hour_engagement_every_three_hours():
     from datetime import datetime, timedelta, timezone
 
     cst = timezone(timedelta(hours=-6))

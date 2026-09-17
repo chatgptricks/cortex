@@ -1355,6 +1355,11 @@ _HOT_MIN_AGE_HOURS = 0.5
 logger = logging.getLogger(__name__)
 
 _SHORT_LOOKBACK_HOURS = 2
+_EIGHT_HOUR_ENGAGEMENT_WINDOW = 8
+# The scheduler runs this pass every three hours. Looking back one full slot
+# beyond the visible eight-hour window guarantees every post is observed once
+# after it crosses 8h, including posts published before the CST day boundary.
+_EIGHT_HOUR_FINALIZATION_LOOKBACK = 11
 # Per-account retries in the daily snapshot job. The job fires once a day and
 # its data can't be backfilled, so a transient Apify timeout on one profile
 # would otherwise cost that account a permanent hole in its history.
@@ -1587,6 +1592,8 @@ def _process_short_term_items(
     *,
     lookback_hours: float = _SHORT_LOOKBACK_HOURS,
     insert_new: bool = True,
+    refresh_window_hours: float | None = None,
+    finalize_after_hours: float | None = None,
 ) -> dict[str, Any]:
     """Shared per-account logic: insert brand-new posts from `items`, then
     refresh likes/comments (and do the one-time HOT check) on every existing
@@ -1616,7 +1623,7 @@ def _process_short_term_items(
     # <=24h window).
     with connect() as conn:
         rows = conn.execute(
-            f"SELECT id, shortcode, published_at, hot_checked FROM {table} WHERE 1=1{scope_sql}", scope_params
+            f"SELECT id, shortcode, published_at, hot_checked, refreshed_8h FROM {table} WHERE 1=1{scope_sql}", scope_params
         ).fetchall()
 
     eligible: dict[str, dict[str, Any]] = {}
@@ -1631,11 +1638,23 @@ def _process_short_term_items(
         # broken. Keep the two in lockstep.
         if age_hours is None or age_hours > lookback_hours:
             continue
-        eligible[shortcode] = {"id": row["id"], "hot_checked": bool(row["hot_checked"]), "age_hours": age_hours}
+        finalize_8h = (
+            finalize_after_hours is not None
+            and age_hours >= finalize_after_hours
+            and not bool(row["refreshed_8h"])
+        )
+        if refresh_window_hours is not None and age_hours > refresh_window_hours and not finalize_8h:
+            continue
+        eligible[shortcode] = {
+            "id": row["id"],
+            "hot_checked": bool(row["hot_checked"]),
+            "age_hours": age_hours,
+            "finalize_8h": finalize_8h,
+        }
 
     items_by_shortcode = {it.get("shortCode"): it for it in items if it.get("shortCode")}
     now_iso = utc_now()
-    engagement_summary: dict[str, Any] = {"checked": len(eligible), "updated": 0, "hot_marked": 0, "unmatched": 0}
+    engagement_summary: dict[str, Any] = {"checked": len(eligible), "updated": 0, "finalized_8h": 0, "hot_marked": 0, "unmatched": 0}
     pending_alerts: list[dict[str, Any]] = []
 
     for shortcode, info in eligible.items():
@@ -1652,6 +1671,10 @@ def _process_short_term_items(
         if comments is not None:
             set_clauses.append("comments = ?")
             params.append(comments)
+        if info["finalize_8h"] and _likes_are_known(item.get("likesCount")):
+            set_clauses += ["likes_at_8h = ?", "comments_at_8h = ?", "refreshed_8h = 1"]
+            params += [likes, comments]
+            engagement_summary["finalized_8h"] += 1
         # Only run the one-time HOT check when the like count is real. With an
         # unknown/hidden count, _apply_likes_floor returns the 500 baseline,
         # which at the ~1h mark computes to a rate of ~500/hr and would
@@ -1833,13 +1856,15 @@ def run_day_engagement_cycle_batch(
     accounts: list[str],
     results_limit: int = 100,
 ) -> dict[str, dict[str, Any]]:
-    """Refresh likes/comments for posts published since midnight CST.
+    """Refresh likes/comments throughout each post's first eight hours.
 
     This deliberately uses the inexpensive profile-posts actor for every
     account, including reel-only accounts, but never inserts results. It only
-    updates shortcodes already stored in the database, preserving each
-    account's configured discovery surface while avoiding the Reel actor's
-    transcript-priced endpoint.
+    updates shortcodes already stored in the database. The extra three-hour
+    lookback catches each post once after its 8h Harvey-ball window expires,
+    stores that final first-eight-hours snapshot, and then stops refreshing it
+    in this cycle. A rolling window also covers late-night posts after CST
+    midnight, which the former current-calendar-day query silently missed.
     """
     if not accounts:
         return {}
@@ -1847,12 +1872,7 @@ def run_day_engagement_cycle_batch(
     from .ingestion_jobs import current, now as ingestion_now
 
     now = ingestion_now()
-    cst = timezone(timedelta(hours=-6))
-    midnight_cst = now.astimezone(cst).replace(hour=0, minute=0, second=0, microsecond=0)
-    lookback_hours = max(
-        1 / 60,
-        (now - midnight_cst.astimezone(UTC)).total_seconds() / 3600,
-    )
+    lookback_hours = _EIGHT_HOUR_FINALIZATION_LOOKBACK
 
     configs: dict[str, dict[str, Any]] = {}
     results: dict[str, dict[str, Any]] = {}
@@ -1888,6 +1908,8 @@ def run_day_engagement_cycle_batch(
                 now,
                 lookback_hours=lookback_hours,
                 insert_new=False,
+                refresh_window_hours=_EIGHT_HOUR_ENGAGEMENT_WINDOW,
+                finalize_after_hours=_EIGHT_HOUR_ENGAGEMENT_WINDOW,
             )
         except Exception as exc:
             results[account] = {"error": f"processing failed: {exc}"}
@@ -1904,7 +1926,7 @@ def _recovery_result() -> dict[str, Any]:
     """
     return {
         "new_posts": {"added": 0, "failed": 0},
-        "engagement": {"checked": 0, "updated": 0, "hot_marked": 0, "unmatched": 0},
+        "engagement": {"checked": 0, "updated": 0, "finalized_8h": 0, "hot_marked": 0, "unmatched": 0},
         "transcripts_updated": 0,
     }
 
