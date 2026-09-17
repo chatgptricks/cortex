@@ -180,6 +180,9 @@ def init_db() -> None:
                 cover_image_path TEXT,
                 is_hot INTEGER NOT NULL DEFAULT 0,
                 likes_at_1h INTEGER,
+                likes_at_8h INTEGER,
+                comments_at_8h INTEGER,
+                refreshed_8h INTEGER NOT NULL DEFAULT 0,
                 hot_checked INTEGER NOT NULL DEFAULT 0,
                 hot_marked_at TEXT,
                 hot_rate_multiplier REAL,
@@ -586,6 +589,9 @@ def init_db() -> None:
             # post. Keep that fact on the source row instead of silently
             # leaving a card that looks current.
             _ensure_column(conn, _post_table, "is_deleted", "is_deleted INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, _post_table, "likes_at_8h", "likes_at_8h INTEGER")
+            _ensure_column(conn, _post_table, "comments_at_8h", "comments_at_8h INTEGER")
+            _ensure_column(conn, _post_table, "refreshed_8h", "refreshed_8h INTEGER NOT NULL DEFAULT 0")
         # audio_id was added to extract_apify_fields after ~5.5k posts already had
         # raw_json captured -- backfill it from the payload we already paid for
         # instead of waiting for those rows to be re-scraped. Cheap once caught up:
@@ -648,6 +654,9 @@ def init_db() -> None:
         # Engagement-refresh / HOT-detection tracking (see apify_sync.py).
         _ensure_column(conn, "posts", "is_hot", "is_hot INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "posts", "likes_at_1h", "likes_at_1h INTEGER")
+        _ensure_column(conn, "posts", "likes_at_8h", "likes_at_8h INTEGER")
+        _ensure_column(conn, "posts", "comments_at_8h", "comments_at_8h INTEGER")
+        _ensure_column(conn, "posts", "refreshed_8h", "refreshed_8h INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "posts", "hot_checked", "hot_checked INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "posts", "hot_marked_at", "hot_marked_at TEXT")
         _ensure_column(conn, "posts", "refreshed_30d", "refreshed_30d INTEGER NOT NULL DEFAULT 0")
@@ -955,6 +964,9 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     for table in ("posts", "dashboard_posts"):
         if conn.execute(f"PRAGMA table_info({table})").fetchall():
             _ensure_column(conn, table, "is_deleted", "is_deleted INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, table, "likes_at_8h", "likes_at_8h INTEGER")
+            _ensure_column(conn, table, "comments_at_8h", "comments_at_8h INTEGER")
+            _ensure_column(conn, table, "refreshed_8h", "refreshed_8h INTEGER NOT NULL DEFAULT 0")
     # Queue closure now stores one Instagram permalink per destination. The
     # managed Postgres import predates this field, so omitting it makes the
     # post feed and Queue reads fail before they can return the existing data.

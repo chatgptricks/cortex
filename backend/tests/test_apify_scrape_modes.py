@@ -74,7 +74,7 @@ def test_manual_post_catch_up_can_extend_the_normal_posts_window() -> None:
     assert payload["onlyPostsNewerThan"] == "2026-09-03T18:00:00Z"
 
 
-def test_current_day_engagement_uses_cst_midnight_and_never_inserts(monkeypatch) -> None:
+def test_eight_hour_engagement_uses_rolling_window_and_never_inserts(monkeypatch) -> None:
     now = datetime(2026, 9, 5, 15, 0, tzinfo=UTC)  # 09:00 CST
     captured: dict = {}
 
@@ -97,8 +97,70 @@ def test_current_day_engagement_uses_cst_midnight_and_never_inserts(monkeypatch)
     assert result["account"]["engagement"]["updated"] == 0
     assert captured["configs"]["account"]["scrape_mode"] == "posts"
     assert captured["kwargs"]["include_reels"] is False
-    assert captured["kwargs"]["lookback_hours"] == 9
+    assert captured["kwargs"]["lookback_hours"] == 11
     assert captured["process_kwargs"]["insert_new"] is False
+    assert captured["process_kwargs"]["refresh_window_hours"] == 8
+    assert captured["process_kwargs"]["finalize_after_hours"] == 8
+
+
+def test_eight_hour_engagement_finalizes_once_after_harvey_ball_expires(monkeypatch, tmp_path) -> None:
+    now = datetime(2026, 9, 5, 15, 0, tzinfo=UTC)
+    path = tmp_path / "eight-hour.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE dashboard_posts (
+                id INTEGER PRIMARY KEY, account TEXT, shortcode TEXT, published_at TEXT,
+                likes INTEGER, comments INTEGER, hot_checked INTEGER NOT NULL DEFAULT 1,
+                likes_at_8h INTEGER, comments_at_8h INTEGER,
+                refreshed_8h INTEGER NOT NULL DEFAULT 0, updated_at TEXT
+            )"""
+        )
+        connection.executemany(
+            "INSERT INTO dashboard_posts VALUES (?, 'account', ?, ?, 10, 1, 1, NULL, NULL, ?, '')",
+            [
+                (1, "inside", "2026-09-05T08:00:00+00:00", 0),
+                (2, "crossed", "2026-09-05T06:30:00+00:00", 0),
+                (3, "done", "2026-09-05T06:00:00+00:00", 1),
+            ],
+        )
+
+    @contextmanager
+    def connect():
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    monkeypatch.setattr(db, "connect", connect)
+    monkeypatch.setattr(db, "utc_now", lambda: now.isoformat())
+    result = apify_sync._process_short_term_items(
+        "account",
+        {"table": "dashboard_posts", "group": "sentient", "hot_threshold": 600},
+        [
+            {"shortCode": "inside", "likesCount": 70, "commentsCount": 7},
+            {"shortCode": "crossed", "likesCount": 85, "commentsCount": 8},
+            {"shortCode": "done", "likesCount": 999, "commentsCount": 99},
+        ],
+        now,
+        lookback_hours=11,
+        insert_new=False,
+        refresh_window_hours=8,
+        finalize_after_hours=8,
+    )
+
+    assert result["engagement"]["updated"] == 2
+    assert result["engagement"]["finalized_8h"] == 1
+    with connect() as connection:
+        inside = connection.execute("SELECT * FROM dashboard_posts WHERE shortcode = 'inside'").fetchone()
+        crossed = connection.execute("SELECT * FROM dashboard_posts WHERE shortcode = 'crossed'").fetchone()
+        done = connection.execute("SELECT * FROM dashboard_posts WHERE shortcode = 'done'").fetchone()
+    assert (inside["likes"], inside["refreshed_8h"], inside["likes_at_8h"]) == (70, 0, None)
+    assert (crossed["likes"], crossed["comments"], crossed["refreshed_8h"]) == (85, 8, 1)
+    assert (crossed["likes_at_8h"], crossed["comments_at_8h"]) == (85, 8)
+    assert (done["likes"], done["comments"]) == (10, 1)
 
 
 def test_manual_reel_catch_up_can_extend_the_reels_window() -> None:
