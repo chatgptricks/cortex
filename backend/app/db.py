@@ -735,6 +735,70 @@ def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: 
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
+_ACCOUNT_SUBCATEGORIES = {
+    "ai_automation": (
+        "ai.excel", "ainterestingupdate", "artificialcoding", "artificialmente.ia",
+        "artificialntellligence", "chatgptips", "chatgptricks", "em3rging",
+        "evolving", "evolvingscience.ai", "planet.ai_", "tecnologia", "trends",
+        "woopleai", "acknowledge.ai", "airesearches", "aitoolhub.co", "alpacka.ai",
+        "artificialintelligenceee", "chatgpt", "eluna.ai", "evolving.ai", "getintoai",
+        "ingenia.ai", "longliveai", "mavgpt", "ohmo.ai", "openai", "rowancheung",
+        "theartificialintelligence", "theglitchnews", "therundownai", "uncover.ai",
+        "weplash.ai",
+    ),
+    "technology_science": (
+        "coderss_world", "futuretech", "galaxies", "innovation", "metav3rse",
+        "robotic", "technology", "techskills",
+    ),
+    "business_growth": (
+        "millonariosgigantes", "passionateincome", "a16z", "canal.mutuo",
+        "daytrading", "entrepreneurbeingentrepreneur", "entrepreneursonig",
+        "growasentrepreneurs", "nick_saraev", "profit", "reputeforge",
+        "simplyougrow", "thevarunmayya",
+    ),
+    "lifestyle_community": (
+        "costarica", "stoicreflections", "traselveloreal", "afterismm",
+        "esc8pe.reality",
+    ),
+    "news_entertainment": ("dexerto", "series"),
+    "personal_brand": ("aigleeson", "ivanelgrande", "sergioprompts"),
+}
+
+
+def _ensure_account_scope_schema(conn: Any) -> None:
+    """Add public categories, subcategories, and per-tool visibility.
+
+    `group_name` keeps its two-value legacy CHECK constraint. `category` is
+    the product-facing value and may additionally be `leads`.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+    if not existing:
+        return
+    added_research = "research_enabled" not in existing
+    added_promos = "promos_enabled" not in existing
+    added_subcategory = "subcategory" not in existing
+    _ensure_column(conn, "accounts", "category", "category TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "accounts", "subcategory", "subcategory TEXT NOT NULL DEFAULT 'other'")
+    _ensure_column(conn, "accounts", "research_enabled", "research_enabled INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(conn, "accounts", "promos_enabled", "promos_enabled INTEGER NOT NULL DEFAULT 0")
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+    if {"category", "group_name"}.issubset(columns):
+        conn.execute("UPDATE accounts SET category = group_name WHERE category IS NULL OR category = ''")
+    if added_research and {"research_enabled", "category"}.issubset(columns):
+        conn.execute("UPDATE accounts SET research_enabled = CASE WHEN category = 'leads' THEN 0 ELSE 1 END")
+    if added_promos and {"promos_enabled", "category"}.issubset(columns):
+        conn.execute(
+            "UPDATE accounts SET promos_enabled = CASE WHEN category IN ('competitors', 'leads') THEN 1 ELSE 0 END"
+        )
+    if added_subcategory and {"handle", "subcategory"}.issubset(columns):
+        for subcategory, handles in _ACCOUNT_SUBCATEGORIES.items():
+            placeholders = ",".join("?" for _ in handles)
+            conn.execute(
+                f"UPDATE accounts SET subcategory = ? WHERE handle IN ({placeholders})",
+                (subcategory, *handles),
+            )
+
+
 _QUEUE_TICKET_COLUMNS = (
     "id",
     "ticket_type",
@@ -938,6 +1002,7 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     # on its first account read after deployment.
     _ensure_column(conn, "accounts", "scrape_mode", "scrape_mode TEXT NOT NULL DEFAULT 'posts'")
     _ensure_column(conn, "accounts", "is_active", "is_active INTEGER NOT NULL DEFAULT 1")
+    _ensure_account_scope_schema(conn)
     # The original @chatgptricks catalogue lives in `posts`. A legacy account
     # row created before the multi-account registry could retain the default
     # `is_canonical = 0`, which silently made Research omit the entire

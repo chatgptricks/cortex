@@ -32,7 +32,16 @@ def _emit(on_progress: ProgressFn, **fields: Any) -> None:
     except Exception:
         pass
 
-VALID_GROUPS = ("sentient", "competitors")
+VALID_GROUPS = ("sentient", "competitors", "leads")
+VALID_SUBCATEGORIES = (
+    "ai_automation",
+    "technology_science",
+    "business_growth",
+    "lifestyle_community",
+    "news_entertainment",
+    "personal_brand",
+    "other",
+)
 
 # The only canonical account is chatgptricks -- it lives in the original
 # `posts` dataset. Every other account (self-serve or seeded) lives in the
@@ -59,10 +68,14 @@ def get_account_config(handle: str) -> dict[str, Any]:
         raise ApifySyncError(f"Unknown account '{handle}'.")
     is_canonical = bool(row["is_canonical"])
     scrape_mode = row["scrape_mode"] if "scrape_mode" in row.keys() else "posts"
+    category = row["category"] if "category" in row.keys() and row["category"] else row["group_name"]
     return {
         "handle": row["handle"],
         "label": row["label"],
-        "group": row["group_name"],
+        "group": category,
+        "subcategory": row["subcategory"] if "subcategory" in row.keys() else "other",
+        "research_enabled": bool(row["research_enabled"]) if "research_enabled" in row.keys() else True,
+        "promos_enabled": bool(row["promos_enabled"]) if "promos_enabled" in row.keys() else row["group_name"] == "competitors",
         "hot_threshold": row["hot_threshold"],
         "scrape_mode": scrape_mode if scrape_mode in VALID_SCRAPE_MODES else "posts",
         "is_canonical": is_canonical,
@@ -71,20 +84,34 @@ def get_account_config(handle: str) -> dict[str, Any]:
     }
 
 
-def list_accounts(active_only: bool = False) -> list[dict[str, Any]]:
+def list_accounts(
+    active_only: bool = False,
+    research_only: bool = False,
+    promos_only: bool = False,
+) -> list[dict[str, Any]]:
     from .db import connect
 
     query = "SELECT * FROM accounts"
+    clauses: list[str] = []
     if active_only:
-        query += " WHERE is_active = 1"
-    query += " ORDER BY group_name, handle"
+        clauses.append("is_active = 1")
+    if research_only:
+        clauses.append("research_enabled = 1")
+    if promos_only:
+        clauses.append("promos_enabled = 1")
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY category, handle"
     with connect() as conn:
         rows = conn.execute(query).fetchall()
     return [
         {
             "handle": row["handle"],
             "label": row["label"],
-            "group": row["group_name"],
+            "group": row["category"] if "category" in row.keys() and row["category"] else row["group_name"],
+            "subcategory": row["subcategory"] if "subcategory" in row.keys() else "other",
+            "research_enabled": bool(row["research_enabled"]) if "research_enabled" in row.keys() else True,
+            "promos_enabled": bool(row["promos_enabled"]) if "promos_enabled" in row.keys() else row["group_name"] == "competitors",
             "hot_threshold": row["hot_threshold"],
             "scrape_mode": row["scrape_mode"] if "scrape_mode" in row.keys() and row["scrape_mode"] in VALID_SCRAPE_MODES else "posts",
             "is_canonical": bool(row["is_canonical"]),
@@ -96,7 +123,14 @@ def list_accounts(active_only: bool = False) -> list[dict[str, Any]]:
 
 
 def create_account(
-    handle: str, label: str, group: str, hot_threshold: int, scrape_mode: str = "posts"
+    handle: str,
+    label: str,
+    group: str,
+    hot_threshold: int,
+    scrape_mode: str = "posts",
+    subcategory: str = "other",
+    research_enabled: bool | None = None,
+    promos_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Self-serve account creation. Always non-canonical -- new accounts
     always write into the generic dashboard_posts table, never `posts`.
@@ -110,7 +144,15 @@ def create_account(
         raise ApifySyncError(f"Group must be one of {VALID_GROUPS}.")
     if scrape_mode not in VALID_SCRAPE_MODES:
         raise ApifySyncError(f"Scrape mode must be one of {VALID_SCRAPE_MODES}.")
+    if subcategory not in VALID_SUBCATEGORIES:
+        raise ApifySyncError(f"Subcategory must be one of {VALID_SUBCATEGORIES}.")
     label = (label or handle).strip()
+    legacy_group = "sentient" if group == "sentient" else "competitors"
+    if group == "leads":
+        research_enabled, promos_enabled = False, True
+    else:
+        research_enabled = True if research_enabled is None else bool(research_enabled)
+        promos_enabled = group == "competitors" if promos_enabled is None else bool(promos_enabled)
     now_iso = utc_now()
 
     with connect() as conn:
@@ -119,10 +161,17 @@ def create_account(
             raise ApifySyncError(f"Account '{handle}' already exists.")
         conn.execute(
             """
-            INSERT INTO accounts (handle, label, group_name, hot_threshold, scrape_mode, is_canonical, is_active, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?)
+            INSERT INTO accounts
+                (handle, label, group_name, category, subcategory, research_enabled,
+                 promos_enabled, hot_threshold, scrape_mode, is_canonical, is_active,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
             """,
-            (handle, label, group, hot_threshold, scrape_mode, now_iso, now_iso),
+            (
+                handle, label, legacy_group, group, subcategory,
+                int(research_enabled), int(promos_enabled), hot_threshold,
+                scrape_mode, now_iso, now_iso,
+            ),
         )
 
     return get_account_config(handle)
@@ -1275,8 +1324,8 @@ def _insert_new_dashboard_posts(
         # immediately, while the durable backfill repairs older rows.
         try:
             with connect() as promo_conn:
-                account_row = promo_conn.execute("SELECT group_name FROM accounts WHERE handle = ?", (account,)).fetchone()
-            if account_row and dict(account_row).get("group_name") == "competitors":
+                account_row = promo_conn.execute("SELECT promos_enabled FROM accounts WHERE handle = ?", (account,)).fetchone()
+            if account_row and bool(dict(account_row).get("promos_enabled")):
                 from .promos import analyze_post
                 analyze_post({
                     "account": account, "shortcode": shortcode,

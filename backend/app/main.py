@@ -32,6 +32,7 @@ from starlette.concurrency import run_in_threadpool
 from .apify_sync import (
     VALID_GROUPS,
     VALID_SCRAPE_MODES,
+    VALID_SUBCATEGORIES,
     ApifySyncError,
     create_account,
     fetch_and_store_avatar,
@@ -512,7 +513,7 @@ def dashboard_accounts() -> dict[str, Any]:
     Sentient Dash. New accounts are added via POST /api/admin/accounts --
     no code changes or redeploys needed to add the next one.
     """
-    return {"accounts": list_accounts(active_only=True)}
+    return {"accounts": list_accounts(active_only=True, research_only=True)}
 
 
 def _likes_or_null(raw: Any) -> int | None:
@@ -5675,8 +5676,8 @@ def admin_request_new_account(
     clean = handle.strip().lstrip("@").lower()
     if not re.fullmatch(r"[a-z0-9_.]{1,30}", clean):
         raise HTTPException(status_code=400, detail="Enter a valid Instagram username, not a URL.")
-    if group not in {"sentient", "competitors"}:
-        raise HTTPException(status_code=400, detail="Choose Sentient or Competitors.")
+    if group not in set(VALID_GROUPS):
+        raise HTTPException(status_code=400, detail="Choose Sentient, Competitors, or Leads.")
     description = f"Group: {group}\n{reason.strip()[:1000]}"
     now = utc_now()
     with connect() as conn:
@@ -8463,6 +8464,9 @@ def admin_create_account(
     group: Annotated[str, Form()] = "competitors",
     hot_threshold: Annotated[int, Form()] = 600,
     scrape_mode: Annotated[str, Form()] = "posts",
+    subcategory: Annotated[str, Form()] = "other",
+    research_enabled: Annotated[bool | None, Form()] = None,
+    promos_enabled: Annotated[bool | None, Form()] = None,
 ) -> dict[str, Any]:
     """Self-serve account creation: register a new IG handle under Sentient
     or Competitors, no code changes or redeploy required. Always
@@ -8477,7 +8481,10 @@ def admin_create_account(
     ):
         raise HTTPException(status_code=401, detail="Incorrect refresh password.")
     try:
-        account = create_account(handle, label, group, hot_threshold, scrape_mode)
+        account = create_account(
+            handle, label, group, hot_threshold, scrape_mode, subcategory,
+            research_enabled, promos_enabled,
+        )
     except ApifySyncError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"account": account}
@@ -8491,6 +8498,9 @@ def admin_update_account_settings(
     label: Annotated[str | None, Form()] = None,
     group: Annotated[str | None, Form()] = None,
     scrape_mode: Annotated[str | None, Form()] = None,
+    subcategory: Annotated[str | None, Form()] = None,
+    research_enabled: Annotated[bool | None, Form()] = None,
+    promos_enabled: Annotated[bool | None, Form()] = None,
 ) -> dict[str, Any]:
     """Edit an account's tunables from the dashboard's Settings panel. Only the
     fields actually supplied are changed, so the panel can PATCH one value at a
@@ -8519,8 +8529,25 @@ def admin_update_account_settings(
     if group is not None:
         if group not in VALID_GROUPS:
             raise HTTPException(status_code=400, detail=f"group must be one of {VALID_GROUPS}.")
-        updates.append("group_name = ?")
-        params.append(group)
+        updates.extend(("group_name = ?", "category = ?"))
+        params.extend(("sentient" if group == "sentient" else "competitors", group))
+        if group == "leads":
+            research_enabled, promos_enabled = False, True
+        elif research_enabled is None:
+            research_enabled = group != "leads"
+        if group != "leads" and promos_enabled is None:
+            promos_enabled = group in {"competitors", "leads"}
+    if subcategory is not None:
+        if subcategory not in VALID_SUBCATEGORIES:
+            raise HTTPException(status_code=400, detail=f"subcategory must be one of {VALID_SUBCATEGORIES}.")
+        updates.append("subcategory = ?")
+        params.append(subcategory)
+    if research_enabled is not None:
+        updates.append("research_enabled = ?")
+        params.append(int(research_enabled))
+    if promos_enabled is not None:
+        updates.append("promos_enabled = ?")
+        params.append(int(promos_enabled))
     if scrape_mode is not None:
         if scrape_mode not in VALID_SCRAPE_MODES:
             raise HTTPException(status_code=400, detail=f"scrape_mode must be one of {VALID_SCRAPE_MODES}.")
