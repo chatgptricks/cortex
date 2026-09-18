@@ -120,7 +120,7 @@ def _opportunity_select(extra: str = "") -> str:
 
 def _account_metadata(conn: Any, account: str) -> dict[str, Any]:
     try:
-        row = conn.execute("SELECT group_name AS account_group, label AS account_group_label FROM accounts WHERE handle = ?", (account,)).fetchone()
+        row = conn.execute("SELECT category AS account_group, label AS account_group_label FROM accounts WHERE handle = ?", (account,)).fetchone()
     except Exception:
         # Lightweight promo unit tests and older local databases may not have
         # the shared account catalog yet.
@@ -129,7 +129,7 @@ def _account_metadata(conn: Any, account: str) -> dict[str, Any]:
 
 
 def _post_rows(conn: Any, account: str | None = None, from_date: str | None = None, to_date: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
-    clauses, params = ["a.group_name = 'competitors'", "p.account = a.handle"], []
+    clauses, params = ["a.promos_enabled = 1", "p.account = a.handle"], []
     if account:
         clauses.append("p.account = ?"); params.append(account)
     if from_date:

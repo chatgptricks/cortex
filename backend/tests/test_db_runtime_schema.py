@@ -4,7 +4,12 @@ import sqlite3
 from contextlib import contextmanager
 
 from app import db
-from app.db import _ensure_runtime_schema_extensions, _has_internal_self_assign, seed_queue_role_roster
+from app.db import (
+    _ensure_account_scope_schema,
+    _ensure_runtime_schema_extensions,
+    _has_internal_self_assign,
+    seed_queue_role_roster,
+)
 
 
 def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> None:
@@ -53,6 +58,10 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
         for row in connection.execute("PRAGMA table_info(accounts)").fetchall()
     }
     assert account_columns["scrape_mode"]["dflt_value"] == "'posts'"
+    assert account_columns["category"]["dflt_value"] == "''"
+    assert account_columns["subcategory"]["dflt_value"] == "'other'"
+    assert account_columns["research_enabled"]["dflt_value"] == "1"
+    assert account_columns["promos_enabled"]["dflt_value"] == "0"
     queue_columns = {
         row["name"]: row
         for row in connection.execute("PRAGMA table_info(queue_requests)").fetchall()
@@ -67,6 +76,44 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
         "SELECT hidden_users, row_order FROM queue_scheduler_preferences"
     ).fetchone()
     assert dict(row) == {"hidden_users": "[]", "row_order": "[]"}
+
+
+def test_account_scope_migration_classifies_existing_roster_once() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """CREATE TABLE accounts (
+               handle TEXT PRIMARY KEY,
+               group_name TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+        )"""
+    )
+    connection.executemany(
+        "INSERT INTO accounts (handle, group_name, updated_at) VALUES (?, ?, '')",
+        (("chatgptricks", "sentient"), ("a16z", "competitors"), ("dexerto", "competitors")),
+    )
+
+    _ensure_account_scope_schema(connection)
+    rows = {
+        row["handle"]: dict(row)
+        for row in connection.execute("SELECT * FROM accounts ORDER BY handle").fetchall()
+    }
+    assert rows["chatgptricks"]["category"] == "sentient"
+    assert rows["chatgptricks"]["subcategory"] == "ai_automation"
+    assert rows["chatgptricks"]["research_enabled"] == 1
+    assert rows["chatgptricks"]["promos_enabled"] == 0
+    assert rows["a16z"]["subcategory"] == "business_growth"
+    assert rows["a16z"]["promos_enabled"] == 1
+    assert rows["dexerto"]["subcategory"] == "news_entertainment"
+
+    connection.execute(
+        "UPDATE accounts SET category = 'leads', research_enabled = 0, promos_enabled = 1 WHERE handle = 'a16z'"
+    )
+    _ensure_account_scope_schema(connection)
+    lead = connection.execute("SELECT * FROM accounts WHERE handle = 'a16z'").fetchone()
+    assert lead["category"] == "leads"
+    assert lead["research_enabled"] == 0
+    assert lead["promos_enabled"] == 1
 def test_gabo_is_not_an_internal_self_assignment_exception() -> None:
     assert not _has_internal_self_assign("gabo@sentientagency.io")
 
