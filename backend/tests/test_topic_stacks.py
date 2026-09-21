@@ -135,6 +135,52 @@ def test_find_similar_bootstraps_a_visible_post_without_membership():
     assert result['matchedCount'] == 0
     assert result['members'][0]['postKey'] == 'test:legacy'
 
+
+def test_find_similar_uses_jev_to_rerank_the_lexical_shortlist(monkeypatch):
+    monkeypatch.setenv('TYPESAFE_API_KEY', 'test-key')
+    posts = [
+        post('a', 'OpenAI launches a new reasoning model for coding agents'),
+        post('b', 'OpenAI releases a new reasoning model for software developers and coding agents'),
+        post('c', 'OpenAI announces new model pricing and API billing changes'),
+    ]
+    with db.connect() as connection:
+        connection.execute(
+            'CREATE TABLE dashboard_posts (account TEXT, shortcode TEXT, caption TEXT, published_at TEXT)'
+        )
+        connection.executemany(
+            'INSERT INTO dashboard_posts VALUES (?, ?, ?, ?)',
+            [('test', item['shortcode'], item['caption'], item['postDate']) for item in posts],
+        )
+    topic_stacks.attach(posts)
+    topic_stacks.separate(['test:a', 'test:b', 'test:c'])
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                'answers': {
+                    'candidate_1': {'type': 'noul', 'noul': 0.91},
+                    'candidate_2': {'type': 'noul', 'noul': 0.18},
+                }
+            }
+
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured.update({'url': url, **kwargs})
+        return FakeResponse()
+
+    monkeypatch.setattr('httpx.post', fake_post)
+    result = topic_stacks.find_similar('test:a')
+
+    assert captured['url'] == 'https://api.typesafe.ai/v1/systemone'
+    assert captured['headers']['Authorization'] == 'Bearer test-key'
+    assert captured['json']['model'] == 'jev-latest'
+    assert result['matchedCount'] == 1
+    assert set(result['postKeys']) == {'test:a', 'test:b'}
+
 @pytest.mark.parametrize(('hours', 'shared', 'score', 'coverage'), [
     (8, 3, .16, .20),
     (24, 4, .22, .20),

@@ -1,5 +1,7 @@
 """Shared append-only topic membership. Existing posts are never reclassified."""
 import json
+import logging
+import os
 import re
 import unicodedata
 import uuid
@@ -7,6 +9,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 from .db import connect
+
+logger = logging.getLogger(__name__)
 
 STOP = set('the a an and or of to in on for with from by at is are was were be been this that these those it its as but you your we our they their has have had just new now more most how what when who why can could will would says said than into about after before all not only one out over up so do does did using use used follow swipe comment link bio ai de la el los las un una unos unas y o en con por para del al es son fue ser como que se su sus este esta esto lo le te tu tus ha han mas muy ya pero si no sobre entre hoy nuevo nueva aqui'.split())
 
@@ -206,6 +210,91 @@ def memberships(conn, keys):
     )
     return {'members': [{'postKey': row['post_key'], 'stackId': row['stack_id'], 'stackSize': counts[row['stack_id']]} for row in rows]}
 
+
+def _source_text(conn, post_key):
+    """Load the caption used to semantically compare a stored post."""
+    account, separator, shortcode = post_key.partition(':')
+    if not separator or not account or not shortcode:
+        return ''
+    try:
+        row = conn.execute(
+            'SELECT caption FROM dashboard_posts '
+            'WHERE account = ? AND shortcode = ? LIMIT 1',
+            (account, shortcode),
+        ).fetchone()
+    except Exception:  # pragma: no cover - old schemas may not have dashboard_posts
+        row = None
+    if row:
+        return str(row['caption'] or '').strip()
+    try:
+        row = conn.execute(
+            'SELECT caption, title, hook_text FROM posts '
+            'WHERE shortcode = ? ORDER BY id DESC LIMIT 1',
+            (shortcode,),
+        ).fetchone()
+    except Exception:  # pragma: no cover - old schemas may not have source tables
+        row = None
+    return ' '.join(str(row[field] or '') for field in ('caption', 'title', 'hook_text')).strip() if row else ''
+
+
+def _semantic_similarity_scores(reference_text, candidates):
+    """Return Jev nouls for a shortlist, or None when semantic ranking is unavailable."""
+    api_key = os.getenv('TYPESAFE_API_KEY', '').strip()
+    if not api_key or not reference_text.strip() or not candidates:
+        return None
+    try:
+        import httpx
+
+        state = {
+            'reference_post': reference_text[:4000],
+            'candidate_posts': {
+                candidate_id: text[:2400]
+                for candidate_id, text in candidates.items()
+            },
+        }
+        questions = {
+            f'candidate_{index}': {
+                'type': 'noul',
+                'instructions': (
+                    f'Is candidate `{candidate_id}` about the same underlying topic as '
+                    'the reference post, rather than merely sharing a broad keyword? '
+                    'Use the full caption meaning, entities, event, product, and angle.'
+                ),
+                'criteria': {
+                    'true': 'The candidate covers the same specific topic or story and would be useful as a similar-post reference.',
+                    'false': 'The candidate is only loosely related, shares generic words, or discusses a different topic.',
+                },
+            }
+            for index, candidate_id in enumerate(candidates, start=1)
+        }
+        response = httpx.post(
+            'https://api.typesafe.ai/v1/systemone',
+            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+            json={'model': 'jev-latest', 'state': state, 'questions': questions},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        answers = payload.get('answers') or {}
+        scores = {}
+        for index, candidate_id in enumerate(candidates, start=1):
+            answer = answers.get(f'candidate_{index}') or {}
+            score = answer.get('noul')
+            if isinstance(score, (int, float)):
+                scores[candidate_id] = max(0.0, min(1.0, float(score)))
+        return scores if len(scores) == len(candidates) else None
+    except Exception as exc:  # Keep Find Similar usable during provider/key outages.
+        logger.warning('Jev Find Similar rerank unavailable; using lexical fallback: %s', exc)
+        return None
+
+
+def _semantic_threshold():
+    try:
+        configured = float(os.getenv('TYPESAFE_FIND_SIMILAR_THRESHOLD', '0.58'))
+    except ValueError:
+        configured = 0.58
+    return max(0.50, min(0.90, configured))
+
 def find_similar(post_key):
     """User-triggered search across the stored topic signatures; never runs on reload."""
     if not isinstance(post_key, str) or not post_key or len(post_key) > 300:
@@ -255,6 +344,7 @@ def find_similar(post_key):
             reference_words = set(json.loads(reference['words']))
         except (TypeError, ValueError):
             reference_words = set()
+        reference_text = _source_text(conn, post_key)
         matching_groups = set()
         # Words are stored as a JSON array. Filter candidates in SQL first so
         # the Python side does not materialize/parse every unrelated post in
@@ -270,8 +360,21 @@ def find_similar(post_key):
             ).fetchall()
         else:
             candidate_rows = ()
+        candidate_texts = {
+            row['post_key']: _source_text(conn, row['post_key'])
+            for row in candidate_rows
+        }
+        semantic_scores = _semantic_similarity_scores(
+            reference_text,
+            {post_key: text for post_key, text in candidate_texts.items() if text},
+        )
+        semantic_threshold = _semantic_threshold()
         for row in candidate_rows:
             if row['stack_id'] == reference['stack_id']:
+                continue
+            if semantic_scores is not None:
+                if semantic_scores.get(row['post_key'], 0.0) >= semantic_threshold:
+                    matching_groups.add(row['stack_id'])
                 continue
             try:
                 other = set(json.loads(row['words']))
