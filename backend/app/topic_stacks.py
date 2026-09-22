@@ -222,14 +222,23 @@ def _source_text(conn, post_key):
         return ''
     try:
         row = conn.execute(
-            'SELECT caption FROM dashboard_posts '
-            'WHERE account = ? AND shortcode = ? LIMIT 1',
+            'SELECT caption, hook_text, transcript, alt_text, first_comment '
+            'FROM dashboard_posts WHERE account = ? AND shortcode = ? LIMIT 1',
             (account, shortcode),
         ).fetchone()
-    except Exception:  # pragma: no cover - old schemas may not have dashboard_posts
-        row = None
+    except Exception:  # pragma: no cover - old schemas may not have rich fields
+        try:
+            row = conn.execute(
+                'SELECT caption FROM dashboard_posts '
+                'WHERE account = ? AND shortcode = ? LIMIT 1',
+                (account, shortcode),
+            ).fetchone()
+        except Exception:  # pragma: no cover - old schemas may not have dashboard_posts
+            row = None
     if row:
-        return str(row['caption'] or '').strip()
+        fields = ('caption', 'hook_text', 'transcript', 'alt_text', 'first_comment')
+        available = set(row.keys()) if hasattr(row, 'keys') else set(fields)
+        return ' '.join(str(row[field] or '').strip() for field in fields if field in available)[:6000]
     try:
         row = conn.execute(
             'SELECT caption, title, hook_text FROM posts '
@@ -242,7 +251,7 @@ def _source_text(conn, post_key):
 
 
 def _semantic_similarity_scores(reference_text, candidates):
-    """Return Jev nouls for candidates; never silently fall back to lexical matching."""
+    """Return strict Jev scores; never silently fall back to lexical matching."""
     api_key = os.getenv('TYPESAFE_API_KEY', '').strip()
     if not api_key:
         raise JevUnavailable('Find Similar requires TYPESAFE_API_KEY to use Jev.')
@@ -260,21 +269,33 @@ def _semantic_similarity_scores(reference_text, candidates):
                 for candidate_id, text in candidates.items()
             },
         }
-        questions = {
-            f'candidate_{index}': {
+        questions = {}
+        for index, candidate_id in enumerate(candidates, start=1):
+            questions[f'candidate_{index}_topic'] = {
                 'type': 'noul',
                 'instructions': (
-                    f'Is candidate `{candidate_id}` about the same underlying topic as '
-                    'the reference post, rather than merely sharing a broad keyword? '
-                    'Use the full caption meaning, entities, event, product, and angle.'
+                    f'Is candidate `{candidate_id}` about the same specific topic or story as '
+                    'the reference post? Compare entities, event, product, claim, and angle. '
+                    'Do not accept a match only because of a shared brand, industry, format, '
+                    'hashtag, or generic advice.'
                 ),
                 'criteria': {
-                    'true': 'The candidate covers the same specific topic or story and would be useful as a similar-post reference.',
-                    'false': 'The candidate is only loosely related, shares generic words, or discusses a different topic.',
+                    'true': 'Both posts cover the same concrete story, event, release, person, product, or claim.',
+                    'false': 'They are only loosely related, share generic words, or discuss different facts.',
                 },
             }
-            for index, candidate_id in enumerate(candidates, start=1)
-        }
+            questions[f'candidate_{index}_stack'] = {
+                'type': 'noul',
+                'instructions': (
+                    f'Would an editor place candidate `{candidate_id}` in the same Topic Stack '
+                    'as the reference post? Require the same underlying event, claim, product '
+                    'release, or person—not merely the same broad subject or account.'
+                ),
+                'criteria': {
+                    'true': 'The two posts are interchangeable members of one narrowly defined topic stack.',
+                    'false': 'They belong in separate stacks because the event, claim, angle, or subject is materially different.',
+                },
+            }
         response = httpx.post(
             'https://api.typesafe.ai/v1/systemone',
             headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
@@ -286,10 +307,15 @@ def _semantic_similarity_scores(reference_text, candidates):
         answers = payload.get('answers') or {}
         scores = {}
         for index, candidate_id in enumerate(candidates, start=1):
-            answer = answers.get(f'candidate_{index}') or {}
-            score = answer.get('noul')
-            if isinstance(score, (int, float)):
-                scores[candidate_id] = max(0.0, min(1.0, float(score)))
+            topic = (answers.get(f'candidate_{index}_topic') or {}).get('noul')
+            stack = (answers.get(f'candidate_{index}_stack') or {}).get('noul')
+            if isinstance(topic, (int, float)) and isinstance(stack, (int, float)):
+                # The weaker independent judgment controls acceptance. This keeps
+                # a strong topical overlap from masking a different editorial stack.
+                scores[candidate_id] = min(
+                    max(0.0, min(1.0, float(topic))),
+                    max(0.0, min(1.0, float(stack))),
+                )
         if len(scores) != len(candidates):
             raise JevUnavailable('Jev returned an incomplete Find Similar response.')
         return scores
@@ -302,10 +328,10 @@ def _semantic_similarity_scores(reference_text, candidates):
 
 def _semantic_threshold():
     try:
-        configured = float(os.getenv('TYPESAFE_FIND_SIMILAR_THRESHOLD', '0.58'))
+        configured = float(os.getenv('TYPESAFE_FIND_SIMILAR_THRESHOLD', '0.72'))
     except ValueError:
-        configured = 0.58
-    return max(0.50, min(0.90, configured))
+        configured = 0.72
+    return max(0.60, min(0.95, configured))
 
 
 def _semantic_int(name, default, minimum, maximum):
