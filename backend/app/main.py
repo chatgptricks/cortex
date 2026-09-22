@@ -86,6 +86,7 @@ from .jev_features import (
     JevFeatureUnavailable,
     audit_stack,
     classify_post,
+    golden_nugget_review,
     queue_suggestions,
     rank_search,
     review_promo,
@@ -2018,6 +2019,23 @@ def dashboard_jev_classify(account: Annotated[str, Form()], shortcode: Annotated
     snapshot = _jev_post_snapshot(account, shortcode)
     try:
         return {"account": snapshot["account"], "shortcode": snapshot["shortcode"], **classify_post(snapshot["text"])}
+    except JevFeatureUnavailable as exc:
+        raise _jev_error(exc) from exc
+
+
+@app.post("/api/dashboard/jev/golden-nugget")
+def dashboard_jev_golden_nugget(account: Annotated[str, Form()], shortcode: Annotated[str, Form()]) -> dict[str, Any]:
+    snapshot = _jev_post_snapshot(account, shortcode)
+    with connect() as conn:
+        target_accounts = [dict(row) for row in conn.execute(
+            "SELECT handle, label FROM accounts WHERE is_active = 1 AND group_name = 'sentient' ORDER BY handle LIMIT 40"
+        ).fetchall()]
+    try:
+        return {
+            "account": snapshot["account"],
+            "shortcode": snapshot["shortcode"],
+            **golden_nugget_review(snapshot["text"], snapshot["account"], target_accounts),
+        }
     except JevFeatureUnavailable as exc:
         raise _jev_error(exc) from exc
 
