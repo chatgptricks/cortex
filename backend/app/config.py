@@ -92,6 +92,10 @@ SCHEDULER_ENABLED = _scheduler_enabled_value.strip().lower() in {"1", "true", "y
 _DEFAULT_CORS_ORIGINS = [
     "https://sentientdash.app",
     "https://www.sentientdash.app",
+    "https://schedulr.work",
+    "https://www.schedulr.work",
+    "https://maxxbot.cloud",
+    "https://www.maxxbot.cloud",
     # Kept alongside the custom domain: GitHub Pages keeps serving this URL
     # (it 301s to the custom domain), and links to it exist in Slack history.
     "https://chatgptricks.github.io",

@@ -154,6 +154,7 @@ def golden_nugget_review(
     text: str,
     source_account: str = "",
     target_accounts: list[dict[str, str]] | None = None,
+    novelty_context: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Judge whether a post contains reusable editorial value, independent of heat."""
     dimensions = {
@@ -224,12 +225,29 @@ def golden_nugget_review(
         ),
         "criteria": account_criteria,
     }
+    if novelty_context is not None:
+        questions["novelty"] = {
+            "type": "score",
+            "instructions": (
+                "How new is the underlying editorial idea compared with the existing dashboard posts provided in "
+                "the state? Judge the idea and angle, not exact wording. A topic can be familiar while the angle is "
+                "new. Penalize ideas that substantially repeat an existing post."
+            ),
+            "levels": [
+                "Already covered by an existing dashboard post",
+                "Mostly the same idea with minor wording changes",
+                "Somewhat new but overlaps an existing angle",
+                "Clearly new angle not covered by the existing posts",
+                "Rare, differentiated opportunity with no meaningful dashboard precedent",
+            ],
+        }
     answers = ask_jev(
         {
             "source_account": f"@{source_account.lstrip('@')}",
             "post_text": text[:9000],
             "evaluation_rule": "Do not use engagement or Hot status as evidence of editorial value.",
             "active_sentient_accounts": account_criteria,
+            "existing_dashboard_posts": novelty_context or [],
         },
         questions,
     )
@@ -238,11 +256,24 @@ def golden_nugget_review(
     for key in dimensions:
         scores[key], confidences[key] = _score_answer(answers, key)
     weighted_score = sum(scores[key] * weight for key, (weight, _, _) in dimensions.items())
-    confidence = sum(confidences.values()) / len(confidences) if confidences else 0.0
+    novelty_score = 0.0
+    novelty_confidence = 0.0
+    if novelty_context is not None:
+        novelty_score, novelty_confidence = _score_answer(answers, "novelty")
+        # Novelty is a meaningful multiplier, not a cosmetic badge. It gets
+        # 18% of the final score while preserving the original signal mix.
+        weighted_score = weighted_score * 0.82 + novelty_score * 0.18
+    confidence_values = list(confidences.values())
+    if novelty_context is not None:
+        confidence_values.append(novelty_confidence)
+    confidence = sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
     jev_signal = _noul(answers, "golden_nugget")
     best_account, account_confidence = _choice_answer(answers, "best_account")
     critical_floor = min(scores.get(key, 0.0) for key in ("insight", "audience_value", "hook", "repurpose", "distinctiveness"))
     strong_signal_count = sum(value >= 0.72 for value in scores.values())
+    if novelty_context is not None and novelty_score >= 0.72:
+        strong_signal_count += 1
+    novelty_gate = novelty_context is None or novelty_score >= 0.78
     if (
         weighted_score >= 0.82
         and jev_signal >= 0.80
@@ -251,6 +282,7 @@ def golden_nugget_review(
         and confidence >= 0.68
         and critical_floor >= 0.70
         and strong_signal_count >= 7
+        and novelty_gate
     ):
         label = "golden_nugget"
     elif weighted_score >= 0.62 and jev_signal >= 0.50 and best_account != "none":
@@ -269,6 +301,11 @@ def golden_nugget_review(
         "dimensions": {key: {"score": round(scores[key], 4), "confidence": round(confidences[key], 4)} for key in dimensions},
         "strengths": ranked_dimensions[:3],
         "weaknesses": ranked_dimensions[-2:],
+        "novelty": {
+            "score": round(novelty_score, 4),
+            "confidence": round(novelty_confidence, 4),
+            "isNewAngle": novelty_context is not None and novelty_score >= 0.78,
+        } if novelty_context is not None else None,
         "mode": "jev_golden_nugget",
     }
 
