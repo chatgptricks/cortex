@@ -99,7 +99,13 @@ def test_separate_keeps_posts_out_of_their_old_stack_after_reload():
     topic_stacks.attach(posts)
     assert posts[0]['stackId'] != posts[1]['stackId']
 
-def test_find_similar_merges_matching_existing_posts_only_when_requested():
+def test_find_similar_merges_matching_existing_posts_only_when_requested(monkeypatch):
+    monkeypatch.setenv('TYPESAFE_API_KEY', 'test-key')
+    monkeypatch.setattr(
+        topic_stacks,
+        '_semantic_similarity_scores',
+        lambda reference, candidates: {key: (0.91 if key == 'test:b' else 0.12) for key in candidates},
+    )
     posts = [post('a', CAPTION), post('b', CAPTION), post('c', 'A completely unrelated cooking recipe with tomatoes and basil')]
     topic_stacks.attach(posts)
     topic_stacks.separate(['test:a', 'test:b'])
@@ -109,6 +115,12 @@ def test_find_similar_merges_matching_existing_posts_only_when_requested():
 
 
 def test_find_similar_supports_non_iterable_production_cursor(monkeypatch):
+    monkeypatch.setenv('TYPESAFE_API_KEY', 'test-key')
+    monkeypatch.setattr(
+        topic_stacks,
+        '_semantic_similarity_scores',
+        lambda reference, candidates: {key: (0.91 if key == 'test:b' else 0.12) for key in candidates},
+    )
     posts = [post('a', CAPTION), post('b', CAPTION), post('c', 'Different story')]
     topic_stacks.attach(posts)
     topic_stacks.separate(['test:a', 'test:b'])
@@ -155,22 +167,30 @@ def test_find_similar_uses_jev_to_rerank_the_lexical_shortlist(monkeypatch):
     topic_stacks.separate(['test:a', 'test:b', 'test:c'])
 
     class FakeResponse:
+        def __init__(self, answers):
+            self.answers = answers
+
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {
-                'answers': {
-                    'candidate_1': {'type': 'noul', 'noul': 0.91},
-                    'candidate_2': {'type': 'noul', 'noul': 0.18},
-                }
-            }
+            return {'answers': self.answers}
 
     captured = {}
 
     def fake_post(url, **kwargs):
         captured.update({'url': url, **kwargs})
-        return FakeResponse()
+        answers = {
+            question_id: {
+                'type': 'noul',
+                'noul': 0.91 if candidate_id == 'test:b' else 0.18,
+            }
+            for question_id, candidate_id in zip(
+                kwargs['json']['questions'],
+                kwargs['json']['candidate_posts'],
+            )
+        }
+        return FakeResponse(answers)
 
     monkeypatch.setattr('httpx.post', fake_post)
     result = topic_stacks.find_similar('test:a')

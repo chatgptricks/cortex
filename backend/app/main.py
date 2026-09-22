@@ -1835,10 +1835,12 @@ def dashboard_stacks_separate(keys: Annotated[str, Form()]) -> dict[str, Any]:
 
 @app.post('/api/dashboard/stacks/find-similar')
 def dashboard_stacks_find_similar(post_key: Annotated[str, Form()]) -> dict[str, Any]:
-    from .topic_stacks import find_similar
+    from .topic_stacks import JevUnavailable, find_similar
     global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
     try:
         result = find_similar(post_key)
+    except JevUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Do not hold the shared Research-cache lock during the full similarity
