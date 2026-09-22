@@ -81,6 +81,16 @@ from .account_backfill_queue import enqueue as enqueue_account_backfill, status 
 from .post_recovery_queue import enqueue as enqueue_post_recovery, status as post_recovery_status
 from .post_refresh_queue import enqueue as enqueue_post_refresh, get as get_post_refresh
 from .promos import create_backfill, get_job, get_opportunity, list_opportunities, update_opportunity
+from .promos_detector import detect_promo
+from .jev_features import (
+    JevFeatureUnavailable,
+    audit_stack,
+    classify_post,
+    queue_suggestions,
+    rank_search,
+    review_promo,
+    verify_caption,
+)
 from .tracker_refresh_queue import enqueue as enqueue_tracker_refresh, get as get_tracker_refresh
 from .queue_rules import (
     SCHEDULER_BUFFER_MINUTES,
@@ -1954,6 +1964,139 @@ def dashboard_post_detail(account: str, shortcode: str) -> dict[str, Any]:
     }
 
 
+def _jev_post_snapshot(account: str, shortcode: str) -> dict[str, Any]:
+    clean_account = account.strip().lstrip("@").lower()
+    clean_shortcode = shortcode.strip()
+    if not clean_account or not clean_shortcode:
+        raise HTTPException(status_code=400, detail="Account and shortcode are required.")
+    _, canonical = _dashboard_catalogue_context()
+    with connect() as conn:
+        if clean_account == str(canonical["handle"]).lower():
+            row = conn.execute(
+                "SELECT caption, title, hook_text FROM posts WHERE shortcode = ? ORDER BY id DESC LIMIT 1",
+                (clean_shortcode,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """SELECT caption, hook_text, transcript, alt_text, first_comment,
+                          hashtags, mentions, paid_partnership
+                   FROM dashboard_posts
+                   WHERE LOWER(account) = ? AND shortcode = ? ORDER BY id DESC LIMIT 1""",
+                (clean_account, clean_shortcode),
+            ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Post not found.")
+    values = dict(row)
+    text = "\n".join(
+        str(values.get(field) or "").strip()
+        for field in ("caption", "title", "hook_text", "transcript", "alt_text", "first_comment")
+        if str(values.get(field) or "").strip()
+    )
+    return {"account": clean_account, "shortcode": clean_shortcode, "text": text, **values}
+
+
+def _jev_error(exc: JevFeatureUnavailable) -> HTTPException:
+    return HTTPException(status_code=503, detail=str(exc))
+
+
+@app.post("/api/dashboard/jev/caption-verify")
+def dashboard_jev_caption_verify(
+    source_account: Annotated[str, Form()],
+    shortcode: Annotated[str, Form()],
+    target_account: Annotated[str, Form()],
+    caption: Annotated[str, Form()],
+) -> dict[str, Any]:
+    context = _caption_generation_context(source_account, shortcode, target_account)
+    try:
+        return verify_caption(context["source_caption"], caption, context["target_account"])
+    except JevFeatureUnavailable as exc:
+        raise _jev_error(exc) from exc
+
+
+@app.post("/api/dashboard/jev/classify")
+def dashboard_jev_classify(account: Annotated[str, Form()], shortcode: Annotated[str, Form()]) -> dict[str, Any]:
+    snapshot = _jev_post_snapshot(account, shortcode)
+    try:
+        return {"account": snapshot["account"], "shortcode": snapshot["shortcode"], **classify_post(snapshot["text"])}
+    except JevFeatureUnavailable as exc:
+        raise _jev_error(exc) from exc
+
+
+@app.post("/api/dashboard/jev/queue-suggestions")
+def dashboard_jev_queue_suggestions(account: Annotated[str, Form()], shortcode: Annotated[str, Form()]) -> dict[str, Any]:
+    snapshot = _jev_post_snapshot(account, shortcode)
+    try:
+        return {"account": snapshot["account"], "shortcode": snapshot["shortcode"], **queue_suggestions(snapshot["text"])}
+    except JevFeatureUnavailable as exc:
+        raise _jev_error(exc) from exc
+
+
+@app.post("/api/dashboard/jev/promo-review")
+def dashboard_jev_promo_review(account: Annotated[str, Form()], shortcode: Annotated[str, Form()]) -> dict[str, Any]:
+    snapshot = _jev_post_snapshot(account, shortcode)
+    deterministic = detect_promo(snapshot)
+    try:
+        return {"account": snapshot["account"], "shortcode": snapshot["shortcode"], **review_promo(snapshot["text"], deterministic)}
+    except JevFeatureUnavailable as exc:
+        raise _jev_error(exc) from exc
+
+
+@app.post("/api/dashboard/jev/audit-stack")
+def dashboard_jev_audit_stack(post_key: Annotated[str, Form()]) -> dict[str, Any]:
+    account, separator, shortcode = post_key.partition(":")
+    if not separator:
+        raise HTTPException(status_code=400, detail="post_key must use account:shortcode.")
+    reference = _jev_post_snapshot(account, shortcode)
+    from .topic_stacks import stack_keys
+    keys = stack_keys(post_key)
+    members: dict[str, str] = {}
+    for key in keys:
+        member_account, member_separator, member_shortcode = key.partition(":")
+        if not member_separator:
+            continue
+        try:
+            members[key] = _jev_post_snapshot(member_account, member_shortcode)["text"]
+        except HTTPException:
+            continue
+    members.pop(post_key, None)
+    if not members:
+        return {"postKey": post_key, "members": [], "mode": "jev_stack_audit"}
+    try:
+        return {"postKey": post_key, **audit_stack(reference["text"], members)}
+    except JevFeatureUnavailable as exc:
+        raise _jev_error(exc) from exc
+
+
+@app.get("/api/dashboard/jev/search")
+def dashboard_jev_search(query: str = Query(..., min_length=3), limit: int = Query(20, ge=1, le=50)) -> dict[str, Any]:
+    clean_query = query.strip()
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT account, shortcode, caption, hook_text, transcript
+               FROM dashboard_posts
+               WHERE COALESCE(caption, '') != '' OR COALESCE(hook_text, '') != ''
+               ORDER BY published_at DESC, id DESC LIMIT 100"""
+        ).fetchall()
+    candidates = {
+        f"{row['account']}:{row['shortcode']}": "\n".join(
+            str(row[field] or "").strip() for field in ("caption", "hook_text", "transcript") if str(row[field] or "").strip()
+        )
+        for row in rows
+    }
+    if not candidates:
+        return {"query": clean_query, "results": [], "mode": "jev_search"}
+    try:
+        ranked = rank_search(clean_query, candidates)
+    except JevFeatureUnavailable as exc:
+        raise _jev_error(exc) from exc
+    return {
+        "query": clean_query,
+        "results": [item for item in ranked if item["score"] >= 0.60][:limit],
+        "candidatesEvaluated": len(candidates),
+        "mode": "jev_search",
+    }
+
+
 def _caption_generation_context(source_account: str, shortcode: str, target_account: str) -> dict[str, Any]:
     """Load the source caption and recent owned-account voice examples."""
     clean_source = source_account.strip().lstrip("@").lower()
@@ -2213,12 +2356,22 @@ def dashboard_generate_caption(
         previous_caption=previous_caption,
         output_language=output_language,
     )
+    try:
+        verification = verify_caption(context["source_caption"], caption, context["target_account"])
+    except JevFeatureUnavailable as exc:
+        raise _jev_error(exc) from exc
+    if not verification["accepted"]:
+        raise HTTPException(
+            status_code=502,
+            detail={"message": "The generated caption did not pass Jev verification.", "verification": verification},
+        )
     return {
         "caption": caption,
         "targetAccount": context["target_account"],
         "outputLanguage": output_language.strip().lower(),
         "model": model,
         "generatedBy": _caller_email(request),
+        "jevVerification": verification,
     }
 
 
