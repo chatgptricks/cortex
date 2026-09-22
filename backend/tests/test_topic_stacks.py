@@ -101,11 +101,12 @@ def test_separate_keeps_posts_out_of_their_old_stack_after_reload():
 
 def test_find_similar_merges_matching_existing_posts_only_when_requested(monkeypatch):
     monkeypatch.setenv('TYPESAFE_API_KEY', 'test-key')
-    monkeypatch.setattr(
-        topic_stacks,
-        '_semantic_similarity_scores',
-        lambda reference, candidates: {key: (0.91 if key == 'test:b' else 0.12) for key in candidates},
-    )
+    def fake_scores(reference, candidates):
+        if 'different' in reference.lower():
+            return {key: 0.12 for key in candidates}
+        return {key: (0.91 if key == 'test:b' else 0.12) for key in candidates}
+
+    monkeypatch.setattr(topic_stacks, '_semantic_similarity_scores', fake_scores)
     posts = [post('a', CAPTION), post('b', CAPTION), post('c', 'A completely unrelated cooking recipe with tomatoes and basil')]
     topic_stacks.attach(posts)
     topic_stacks.separate(['test:a', 'test:b'])
@@ -116,11 +117,12 @@ def test_find_similar_merges_matching_existing_posts_only_when_requested(monkeyp
 
 def test_find_similar_supports_non_iterable_production_cursor(monkeypatch):
     monkeypatch.setenv('TYPESAFE_API_KEY', 'test-key')
-    monkeypatch.setattr(
-        topic_stacks,
-        '_semantic_similarity_scores',
-        lambda reference, candidates: {key: (0.91 if key == 'test:b' else 0.12) for key in candidates},
-    )
+    def fake_scores(reference, candidates):
+        if 'different' in reference.lower():
+            return {key: 0.12 for key in candidates}
+        return {key: (0.91 if key == 'test:b' else 0.12) for key in candidates}
+
+    monkeypatch.setattr(topic_stacks, '_semantic_similarity_scores', fake_scores)
     posts = [post('a', CAPTION), post('b', CAPTION), post('c', 'Different story')]
     topic_stacks.attach(posts)
     topic_stacks.separate(['test:a', 'test:b'])
@@ -187,7 +189,7 @@ def test_find_similar_uses_jev_to_rerank_the_lexical_shortlist(monkeypatch):
             }
             for question_id in kwargs['json']['questions']
             for candidate_id in [
-                kwargs['json']['candidate_posts'][int(question_id.split('_')[1]) - 1]
+                list(kwargs['json']['state']['candidate_posts'])[int(question_id.split('_')[1]) - 1]
             ]
         }
         return FakeResponse(answers)
@@ -232,7 +234,7 @@ def test_find_similar_requires_both_jev_judgments(monkeypatch):
 
     def fake_post(url, **kwargs):
         answers = {}
-        candidate_posts = kwargs['json']['candidate_posts']
+        candidate_posts = kwargs['json']['state']['candidate_posts']
         for index, candidate_id in enumerate(candidate_posts, start=1):
             answers[f'candidate_{index}_topic'] = {'noul': 0.95}
             answers[f'candidate_{index}_stack'] = {

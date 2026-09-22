@@ -97,7 +97,7 @@ def test_caption_generation_requires_server_key(monkeypatch):
 
 
 def test_caption_endpoint_returns_editable_result(monkeypatch):
-    context = {"target_account": "ours"}
+    context = {"target_account": "ours", "source_caption": "Original source"}
     generated = {}
     monkeypatch.setattr(main, "_caption_generation_context", lambda *_: context)
     monkeypatch.setattr(
@@ -105,6 +105,8 @@ def test_caption_endpoint_returns_editable_result(monkeypatch):
         "_openai_caption_text",
         lambda value, **options: (generated.update(options) or ("A genuinely new caption", "gpt-5-mini")),
     )
+    verification = {"accepted": True, "factFidelity": 0.95, "targetAlignment": 0.95, "unsupportedClaims": 0.02}
+    monkeypatch.setattr(main, "verify_caption", lambda *_: verification)
     request = SimpleNamespace(state=SimpleNamespace(user_email="writer@example.com"))
 
     result = main.dashboard_generate_caption(request, "source", "SRC1", "ours", True, "Earlier draft", "es")
@@ -115,6 +117,7 @@ def test_caption_endpoint_returns_editable_result(monkeypatch):
         "outputLanguage": "es",
         "model": "gpt-5-mini",
         "generatedBy": "writer@example.com",
+        "jevVerification": verification,
     }
     assert generated == {
         "remove_manychat_automation": True,

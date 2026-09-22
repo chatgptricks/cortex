@@ -30,6 +30,29 @@ def _noul(answers: dict[str, Any], key: str) -> float:
     return _clamp(answer)
 
 
+def _score_answer(answers: dict[str, Any], key: str, levels: int = 5) -> tuple[float, float]:
+    """Return a normalized Score value and its confidence."""
+    answer = answers.get(key) or {}
+    if not isinstance(answer, dict):
+        return 0.0, 0.0
+    try:
+        score = float(answer.get("score"))
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    try:
+        confidence = _clamp(answer.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return max(0.0, min(1.0, score / max(1, levels - 1))), confidence
+
+
+def _choice_answer(answers: dict[str, Any], key: str) -> tuple[str, float]:
+    answer = answers.get(key) or {}
+    if not isinstance(answer, dict):
+        return "none", 0.0
+    return str(answer.get("choice") or "none"), _clamp(answer.get("confidence"))
+
+
 def ask_jev(state: dict[str, Any], questions: dict[str, Any]) -> dict[str, Any]:
     """Run one bounded fan-out request and fail closed on missing answers."""
     api_key = os.getenv("TYPESAFE_API_KEY", "").strip()
@@ -125,6 +148,129 @@ def classify_post(text: str) -> dict[str, Any]:
     scores = {key: _noul(answers, key) for key in labels}
     label = max(scores, key=scores.get)
     return {"label": label, "scores": scores, "mode": "jev_classification"}
+
+
+def golden_nugget_review(
+    text: str,
+    source_account: str = "",
+    target_accounts: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Judge whether a post contains reusable editorial value, independent of heat."""
+    dimensions = {
+        "insight": (0.24, "How strong is the useful insight or idea in this post?", [
+            "No reusable idea", "A vague observation", "A useful but familiar idea",
+            "A clear, meaningful insight", "A sharp, unusually valuable insight",
+        ]),
+        "audience_value": (0.20, "How much would this help or matter to our target audience?", [
+            "No clear audience value", "Narrow or weak value", "Useful to a defined audience",
+            "Broadly useful to our audience", "Highly useful and likely to earn saves or shares",
+        ]),
+        "hook": (0.16, "How much hook potential does the underlying idea have for a new post?", [
+            "No viable hook", "Needs a completely new idea", "One workable hook is visible",
+            "Several strong hooks are visible", "The idea naturally creates a compelling hook",
+        ]),
+        "repurpose": (0.18, "How flexibly can the idea be adapted into content for our accounts?", [
+            "Cannot be adapted without copying", "Adaptation would be forced", "One plausible adaptation",
+            "Several natural formats or angles", "Highly adaptable across accounts and formats",
+        ]),
+        "evergreen": (0.12, "How durable is the idea beyond the post's current moment?", [
+            "Only useful for the immediate moment", "Expires very quickly", "Useful for a short window",
+            "Mostly evergreen", "Durable and useful well beyond the original post",
+        ]),
+        "concreteness": (0.10, "How much concrete evidence, detail, or specificity supports the idea?", [
+            "Pure assertion with no useful detail", "Very little detail", "Some supporting detail",
+            "Concrete details make it credible", "Specific evidence makes it highly defensible",
+        ]),
+        "distinctiveness": (0.10, "How rare or differentiated is the underlying idea in our content landscape?", [
+            "Generic or already common", "Slightly different wording only", "A somewhat distinct angle",
+            "Clearly differentiated from common takes", "Rare, surprising, and difficult to substitute",
+        ]),
+    }
+    target_accounts = target_accounts or []
+    account_criteria = {
+        str(item.get("handle") or "none"): (
+            f"{item.get('label') or item.get('handle')}: an active Sentient account that could own the idea"
+        )
+        for item in target_accounts
+        if str(item.get("handle") or "").strip()
+    }
+    account_criteria["none"] = "No active Sentient account has a credible, natural fit for this idea."
+    questions: dict[str, Any] = {}
+    for key, (_, instruction, levels) in dimensions.items():
+        questions[key] = {
+            "type": "score",
+            "instructions": (
+                f"{instruction} Evaluate the underlying editorial opportunity, not the post's likes, "
+                "views, account size, or current virality. A post can be a golden nugget even when it is not Hot."
+            ),
+            "levels": levels,
+        }
+    questions["golden_nugget"] = {
+        "type": "noul",
+        "instructions": (
+            "Does this post contain a specific, defensible idea worth developing into an original post "
+            "for one of our accounts, even if the source post has low engagement?"
+        ),
+        "criteria": {
+            "true": "There is a clear reusable insight with a credible path to an original adaptation.",
+            "false": "The post is mostly noise, generic commentary, unsupported claims, or dependent on its current hype.",
+        },
+    }
+    questions["best_account"] = {
+        "type": "choice",
+        "instructions": (
+            "Which active Sentient account is the most natural owner for an original post based on this idea? "
+            "Choose none if the fit is forced, generic, or unsupported."
+        ),
+        "criteria": account_criteria,
+    }
+    answers = ask_jev(
+        {
+            "source_account": f"@{source_account.lstrip('@')}",
+            "post_text": text[:9000],
+            "evaluation_rule": "Do not use engagement or Hot status as evidence of editorial value.",
+            "active_sentient_accounts": account_criteria,
+        },
+        questions,
+    )
+    scores: dict[str, float] = {}
+    confidences: dict[str, float] = {}
+    for key in dimensions:
+        scores[key], confidences[key] = _score_answer(answers, key)
+    weighted_score = sum(scores[key] * weight for key, (weight, _, _) in dimensions.items())
+    confidence = sum(confidences.values()) / len(confidences) if confidences else 0.0
+    jev_signal = _noul(answers, "golden_nugget")
+    best_account, account_confidence = _choice_answer(answers, "best_account")
+    critical_floor = min(scores.get(key, 0.0) for key in ("insight", "audience_value", "hook", "repurpose", "distinctiveness"))
+    strong_signal_count = sum(value >= 0.72 for value in scores.values())
+    if (
+        weighted_score >= 0.82
+        and jev_signal >= 0.80
+        and best_account != "none"
+        and account_confidence >= 0.72
+        and confidence >= 0.68
+        and critical_floor >= 0.70
+        and strong_signal_count >= 7
+    ):
+        label = "golden_nugget"
+    elif weighted_score >= 0.62 and jev_signal >= 0.50 and best_account != "none":
+        label = "promising"
+    else:
+        label = "not_yet"
+    ranked_dimensions = sorted(scores, key=scores.get, reverse=True)
+    return {
+        "label": label,
+        "score": round(weighted_score, 4),
+        "confidence": round(confidence, 4),
+        "jevSignal": round(jev_signal, 4),
+        "targetAccount": best_account if best_account != "none" else None,
+        "targetAccountConfidence": round(account_confidence, 4),
+        "strongSignalCount": strong_signal_count,
+        "dimensions": {key: {"score": round(scores[key], 4), "confidence": round(confidences[key], 4)} for key in dimensions},
+        "strengths": ranked_dimensions[:3],
+        "weaknesses": ranked_dimensions[-2:],
+        "mode": "jev_golden_nugget",
+    }
 
 
 def queue_suggestions(text: str) -> dict[str, Any]:
