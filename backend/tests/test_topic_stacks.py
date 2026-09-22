@@ -185,10 +185,10 @@ def test_find_similar_uses_jev_to_rerank_the_lexical_shortlist(monkeypatch):
                 'type': 'noul',
                 'noul': 0.91 if candidate_id == 'test:b' else 0.18,
             }
-            for question_id, candidate_id in zip(
-                kwargs['json']['questions'],
-                kwargs['json']['candidate_posts'],
-            )
+            for question_id in kwargs['json']['questions']
+            for candidate_id in [
+                kwargs['json']['candidate_posts'][int(question_id.split('_')[1]) - 1]
+            ]
         }
         return FakeResponse(answers)
 
@@ -198,6 +198,51 @@ def test_find_similar_uses_jev_to_rerank_the_lexical_shortlist(monkeypatch):
     assert captured['url'] == 'https://api.typesafe.ai/v1/systemone'
     assert captured['headers']['Authorization'] == 'Bearer test-key'
     assert captured['json']['model'] == 'jev-latest'
+    assert result['matchedCount'] == 1
+    assert set(result['postKeys']) == {'test:a', 'test:b'}
+
+
+def test_find_similar_requires_both_jev_judgments(monkeypatch):
+    monkeypatch.setenv('TYPESAFE_API_KEY', 'test-key')
+    posts = [
+        post('a', 'OpenAI launches a new reasoning model for coding agents'),
+        post('b', 'OpenAI releases a new reasoning model for software developers and coding agents'),
+        post('c', 'OpenAI announces new model pricing and API billing changes'),
+    ]
+    with db.connect() as connection:
+        connection.execute(
+            'CREATE TABLE dashboard_posts (account TEXT, shortcode TEXT, caption TEXT, published_at TEXT)'
+        )
+        connection.executemany(
+            'INSERT INTO dashboard_posts VALUES (?, ?, ?, ?)',
+            [('test', item['shortcode'], item['caption'], item['postDate']) for item in posts],
+        )
+    topic_stacks.attach(posts)
+    topic_stacks.separate(['test:a', 'test:b', 'test:c'])
+
+    class FakeResponse:
+        def __init__(self, answers):
+            self.answers = answers
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {'answers': self.answers}
+
+    def fake_post(url, **kwargs):
+        answers = {}
+        candidate_posts = kwargs['json']['candidate_posts']
+        for index, candidate_id in enumerate(candidate_posts, start=1):
+            answers[f'candidate_{index}_topic'] = {'noul': 0.95}
+            answers[f'candidate_{index}_stack'] = {
+                'noul': 0.95 if candidate_id == 'test:b' else 0.41,
+            }
+        return FakeResponse(answers)
+
+    monkeypatch.setattr('httpx.post', fake_post)
+    result = topic_stacks.find_similar('test:a')
+
     assert result['matchedCount'] == 1
     assert set(result['postKeys']) == {'test:a', 'test:b'}
 
