@@ -12,6 +12,10 @@ from .db import connect
 
 logger = logging.getLogger(__name__)
 
+
+class JevUnavailable(RuntimeError):
+    """Find Similar cannot make a result without its semantic judge."""
+
 STOP = set('the a an and or of to in on for with from by at is are was were be been this that these those it its as but you your we our they their has have had just new now more most how what when who why can could will would says said than into about after before all not only one out over up so do does did using use used follow swipe comment link bio ai de la el los las un una unos unas y o en con por para del al es son fue ser como que se su sus este esta esto lo le te tu tus ha han mas muy ya pero si no sobre entre hoy nuevo nueva aqui'.split())
 
 def initialize(conn):
@@ -238,10 +242,14 @@ def _source_text(conn, post_key):
 
 
 def _semantic_similarity_scores(reference_text, candidates):
-    """Return Jev nouls for a shortlist, or None when semantic ranking is unavailable."""
+    """Return Jev nouls for candidates; never silently fall back to lexical matching."""
     api_key = os.getenv('TYPESAFE_API_KEY', '').strip()
-    if not api_key or not reference_text.strip() or not candidates:
-        return None
+    if not api_key:
+        raise JevUnavailable('Find Similar requires TYPESAFE_API_KEY to use Jev.')
+    if not reference_text.strip():
+        raise ValueError('The selected post does not have caption text for Jev to compare.')
+    if not candidates:
+        return {}
     try:
         import httpx
 
@@ -282,10 +290,14 @@ def _semantic_similarity_scores(reference_text, candidates):
             score = answer.get('noul')
             if isinstance(score, (int, float)):
                 scores[candidate_id] = max(0.0, min(1.0, float(score)))
-        return scores if len(scores) == len(candidates) else None
+        if len(scores) != len(candidates):
+            raise JevUnavailable('Jev returned an incomplete Find Similar response.')
+        return scores
     except Exception as exc:  # Keep Find Similar usable during provider/key outages.
-        logger.warning('Jev Find Similar rerank unavailable; using lexical fallback: %s', exc)
-        return None
+        if isinstance(exc, JevUnavailable):
+            raise
+        logger.warning('Jev Find Similar request failed: %s', exc)
+        raise JevUnavailable('Jev is temporarily unavailable. Find Similar was not applied.') from exc
 
 
 def _semantic_threshold():
@@ -295,8 +307,16 @@ def _semantic_threshold():
         configured = 0.58
     return max(0.50, min(0.90, configured))
 
+
+def _semantic_int(name, default, minimum, maximum):
+    try:
+        configured = int(os.getenv(name, str(default)))
+    except ValueError:
+        configured = default
+    return max(minimum, min(maximum, configured))
+
 def find_similar(post_key):
-    """User-triggered search across the stored topic signatures; never runs on reload."""
+    """User-triggered Jev-only search; never runs on reload."""
     if not isinstance(post_key, str) or not post_key or len(post_key) > 300:
         raise ValueError('Choose a valid post.')
     with connect() as conn:
@@ -341,53 +361,52 @@ def find_similar(post_key):
             if not reference:
                 raise ValueError('This post is no longer available. Refresh and try again.')
         try:
-            reference_words = set(json.loads(reference['words']))
+            reference_words = json.loads(reference['words'])
         except (TypeError, ValueError):
-            reference_words = set()
-        reference_text = _source_text(conn, post_key)
+            reference_words = []
+        reference_text = _source_text(conn, post_key) or ' '.join(reference_words)
         matching_groups = set()
-        # Words are stored as a JSON array. Filter candidates in SQL first so
-        # the Python side does not materialize/parse every unrelated post in
-        # the catalogue. The final Jaccard/coverage calculation below remains
-        # unchanged, preserving the existing grouping semantics.
-        if reference_words:
-            clauses = ' OR '.join('words LIKE ?' for _ in reference_words)
-            params = (post_key, *(f'%"{word}"%' for word in sorted(reference_words)))
-            candidate_rows = conn.execute(
-                f'SELECT post_key, stack_id, words FROM topic_stack_members '
-                f'WHERE post_key != ? AND ({clauses})',
-                params,
-            ).fetchall()
-        else:
-            candidate_rows = ()
+        candidate_limit = _semantic_int('TYPESAFE_FIND_SIMILAR_CANDIDATE_LIMIT', 100, 10, 500)
+        batch_size = _semantic_int('TYPESAFE_FIND_SIMILAR_BATCH_SIZE', 25, 5, 50)
+        # Recency only controls the bounded input volume. Jev makes the actual
+        # similarity decision; no keyword/Jaccard filter is applied here.
+        candidate_rows = conn.execute(
+            'SELECT post_key, stack_id, words FROM topic_stack_members '
+            'WHERE post_key != ? AND stack_id != ? '
+            'ORDER BY posted_at DESC, post_key DESC LIMIT ?',
+            (post_key, reference['stack_id'], candidate_limit),
+        ).fetchall()
         candidate_texts = {
-            row['post_key']: _source_text(conn, row['post_key'])
+            row['post_key']: _source_text(conn, row['post_key']) or ' '.join(
+                json.loads(row['words']) if isinstance(row['words'], str) else []
+            )
             for row in candidate_rows
         }
-        semantic_scores = _semantic_similarity_scores(
-            reference_text,
-            {post_key: text for post_key, text in candidate_texts.items() if text},
-        )
+        candidate_texts = {candidate_id: text for candidate_id, text in candidate_texts.items() if text}
+        if not candidate_texts:
+            result = memberships(conn, [post_key])
+            result['matchedCount'] = 0
+            result['similarityMode'] = 'jev_only'
+            result['candidatesEvaluated'] = 0
+            return result
+        semantic_scores = {}
+        candidate_items = list(candidate_texts.items())
+        for start in range(0, len(candidate_items), batch_size):
+            semantic_scores.update(_semantic_similarity_scores(
+                reference_text,
+                dict(candidate_items[start:start + batch_size]),
+            ))
         semantic_threshold = _semantic_threshold()
         for row in candidate_rows:
             if row['stack_id'] == reference['stack_id']:
                 continue
-            if semantic_scores is not None:
-                if semantic_scores.get(row['post_key'], 0.0) >= semantic_threshold:
-                    matching_groups.add(row['stack_id'])
-                continue
-            try:
-                other = set(json.loads(row['words']))
-            except (TypeError, ValueError):
-                continue
-            shared = len(reference_words & other)
-            score = shared / len(reference_words | other) if reference_words | other else 0
-            coverage = shared / min(len(reference_words), len(other)) if reference_words and other else 0
-            if shared >= 4 and (score >= .28 or coverage >= .60):
+            if semantic_scores.get(row['post_key'], 0.0) >= semantic_threshold:
                 matching_groups.add(row['stack_id'])
         if not matching_groups:
             result = memberships(conn, [post_key])
             result['matchedCount'] = 0
+            result['similarityMode'] = 'jev_only'
+            result['candidatesEvaluated'] = len(candidate_texts)
             return result
         matching_groups.add(reference['stack_id'])
         # The expensive candidate scan is read-only. Serialize only the
@@ -398,7 +417,14 @@ def find_similar(post_key):
         destination = sorted(matching_groups)[0]
         conn.execute(f'UPDATE topic_stack_members SET stack_id = ? WHERE stack_id IN ({marks})', (destination, *sorted(matching_groups)))
         members = [row['post_key'] for row in conn.execute('SELECT post_key FROM topic_stack_members WHERE stack_id = ? ORDER BY post_key', (destination,)).fetchall()]
-        result = {'stackId': destination, 'postKeys': members, 'stackSize': len(members), 'matchedCount': len(members) - 1}
+        result = {
+            'stackId': destination,
+            'postKeys': members,
+            'stackSize': len(members),
+            'matchedCount': len(members) - 1,
+            'similarityMode': 'jev_only',
+            'candidatesEvaluated': len(candidate_texts),
+        }
         return result
 
 def stack_keys(post_key):
