@@ -2523,11 +2523,43 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
         )
         item = next((it for it in items if (it.get("shortCode") or "") == clean), items[0] if items else None)
     if not item:
-        # A blank actor result can mean a temporary Instagram challenge or a
-        # short transport failure. Do not turn that into a destructive hidden
-        # state. A post is only marked deleted when a dedicated deletion check
-        # can prove it; this endpoint's contract is count refresh, not delete.
-        raise ApifySyncError("Instagram did not return counts for this post. The saved counts were kept; try again shortly.")
+        # Two independent direct lookups returning no item is the scraper's
+        # strongest deletion signal. A single failed request is never enough:
+        # challenges and short transport failures can also produce an empty
+        # dataset. Keep the row visible and preserve its last known counts.
+        with connect() as conn:
+            conn.execute(
+                f"UPDATE {table} SET is_deleted = 1, updated_at = ? WHERE {where}",
+                [utc_now(), *where_params],
+            )
+        return {
+            "account": handle,
+            "shortcode": clean,
+            "likes": dict(row).get("likes"),
+            "comments": dict(row).get("comments"),
+            "likes_before": dict(row).get("likes"),
+            "comments_before": dict(row).get("comments"),
+            "deleted": True,
+            "cover_refreshed": False,
+        }
+
+    explicit_error = str(item.get("error") or item.get("errorDescription") or "").lower()
+    if any(signal in explicit_error for signal in ("not found", "not_found", "deleted", "unavailable")):
+        with connect() as conn:
+            conn.execute(
+                f"UPDATE {table} SET is_deleted = 1, updated_at = ? WHERE {where}",
+                [utc_now(), *where_params],
+            )
+        return {
+            "account": handle,
+            "shortcode": clean,
+            "likes": dict(row).get("likes"),
+            "comments": dict(row).get("comments"),
+            "likes_before": dict(row).get("likes"),
+            "comments_before": dict(row).get("comments"),
+            "deleted": True,
+            "cover_refreshed": False,
+        }
 
     cover_refreshed = _refresh_cover_from_item(table, handle, clean, row, item)
 
@@ -2552,6 +2584,7 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
         "comments": comments if comments is not None else before.get("comments"),
         "likes_before": before.get("likes"),
         "comments_before": before.get("comments"),
+        "deleted": False,
         "cover_refreshed": cover_refreshed,
     }
 

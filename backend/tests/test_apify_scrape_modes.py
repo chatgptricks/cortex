@@ -280,7 +280,7 @@ def test_short_apify_call_respects_the_callers_deadline(monkeypatch):
     assert captured["poll_interval"] == 5.0
 
 
-def test_reload_counts_falls_back_without_hiding_a_live_post(monkeypatch, tmp_path):
+def test_reload_counts_marks_post_deleted_after_two_empty_direct_checks(monkeypatch, tmp_path):
     path = tmp_path / "reload.sqlite3"
     with sqlite3.connect(path) as connection:
         connection.execute(
@@ -308,9 +308,9 @@ def test_reload_counts_falls_back_without_hiding_a_live_post(monkeypatch, tmp_pa
     monkeypatch.setattr(apify_sync, "get_account_config", lambda _: {"table": "dashboard_posts"})
     monkeypatch.setattr(apify_sync, "_fetch_apify_items", lambda payload, **_: calls.append(payload) or [])
 
-    with pytest.raises(apify_sync.ApifySyncError, match="saved counts were kept"):
-        apify_sync.refresh_single_post("account", "post")
+    result = apify_sync.refresh_single_post("account", "post")
 
     assert [call["resultsType"] for call in calls] == ["details", "posts"]
+    assert result["deleted"] is True
     with connect() as connection:
-        assert tuple(connection.execute("SELECT likes, comments, is_deleted FROM dashboard_posts").fetchone()) == (100, 10, 0)
+        assert tuple(connection.execute("SELECT likes, comments, is_deleted FROM dashboard_posts").fetchone()) == (100, 10, 1)
