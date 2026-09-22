@@ -1,7 +1,7 @@
 from app import jev_features
 
 
-def _answer_set(score=4, confidence=0.9, nugget=0.9, account="chatgptricks"):
+def _answer_set(score=4, confidence=0.9, nugget=0.9, account="chatgptricks", novelty=None):
     answers = {
         key: {"type": "score", "score": score, "confidence": confidence}
         for key in (
@@ -16,6 +16,8 @@ def _answer_set(score=4, confidence=0.9, nugget=0.9, account="chatgptricks"):
     }
     answers["golden_nugget"] = {"type": "noul", "noul": nugget}
     answers["best_account"] = {"type": "choice", "choice": account, "confidence": confidence}
+    if novelty is not None:
+        answers["novelty"] = {"type": "score", "score": novelty, "confidence": confidence}
     return answers
 
 
@@ -48,3 +50,31 @@ def test_golden_nugget_rejects_weak_or_unowned_ideas(monkeypatch):
 
     assert result["label"] == "not_yet"
     assert result["targetAccount"] is None
+
+
+def test_news_novelty_is_required_for_golden_nugget(monkeypatch):
+    monkeypatch.setattr(jev_features, "ask_jev", lambda state, questions: _answer_set(novelty=2))
+
+    result = jev_features.golden_nugget_review(
+        "A strong idea that repeats a post already in the dashboard.",
+        "news-source",
+        [{"handle": "chatgptricks", "label": "ChatGPT Tricks"}],
+        novelty_context=[{"account": "chatgptricks", "shortcode": "abc", "text": "Existing post"}],
+    )
+
+    assert result["label"] == "promising"
+    assert result["novelty"]["isNewAngle"] is False
+
+
+def test_news_novelty_can_unlock_golden_nugget(monkeypatch):
+    monkeypatch.setattr(jev_features, "ask_jev", lambda state, questions: _answer_set(novelty=4))
+
+    result = jev_features.golden_nugget_review(
+        "A rare, specific idea not previously covered.",
+        "news-source",
+        [{"handle": "chatgptricks", "label": "ChatGPT Tricks"}],
+        novelty_context=[],
+    )
+
+    assert result["label"] == "golden_nugget"
+    assert result["novelty"]["isNewAngle"] is True

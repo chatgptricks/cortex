@@ -2040,6 +2040,102 @@ def dashboard_jev_golden_nugget(account: Annotated[str, Form()], shortcode: Anno
         raise _jev_error(exc) from exc
 
 
+def _news_similarity_tokens(value: Any) -> set[str]:
+    words = re.findall(r"[a-z0-9]{4,}", str(value or "").lower())
+    stop_words = {
+        "about", "after", "also", "been", "from", "have", "into", "just", "more", "news", "that",
+        "their", "this", "with", "will", "what", "when", "where", "which", "while", "your",
+    }
+    return {word for word in words if word not in stop_words}
+
+
+def _news_existing_posts(article_text: str, limit: int = 8) -> list[dict[str, str]]:
+    """Return a small, deterministic novelty shortlist for Jev.
+
+    Exact retrieval is deliberately code-owned. Jev only judges the semantic
+    difference between the incoming story and these candidate precedents.
+    """
+    incoming_tokens = _news_similarity_tokens(article_text)
+    if not incoming_tokens:
+        return []
+    candidates: list[dict[str, str]] = []
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT shortcode, caption, title, hook_text
+               FROM posts
+               WHERE COALESCE(caption, '') != '' OR COALESCE(title, '') != ''
+               ORDER BY published_at DESC, id DESC LIMIT 250"""
+        ).fetchall()
+        for row in rows:
+            values = dict(row)
+            text = "\n".join(str(values.get(field) or "").strip() for field in ("caption", "title", "hook_text") if str(values.get(field) or "").strip())
+            candidates.append({"account": "chatgptricks", "shortcode": str(values.get("shortcode") or ""), "text": text})
+        rows = conn.execute(
+            """SELECT account, shortcode, caption, hook_text
+               FROM dashboard_posts
+               WHERE COALESCE(caption, '') != ''
+               ORDER BY published_at DESC, id DESC LIMIT 500"""
+        ).fetchall()
+        for row in rows:
+            values = dict(row)
+            text = "\n".join(str(values.get(field) or "").strip() for field in ("caption", "hook_text") if str(values.get(field) or "").strip())
+            candidates.append({"account": str(values.get("account") or ""), "shortcode": str(values.get("shortcode") or ""), "text": text})
+
+    ranked = []
+    for item in candidates:
+        tokens = _news_similarity_tokens(item["text"])
+        if not tokens:
+            continue
+        overlap = len(incoming_tokens & tokens) / max(1, min(len(incoming_tokens), len(tokens)))
+        if overlap >= 0.12:
+            ranked.append((overlap, item))
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in ranked[:limit]]
+
+
+@app.post("/api/dashboard/jev/news-review")
+async def dashboard_jev_news_review(request: Request) -> dict[str, Any]:
+    """DEV-only Jev review for News, Reddit, and X sourcing candidates."""
+    if not getattr(request.state, "is_dev", False):
+        raise HTTPException(status_code=403, detail="News Jev review is currently available only to DEV users.")
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="A JSON article payload is required.") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="A JSON article payload is required.")
+    source_type = str(payload.get("sourceType") or "").strip().lower()
+    if source_type not in {"news", "reddit", "x"}:
+        raise HTTPException(status_code=400, detail="Only News, Reddit, and X candidates are supported.")
+    headline = str(payload.get("headline") or payload.get("title") or "").strip()
+    description = str(payload.get("description") or payload.get("reason") or "").strip()
+    source = str(payload.get("source") or payload.get("author") or payload.get("subreddit") or source_type).strip()
+    text = "\n".join(part for part in (headline, description, source) if part)[:9000]
+    if len(headline) < 8:
+        raise HTTPException(status_code=400, detail="The candidate needs a usable headline or title.")
+    with connect() as conn:
+        target_accounts = [dict(row) for row in conn.execute(
+            "SELECT handle, label FROM accounts WHERE is_active = 1 AND group_name = 'sentient' ORDER BY handle LIMIT 40"
+        ).fetchall()]
+    existing_posts = _news_existing_posts(text)
+    try:
+        review = golden_nugget_review(
+            text,
+            source_account=source,
+            target_accounts=target_accounts,
+            novelty_context=existing_posts,
+        )
+    except JevFeatureUnavailable as exc:
+        raise _jev_error(exc) from exc
+    return {
+        "sourceType": source_type,
+        "headline": headline,
+        "source": source,
+        "existingCandidates": existing_posts,
+        **review,
+    }
+
+
 @app.post("/api/dashboard/jev/queue-suggestions")
 def dashboard_jev_queue_suggestions(account: Annotated[str, Form()], shortcode: Annotated[str, Form()]) -> dict[str, Any]:
     snapshot = _jev_post_snapshot(account, shortcode)
