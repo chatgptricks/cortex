@@ -7715,6 +7715,31 @@ def admin_promo_detail(account: str, shortcode: str) -> dict[str, Any]:
     return item
 
 
+@app.post("/api/admin/promos/{account}/{shortcode}/jev-review")
+def admin_promo_jev_review(account: str, shortcode: str, request: Request) -> dict[str, Any]:
+    """Persist a bounded Jev assessment without changing detector classification."""
+    from .promos import update_opportunity
+
+    item = get_opportunity(account, shortcode)
+    if not item:
+        raise HTTPException(status_code=404, detail="Promo opportunity not found.")
+    snapshot = _jev_post_snapshot(account, shortcode)
+    deterministic = detect_promo(snapshot)
+    try:
+        assessment = review_promo(snapshot["text"], deterministic)
+    except JevFeatureUnavailable as exc:
+        raise _jev_error(exc) from exc
+    updated = update_opportunity(
+        account,
+        shortcode,
+        {"jev_review": assessment},
+        str(getattr(request.state, "user_email", "unknown")),
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Promo opportunity not found.")
+    return updated
+
+
 @app.patch("/api/admin/promos/{account}/{shortcode}")
 async def admin_promo_update(account: str, shortcode: str, request: Request) -> dict[str, Any]:
     payload = await request.json()
