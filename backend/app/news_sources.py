@@ -10,6 +10,18 @@ PUBLISHERS = {
     'manufacturingdigital.com', 'www.citriniresearch.com',
     'openai.com', 'www.anthropic.com', 'blog.google',
     'www.theverge.com', 'arstechnica.com', 'venturebeat.com',
+    # Publishers observed in the connected RSS.app feeds.
+    'bastillepost.com', 'www.bastillepost.com', 'news.sbs.co.kr',
+    'winnipegfreepress.com', 'www.winnipegfreepress.com', 'jpost.com', 'www.jpost.com',
+    'benzinga.com', 'www.benzinga.com', 'fortune.com', 'www.fortune.com',
+    'axios.com', 'www.axios.com', 'prospect.org', 'www.prospect.org',
+    'finance.yahoo.com', 'www.foxnews.com', 'foxnews.com', 'apnews.com', 'www.apnews.com',
+    'macrumors.com', 'www.macrumors.com', 'gizmodo.com', 'www.gizmodo.com',
+    'www.nvidia.com', 'news.google.com',
+    'ft.com', 'www.ft.com', 'businessinsider.com', 'www.businessinsider.com',
+    'qz.com', 'www.qz.com', 'bbc.com', 'www.bbc.com', 'cnbc.com', 'www.cnbc.com',
+    'techspot.com', 'www.techspot.com', 'theglobeandmail.com', 'www.theglobeandmail.com',
+    'techcrunch.com', 'www.techcrunch.com', 'theverge.com', 'arstechnica.com',
 }
 
 class ArticleText(HTMLParser):

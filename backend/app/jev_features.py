@@ -163,6 +163,8 @@ def golden_nugget_review(
     source_account: str = "",
     target_accounts: list[dict[str, str]] | None = None,
     novelty_context: list[dict[str, str]] | None = None,
+    is_news: bool = False,
+    discovery_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Judge whether a post contains reusable editorial value, independent of heat."""
     dimensions = {
@@ -195,6 +197,28 @@ def golden_nugget_review(
             "Clearly differentiated from common takes", "Rare, surprising, and difficult to substitute",
         ]),
     }
+    if is_news:
+        # News discovery scores story potential, without requiring an account fit.
+        dimensions.pop("evergreen")
+        dimensions["viral_potential"] = (0.20, "How likely is this story idea to earn shares, comments, or saves when adapted into an original social post?", [
+            "No clear social hook or reason to pass it on",
+            "Interesting to a narrow group but easy to ignore",
+            "Has one usable hook or practical takeaway for a defined audience",
+            "Likely to prompt a strong reaction, useful discussion, or repeat sharing across our audience",
+            "Combines a surprising or highly relatable idea with a simple, compelling hook people will want to share",
+        ])
+        dimensions["timeliness"] = (0.08, "How much does this story's timing increase its value as a post right now?", [
+            "No timely reason to post it", "The moment has mostly passed or the story is stale",
+            "Still relevant, but not especially time-sensitive", "Fresh development with an active audience conversation",
+            "Breaking or rapidly developing story with a short, valuable window to post",
+        ])
+        dimensions["evidence_quality"] = (0.08, "How well can the supplied source material support an accurate, defensible post?", [
+            "Unsupported, misleading, or impossible to verify from supplied evidence",
+            "Only a headline or an unsubstantiated claim is available",
+            "Some concrete evidence is available but important details need reporting",
+            "Specific facts and a credible source support the central point",
+            "Detailed primary or independently corroborated evidence supports a clear, accurate post",
+        ])
     target_accounts = target_accounts or []
     account_criteria = {
         str(item.get("handle") or "none"): (
@@ -209,30 +233,32 @@ def golden_nugget_review(
         questions[key] = {
             "type": "score",
             "instructions": (
-                f"{instruction} Evaluate the underlying editorial opportunity, not the post's likes, "
-                "views, account size, or current virality. A post can be a golden nugget even when it is not Hot."
+                f"{instruction} "
+                + (
+                    "Judge the story's inherent audience appeal and format potential. Treat feed filters or repeated coverage only as discovery hints; they are not verified per-post engagement or proof that claims are true."
+                    if is_news else
+                    "Evaluate the underlying editorial opportunity, not the post's likes, views, account size, or current virality. A post can be a golden nugget even when it is not Hot."
+                )
             ),
             "criteria": levels,
         }
     questions["golden_nugget"] = {
         "type": "noul",
-        "instructions": (
-            "Does this post contain a specific, defensible idea worth developing into an original post "
-            "for one of our accounts, even if the source post has low engagement?"
-        ),
+        "instructions": ("Could this story support an original social post with a strong hook, useful audience takeaway, and credible evidence? Judge the story's potential without promising reach or treating a feed filter as verified engagement." if is_news else "Does this post contain a specific, defensible idea worth developing into an original post for one of our accounts, even if the source post has low engagement?"),
         "criteria": {
             "true": "There is a clear reusable insight with a credible path to an original adaptation.",
             "false": "The post is mostly noise, generic commentary, unsupported claims, or dependent on its current hype.",
         },
     }
-    questions["best_account"] = {
-        "type": "choice",
-        "instructions": (
-            "Which active Sentient account is the most natural owner for an original post based on this idea? "
-            "Consider an accessible original adaptation for the account audience, not copying the source style. Recent posts are examples, not topic restrictions. Choose none only when the idea is outside every account audience."
-        ),
-        "criteria": account_criteria,
-    }
+    if not is_news:
+        questions["best_account"] = {
+            "type": "choice",
+            "instructions": (
+                "Which active Sentient account is the most natural owner for an original post based on this idea? "
+                "Consider an accessible original adaptation for the account audience, not copying the source style. Recent posts are examples, not topic restrictions. Choose none only when the idea is outside every account audience."
+            ),
+            "criteria": account_criteria,
+        }
     if novelty_context is not None:
         questions["editorial_angle"] = {
             "type": "choice",
@@ -277,6 +303,7 @@ def golden_nugget_review(
             "evaluation_rule": "Do not use engagement or Hot status as evidence of editorial value.",
             "active_sentient_accounts": account_criteria,
             "existing_dashboard_posts": novelty_context or [],
+            "news_discovery_context": (discovery_context or {}) if is_news else {},
         },
         questions,
     )
@@ -298,31 +325,36 @@ def golden_nugget_review(
         confidence_values.append(novelty_confidence)
     confidence = sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
     jev_signal = _noul(answers, "golden_nugget")
-    best_account, account_confidence = _choice_answer(answers, "best_account")
-    critical_floor = min(scores.get(key, 0.0) for key in ("insight", "audience_value", "hook", "repurpose", "distinctiveness"))
+    best_account, account_confidence = _choice_answer(answers, "best_account") if not is_news else ("none", 0.0)
+    critical_keys = ("insight", "audience_value", "hook", "repurpose", "distinctiveness", "viral_potential") if is_news else ("insight", "audience_value", "hook", "repurpose", "distinctiveness")
+    critical_floor = min(scores.get(key, 0.0) for key in critical_keys)
     strong_signal_count = sum(value >= 0.68 for value in scores.values())
     if bool(novelty_context) and novelty_score >= 0.68:
         strong_signal_count += 1
     novelty_gate = not novelty_context or novelty_score >= 0.68
     # News discovery judges the idea separately from assigning its eventual owner.
-    account_gate = novelty_context is not None or (best_account != "none" and account_confidence >= 0.55)
+    account_gate = is_news or novelty_context is not None or (best_account != "none" and account_confidence >= 0.55)
+    viral_gate = scores.get("viral_potential", 0.0)
+    evidence_gate = scores.get("evidence_quality", 1.0)
     if (
-        weighted_score >= 0.72
-        and jev_signal >= 0.65
+        weighted_score >= (0.68 if is_news else 0.72)
+        and jev_signal >= (0.58 if is_news else 0.65)
         and account_gate
-        and critical_floor >= 0.50
+        and critical_floor >= (0.45 if is_news else 0.50)
         and strong_signal_count >= 4
         and novelty_gate
+        and (not is_news or (viral_gate >= 0.68 and evidence_gate >= 0.40))
     ):
         label = "golden_nugget"
     # Potential is a deliberately wider discovery bucket for ideas that have
     # evidence and an adaptation path but miss one or more Golden gates.
     elif (
-        weighted_score >= 0.56
-        and jev_signal >= 0.40
-        and critical_floor >= 0.30
+        weighted_score >= (0.50 if is_news else 0.56)
+        and jev_signal >= (0.34 if is_news else 0.40)
+        and critical_floor >= (0.24 if is_news else 0.30)
         and strong_signal_count >= 2
         and (novelty_context is not None or account_gate)
+        and (not is_news or (viral_gate >= 0.34 and evidence_gate >= 0.20))
     ):
         label = "potential"
     else:
@@ -333,12 +365,12 @@ def golden_nugget_review(
         "score": round(weighted_score, 4),
         "confidence": round(confidence, 4),
         "jevSignal": round(jev_signal, 4),
-        "targetAccount": best_account if best_account != "none" else None,
-        "targetAccountConfidence": round(account_confidence, 4),
+        "targetAccount": None if is_news or best_account == "none" else best_account,
+        "targetAccountConfidence": 0.0 if is_news else round(account_confidence, 4),
         "strongSignalCount": strong_signal_count,
         "classificationGates": {
-            "golden": {"score": 0.72, "jevSignal": 0.65, "criticalDimensionFloor": 0.50, "strongSignals": 4, "novelty": 0.68},
-            "potential": {"score": 0.56, "jevSignal": 0.40, "criticalDimensionFloor": 0.30, "strongSignals": 2},
+            "golden": {"score": 0.68 if is_news else 0.72, "jevSignal": 0.58 if is_news else 0.65, "criticalDimensionFloor": 0.45 if is_news else 0.50, "strongSignals": 4, "novelty": 0.68, **({"viralPotential": 0.68, "evidenceQuality": 0.40} if is_news else {})},
+            "potential": {"score": 0.50 if is_news else 0.56, "jevSignal": 0.34 if is_news else 0.40, "criticalDimensionFloor": 0.24 if is_news else 0.30, "strongSignals": 2, **({"viralPotential": 0.34, "evidenceQuality": 0.20} if is_news else {})},
         },
         "dimensions": {key: {"score": round(scores[key], 4), "confidence": round(confidences[key], 4)} for key in dimensions},
         "strengths": ranked_dimensions[:3],
@@ -350,7 +382,9 @@ def golden_nugget_review(
         } if bool(novelty_context) else None,
         "editorialAngle": _choice_answer(answers, "editorial_angle")[0] if novelty_context is not None else None,
         "postFormat": _choice_answer(answers, "post_format")[0] if novelty_context is not None else None,
-        "mode": "jev_golden_nugget",
+        "viralPotential": round(viral_gate, 4) if is_news else None,
+        "evidenceQuality": round(evidence_gate, 4) if is_news else None,
+        "mode": "jev_news_discovery" if is_news else "jev_golden_nugget",
     }
 
 
