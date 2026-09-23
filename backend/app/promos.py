@@ -11,6 +11,9 @@ from typing import Any
 from .db import connect, utc_now
 from . import db, ingestion_jobs
 from .promos_detector import DETECTOR_VERSION, detect_promo
+from .jev_features import discover_promos
+
+JEV_PROMO_MODEL_VERSION = "jev-promo-discovery-v1"
 
 
 def _initialize_topic_stacks(conn: Any) -> None:
@@ -26,6 +29,11 @@ def _json(value: Any) -> str:
 
 def _hash_post(post: dict[str, Any]) -> str:
     raw = _json({key: post.get(key) for key in ("caption", "first_comment", "hashtags", "mentions", "paid_partnership", "permalink")})
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _hash_jev_post(post: dict[str, Any]) -> str:
+    raw = _json({key: post.get(key) for key in ("caption", "first_comment", "hashtags", "mentions", "paid_partnership", "permalink", "alt_text", "transcript", "hook_text")})
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -78,6 +86,22 @@ def analyze_post(post: dict[str, Any]) -> dict[str, Any]:
                        VALUES (?, ?, ?, ?, 'done', 1, ?)
                        ON CONFLICT(account, shortcode) DO UPDATE SET input_hash = excluded.input_hash, detector_version = excluded.detector_version, status = 'done', attempts = promo_scans.attempts + 1, error = NULL, updated_at = excluded.updated_at""", (account, shortcode, digest, DETECTOR_VERSION, now))
         if analysis["classification"] == "not_promo":
+            semantic = conn.execute(
+                "SELECT input_hash, model_version, is_candidate FROM promo_jev_scans WHERE account = ? AND shortcode = ?",
+                (account, shortcode),
+            ).fetchone()
+            previous_opportunity = conn.execute(
+                "SELECT analysis_json, review_status, first_detected_at FROM promo_opportunities WHERE account = ? AND shortcode = ?",
+                (account, shortcode),
+            ).fetchone()
+            if (
+                semantic and semantic["input_hash"] == _hash_jev_post(post) and semantic["model_version"] == JEV_PROMO_MODEL_VERSION
+                and semantic["is_candidate"] and previous_opportunity
+                and previous_opportunity["review_status"] == "new"
+                and json.loads(previous_opportunity["analysis_json"] or "{}").get("classification_source") == "jev_semantic_scan"
+            ):
+                saved = json.loads(previous_opportunity["analysis_json"] or "{}")
+                return {**saved, "account": account, "shortcode": shortcode, "published_at": post.get("published_at"), "first_detected_at": previous_opportunity["first_detected_at"], "last_analyzed_at": now, "review_status": "new"}
             conn.execute("DELETE FROM promo_opportunities WHERE account = ? AND shortcode = ?", (account, shortcode))
             return {**analysis, "account": account, "shortcode": shortcode, "published_at": post.get("published_at"), "first_detected_at": None, "last_analyzed_at": now, "review_status": "not_promo"}
         previous_row = conn.execute("SELECT first_detected_at, review_status, review_override_json FROM promo_opportunities WHERE account = ? AND shortcode = ?", (account, shortcode)).fetchone()
@@ -139,7 +163,7 @@ def _post_rows(conn: Any, account: str | None = None, from_date: str | None = No
         clauses.append("p.published_at >= ?"); params.append(from_date)
     if to_date:
         clauses.append("p.published_at <= ?"); params.append(to_date)
-    rows = conn.execute(f"""SELECT p.account, p.shortcode, p.caption, p.first_comment, p.hashtags, p.mentions, p.paid_partnership, p.permalink, p.published_at, p.cover_image_path, p.cover_source_url
+    rows = conn.execute(f"""SELECT p.account, p.shortcode, p.caption, p.first_comment, p.hashtags, p.mentions, p.paid_partnership, p.permalink, p.published_at, p.cover_image_path, p.cover_source_url, p.alt_text, p.transcript, p.hook_text
                             FROM dashboard_posts p JOIN accounts a ON a.handle = p.account
                             WHERE {' AND '.join(clauses)} ORDER BY p.published_at DESC LIMIT ?""", (*params, max(1, min(limit, 2000)))).fetchall()
     result = []
@@ -149,6 +173,98 @@ def _post_rows(conn: Any, account: str | None = None, from_date: str | None = No
             if item.get(key): item[key] = [value.strip() for value in str(item[key]).split(",") if value.strip()]
         result.append(item)
     return result
+
+
+def process_jev_posts(*, limit: int = 2000, job_id: str | None = None, batch_size: int = 8) -> dict[str, int]:
+    """Search stored competitor posts with Jev and save only review candidates."""
+    with connect() as conn:
+        _initialize_topic_stacks(conn)
+        posts = _post_rows(conn, limit=limit)
+        pending = []
+        for post in posts:
+            post["deterministic_classification"] = detect_promo(post)["classification"]
+            key = (post["account"], post["shortcode"])
+            previous_scan = conn.execute(
+                "SELECT input_hash, model_version FROM promo_jev_scans WHERE account = ? AND shortcode = ?",
+                key,
+            ).fetchone()
+            if previous_scan and previous_scan["input_hash"] == _hash_jev_post(post) and previous_scan["model_version"] == JEV_PROMO_MODEL_VERSION:
+                continue
+            previous_promo = conn.execute(
+                "SELECT review_status FROM promo_opportunities WHERE account = ? AND shortcode = ?", key
+            ).fetchone()
+            if previous_promo and previous_promo["review_status"] in {"reviewed", "dismissed"}:
+                continue
+            pending.append(post)
+        if job_id:
+            conn.execute("UPDATE promo_jobs SET total = ?, updated_at = ? WHERE job_id = ?", (len(pending), utc_now(), job_id))
+
+    processed = 0
+    found = 0
+    for offset in range(0, len(pending), max(1, min(batch_size, 12))):
+        batch = pending[offset:offset + max(1, min(batch_size, 12))]
+        assessments = discover_promos(batch)
+        with connect() as conn:
+            for post in batch:
+                key = f"{post['account']}:{post['shortcode']}"
+                assessment = assessments[key]
+                for field, label in (("caption", "Caption"), ("first_comment", "First comment"), ("alt_text", "Image text"), ("transcript", "Video transcript"), ("hook_text", "Video text")):
+                    excerpt = str(post.get(field) or "").strip()
+                    if excerpt:
+                        assessment["contextSource"] = label
+                        assessment["contextExcerpt"] = excerpt[:500]
+                        break
+                digest = _hash_jev_post(post)
+                now = utc_now()
+                candidate = bool(assessment["needsReview"])
+                conn.execute(
+                    """INSERT INTO promo_jev_scans(account, shortcode, input_hash, model_version, semantic_score, relationship, relationship_confidence, is_candidate, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(account, shortcode) DO UPDATE SET input_hash = excluded.input_hash, model_version = excluded.model_version,
+                         semantic_score = excluded.semantic_score, relationship = excluded.relationship,
+                         relationship_confidence = excluded.relationship_confidence, is_candidate = excluded.is_candidate, updated_at = excluded.updated_at""",
+                    (post["account"], post["shortcode"], digest, JEV_PROMO_MODEL_VERSION, assessment["semanticPromo"], assessment["commercialRelationship"], assessment["relationshipConfidence"], int(candidate), now),
+                )
+                current = conn.execute("SELECT * FROM promo_opportunities WHERE account = ? AND shortcode = ?", (post["account"], post["shortcode"])).fetchone()
+                if candidate and (not current or current["review_status"] == "new"):
+                    analysis = detect_promo(post)
+                    analysis.update({"classification": "needs_review", "is_promo": True, "classification_source": "jev_semantic_scan", "jev_review": assessment})
+                    analysis.setdefault("evidence", []).append({
+                        "family": "jev_semantic", "rule": f"JEV commercial-intent candidate · {assessment.get('contextSource') or 'stored text'}", "source": "semantic_review",
+                        "text": str(assessment.get("contextExcerpt") or "Commercial intent signal in stored post context.")[:240],
+                    })
+                    if current:
+                        override = json.loads(current["review_override_json"] or "{}")
+                        override["jev_review"] = assessment
+                        conn.execute(
+                            "UPDATE promo_opportunities SET review_override_json = ?, last_analyzed_at = ? WHERE account = ? AND shortcode = ?",
+                            (_json(override), now, post["account"], post["shortcode"]),
+                        )
+                    else:
+                        conn.execute(
+                            """INSERT INTO promo_opportunities(account, shortcode, classification, client, product, analysis_json, review_status, review_override_json, published_at, first_detected_at, last_analyzed_at)
+                               VALUES (?, ?, 'needs_review', NULL, NULL, ?, 'new', ?, ?, ?, ?)""",
+                            (post["account"], post["shortcode"], _json(analysis), _json({"jev_review": assessment}), post.get("published_at"), now, now),
+                        )
+                    found += 1
+                elif not candidate and current and current["review_status"] == "new":
+                    try:
+                        prior_analysis = json.loads(current["analysis_json"] or "{}")
+                    except (TypeError, ValueError):
+                        prior_analysis = {}
+                    if prior_analysis.get("classification_source") == "jev_semantic_scan":
+                        conn.execute("DELETE FROM promo_opportunities WHERE account = ? AND shortcode = ?", (post["account"], post["shortcode"]))
+                    else:
+                        override = json.loads(current["review_override_json"] or "{}")
+                        override["jev_review"] = assessment
+                        conn.execute("UPDATE promo_opportunities SET review_override_json = ?, last_analyzed_at = ? WHERE account = ? AND shortcode = ?", (_json(override), now, post["account"], post["shortcode"]))
+                processed += 1
+            if job_id:
+                conn.execute("UPDATE promo_jobs SET processed = ?, found = ?, heartbeat_at = ?, updated_at = ? WHERE job_id = ?", (processed, found, utc_now(), utc_now(), job_id))
+    if job_id:
+        with connect() as conn:
+            conn.execute("UPDATE promo_jobs SET status = 'done', processed = ?, found = ?, finished_at = ?, updated_at = ? WHERE job_id = ?", (processed, found, utc_now(), utc_now(), job_id))
+    return {"processed": processed, "total": len(pending), "found": found}
 
 
 def process_posts(*, account: str | None = None, from_date: str | None = None, to_date: str | None = None, limit: int = 500, job_id: str | None = None) -> dict[str, int]:
@@ -178,8 +294,8 @@ def _ensure_jobs(conn: Any) -> None:
         requested_to TEXT, processed INTEGER NOT NULL DEFAULT 0,
         total INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL, account TEXT, row_limit INTEGER NOT NULL DEFAULT 500,
-        heartbeat_at TEXT, finished_at TEXT)""")
-    for name, definition in (("account", "account TEXT"), ("row_limit", "row_limit INTEGER NOT NULL DEFAULT 500"), ("heartbeat_at", "heartbeat_at TEXT"), ("finished_at", "finished_at TEXT")):
+        heartbeat_at TEXT, finished_at TEXT, job_type TEXT NOT NULL DEFAULT 'backfill', found INTEGER NOT NULL DEFAULT 0)""")
+    for name, definition in (("account", "account TEXT"), ("row_limit", "row_limit INTEGER NOT NULL DEFAULT 500"), ("heartbeat_at", "heartbeat_at TEXT"), ("finished_at", "finished_at TEXT"), ("job_type", "job_type TEXT NOT NULL DEFAULT 'backfill'"), ("found", "found INTEGER NOT NULL DEFAULT 0")):
         db._ensure_column(conn, "promo_jobs", name, definition)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_jobs_status ON promo_jobs(status, created_at)")
 
@@ -188,7 +304,7 @@ def create_backfill(*, from_date: str | None = None, to_date: str | None = None,
     now = utc_now()
     with connect() as conn:
         _ensure_jobs(conn)
-        existing = conn.execute("""SELECT job_id FROM promo_jobs WHERE status IN ('queued', 'running')
+        existing = conn.execute("""SELECT job_id FROM promo_jobs WHERE status IN ('queued', 'running') AND job_type = 'backfill'
             AND COALESCE(requested_from, '') = COALESCE(?, '') AND COALESCE(requested_to, '') = COALESCE(?, '')
             AND COALESCE(account, '') = COALESCE(?, '') LIMIT 1""", (from_date, to_date, account)).fetchone()
         if existing:
@@ -197,6 +313,20 @@ def create_backfill(*, from_date: str | None = None, to_date: str | None = None,
             job_id = uuid.uuid4().hex
             conn.execute("""INSERT INTO promo_jobs(job_id, status, requested_from, requested_to, account, row_limit, created_at, updated_at)
                 VALUES (?, 'queued', ?, ?, ?, ?, ?, ?)""", (job_id, from_date, to_date, account, max(1, min(limit, 2000)), now, now))
+    _WAKE.set()
+    return job_id
+
+
+def create_jev_scan(*, limit: int = 2000) -> str:
+    now = utc_now()
+    with connect() as conn:
+        _ensure_jobs(conn)
+        existing = conn.execute("SELECT job_id FROM promo_jobs WHERE status IN ('queued', 'running') AND job_type = 'jev_scan' LIMIT 1").fetchone()
+        if existing:
+            job_id = str(existing["job_id"])
+        else:
+            job_id = uuid.uuid4().hex
+            conn.execute("INSERT INTO promo_jobs(job_id, status, row_limit, job_type, created_at, updated_at) VALUES (?, 'queued', ?, 'jev_scan', ?, ?)", (job_id, max(1, min(limit, 2000)), now, now))
     _WAKE.set()
     return job_id
 
@@ -219,8 +349,11 @@ def _run_job(task: dict[str, Any]) -> None:
     job_id = task["job_id"]
     try:
         def work() -> None:
-            process_posts(account=task.get("account"), from_date=task.get("requested_from"), to_date=task.get("requested_to"), limit=int(task.get("row_limit") or 500), job_id=job_id)
-        complete = ingestion_jobs.run(f"promo-backfill:{job_id}", "01", work)
+            if task.get("job_type") == "jev_scan":
+                process_jev_posts(limit=int(task.get("row_limit") or 2000), job_id=job_id)
+            else:
+                process_posts(account=task.get("account"), from_date=task.get("requested_from"), to_date=task.get("requested_to"), limit=int(task.get("row_limit") or 500), job_id=job_id)
+        complete = ingestion_jobs.run(f"promo-{task.get('job_type') or 'backfill'}:{job_id}", "01", work)
         if not complete:
             raise RuntimeError("Promo processing lease failed; retained for retry")
     except Exception as exc:
@@ -259,7 +392,8 @@ def list_opportunities(*, client: str | None = None, account: str | None = None,
     if review: clauses.append("o.review_status = ?"); params.append(review)
     if cursor:
         stamp, cur_account, cur_shortcode = (cursor.split("|", 2) + ["", ""])[:3]
-        clauses.append("(o.first_detected_at, o.account, o.shortcode) < (?, ?, ?)"); params.extend([stamp, cur_account, cur_shortcode])
+        clauses.append("(o.first_detected_at < ? OR (o.first_detected_at = ? AND (o.account, o.shortcode) > (?, ?)))")
+        params.extend([stamp, stamp, cur_account, cur_shortcode])
     with connect() as conn:
         _initialize_topic_stacks(conn)
         rows = conn.execute(f"{_opportunity_select()} WHERE {' AND '.join(clauses)} ORDER BY o.first_detected_at DESC, o.account, o.shortcode LIMIT ?", (*params, max(1, min(limit, 100)))).fetchall()
@@ -309,9 +443,9 @@ def update_opportunity(account: str, shortcode: str, payload: dict[str, Any], re
         if jev_review is not None:
             relationship = str(jev_review.get("commercialRelationship") or "unclear")
             recommendation = str(jev_review.get("recommendation") or "human_review")
-            if relationship not in {"paid_sponsorship", "affiliate_offer", "gifted_or_brand_relationship", "own_product_or_service", "organic_recommendation", "unclear"}:
+            if relationship not in {"paid_sponsorship", "affiliate_offer", "gifted_or_brand_relationship", "own_product_or_service", "organic_recommendation", "editorial_mention", "unclear"}:
                 relationship = "unclear"
-            if recommendation not in {"possible_missed_promotion", "conflicting_evidence", "human_review", "assessment_available"}:
+            if recommendation not in {"possible_missed_promotion", "conflicting_evidence", "human_review", "assessment_available", "no_promotion_signal"}:
                 recommendation = "human_review"
             allowed["jev_review"] = {
                 "semanticPromo": semantic,
@@ -321,6 +455,10 @@ def update_opportunity(account: str, shortcode: str, payload: dict[str, Any], re
                 "deterministicClassification": str(jev_review.get("deterministicClassification") or "not_promo")[:40],
                 "recommendation": recommendation,
                 "guidance": str(jev_review.get("guidance") or "Review the source evidence manually.")[:500],
+                "source": str(jev_review.get("source") or "jev_manual_review")[:50],
+                "contextSources": [str(value)[:40] for value in jev_review.get("contextSources", [])[:8] if isinstance(value, str)] if isinstance(jev_review.get("contextSources"), list) else [],
+                "contextSource": str(jev_review.get("contextSource") or "")[:40],
+                "contextExcerpt": str(jev_review.get("contextExcerpt") or "")[:500],
                 "mode": "jev_promo_review",
                 "reviewedAt": utc_now(),
             }
