@@ -226,6 +226,10 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     # between roles he already has, never into Dev or an unassigned privilege.
     request.state.available_operating_roles = list(dict.fromkeys(request.state.operating_roles))
     request.state.is_dev = email == "esteban@sentientagency.io"
+    # News is a DEV tool by default. Ivan has a deliberately narrow exception
+    # so he can use News and its Jev review without receiving the broader Dev
+    # capabilities checked by request.state.is_dev elsewhere.
+    request.state.can_access_news = request.state.is_dev or email == "ivan@sentientagency.io"
     request.state.can_role_switch = request.state.is_dev or email == "ivan@sentientagency.io"
     preview_role = request.headers.get("x-queue-role-preview", "").strip().lower()
     request.state.queue_role_preview_active = False
@@ -505,6 +509,7 @@ def dashboard_me(request: Request) -> dict[str, Any]:
         "operating_role": getattr(request.state, "operating_role", "sales"),
         "operating_roles": getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]),
         "is_dev": bool(getattr(request.state, "is_dev", False)),
+        "can_access_news": bool(getattr(request.state, "can_access_news", False)),
         # This is intentionally narrower than coordinator access: it only
         # unlocks the Queue creation flows that are internally approved for
         # the user, never the broader VC/Admin dashboard tools.
@@ -2096,9 +2101,9 @@ def _news_existing_posts(article_text: str, limit: int = 8) -> list[dict[str, st
 
 @app.post("/api/dashboard/jev/news-review")
 async def dashboard_jev_news_review(request: Request) -> dict[str, Any]:
-    """DEV-only Jev review for News, Reddit, and X sourcing candidates."""
-    if not getattr(request.state, "is_dev", False):
-        raise HTTPException(status_code=403, detail="News Jev review is currently available only to DEV users.")
+    """Restricted Jev review for authorized News, Reddit, and X users."""
+    if not getattr(request.state, "can_access_news", False):
+        raise HTTPException(status_code=403, detail="News Jev review is not available to this account.")
     try:
         payload = await request.json()
     except Exception as exc:
