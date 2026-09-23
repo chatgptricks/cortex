@@ -78,3 +78,17 @@ def test_news_novelty_can_unlock_golden_nugget(monkeypatch):
 
     assert result["label"] == "golden_nugget"
     assert result["novelty"]["isNewAngle"] is True
+
+
+def test_news_good_candidate_passes_calibrated_top_candidate_threshold(monkeypatch):
+    monkeypatch.setattr(jev_features, "ask_jev", lambda state, questions: _answer_set(score=3, novelty=3))
+
+    result = jev_features.golden_nugget_review(
+        "A useful and meaningfully new story with a clear adaptation path.",
+        "news-source",
+        [{"handle": "chatgptricks", "label": "ChatGPT Tricks"}],
+        novelty_context=[],
+    )
+
+    assert result["label"] == "golden_nugget"
+    assert result["score"] == 0.75
