@@ -239,6 +239,21 @@ def test_empty_profile_does_not_discard_other_accounts_paid_posts(monkeypatch):
     assert result['active'][0]['shortCode'] == 'saved'
 
 
+def test_unattributed_post_does_not_block_attributed_paid_posts(monkeypatch, caplog):
+    monkeypatch.setattr(apify_sync, '_fetch_apify_items', lambda *a, **k: [
+        {'shortCode': 'unmatched', 'ownerUsername': 'neighboring-profile'},
+        {'shortCode': 'saved', 'ownerUsername': 'active', 'type': 'Image'},
+    ])
+    configs = {'active': {'handle': 'active', 'scrape_mode': 'posts'}}
+
+    result = apify_sync._collect_short_term_items(
+        configs, 20, datetime.now(UTC), include_reels=False
+    )
+
+    assert [item['shortCode'] for item in result['active']] == ['saved']
+    assert 'skipped 1 post(s) without a matching account' in caplog.text
+
+
 def test_unavailable_profile_does_not_block_the_shared_scheduled_batch(monkeypatch, caplog):
     monkeypatch.setattr(apify_sync, '_fetch_apify_items', lambda *a, **k: [
         {

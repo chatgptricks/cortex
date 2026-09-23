@@ -1588,6 +1588,7 @@ def _collect_short_term_items(
             _short_term_payload(post_handles, results_limit, now, lookback_hours=lookback_hours)
         )
         post_owner_to_account = {cfg["handle"].lower(): account for account, cfg in post_configs.items()}
+        unattributed_posts = 0
         for item in post_items:
             source_account = _item_requested_account(item, post_owner_to_account)
             if item.get("error") == "no_items":
@@ -1603,9 +1604,19 @@ def _collect_short_term_items(
                 raise ApifySyncError(f"Apify returned an account error: {item.get('error')}")
             account = source_account or post_owner_to_account.get(_item_owner_username(item))
             if _item_shortcode(item) and not account:
-                raise ApifySyncError("Apify returned a post without a matching account; dataset retained")
+                # A shared actor run can contain a stray neighboring-profile
+                # row. Failing the whole cycle here traps every account behind
+                # the same paid dataset on each retry. Never guess an owner,
+                # but keep importing the rows that were safely attributed.
+                unattributed_posts += 1
+                continue
             if account:
                 items_by_account[account].append(item)
+        if unattributed_posts:
+            logger.warning(
+                "Short-term collection skipped %s post(s) without a matching account; attributed posts retained",
+                unattributed_posts,
+            )
 
     # The Reels actor is materially more expensive than the profile-posts
     # actor. Automated cycles must never invoke it: only a deliberately
@@ -2041,6 +2052,7 @@ def run_short_term_cycle_batch_paged(
                 for account, cfg in configs.items()
                 if cfg["scrape_mode"] in {"posts", "both"}
             }
+            unattributed_posts = 0
             for item in page:
                 requested = _item_requested_account(item, owner_to_account)
                 if item.get("error") == "no_items":
@@ -2052,9 +2064,17 @@ def run_short_term_cycle_batch_paged(
                     raise ApifySyncError(f"Apify returned an account error: {item.get('error')}")
                 account = requested or owner_to_account.get(_item_owner_username(item))
                 if _item_shortcode(item) and not account:
-                    raise ApifySyncError("Apify returned a post without a matching account; dataset retained")
+                    # Match the non-paged collector: one malformed or foreign
+                    # row must not block valid posts from a paid recovery run.
+                    unattributed_posts += 1
+                    continue
                 if account and "error" not in results[account]:
                     by_account.setdefault(account, []).append(item)
+            if unattributed_posts:
+                logger.warning(
+                    "Paged recovery skipped %s post(s) without a matching account; attributed posts retained",
+                    unattributed_posts,
+                )
         else:
             owner_to_account = {
                 cfg["handle"].lower(): account
