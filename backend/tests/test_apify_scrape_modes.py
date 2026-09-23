@@ -254,6 +254,22 @@ def test_unattributed_post_does_not_block_attributed_paid_posts(monkeypatch, cap
     assert 'skipped 1 post(s) without a matching account' in caplog.text
 
 
+def test_reconcile_queue_hot_uses_database_connection(monkeypatch):
+    connection = object()
+    calls = []
+
+    @contextmanager
+    def fake_connect():
+        yield connection
+
+    monkeypatch.setattr('app.db.connect', fake_connect)
+    monkeypatch.setattr('app.main._queue_v2_auto_pool_hot', calls.append)
+
+    apify_sync._reconcile_queue_hot()
+
+    assert calls == [connection]
+
+
 def test_unavailable_profile_does_not_block_the_shared_scheduled_batch(monkeypatch, caplog):
     monkeypatch.setattr(apify_sync, '_fetch_apify_items', lambda *a, **k: [
         {
