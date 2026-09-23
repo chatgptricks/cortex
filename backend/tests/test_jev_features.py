@@ -66,7 +66,7 @@ def test_news_novelty_is_required_for_golden_nugget(monkeypatch):
     assert result["novelty"]["isNewAngle"] is False
 
 
-def test_news_novelty_can_unlock_golden_nugget(monkeypatch):
+def test_news_without_comparisons_does_not_claim_verified_novelty(monkeypatch):
     monkeypatch.setattr(jev_features, "ask_jev", lambda state, questions: _answer_set(novelty=4))
 
     result = jev_features.golden_nugget_review(
@@ -77,7 +77,7 @@ def test_news_novelty_can_unlock_golden_nugget(monkeypatch):
     )
 
     assert result["label"] == "golden_nugget"
-    assert result["novelty"]["isNewAngle"] is True
+    assert result["novelty"] is None
 
 
 def test_news_good_candidate_passes_calibrated_top_candidate_threshold(monkeypatch):
