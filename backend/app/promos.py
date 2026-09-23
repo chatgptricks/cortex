@@ -16,6 +16,24 @@ from .jev_features import discover_promos
 JEV_PROMO_MODEL_VERSION = "jev-promo-discovery-v1"
 
 
+def _ensure_jev_scans_table(conn: Any) -> None:
+    """Support older or lightweight databases that have not run db.initialize()."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS promo_jev_scans (
+               account TEXT NOT NULL,
+               shortcode TEXT NOT NULL,
+               input_hash TEXT NOT NULL,
+               model_version TEXT NOT NULL,
+               semantic_score REAL NOT NULL DEFAULT 0,
+               relationship TEXT NOT NULL DEFAULT 'unclear',
+               relationship_confidence REAL NOT NULL DEFAULT 0,
+               is_candidate INTEGER NOT NULL DEFAULT 0,
+               updated_at TEXT NOT NULL,
+               PRIMARY KEY(account, shortcode)
+           )"""
+    )
+
+
 def _initialize_topic_stacks(conn: Any) -> None:
     """Keep Promos usable in older/local databases before stack migration."""
     from .topic_stacks import initialize
@@ -61,6 +79,7 @@ def analyze_post(post: dict[str, Any]) -> dict[str, Any]:
     analysis = detect_promo(post)
     with connect() as conn:
         _initialize_topic_stacks(conn)
+        _ensure_jev_scans_table(conn)
         stack = _promo_stack_context(conn, account, shortcode)
         analysis["stack_id"] = stack["stack_id"]
         analysis["stack_size"] = stack["stack_size"]
