@@ -1815,6 +1815,7 @@ def _reconcile_queue_hot() -> None:
     try:
         # Imported lazily because main.py imports this module during startup.
         from .main import _queue_v2_auto_pool_hot
+        from .db import connect
 
         with connect() as conn:
             _queue_v2_auto_pool_hot(conn)
