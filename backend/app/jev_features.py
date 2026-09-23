@@ -190,7 +190,7 @@ def golden_nugget_review(
     target_accounts = target_accounts or []
     account_criteria = {
         str(item.get("handle") or "none"): (
-            f"{item.get('label') or item.get('handle')}: an active Sentient account that could own the idea"
+            f"{item.get('label') or item.get('handle')}: active Sentient account. Recent content: {item.get('examples') or 'No examples available; infer fit conservatively from the account name.'}"
         )
         for item in target_accounts
         if str(item.get("handle") or "").strip()
@@ -204,7 +204,7 @@ def golden_nugget_review(
                 f"{instruction} Evaluate the underlying editorial opportunity, not the post's likes, "
                 "views, account size, or current virality. A post can be a golden nugget even when it is not Hot."
             ),
-            "levels": levels,
+            "criteria": levels,
         }
     questions["golden_nugget"] = {
         "type": "noul",
@@ -225,7 +225,7 @@ def golden_nugget_review(
         ),
         "criteria": account_criteria,
     }
-    if novelty_context is not None:
+    if bool(novelty_context):
         questions["novelty"] = {
             "type": "score",
             "instructions": (
@@ -233,7 +233,7 @@ def golden_nugget_review(
                 "the state? Judge the idea and angle, not exact wording. A topic can be familiar while the angle is "
                 "new. Penalize ideas that substantially repeat an existing post."
             ),
-            "levels": [
+            "criteria": [
                 "Already covered by an existing dashboard post",
                 "Mostly the same idea with minor wording changes",
                 "Somewhat new but overlaps an existing angle",
@@ -259,28 +259,27 @@ def golden_nugget_review(
     weighted_score = sum(scores[key] * weight for key, (weight, _, _) in dimensions.items()) / total_weight
     novelty_score = 0.0
     novelty_confidence = 0.0
-    if novelty_context is not None:
+    if bool(novelty_context):
         novelty_score, novelty_confidence = _score_answer(answers, "novelty")
         # Novelty is a meaningful multiplier, not a cosmetic badge. It gets
         # 18% of the final score while preserving the original signal mix.
         weighted_score = weighted_score * 0.82 + novelty_score * 0.18
     confidence_values = list(confidences.values())
-    if novelty_context is not None:
+    if bool(novelty_context):
         confidence_values.append(novelty_confidence)
     confidence = sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
     jev_signal = _noul(answers, "golden_nugget")
     best_account, account_confidence = _choice_answer(answers, "best_account")
     critical_floor = min(scores.get(key, 0.0) for key in ("insight", "audience_value", "hook", "repurpose", "distinctiveness"))
     strong_signal_count = sum(value >= 0.68 for value in scores.values())
-    if novelty_context is not None and novelty_score >= 0.68:
+    if bool(novelty_context) and novelty_score >= 0.68:
         strong_signal_count += 1
-    novelty_gate = novelty_context is None or novelty_score >= 0.68
+    novelty_gate = not novelty_context or novelty_score >= 0.68
     if (
         weighted_score >= 0.72
         and jev_signal >= 0.65
         and best_account != "none"
         and account_confidence >= 0.55
-        and confidence >= 0.50
         and critical_floor >= 0.50
         and strong_signal_count >= 4
         and novelty_gate
@@ -305,8 +304,8 @@ def golden_nugget_review(
         "novelty": {
             "score": round(novelty_score, 4),
             "confidence": round(novelty_confidence, 4),
-            "isNewAngle": novelty_context is not None and novelty_score >= 0.78,
-        } if novelty_context is not None else None,
+            "isNewAngle": bool(novelty_context) and novelty_score >= 0.68,
+        } if bool(novelty_context) else None,
         "mode": "jev_golden_nugget",
     }
 

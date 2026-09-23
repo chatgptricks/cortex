@@ -2074,6 +2074,7 @@ def _news_existing_posts(article_text: str, limit: int = 8) -> list[dict[str, st
             """SELECT account, shortcode, caption, hook_text
                FROM dashboard_posts
                WHERE COALESCE(caption, '') != ''
+                 AND account IN (SELECT handle FROM accounts WHERE group_name = 'sentient' AND is_active = 1)
                ORDER BY published_at DESC, id DESC LIMIT 500"""
         ).fetchall()
         for row in rows:
@@ -2120,9 +2121,16 @@ async def dashboard_jev_news_review(request: Request) -> dict[str, Any]:
         target_accounts = [dict(row) for row in conn.execute(
             "SELECT handle, label FROM accounts WHERE is_active = 1 AND group_name = 'sentient' ORDER BY handle LIMIT 40"
         ).fetchall()]
+        for account in target_accounts:
+            examples = conn.execute(
+                "SELECT caption FROM dashboard_posts WHERE account = ? AND COALESCE(caption, '') != '' ORDER BY published_at DESC LIMIT 3",
+                (account["handle"],),
+            ).fetchall()
+            account["examples"] = " | ".join(str(row["caption"])[:400] for row in examples)
     existing_posts = _news_existing_posts(text)
     try:
-        review = golden_nugget_review(
+        review = await run_in_threadpool(
+            golden_nugget_review,
             text,
             source_account=source,
             target_accounts=target_accounts,
