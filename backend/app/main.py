@@ -2127,7 +2127,10 @@ async def dashboard_jev_news_review(request: Request) -> dict[str, Any]:
                 (account["handle"],),
             ).fetchall()
             account["examples"] = " | ".join(str(row["caption"])[:400] for row in examples)
-    existing_posts = _news_existing_posts(text)
+    from .news_sources import article_evidence
+    evidence_text, evidence_source = await run_in_threadpool(article_evidence, url, description)
+    text = "\n".join(part for part in (headline, evidence_text[:8000], source, published, url) if part)[:9000]
+    existing_posts = await run_in_threadpool(_news_existing_posts, text)
     try:
         review = await run_in_threadpool(
             golden_nugget_review,
@@ -2143,6 +2146,8 @@ async def dashboard_jev_news_review(request: Request) -> dict[str, Any]:
         "headline": headline,
         "source": source,
         "existingCandidates": existing_posts,
+        "evidenceSource": evidence_source,
+        "evidenceText": evidence_text[:8000],
         **review,
     }
 
