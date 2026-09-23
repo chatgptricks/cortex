@@ -80,7 +80,7 @@ from .scheduler import start_scheduler
 from .account_backfill_queue import enqueue as enqueue_account_backfill, status as account_backfill_status
 from .post_recovery_queue import enqueue as enqueue_post_recovery, status as post_recovery_status
 from .post_refresh_queue import enqueue as enqueue_post_refresh, get as get_post_refresh
-from .promos import create_backfill, get_job, get_opportunity, list_opportunities, update_opportunity
+from .promos import create_backfill, create_jev_scan, get_job, get_opportunity, list_opportunities, update_opportunity
 from .promos_detector import detect_promo
 from .jev_features import (
     JevFeatureUnavailable,
@@ -7697,6 +7697,19 @@ def admin_promos(
     cursor: str | None = None,
 ) -> dict[str, Any]:
     return list_opportunities(client=client, account=account, classification=classification, review=review, limit=limit, cursor=cursor)
+
+
+@app.post("/api/admin/promos/jev-scan")
+async def admin_promos_jev_scan(request: Request) -> dict[str, str]:
+    """Queue a semantic discovery pass over stored competitor posts only."""
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON object required")
+    try:
+        limit = max(1, min(int(payload.get("limit", 2000)), 2000))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="limit must be an integer")
+    return {"job_id": create_jev_scan(limit=limit), "job_type": "jev_scan"}
 
 
 @app.get("/api/admin/promos/jobs/{job_id}")

@@ -1073,6 +1073,20 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
                error TEXT,
                updated_at TEXT NOT NULL,
                PRIMARY KEY(account, shortcode)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS promo_jev_scans (
+               account TEXT NOT NULL,
+               shortcode TEXT NOT NULL,
+               input_hash TEXT NOT NULL,
+               model_version TEXT NOT NULL,
+               semantic_score REAL NOT NULL DEFAULT 0,
+               relationship TEXT NOT NULL DEFAULT 'unclear',
+               relationship_confidence REAL NOT NULL DEFAULT 0,
+               is_candidate INTEGER NOT NULL DEFAULT 0,
+               updated_at TEXT NOT NULL,
+               PRIMARY KEY(account, shortcode)
            )"""
     )
     conn.execute(
@@ -1135,6 +1149,7 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     _ensure_column(conn, "account_backfill_jobs", "heartbeat_at", "heartbeat_at TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_opportunities_date ON promo_opportunities(first_detected_at DESC, account, shortcode)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_scans_status ON promo_scans(status, updated_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_jev_scans_version ON promo_jev_scans(model_version, updated_at)")
 
 
 # --- Sentient Dash users (Google sign-in allowlist + roles) ----------------
