@@ -307,8 +307,16 @@ def golden_nugget_review(
         and novelty_gate
     ):
         label = "golden_nugget"
-    elif weighted_score >= 0.62 and jev_signal >= 0.50 and account_gate:
-        label = "promising"
+    # Potential is a deliberately wider discovery bucket for ideas that have
+    # evidence and an adaptation path but miss one or more Golden gates.
+    elif (
+        weighted_score >= 0.56
+        and jev_signal >= 0.40
+        and critical_floor >= 0.30
+        and strong_signal_count >= 2
+        and (novelty_context is not None or account_gate)
+    ):
+        label = "potential"
     else:
         label = "not_yet"
     ranked_dimensions = sorted(scores, key=scores.get, reverse=True)
@@ -320,6 +328,10 @@ def golden_nugget_review(
         "targetAccount": best_account if best_account != "none" else None,
         "targetAccountConfidence": round(account_confidence, 4),
         "strongSignalCount": strong_signal_count,
+        "classificationGates": {
+            "golden": {"score": 0.72, "jevSignal": 0.65, "criticalDimensionFloor": 0.50, "strongSignals": 4, "novelty": 0.68},
+            "potential": {"score": 0.56, "jevSignal": 0.40, "criticalDimensionFloor": 0.30, "strongSignals": 2},
+        },
         "dimensions": {key: {"score": round(scores[key], 4), "confidence": round(confidences[key], 4)} for key in dimensions},
         "strengths": ranked_dimensions[:3],
         "weaknesses": ranked_dimensions[-2:],
