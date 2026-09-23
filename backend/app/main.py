@@ -2110,7 +2110,10 @@ async def dashboard_jev_news_review(request: Request) -> dict[str, Any]:
     headline = str(payload.get("headline") or payload.get("title") or "").strip()
     description = str(payload.get("description") or payload.get("reason") or "").strip()
     source = str(payload.get("source") or payload.get("author") or payload.get("subreddit") or source_type).strip()
-    text = "\n".join(part for part in (headline, description, source) if part)[:9000]
+    author = str(payload.get("author") or "").strip()
+    url = str(payload.get("url") or "").strip()
+    published = str(payload.get("published") or "").strip()
+    text = "\n".join(part for part in (headline, description, source, author, published, url) if part)[:9000]
     if len(headline) < 8:
         raise HTTPException(status_code=400, detail="The candidate needs a usable headline or title.")
     with connect() as conn:
