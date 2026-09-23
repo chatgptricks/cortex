@@ -62,7 +62,7 @@ def test_news_novelty_is_required_for_golden_nugget(monkeypatch):
         novelty_context=[{"account": "chatgptricks", "shortcode": "abc", "text": "Existing post"}],
     )
 
-    assert result["label"] == "promising"
+    assert result["label"] == "potential"
     assert result["novelty"]["isNewAngle"] is False
 
 
