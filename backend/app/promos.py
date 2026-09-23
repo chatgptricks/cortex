@@ -37,7 +37,10 @@ def _row_item(row: dict[str, Any]) -> dict[str, Any]:
     result = {**analysis, "account": row["account"], "shortcode": row["shortcode"], "classification": row["classification"], "client": row.get("client"), "product": row.get("product"), "review_status": row.get("review_status") or "new", "published_at": row.get("published_at"), "first_detected_at": row.get("first_detected_at"), "last_analyzed_at": row.get("last_analyzed_at"), "stack_id": stack_id, "stack_size": int(stack_size), "account_group": row.get("account_group"), "account_group_label": row.get("account_group_label")}
     if override:
         result["overrides"] = override
+        result["jev_review"] = override.get("jev_review")
         result.update({key: value for key, value in override.items() if key in {"client", "product", "classification"} and value is not None})
+    else:
+        result["jev_review"] = None
     return result
 
 
@@ -294,6 +297,33 @@ def get_opportunity(account: str, shortcode: str) -> dict[str, Any] | None:
 
 def update_opportunity(account: str, shortcode: str, payload: dict[str, Any], reviewer: str) -> dict[str, Any] | None:
     allowed = {key: payload[key] for key in ("client", "product", "classification") if key in payload and isinstance(payload[key], str)}
+    jev_review = payload.get("jev_review")
+    if isinstance(jev_review, dict):
+        semantic = jev_review.get("semanticPromo")
+        relationship_confidence = jev_review.get("relationshipConfidence")
+        try:
+            semantic = max(0.0, min(1.0, float(semantic)))
+            relationship_confidence = max(0.0, min(1.0, float(relationship_confidence)))
+        except (TypeError, ValueError):
+            jev_review = None
+        if jev_review is not None:
+            relationship = str(jev_review.get("commercialRelationship") or "unclear")
+            recommendation = str(jev_review.get("recommendation") or "human_review")
+            if relationship not in {"paid_sponsorship", "affiliate_offer", "gifted_or_brand_relationship", "own_product_or_service", "organic_recommendation", "unclear"}:
+                relationship = "unclear"
+            if recommendation not in {"possible_missed_promotion", "conflicting_evidence", "human_review", "assessment_available"}:
+                recommendation = "human_review"
+            allowed["jev_review"] = {
+                "semanticPromo": semantic,
+                "needsReview": bool(jev_review.get("needsReview")),
+                "commercialRelationship": relationship,
+                "relationshipConfidence": relationship_confidence,
+                "deterministicClassification": str(jev_review.get("deterministicClassification") or "not_promo")[:40],
+                "recommendation": recommendation,
+                "guidance": str(jev_review.get("guidance") or "Review the source evidence manually.")[:500],
+                "mode": "jev_promo_review",
+                "reviewedAt": utc_now(),
+            }
     review = payload.get("review_status") if payload.get("review_status") in {"new", "reviewed", "dismissed"} else None
     with connect() as conn:
         row = conn.execute("SELECT * FROM promo_opportunities WHERE account = ? AND shortcode = ?", (account, shortcode)).fetchone()

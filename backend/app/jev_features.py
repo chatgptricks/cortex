@@ -50,7 +50,15 @@ def _choice_answer(answers: dict[str, Any], key: str) -> tuple[str, float]:
     answer = answers.get(key) or {}
     if not isinstance(answer, dict):
         return "none", 0.0
-    return str(answer.get("choice") or "none"), _clamp(answer.get("confidence"))
+    choice = answer.get("choice") or answer.get("label") or answer.get("value")
+    if not choice:
+        probabilities = answer.get("probabilities")
+        if isinstance(probabilities, dict) and probabilities:
+            choice = max(probabilities, key=lambda option: _clamp(probabilities[option]))
+    confidence = _clamp(answer.get("confidence"))
+    if not confidence and isinstance(answer.get("probabilities"), dict):
+        confidence = max((_clamp(value) for value in answer["probabilities"].values()), default=0.0)
+    return str(choice or "none"), confidence
 
 
 def ask_jev(state: dict[str, Any], questions: dict[str, Any]) -> dict[str, Any]:
@@ -389,14 +397,47 @@ def review_promo(text: str, deterministic: dict[str, Any]) -> dict[str, Any]:
             "instructions": "Is the promotion classification ambiguous enough that a human should review it?",
             "criteria": {"true": "Evidence is mixed, indirect, or could reasonably be interpreted either way.", "false": "The commercial status is clear from the available evidence."},
         },
+        "commercial_relationship": {
+            "type": "choice",
+            "instructions": (
+                "What commercial relationship, if any, is supported by this post? Judge only the supplied post evidence. "
+                "A recommendation or product mention alone does not prove payment or sponsorship."
+            ),
+            "criteria": {
+                "paid_sponsorship": "The post itself indicates a paid sponsorship, paid partnership, or advertising placement.",
+                "affiliate_offer": "The creator offers a referral or affiliate link/code or states they earn commission.",
+                "gifted_or_brand_relationship": "The post indicates a gifted product, brand partnership, ambassador role, or other relationship, but does not establish direct payment.",
+                "own_product_or_service": "The author is promoting their own product, service, event, or commercial offering.",
+                "organic_recommendation": "The author recommends or discusses something without evidence of a commercial relationship or offer.",
+                "unclear": "The available post text does not support a reliable relationship classification.",
+            },
+        },
     }
     answers = ask_jev({"post_text": text[:7000], "deterministic_analysis": deterministic}, questions)
     semantic = _noul(answers, "semantic_promo")
     review = _noul(answers, "needs_review")
+    relationship, relationship_confidence = _choice_answer(answers, "commercial_relationship")
+    deterministic_classification = str(deterministic.get("classification") or "not_promo")
+    if semantic >= 0.75 and deterministic_classification == "not_promo":
+        recommendation = "possible_missed_promotion"
+        guidance = "Jev found commercial intent despite no deterministic promo match. Check the caption and commercial details before confirming."
+    elif semantic <= 0.25 and deterministic_classification in {"disclosed", "likely"}:
+        recommendation = "conflicting_evidence"
+        guidance = "Jev found little semantic support for promotion. Keep the explicit rule evidence and inspect the post context before changing anything."
+    elif review >= 0.55 or relationship == "unclear":
+        recommendation = "human_review"
+        guidance = "The relationship is ambiguous. Check the evidence and the original post."
+    else:
+        recommendation = "assessment_available"
+        guidance = "Use this as an additional assessment of the post text; it does not establish whether money changed hands."
     return {
         "semanticPromo": semantic,
         "needsReview": review >= 0.55,
-        "deterministicClassification": deterministic.get("classification"),
+        "commercialRelationship": relationship,
+        "relationshipConfidence": relationship_confidence,
+        "deterministicClassification": deterministic_classification,
+        "recommendation": recommendation,
+        "guidance": guidance,
         "mode": "jev_promo_review",
     }
 
