@@ -221,7 +221,7 @@ def golden_nugget_review(
         "type": "choice",
         "instructions": (
             "Which active Sentient account is the most natural owner for an original post based on this idea? "
-            "Choose none if the fit is forced, generic, or unsupported."
+            "Consider an accessible original adaptation for the account audience, not copying the source style. Recent posts are examples, not topic restrictions. Choose none only when the idea is outside every account audience."
         ),
         "criteria": account_criteria,
     }
@@ -296,17 +296,18 @@ def golden_nugget_review(
     if bool(novelty_context) and novelty_score >= 0.68:
         strong_signal_count += 1
     novelty_gate = not novelty_context or novelty_score >= 0.68
+    # News discovery judges the idea separately from assigning its eventual owner.
+    account_gate = novelty_context is not None or (best_account != "none" and account_confidence >= 0.55)
     if (
         weighted_score >= 0.72
         and jev_signal >= 0.65
-        and best_account != "none"
-        and account_confidence >= 0.55
+        and account_gate
         and critical_floor >= 0.50
         and strong_signal_count >= 4
         and novelty_gate
     ):
         label = "golden_nugget"
-    elif weighted_score >= 0.62 and jev_signal >= 0.50 and best_account != "none":
+    elif weighted_score >= 0.62 and jev_signal >= 0.50 and account_gate:
         label = "promising"
     else:
         label = "not_yet"
