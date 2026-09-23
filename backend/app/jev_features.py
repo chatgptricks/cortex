@@ -225,6 +225,27 @@ def golden_nugget_review(
         ),
         "criteria": account_criteria,
     }
+    if novelty_context is not None:
+        questions["editorial_angle"] = {
+            "type": "choice",
+            "instructions": "Choose the strongest original editorial treatment supported by the supplied source excerpt. Do not assume facts missing from the excerpt.",
+            "criteria": {
+                "practical_guide": "Teach a useful workflow, tool or concrete action the reader can try.",
+                "comparison": "Explain a supported difference between tools, approaches, costs or capabilities.",
+                "what_changes": "Explain a specific announcement and its practical consequences for the reader.",
+                "visual_explainer": "Make a technical concept or robotics development easy to understand visually.",
+                "needs_reporting": "The excerpt lacks enough substance; investigate the original source before developing a post.",
+            },
+        }
+        questions["post_format"] = {
+            "type": "choice",
+            "instructions": "Which post format best communicates the supported idea?",
+            "criteria": {
+                "carousel": "An ordered explanation with several distinct useful points.",
+                "reel": "A demonstration or visual story, subject to obtaining usable footage.",
+                "single_post": "One clear announcement, takeaway or comparison fits one image and caption.",
+            },
+        }
     if bool(novelty_context):
         questions["novelty"] = {
             "type": "score",
@@ -306,6 +327,8 @@ def golden_nugget_review(
             "confidence": round(novelty_confidence, 4),
             "isNewAngle": bool(novelty_context) and novelty_score >= 0.68,
         } if bool(novelty_context) else None,
+        "editorialAngle": _choice_answer(answers, "editorial_angle")[0] if novelty_context is not None else None,
+        "postFormat": _choice_answer(answers, "post_format")[0] if novelty_context is not None else None,
         "mode": "jev_golden_nugget",
     }
 
