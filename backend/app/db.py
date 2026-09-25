@@ -981,6 +981,8 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     Postgres. Keep post-cutover additions here as well as in SQLite's full
     bootstrap above so a newly deployed backend cannot outrun its database.
     """
+    from .vault import ensure_schema as ensure_vault_schema
+    ensure_vault_schema(conn)
     _ensure_column(conn, "dashboard_users", "time_zone", "time_zone TEXT NOT NULL DEFAULT ''")
     _ensure_column(
         conn,
