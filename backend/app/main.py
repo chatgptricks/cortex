@@ -106,6 +106,8 @@ from .queue_rules import (
 
 
 app = FastAPI(title="Cortex API", version="1.0.0")
+from .vault import router as vault_router
+app.include_router(vault_router)
 
 DEFAULT_PERSON_OPTIONS = [
     "Elon Musk",
@@ -510,6 +512,7 @@ def dashboard_me(request: Request) -> dict[str, Any]:
         "operating_roles": getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]),
         "is_dev": bool(getattr(request.state, "is_dev", False)),
         "can_access_news": bool(getattr(request.state, "can_access_news", False)),
+        "queue_role_preview_active": bool(getattr(request.state, "queue_role_preview_active", False)),
         # This is intentionally narrower than coordinator access: it only
         # unlocks the Queue creation flows that are internally approved for
         # the user, never the broader VC/Admin dashboard tools.
