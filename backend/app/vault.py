@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
 from .db import connect
+from .vault_text import fetch_tweet_text
 
 router = APIRouter(prefix="/api/dashboard/vault", tags=["vault"])
 
@@ -18,6 +19,9 @@ def ensure_schema(conn):
         slack_url TEXT NOT NULL DEFAULT '', priority DOUBLE PRECISION NOT NULL,
         discarded INTEGER NOT NULL DEFAULT 0
     )""")
+    from .db import _ensure_column
+    for column, default in [('tweet_text', ''), ('tweet_author', ''), ('tweet_image', ''), ('tweet_avatar', ''), ('tweet_media_type', ''), ('text_status', 'pending')]:
+        _ensure_column(conn, "vault_links", column, f"{column} TEXT NOT NULL DEFAULT '{default}'")
 
 
 def require_dev(request: Request):
@@ -78,7 +82,7 @@ def list_links(response: Response):
 @router.post("", dependencies=[Depends(require_dev)])
 def create_link(item: LinkInput, response: Response):
     response.headers["Cache-Control"] = "private, no-store"
-    return add_link(item)
+    return enrich_link(add_link(item)["id"])
 
 
 @router.patch("/{link_id}", dependencies=[Depends(require_dev)])
@@ -93,3 +97,25 @@ def update_link(link_id: str, item: LinkUpdate, response: Response):
         if item.discarded is not None:
             conn.execute("UPDATE vault_links SET discarded = ? WHERE id = ?", (int(item.discarded), link_id))
         return dict(conn.execute("SELECT * FROM vault_links WHERE id = ?", (link_id,)).fetchone())
+
+
+def enrich_link(link_id: str):
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM vault_links WHERE id = ?", (link_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Link not found.")
+    if row["text_status"] in {"ready", "not_applicable"}:
+        return dict(row)
+    preview = fetch_tweet_text(row["url"])
+    with connect() as conn:
+        # Preserve a successful result if another request finished first.
+        conn.execute("""UPDATE vault_links SET tweet_text = ?, tweet_author = ?, tweet_image = ?, tweet_avatar = ?, tweet_media_type = ?, text_status = ?
+            WHERE id = ? AND text_status NOT IN ('ready', 'not_applicable')""",
+            (preview["tweet_text"], preview["tweet_author"], preview.get("tweet_image", ""), preview.get("tweet_avatar", ""), preview.get("tweet_media_type", ""), preview["text_status"], link_id))
+        return dict(conn.execute("SELECT * FROM vault_links WHERE id = ?", (link_id,)).fetchone())
+
+
+@router.post("/{link_id}/text", dependencies=[Depends(require_dev)])
+def load_tweet_text(link_id: str, response: Response):
+    response.headers["Cache-Control"] = "private, no-store"
+    return enrich_link(link_id)

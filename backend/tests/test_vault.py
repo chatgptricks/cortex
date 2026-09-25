@@ -59,3 +59,19 @@ def test_persistent_add_duplicate_priority_discard_restore(client):
 @pytest.mark.parametrize('url', ['javascript:alert(1)', 'data:text/html,x', 'https://user:pass@example.com', '', 'not a url'])
 def test_invalid_links_rejected(client, url):
     assert client.post('/api/dashboard/vault', headers={'x-test-role':'dev'}, json={'url':url}).status_code == 422
+
+
+def test_tweet_text_is_persistent_and_not_refetched(client, monkeypatch):
+    calls = []
+    def preview(url):
+        calls.append(url)
+        return {'tweet_text':'A readable tweet', 'tweet_author':'Creator', 'text_status':'ready'}
+    monkeypatch.setattr(vault, 'fetch_tweet_text', preview)
+    client.headers['x-test-role'] = 'dev'
+    row = client.post('/api/dashboard/vault', json={'url':'https://x.com/creator/status/123'}).json()
+    assert row['tweet_text'] == 'A readable tweet'
+    assert client.get('/api/dashboard/vault').json()['items'][0]['tweet_text'] == 'A readable tweet'
+    assert client.post('/api/dashboard/vault/'+row['id']+'/text').json()['tweet_text'] == 'A readable tweet'
+    assert calls == [row['url']]
+    client.headers['x-test-role'] = 'admin'
+    assert client.post('/api/dashboard/vault/'+row['id']+'/text').status_code == 403
