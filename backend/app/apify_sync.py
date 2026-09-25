@@ -1913,6 +1913,28 @@ def run_short_term_cycle_batch(
     return results
 
 
+def _needs_eight_hour_refresh(account: str, cfg: dict[str, Any], now: datetime) -> bool:
+    """Gate only the update-only pass; discovery must still scan every account."""
+    from .db import connect
+
+    scope_sql, scope_params = _account_scope(cfg["table"], account)
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT shortcode, published_at, refreshed_8h FROM {cfg['table']} WHERE 1=1{scope_sql}",
+            scope_params,
+        ).fetchall()
+    for row in rows:
+        code = row["shortcode"]
+        if not code or code.startswith("post-"):
+            continue
+        age = _post_age_hours(row["published_at"], now)
+        if age is None or age > _EIGHT_HOUR_FINALIZATION_LOOKBACK:
+            continue
+        if age <= _EIGHT_HOUR_ENGAGEMENT_WINDOW or not bool(row["refreshed_8h"]):
+            return True
+    return False
+
+
 def run_day_engagement_cycle_batch(
     accounts: list[str],
     results_limit: int = 100,
@@ -1948,6 +1970,39 @@ def run_day_engagement_cycle_batch(
     journal = current()
     if journal:
         configs = journal.frozen("configs", configs)
+    # Freeze the selection across retries: changing accounts after an actor
+    # has been paid for would invalidate the journal's positional run inputs.
+    # An older in-flight job already contains a paid full-account run; reuse it.
+    selected = None
+    if journal:
+        selected = journal.state.get("engagement_accounts")
+        if selected is None and "run:0" in journal.state:
+            selected = list(configs)
+    if selected is None:
+        selected = []
+        for account, cfg in configs.items():
+            try:
+                if _needs_eight_hour_refresh(account, cfg, now):
+                    selected.append(account)
+            except Exception as exc:
+                results[account] = {"error": f"eligibility lookup failed: {exc}"}
+        if any(result.get("error") for result in results.values()):
+            raise ApifySyncError(f"Engagement eligibility lookup failed: {results}")
+        # Do not freeze lookup failures as permanent omissions.
+        if journal:
+            selected = journal.frozen("engagement_accounts", selected)
+    for account in configs:
+        if account not in selected and account not in results:
+            results[account] = {
+                "new_posts": {"added": 0, "failed": 0},
+                "engagement": {"checked": 0, "updated": 0, "finalized_8h": 0, "hot_marked": 0, "unmatched": 0},
+                "transcripts_updated": 0,
+            }
+    logger.info("Eight-hour engagement selection: %d of %d accounts need a scan", len(selected), len(configs))
+    configs = {account: cfg for account, cfg in configs.items() if account in selected}
+    if not configs:
+        _reconcile_queue_hot()
+        return results
     collection_configs = {
         account: {**cfg, "scrape_mode": "posts"}
         for account, cfg in configs.items()

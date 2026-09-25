@@ -60,7 +60,7 @@ def now():
     return datetime.fromisoformat(journal.frozen('now', value.isoformat())) if journal else value
 
 
-def run(key, slot, callback):
+def run(key, slot, callback, *, retain_result=False):
     owner = uuid.uuid4().hex
     epoch = time.time()
     with db.connect() as conn:
@@ -100,11 +100,14 @@ def run(key, slot, callback):
     thread.start()
     token = _current.set(journal)
     try:
-        callback()
+        result = callback()
         journal.save()
+        completed_state = {"last_success_at": db.utc_now()}
+        if retain_result:
+            completed_state["result"] = result
         with db.connect() as conn:
             conn.execute("UPDATE ingestion_jobs SET status = 'done', lease_until = 0, error = NULL, state = ?, updated_at = ? WHERE job_key = ? AND owner = ?",
-                         (json.dumps({"last_success_at": db.utc_now()}), db.utc_now(), key, owner))
+                         (json.dumps(completed_state), db.utc_now(), key, owner))
         return True
     except Exception as exc:
         with db.connect() as conn:
@@ -116,3 +119,36 @@ def run(key, slot, callback):
         _current.reset(token)
         stop.set()
         thread.join(timeout=2)
+
+
+class IngestionPending(RuntimeError):
+    """Paid work is retained and can be resumed without starting another run."""
+
+
+def call(key, callback, *, slot=None):
+    """Return a durable result for a manual operation.
+
+    Explicit slots make queue redelivery idempotent. A new HTTP request gets a
+    new slot, but an unfinished prior request always resumes its original run.
+    Completed results are retained to cover a crash before queue/UI delivery.
+    """
+    requested_slot = slot or datetime.now(UTC).isoformat(timespec="microseconds")
+    output = []
+
+    def work():
+        result = callback()
+        output.append(result)
+        return result
+
+    if run(key, requested_slot, work, retain_result=True):
+        return output[0]
+    with db.connect() as conn:
+        row = conn.execute("SELECT slot, status, state, error FROM ingestion_jobs WHERE job_key = ?", (key,)).fetchone()
+    if row and row["status"] == "done" and row["slot"] == requested_slot:
+        state = json.loads(row["state"])
+        if "result" in state:
+            return state["result"]
+    raise IngestionPending(
+        (row["error"] if row else None)
+        or "Refresh is already running; retry shortly. The paid run is retained."
+    )

@@ -14,7 +14,7 @@ import threading
 import uuid
 from typing import Any
 
-from . import db
+from . import db, ingestion_jobs
 
 logger = logging.getLogger(__name__)
 _WAKE = threading.Event()
@@ -26,7 +26,7 @@ _ENQUEUE_LOCK_KEY = 7042198364
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
 def initialize(conn: Any) -> None:
@@ -84,7 +84,8 @@ def enqueue(*, account: str, shortcode: str) -> dict[str, Any]:
             conn.execute(
                 """UPDATE post_refresh_jobs
                    SET account = ?, shortcode = ?, status = 'queued',
-                       result_json = '{}', error = NULL, requested_at = ?,
+                       result_json = '{}', error = NULL,
+                       requested_at = CASE WHEN status = 'error' THEN requested_at ELSE ? END,
                        started_at = NULL, heartbeat_at = NULL, finished_at = NULL,
                        updated_at = ?
                    WHERE job_key = ?""",
@@ -119,7 +120,7 @@ def get(job_id: str) -> dict[str, Any] | None:
 
 
 def _recover_stale() -> None:
-    threshold = (datetime.now(UTC) - timedelta(seconds=_STALE_SECONDS)).isoformat(timespec="seconds")
+    threshold = (datetime.now(UTC) - timedelta(seconds=_STALE_SECONDS)).isoformat(timespec="microseconds")
     with db.connect() as conn:
         initialize(conn)
         conn.execute(
@@ -183,7 +184,11 @@ def _run(task: dict[str, Any]) -> None:
     try:
         from .apify_sync import refresh_single_post
 
-        result = refresh_single_post(task["account"], task["shortcode"])
+        result = ingestion_jobs.call(
+            f"manual-post:{task['account']}:{task['shortcode']}",
+            lambda: refresh_single_post(task["account"], task["shortcode"]),
+            slot=task["requested_at"],
+        )
         now = _now()
         with db.connect() as conn:
             conn.execute(

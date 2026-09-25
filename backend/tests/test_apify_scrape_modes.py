@@ -75,6 +75,7 @@ def test_manual_post_catch_up_can_extend_the_normal_posts_window() -> None:
 
 
 def test_eight_hour_engagement_uses_rolling_window_and_never_inserts(monkeypatch) -> None:
+    monkeypatch.setattr(apify_sync, "_needs_eight_hour_refresh", lambda *args: True)
     now = datetime(2026, 9, 5, 15, 0, tzinfo=UTC)  # 09:00 CST
     captured: dict = {}
 
