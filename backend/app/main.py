@@ -7459,7 +7459,14 @@ def dashboard_refresh(request: Request) -> dict[str, Any]:
             # This is a bulk dashboard action, not the deliberate
             # account-specific Reel operation. It may refresh normal posts,
             # but it must never fan out into the expensive Reels actor.
-            results[handle] = run_manual_refresh(handle, include_reels=False)
+            from .ingestion_jobs import call, IngestionPending
+            try:
+                results[handle] = call(
+                    f"manual-dashboard:{handle}",
+                    lambda: run_manual_refresh(handle, include_reels=False),
+                )
+            except IngestionPending as exc:
+                results[handle] = {"error": str(exc)}
         except ApifySyncError as exc:
             results[handle] = {"error": str(exc)}
     _invalidate_dashboard_posts_cache()

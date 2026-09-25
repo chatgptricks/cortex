@@ -26,6 +26,8 @@ import json
 import logging
 import re
 import time
+import threading
+from datetime import UTC, datetime
 import zipfile
 from typing import Any
 from urllib.parse import urlparse
@@ -130,11 +132,29 @@ def _slides_from_apify(shortcode: str) -> list[dict[str, Any]]:
         "directUrls": [f"https://www.instagram.com/p/{shortcode}/"],
         "resultsType": "details",
     }
-    items = _run_apify_actor_and_fetch(payload, max_wait_seconds=180.0)
-    item = next((i for i in items if isinstance(i, dict)), None)
-    if not item:
-        raise PostMediaError("Apify returned no result for this post")
+    from .ingestion_jobs import call, IngestionPending
 
+    def resolve():
+        rows = _run_apify_actor_and_fetch(payload, max_wait_seconds=180.0)
+        item = next((row for row in rows if row.get("shortCode") == shortcode), None)
+        if item is None:
+            raise PostMediaError("Apify returned no matching result for this post")
+        media = _slides_from_item(item)
+        for index, entry in enumerate(media, start=1):
+            entry["index"] = index
+            entry["filename"] = f"{index:02d}{_suffix_for(entry['url'], None)}"
+        # Cache persistence belongs to the paid job, so a DB failure retries
+        # the saved dataset instead of discarding a successful lookup.
+        _cache_put(shortcode, media, "apify")
+        return media
+
+    try:
+        return call(f"manual-media:{shortcode}", resolve)
+    except IngestionPending as exc:
+        raise PostMediaError(str(exc)) from exc
+
+
+def _slides_from_item(item: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
 
     # A carousel arrives as childPosts, one entry per slide, in order. Each
@@ -187,27 +207,134 @@ _CACHE_TTL_SECONDS = 900.0
 _CACHE_MAX = 200
 
 
+# Bounded locks coalesce requests within a process. Durable Apify leases also
+# prevent duplicate paid runs between API processes.
+_MEDIA_LOCKS = [threading.Lock() for _ in range(64)]
+
+
+def _initialize_cache(conn) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS post_media_cache (
+        shortcode TEXT PRIMARY KEY, stored_at DOUBLE PRECISION NOT NULL,
+        items_json TEXT NOT NULL, source TEXT NOT NULL)""")
+
+
+def _urls_available(items: list[dict[str, Any]]) -> bool:
+    """Reject expired, incomplete or login-page media before reusing it."""
+    if not items:
+        return False
+    targets = {}
+    for item in items:
+        url = item.get("url")
+        kind = item.get("kind")
+        if not isinstance(url, str) or kind not in {"image", "video"}:
+            return False
+        targets[url] = kind
+        if item.get("poster"):
+            targets[item["poster"]] = "image"
+    try:
+        with httpx.Client(timeout=_TIMEOUT, follow_redirects=True, headers=_BROWSER_HEADERS) as client:
+            for url, kind in targets.items():
+                if urlparse(url).scheme != "https":
+                    return False
+                response = client.head(url)
+                if response.status_code != 200 or not response.headers.get("content-type", "").lower().startswith(kind + "/"):
+                    return False
+        return True
+    except httpx.HTTPError:
+        return False
+
+
 def _cache_get(shortcode: str) -> tuple[list[dict[str, Any]], str] | None:
     hit = _CACHE.get(shortcode)
-    if not hit:
-        return None
-    stored_at, items, source = hit
-    if time.monotonic() - stored_at > _CACHE_TTL_SECONDS:
+    if hit:
+        stored_at, items, source = hit
+        if time.monotonic() - stored_at < _CACHE_TTL_SECONDS:
+            return [dict(it) for it in items], source
         _CACHE.pop(shortcode, None)
+    from .db import connect
+    with connect() as conn:
+        _initialize_cache(conn)
+        row = conn.execute("SELECT * FROM post_media_cache WHERE shortcode = ?", (shortcode,)).fetchone()
+    if not row:
         return None
-    # Copied on the way out so a caller stamping index/filename onto the dicts
-    # can't mutate what the next caller receives.
-    return [dict(it) for it in items], source
+    age = time.time() - row["stored_at"]
+    if age < 0 or age >= _CACHE_TTL_SECONDS:
+        return None
+    try:
+        items = json.loads(row["items_json"])
+        if not _urls_available(items):
+            return None
+    except (ValueError, TypeError, AttributeError):
+        return None
+    _memory_put(shortcode, items, row["source"], age=age)
+    return [dict(it) for it in items], row["source"]
+
+
+def _memory_put(shortcode, items, source, *, age=0):
+    if len(_CACHE) >= _CACHE_MAX:
+        oldest = min(_CACHE, key=lambda key: _CACHE[key][0])
+        _CACHE.pop(oldest, None)
+    _CACHE[shortcode] = (time.monotonic() - age, [dict(it) for it in items], source)
 
 
 def _cache_put(shortcode: str, items: list[dict[str, Any]], source: str) -> None:
-    if len(_CACHE) >= _CACHE_MAX:
-        oldest = min(_CACHE, key=lambda k: _CACHE[k][0])
-        _CACHE.pop(oldest, None)
-    _CACHE[shortcode] = (time.monotonic(), [dict(it) for it in items], source)
+    from .db import connect
+    with connect() as conn:
+        _initialize_cache(conn)
+        conn.execute(
+            "INSERT INTO post_media_cache (shortcode, stored_at, items_json, source) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(shortcode) DO UPDATE SET stored_at = excluded.stored_at, items_json = excluded.items_json, source = excluded.source",
+            (shortcode, time.time(), json.dumps(items), source),
+        )
+        conn.execute("DELETE FROM post_media_cache WHERE stored_at < ?", (time.time() - _CACHE_TTL_SECONDS,))
+    _memory_put(shortcode, items, source)
+
+
+def _saved_media(shortcode: str) -> list[dict[str, Any]] | None:
+    """Reuse a recent, complete payload already paid for by ingestion.
+
+    Likes refreshes change updated_at but not enriched_at: use the latter so
+    an old media payload cannot acquire a fresh cache lifetime accidentally.
+    Never substitute compressed dashboard covers for original download media.
+    """
+    from .db import connect
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT raw_json, enriched_at FROM dashboard_posts WHERE shortcode = ? "
+            "AND raw_json IS NOT NULL ORDER BY enriched_at DESC LIMIT 3", (shortcode,),
+        ).fetchall()
+    for row in rows:
+        try:
+            captured = datetime.fromisoformat(row["enriched_at"].replace("Z", "+00:00"))
+            age = (datetime.now(UTC) - captured).total_seconds()
+            if not 0 <= age < _CACHE_TTL_SECONDS:
+                continue
+            raw = json.loads(row["raw_json"])
+            if raw.get("shortCode") != shortcode:
+                continue
+            children = raw.get("childPosts") or []
+            if raw.get("type") == "Sidecar" and not children:
+                continue
+            if any(child.get("type") == "Video" and not child.get("videoUrl") for child in children):
+                continue
+            if raw.get("type") == "Video" and not raw.get("videoUrl"):
+                continue
+            items = _slides_from_item(raw)
+            if children and len(items) != len(children):
+                continue
+            if _urls_available(items):
+                return items
+        except (ValueError, TypeError, AttributeError, PostMediaError):
+            continue
+    return None
 
 
 def collect_media(shortcode: str, *, use_cache: bool = True) -> tuple[list[dict[str, Any]], str]:
+    with _MEDIA_LOCKS[hash(shortcode) % len(_MEDIA_LOCKS)]:
+        return _collect_media(shortcode, use_cache=use_cache)
+
+
+def _collect_media(shortcode: str, *, use_cache: bool = True) -> tuple[list[dict[str, Any]], str]:
     """Returns (items, source) for a post, trying the free path first.
 
     Each item is {kind, url, poster, index, filename}: everything the picker
@@ -226,7 +353,9 @@ def collect_media(shortcode: str, *, use_cache: bool = True) -> tuple[list[dict[
         logger.info("post_media: %s resolved %d item(s) from instagram", shortcode, len(items))
     except Exception as exc:  # noqa: BLE001 -- any failure here just means "fall back"
         logger.info("post_media: instagram path failed for %s (%s); falling back to Apify", shortcode, exc)
-        items = _slides_from_apify(shortcode)
+        items = _saved_media(shortcode) if use_cache else None
+        if items is None:
+            items = _slides_from_apify(shortcode)
         source = "apify"
         logger.info("post_media: %s resolved %d item(s) from apify", shortcode, len(items))
 

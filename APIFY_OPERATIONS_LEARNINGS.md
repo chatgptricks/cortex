@@ -252,3 +252,26 @@ También: liberar los reclamos si el lote falla, para que las filas no queden tr
 - **Disco de Render:** 2GB. Los covers son el mayor consumidor. WebP q82 ahorra ~31%.
 - **Apify:** máximo 100 archivos por request al worker de OCR; `onlyPostsNewerThan` es
   cota inferior (no hay cota superior nativa, el filtro de fecha superior va en Python).
+
+## 13. Ahorro sin reducir cobertura (2026-09-25)
+
+- Discovery conserva todas las cuentas, frecuencias, límites y solapamiento.
+  Solo el ciclo de engagement (sin inserciones) omite cuentas sin posts
+  elegibles: <=8h o pendientes de finalizar hasta 11h. La selección queda
+  congelada en el journal para recuperar exactamente el mismo dataset.
+- `ingestion_jobs.call()` conserva el resultado final y permite recuperar
+  operaciones manuales. Reload Counts mantiene la identidad del intento al
+  reintentar un error; un refresh posterior exitoso sí solicita datos nuevos.
+  El refresh global y el fallback de medios también conservan runs pagados.
+- Los medios tienen caché compartida en DB con el mismo TTL de 15 minutos.
+  Al recuperarla tras reiniciar se conserva la edad original y se comprueban
+  las URLs y tipos MIME. Un raw_json reciente y completo puede reutilizarse
+  tras fallar la vía gratuita de Instagram. Nunca sustituir originales por
+  covers comprimidos ni videos por sus posters.
+- Apify también facturó filas `no_items` en el run auditado. Filtrarlas después
+  de descargar el dataset no recupera ese cargo. No reducir discovery ni
+  desactivar cuentas para ocultar ese costo; cualquier cambio de actor o
+  facturación requiere comprobar primero equivalencia y precio real.
+- Validación: tests de límites 8h/11h, cuentas vacías, selección congelada,
+  reintentos tras pago, redelivery de resultados, caché tras reinicios,
+  expiración, tipos MIME y orden de carruseles. Ningún test inicia scrapes.
