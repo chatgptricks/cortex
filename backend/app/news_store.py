@@ -135,10 +135,10 @@ def review_one(story_id):
     return result
 
 
-def process_pending(limit=100):
+def process_pending():
     with connect() as conn:
         ensure(conn)
-        rows = conn.execute('SELECT id FROM news_stories WHERE review_json IS NULL ORDER BY CASE WHEN error IS NULL THEN 0 ELSE 1 END, updated_at DESC LIMIT ?', (limit,)).fetchall()
+        rows = conn.execute('SELECT id FROM news_stories WHERE review_json IS NULL ORDER BY CASE WHEN error IS NULL THEN 0 ELSE 1 END, updated_at DESC').fetchall()
     failures = 0
     for row in rows:
         try:
