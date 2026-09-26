@@ -1,4 +1,5 @@
 """Private DEV link collection. No third-party scraping or paid calls."""
+import json
 from datetime import datetime, timezone
 from uuid import uuid4
 from urllib.parse import urlsplit
@@ -6,7 +7,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
-from .db import connect
+from .db import connect, utc_now
 from .vault_text import fetch_tweet_text
 
 router = APIRouter(prefix="/api/dashboard/vault", tags=["vault"])
@@ -22,6 +23,8 @@ def ensure_schema(conn):
     from .db import _ensure_column
     for column, default in [('tweet_text', ''), ('tweet_author', ''), ('tweet_image', ''), ('tweet_avatar', ''), ('tweet_media_type', ''), ('text_status', 'pending')]:
         _ensure_column(conn, "vault_links", column, f"{column} TEXT NOT NULL DEFAULT '{default}'")
+    _ensure_column(conn, "vault_links", "done", "done INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "vault_links", "pool_request_id", "pool_request_id INTEGER")
 
 
 def require_dev(request: Request):
@@ -54,6 +57,7 @@ class LinkInput(BaseModel):
 class LinkUpdate(BaseModel):
     priority: float | None = Field(default=None, allow_inf_nan=False)
     discarded: bool | None = None
+    done: bool | None = None
 
 
 def add_link(item: LinkInput):
@@ -88,6 +92,8 @@ def create_link(item: LinkInput, response: Response):
 @router.patch("/{link_id}", dependencies=[Depends(require_dev)])
 def update_link(link_id: str, item: LinkUpdate, response: Response):
     response.headers["Cache-Control"] = "private, no-store"
+    if item.done and item.discarded:
+        raise HTTPException(422, "A link cannot be done and discarded at the same time.")
     with connect() as conn:
         row = conn.execute("SELECT * FROM vault_links WHERE id = ?", (link_id,)).fetchone()
         if row is None:
@@ -95,7 +101,9 @@ def update_link(link_id: str, item: LinkUpdate, response: Response):
         if item.priority is not None:
             conn.execute("UPDATE vault_links SET priority = ? WHERE id = ?", (item.priority, link_id))
         if item.discarded is not None:
-            conn.execute("UPDATE vault_links SET discarded = ? WHERE id = ?", (int(item.discarded), link_id))
+            conn.execute("UPDATE vault_links SET discarded = ?, done = CASE WHEN ? = 1 THEN 0 ELSE done END WHERE id = ?", (int(item.discarded), int(item.discarded), link_id))
+        if item.done is not None:
+            conn.execute("UPDATE vault_links SET done = ?, discarded = CASE WHEN ? = 1 THEN 0 ELSE discarded END WHERE id = ?", (int(item.done), int(item.done), link_id))
         return dict(conn.execute("SELECT * FROM vault_links WHERE id = ?", (link_id,)).fetchone())
 
 
@@ -119,3 +127,46 @@ def enrich_link(link_id: str):
 def load_tweet_text(link_id: str, response: Response):
     response.headers["Cache-Control"] = "private, no-store"
     return enrich_link(link_id)
+
+
+@router.post("/{link_id}/pool", dependencies=[Depends(require_dev)])
+def send_to_pool(link_id: str, request: Request, response: Response):
+    """Atomically create one ordinary Queue request from a Vault source."""
+    from .main import _queue_v2_log, _queue_v2_publish, _queue_v2_priority
+    response.headers["Cache-Control"] = "private, no-store"
+    caller = getattr(request.state, "user_email", "")
+    if not caller:
+        raise HTTPException(401, "Sign in required.")
+    with connect() as conn:
+        # A write locks this row on both supported databases until commit.
+        # Creation and the link back to Vault must succeed or roll back together.
+        conn.execute("UPDATE vault_links SET pool_request_id = pool_request_id WHERE id = ?", (link_id,))
+        row = conn.execute("SELECT * FROM vault_links WHERE id = ?", (link_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Link not found.")
+        if row["discarded"]:
+            raise HTTPException(409, "Restore this link before sending it to the Pool.")
+        if row["pool_request_id"]:
+            return dict(row)
+        shortcode = f"vault-{link_id}"
+        existing = conn.execute("SELECT id FROM queue_requests WHERE post_account = '' AND post_shortcode = ?", (shortcode,)).fetchone()
+        if existing:
+            request_id = existing["id"]
+        else:
+            now = utc_now()
+            title = (row["tweet_text"].splitlines()[0] if row["tweet_text"] else row["title"])[:160]
+            post_type = "Reel" if row["tweet_media_type"] in {"video", "animated_gif"} else "Image"
+            # Only the chosen source goes to the shared Pool, never DM provenance.
+            cursor = conn.execute("""INSERT INTO queue_requests (
+                post_account, post_shortcode, post_title, is_custom, post_permalink,
+                post_caption, post_type, cover_url, production_points, priority,
+                deadline_at, tags, brief, notes, reference_links, coordinator_email,
+                created_at, updated_at
+            ) VALUES ('', ?, ?, 1, ?, ?, ?, ?, 3, ?, '', '[]', ?, '', ?, ?, ?, ?)""",
+                (shortcode, title, row["url"], row["tweet_text"], post_type, row["tweet_image"],
+                 _queue_v2_priority("normal"), row["tweet_text"], json.dumps([row["url"]]), caller, now, now))
+            request_id = int(cursor.lastrowid)
+            _queue_v2_log(conn, request_id, caller, "created", {"title": title, "postType": post_type, "productionPoints": 3, "sourceUrl": row["url"]})
+            _queue_v2_publish(conn, "created", caller, [request_id])
+        conn.execute("UPDATE vault_links SET pool_request_id = ? WHERE id = ?", (request_id, link_id))
+        return dict(conn.execute("SELECT * FROM vault_links WHERE id = ?", (link_id,)).fetchone())
