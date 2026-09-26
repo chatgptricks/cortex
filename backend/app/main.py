@@ -8866,9 +8866,10 @@ def admin_delete_account(
             raise HTTPException(status_code=404, detail="Unknown account.")
         if account["is_canonical"]:
             raise HTTPException(status_code=400, detail="Cannot delete the canonical account.")
-        retained_posts = conn.execute(
-            "SELECT COUNT(*) FROM dashboard_posts WHERE account = ?", (normalized,)
-        ).fetchone()[0]
+        post_count = conn.execute(
+            "SELECT COUNT(*) AS retained_posts FROM dashboard_posts WHERE account = ?", (normalized,)
+        ).fetchone()
+        retained_posts = int(post_count["retained_posts"])
         conn.execute("DELETE FROM queue_designer_accounts WHERE account_handle = ?", (normalized,))
         conn.execute("DELETE FROM accounts WHERE handle = ?", (normalized,))
     _invalidate_dashboard_posts_cache()
