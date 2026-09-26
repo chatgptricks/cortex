@@ -26,6 +26,8 @@ services:
         sync: false
       - key: APIFY_TOKEN
         sync: false
+      - key: TYPESAFE_API_KEY
+        sync: false
       - key: SENTIENT_OCR_URL
         sync: false
       - key: SENTIENT_OCR_TOKEN
