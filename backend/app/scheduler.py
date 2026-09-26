@@ -310,6 +310,12 @@ def _launch(name, callback):
 def _tick() -> None:
     now_cst = datetime.now(_CST)
 
+    # News is a shared background queue, independent of open browser tabs.
+    from .news_store import scheduled_pass
+    from .ingestion_jobs import run as run_news_job
+    news_slot = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:') + str(datetime.now(timezone.utc).minute // 15)
+    _launch('news', lambda: run_news_job('scheduled-news', news_slot, scheduled_pass))
+
     bucket = _bucket_key(now_cst)
     from .ingestion_jobs import run
     def short_pass():

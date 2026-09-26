@@ -2102,6 +2102,54 @@ def _news_existing_posts(article_text: str, limit: int = 8) -> list[dict[str, st
     return [item for _, item in ranked[:limit]]
 
 
+@app.get("/api/dashboard/news")
+def dashboard_news(request: Request) -> dict[str, Any]:
+    if not getattr(request.state, "can_access_news", False):
+        raise HTTPException(status_code=403, detail="News is not available to this account.")
+    from .news_store import list_stories
+    return list_stories()
+
+
+@app.post("/api/dashboard/news/import")
+async def dashboard_news_import(request: Request) -> dict[str, Any]:
+    if not getattr(request.state, "can_access_news", False):
+        raise HTTPException(status_code=403, detail="News is not available to this account.")
+    payload = await request.json()
+    from .news_store import import_legacy
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid News workspace.")
+    try:
+        import_legacy(payload.get("saved", {}), payload.get("reviews", {}))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.post("/api/dashboard/news/save")
+async def dashboard_news_save(request: Request) -> dict[str, Any]:
+    if not getattr(request.state, "can_access_news", False):
+        raise HTTPException(status_code=403, detail="News is not available to this account.")
+    payload = await request.json()
+    from .news_store import save
+    if not isinstance(payload, dict) or not save(str(payload.get("id") or ""), bool(payload.get("saved")), payload.get("brief")):
+        raise HTTPException(status_code=404, detail="Story not found.")
+    return {"ok": True}
+
+
+@app.post("/api/dashboard/news/review")
+async def dashboard_news_review(request: Request) -> dict[str, Any]:
+    if not getattr(request.state, "can_access_news", False):
+        raise HTTPException(status_code=403, detail="News is not available to this account.")
+    payload = await request.json()
+    from .news_store import review_one
+    try:
+        return await run_in_threadpool(review_one, str(payload.get("id") or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except JevFeatureUnavailable as exc:
+        raise _jev_error(exc) from exc
+
+
 @app.post("/api/dashboard/jev/news-review")
 async def dashboard_jev_news_review(request: Request) -> dict[str, Any]:
     """Restricted Jev review for authorized News, Reddit, and X users."""
