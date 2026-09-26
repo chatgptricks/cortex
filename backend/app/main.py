@@ -8842,6 +8842,39 @@ def admin_create_account(
     return {"account": account}
 
 
+@app.post("/api/admin/accounts/delete")
+def admin_delete_account(
+    request: Request,
+    password: Annotated[str, Form()],
+    handle: Annotated[str, Form()],
+) -> dict[str, Any]:
+    """Remove an account from the registry while preserving all post history."""
+    if not getattr(request.state, "is_dev", False):
+        raise HTTPException(status_code=403, detail="Only Dev can delete accounts.")
+    if not TRICKS_DASH_REFRESH_PASSWORD or not secrets.compare_digest(
+        password.strip(), TRICKS_DASH_REFRESH_PASSWORD
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect refresh password.")
+    normalized = handle.strip().lstrip("@").lower()
+    if not normalized or normalized == "chatgptricks":
+        raise HTTPException(status_code=400, detail="Cannot delete the canonical account or an empty handle.")
+    with connect() as conn:
+        account = conn.execute(
+            "SELECT handle, is_canonical FROM accounts WHERE handle = ?", (normalized,)
+        ).fetchone()
+        if not account:
+            raise HTTPException(status_code=404, detail="Unknown account.")
+        if account["is_canonical"]:
+            raise HTTPException(status_code=400, detail="Cannot delete the canonical account.")
+        retained_posts = conn.execute(
+            "SELECT COUNT(*) FROM dashboard_posts WHERE account = ?", (normalized,)
+        ).fetchone()[0]
+        conn.execute("DELETE FROM queue_designer_accounts WHERE account_handle = ?", (normalized,))
+        conn.execute("DELETE FROM accounts WHERE handle = ?", (normalized,))
+    _invalidate_dashboard_posts_cache()
+    return {"ok": True, "handle": normalized, "retained_posts": retained_posts}
+
+
 @app.post("/api/admin/accounts/{handle}/settings")
 def admin_update_account_settings(
     handle: str,
