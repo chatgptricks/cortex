@@ -138,8 +138,10 @@ def create_account(
     from .db import connect, utc_now
 
     handle = handle.strip().lstrip("@").lower()
-    if not handle:
-        raise ApifySyncError("Account handle is required.")
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9._]{0,28}[a-z0-9])?", handle):
+        raise ApifySyncError(
+            "Enter a valid Instagram username: 1–30 letters, numbers, periods, or underscores."
+        )
     if group not in VALID_GROUPS:
         raise ApifySyncError(f"Group must be one of {VALID_GROUPS}.")
     if scrape_mode not in VALID_SCRAPE_MODES:
