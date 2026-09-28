@@ -108,6 +108,9 @@ from .queue_rules import (
 app = FastAPI(title="Cortex API", version="1.0.0")
 from .vault import router as vault_router
 app.include_router(vault_router)
+from .golden_nuggets import record_review as record_golden_nugget_review
+from .golden_nuggets import router as golden_nuggets_router
+app.include_router(golden_nuggets_router)
 
 DEFAULT_PERSON_OPTIONS = [
     "Elon Musk",
@@ -2032,20 +2035,21 @@ def dashboard_jev_classify(account: Annotated[str, Form()], shortcode: Annotated
 
 
 @app.post("/api/dashboard/jev/golden-nugget")
-def dashboard_jev_golden_nugget(account: Annotated[str, Form()], shortcode: Annotated[str, Form()]) -> dict[str, Any]:
+def dashboard_jev_golden_nugget(
+    request: Request, account: Annotated[str, Form()], shortcode: Annotated[str, Form()]
+) -> dict[str, Any]:
     snapshot = _jev_post_snapshot(account, shortcode)
     with connect() as conn:
         target_accounts = [dict(row) for row in conn.execute(
             "SELECT handle, label FROM accounts WHERE is_active = 1 AND group_name = 'sentient' ORDER BY handle LIMIT 40"
         ).fetchall()]
     try:
-        return {
-            "account": snapshot["account"],
-            "shortcode": snapshot["shortcode"],
-            **golden_nugget_review(snapshot["text"], snapshot["account"], target_accounts),
-        }
+        review = golden_nugget_review(snapshot["text"], snapshot["account"], target_accounts)
     except JevFeatureUnavailable as exc:
         raise _jev_error(exc) from exc
+    # Shared with every user: the gold card is not a private, per-tab result.
+    record_golden_nugget_review(snapshot["account"], snapshot["shortcode"], review, _caller_email(request))
+    return {"account": snapshot["account"], "shortcode": snapshot["shortcode"], **review}
 
 
 def _news_similarity_tokens(value: Any) -> set[str]:
