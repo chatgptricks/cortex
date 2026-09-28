@@ -111,6 +111,8 @@ app.include_router(vault_router)
 from .golden_nuggets import record_review as record_golden_nugget_review
 from .golden_nuggets import router as golden_nuggets_router
 app.include_router(golden_nuggets_router)
+from .user_preferences import router as user_preferences_router
+app.include_router(user_preferences_router)
 
 DEFAULT_PERSON_OPTIONS = [
     "Elon Musk",
