@@ -171,6 +171,9 @@ def test_openai_caption_request_is_stateless_and_parses_output(monkeypatch):
     assert captured["json"]["input"].find('"REMOVE_MANYCHAT_AUTOMATION": false') >= 0
     assert captured["json"]["input"].find('"OUTPUT_LANGUAGE": "the same language as SOURCE_CAPTION"') >= 0
     assert captured["headers"]["Authorization"] == "Bearer test-secret"
+    # Reasoning shares the output budget; keep it low with room for the caption.
+    assert captured["json"]["reasoning"] == {"effort": "low"}
+    assert captured["json"]["max_output_tokens"] >= 4_000
 
 
 def test_caption_policy_rejects_foreign_follow_cta_and_requested_manychat():
@@ -328,3 +331,88 @@ def test_regenerate_sends_previous_caption_and_retries_an_identical_result(monke
     assert len(calls) == 2
     assert '"PREVIOUS_CAPTION": "Earlier draft"' in calls[0]["input"]
     assert "DRAFT_TO_REPLACE" in calls[1]["input"]
+
+
+def _endpoint_request():
+    return SimpleNamespace(state=SimpleNamespace(user_email="writer@example.com"))
+
+
+def test_caption_endpoint_regenerates_once_from_jev_feedback(monkeypatch):
+    context = {"target_account": "ours", "source_caption": "Original source"}
+    calls = []
+    monkeypatch.setattr(main, "_caption_generation_context", lambda *_: context)
+
+    def generate(value, **options):
+        calls.append(options)
+        return (f"Draft {len(calls)}", "gpt-5-mini")
+
+    rejected = {"accepted": False, "factFidelity": 0.7, "targetAlignment": 0.9, "unsupportedClaims": 0.6}
+    accepted = {"accepted": True, "factFidelity": 0.95, "targetAlignment": 0.95, "unsupportedClaims": 0.02}
+    reviews = iter([rejected, accepted])
+    monkeypatch.setattr(main, "_openai_caption_text", generate)
+    monkeypatch.setattr(main, "verify_caption", lambda *_: next(reviews))
+
+    result = main.dashboard_generate_caption(_endpoint_request(), "source", "SRC1", "ours", False, "", "en")
+
+    assert result["caption"] == "Draft 2"
+    assert result["jevVerification"] == accepted
+    assert "jevWarning" not in result
+    feedback = calls[1]["verification_feedback"]
+    assert feedback["draft"] == "Draft 1"
+    assert any("SOURCE_CAPTION does not state" in issue for issue in feedback["issues"])
+
+
+def test_caption_endpoint_returns_flagged_draft_after_second_rejection(monkeypatch):
+    context = {"target_account": "ours", "source_caption": "Original source"}
+    drafts = iter([("Better draft", "gpt-5-mini"), ("Worse draft", "gpt-5-mini")])
+    better = {"accepted": False, "factFidelity": 0.76, "targetAlignment": 0.9, "unsupportedClaims": 0.3}
+    worse = {"accepted": False, "factFidelity": 0.5, "targetAlignment": 0.6, "unsupportedClaims": 0.7}
+    reviews = iter([better, worse])
+    monkeypatch.setattr(main, "_caption_generation_context", lambda *_: context)
+    monkeypatch.setattr(main, "_openai_caption_text", lambda value, **options: next(drafts))
+    monkeypatch.setattr(main, "verify_caption", lambda *_: next(reviews))
+
+    result = main.dashboard_generate_caption(_endpoint_request(), "source", "SRC1", "ours", False, "", "en")
+
+    assert result["caption"] == "Better draft"
+    assert result["jevVerification"] == better
+    assert result["jevWarning"].startswith("Jev flagged this caption")
+
+
+def test_caption_endpoint_keeps_caption_when_jev_is_unavailable(monkeypatch):
+    context = {"target_account": "ours", "source_caption": "Original source"}
+    monkeypatch.setattr(main, "_caption_generation_context", lambda *_: context)
+    monkeypatch.setattr(main, "_openai_caption_text", lambda value, **options: ("Usable caption", "gpt-5-mini"))
+
+    def unavailable(*_):
+        raise main.JevFeatureUnavailable("down")
+
+    monkeypatch.setattr(main, "verify_caption", unavailable)
+
+    result = main.dashboard_generate_caption(_endpoint_request(), "source", "SRC1", "ours", False, "", "en")
+
+    assert result["caption"] == "Usable caption"
+    assert result["jevVerification"] is None
+    assert result["jevWarning"].startswith("Jev verification is unavailable")
+
+
+def test_caption_endpoint_keeps_first_draft_when_guided_retry_fails(monkeypatch):
+    context = {"target_account": "ours", "source_caption": "Original source"}
+    rejected = {"accepted": False, "factFidelity": 0.7, "targetAlignment": 0.9, "unsupportedClaims": 0.6}
+    calls = []
+
+    def generate(value, **options):
+        calls.append(options)
+        if options.get("verification_feedback"):
+            raise main.HTTPException(status_code=502, detail="The AI returned an empty caption. Try again.")
+        return ("First draft", "gpt-5-mini")
+
+    monkeypatch.setattr(main, "_caption_generation_context", lambda *_: context)
+    monkeypatch.setattr(main, "_openai_caption_text", generate)
+    monkeypatch.setattr(main, "verify_caption", lambda *_: rejected)
+
+    result = main.dashboard_generate_caption(_endpoint_request(), "source", "SRC1", "ours", False, "", "en")
+
+    assert result["caption"] == "First draft"
+    assert len(calls) == 2
+    assert result["jevWarning"].startswith("Jev flagged this caption")
