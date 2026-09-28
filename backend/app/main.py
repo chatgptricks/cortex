@@ -93,6 +93,7 @@ from .jev_features import (
     verify_caption,
 )
 from .tracker_refresh_queue import enqueue as enqueue_tracker_refresh, get as get_tracker_refresh
+from .tracker_refresh_queue import last_requested_at as last_tracker_refresh_request
 from .queue_rules import (
     SCHEDULER_BUFFER_MINUTES,
     SCHEDULER_END,
@@ -1064,6 +1065,38 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
     }
 
 
+# Manual Tracker refreshes are paid Apify runs. Everyone may refresh, with a
+# per-person limit: DEV is unlimited, admins once every 5 minutes, everyone
+# else once an hour. A DEV role preview follows the previewed role's limit.
+_TRACKER_REFRESH_WINDOW_SECONDS = {"admin": 5 * 60, "member": 60 * 60}
+
+
+def _tracker_refresh_allowance(request: Request) -> dict[str, Any]:
+    if getattr(request.state, "is_dev", False) and not getattr(request.state, "queue_role_preview_active", False):
+        return {"unlimited": True, "windowSeconds": 0, "retryAfterSeconds": 0}
+    window = _TRACKER_REFRESH_WINDOW_SECONDS["admin" if getattr(request.state, "is_admin", False) else "member"]
+    last = last_tracker_refresh_request(str(request.state.user_email))
+    elapsed = (datetime.now(UTC) - last).total_seconds() if last else window
+    return {"unlimited": False, "windowSeconds": window, "retryAfterSeconds": max(0, int(window - elapsed))}
+
+
+def _require_tracker_refresh_allowance(request: Request) -> None:
+    retry_after = _tracker_refresh_allowance(request)["retryAfterSeconds"]
+    if retry_after <= 0:
+        return
+    minutes = max(1, -(-retry_after // 60))
+    raise HTTPException(
+        status_code=429,
+        detail=f"You can refresh the Tracker again in {minutes} minute{'s' if minutes != 1 else ''}.",
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+@app.get("/api/tracker/refresh-allowance")
+def tracker_refresh_allowance(request: Request) -> dict[str, Any]:
+    return _tracker_refresh_allowance(request)
+
+
 @app.post("/api/tracker/accounts/{handle}/refresh", status_code=202)
 def tracker_account_refresh(handle: str, request: Request) -> dict[str, Any]:
     """Queue one account snapshot; the worker owns paid Apify execution."""
@@ -1072,16 +1105,14 @@ def tracker_account_refresh(handle: str, request: Request) -> dict[str, Any]:
     known = {a["handle"] for a in list_accounts(active_only=True)}
     if clean not in known:
         raise HTTPException(status_code=404, detail=f"Unknown or inactive account '{clean}'.")
-    if not (getattr(request.state, "is_admin", False) or getattr(request.state, "is_dev", False)):
-        raise HTTPException(status_code=403, detail="Admin or Dev access is required to run a paid Tracker refresh.")
+    _require_tracker_refresh_allowance(request)
     return enqueue_tracker_refresh(kind="account", handle=clean, requested_by=str(request.state.user_email))
 
 
 @app.post("/api/tracker/snapshot-now", status_code=202)
 def tracker_snapshot_now(request: Request) -> dict[str, Any]:
     """Queue the all-account daily snapshot without blocking the API."""
-    if not (getattr(request.state, "is_admin", False) or getattr(request.state, "is_dev", False)):
-        raise HTTPException(status_code=403, detail="Admin or Dev access is required to run a paid Tracker refresh.")
+    _require_tracker_refresh_allowance(request)
     return enqueue_tracker_refresh(kind="all", handle=None, requested_by=str(request.state.user_email))
 
 
