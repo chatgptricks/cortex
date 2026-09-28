@@ -2418,6 +2418,7 @@ def _openai_caption_text(
     remove_manychat_automation: bool = False,
     previous_caption: str = "",
     output_language: str = "same",
+    verification_feedback: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Generate one adapted caption through OpenAI's stateless Responses API."""
     import httpx
@@ -2442,6 +2443,7 @@ Preserve a genuine editorial source, photo, video, or creator credit only when t
 Rebuild every promotional CTA for TARGET_ACCOUNT. A follow or subscribe CTA may mention only TARGET_ACCOUNT; never preserve or promote the source account or any other account from SOURCE_CAPTION.
 When REMOVE_MANYCHAT_AUTOMATION is true, completely remove comment-keyword, DM-keyword, and "I will send you" automations, including the keyword and delivery promise. Do not replace them with another engagement automation.
 When REMOVE_MANYCHAT_AUTOMATION is false, you may retain the automation mechanic and keyword when it is central to the source, but it must be written for TARGET_ACCOUNT and must not direct users to another account.
+When JEV_FEEDBACK is present, FLAGGED_DRAFT failed a fact and account review. Write a new caption that fixes every JEV_FEEDBACK issue: stay strictly within SOURCE_CAPTION's facts and speak only for TARGET_ACCOUNT.
 When PREVIOUS_CAPTION is present, this is a regeneration. Produce a meaningfully different alternative: use a different opening, sentence structure, and CTA wording while preserving the source's supported facts.
 Match the target examples' usual language, length, paragraph rhythm, emoji, CTA, and hashtag habits when the examples make them clear; otherwise keep the source language.
 Do not mention this task, the source account, imitation, rewriting, or AI. Return only the finished caption with no label, quotation marks, or Markdown fence."""
@@ -2456,6 +2458,9 @@ Do not mention this task, the source account, imitation, rewriting, or AI. Retur
     clean_previous_caption = previous_caption.strip()
     if clean_previous_caption:
         request_context["PREVIOUS_CAPTION"] = clean_previous_caption
+    if verification_feedback:
+        request_context["FLAGGED_DRAFT"] = verification_feedback["draft"]
+        request_context["JEV_FEEDBACK"] = verification_feedback["issues"]
 
     def request_caption(input_payload: dict[str, Any], request_instructions: str) -> str:
         input_text = json.dumps(input_payload, ensure_ascii=False)
@@ -2468,7 +2473,11 @@ Do not mention this task, the source account, imitation, rewriting, or AI. Retur
                         "model": model,
                         "instructions": request_instructions,
                         "input": input_text,
-                        "max_output_tokens": 1_200,
+                        # Reasoning tokens count against max_output_tokens. With
+                        # the default effort they could consume the whole budget
+                        # and return no caption at all.
+                        "reasoning": {"effort": "low"},
+                        "max_output_tokens": 4_000,
                         "store": False,
                     },
                 )
@@ -2479,6 +2488,10 @@ Do not mention this task, the source account, imitation, rewriting, or AI. Retur
                 raise HTTPException(status_code=503, detail="AI caption generation is temporarily unavailable.")
             response.raise_for_status()
             payload = response.json()
+            if payload.get("status") == "incomplete":
+                logging.getLogger(__name__).warning(
+                    "OpenAI caption response was incomplete: %s", payload.get("incomplete_details")
+                )
         except HTTPException:
             raise
         except (httpx.HTTPError, ValueError):
@@ -2550,22 +2563,30 @@ def dashboard_generate_caption(
 ) -> dict[str, Any]:
     """Generate an editable, account-adapted alternative to a source caption."""
     context = _caption_generation_context(source_account, shortcode, target_account)
-    caption, model = _openai_caption_text(
-        context,
-        remove_manychat_automation=remove_manychat_automation,
-        previous_caption=previous_caption,
-        output_language=output_language,
-    )
-    try:
-        verification = verify_caption(context["source_caption"], caption, context["target_account"])
-    except JevFeatureUnavailable as exc:
-        raise _jev_error(exc) from exc
-    if not verification["accepted"]:
-        raise HTTPException(
-            status_code=502,
-            detail={"message": "The generated caption did not pass Jev verification.", "verification": verification},
-        )
-    return {
+    options = {
+        "remove_manychat_automation": remove_manychat_automation,
+        "previous_caption": previous_caption,
+        "output_language": output_language,
+    }
+    caption, model = _openai_caption_text(context, **options)
+    verification, warning = _jev_caption_review(context, caption)
+    if verification and not verification["accepted"]:
+        # One guided regeneration from Jev's concerns. A second rejection still
+        # returns the better draft, flagged for review, instead of discarding
+        # a usable caption.
+        feedback = {"draft": caption, "issues": _jev_caption_issues(verification)}
+        try:
+            retry_caption, retry_model = _openai_caption_text(context, **options, verification_feedback=feedback)
+        except HTTPException:
+            # The first draft is still usable; a failed retry must not lose it.
+            logging.getLogger(__name__).warning("Guided caption regeneration failed", exc_info=True)
+        else:
+            retry_verification, retry_warning = _jev_caption_review(context, retry_caption)
+            if retry_verification is None or _jev_caption_score(retry_verification) >= _jev_caption_score(verification):
+                caption, model, verification, warning = retry_caption, retry_model, retry_verification, retry_warning
+        if verification and not verification["accepted"]:
+            warning = "Jev flagged this caption. Check its facts and CTA before publishing."
+    result = {
         "caption": caption,
         "targetAccount": context["target_account"],
         "outputLanguage": output_language.strip().lower(),
@@ -2573,6 +2594,37 @@ def dashboard_generate_caption(
         "generatedBy": _caller_email(request),
         "jevVerification": verification,
     }
+    if warning:
+        result["jevWarning"] = warning
+    return result
+
+
+def _jev_caption_review(context: dict[str, Any], caption: str) -> tuple[dict[str, Any] | None, str]:
+    """Jev review is advisory when Jev itself is unavailable."""
+    try:
+        return verify_caption(context["source_caption"], caption, context["target_account"]), ""
+    except JevFeatureUnavailable:
+        logging.getLogger(__name__).warning("Jev caption verification unavailable", exc_info=True)
+        return None, "Jev verification is unavailable right now. Check this caption before publishing."
+
+
+def _jev_caption_score(verification: dict[str, Any]) -> float:
+    return (
+        float(verification.get("factFidelity") or 0)
+        + float(verification.get("targetAlignment") or 0)
+        - float(verification.get("unsupportedClaims") or 0)
+    )
+
+
+def _jev_caption_issues(verification: dict[str, Any]) -> list[str]:
+    issues = []
+    if float(verification.get("factFidelity") or 0) < 0.78:
+        issues.append("Keep the source's facts and core subject exactly; do not change or drop material details.")
+    if float(verification.get("targetAlignment") or 0) < 0.82:
+        issues.append("Speak only for TARGET_ACCOUNT; never credit, promote, or direct users to another account.")
+    if float(verification.get("unsupportedClaims") or 0) > 0.22:
+        issues.append("Remove every fact, number, quote, date, link, or claim that SOURCE_CAPTION does not state.")
+    return issues or ["Stay closer to SOURCE_CAPTION's supported facts."]
 
 
 def _media_response(reference: str | Path | None, detail: str) -> Response:
