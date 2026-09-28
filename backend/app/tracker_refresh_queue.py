@@ -71,6 +71,20 @@ def enqueue(*, kind: str, handle: str | None, requested_by: str) -> dict[str, An
     return _item(row)
 
 
+def last_requested_at(requested_by: str) -> datetime | None:
+    """When this person last created a manual refresh (for per-user limits)."""
+    with db.connect() as conn:
+        initialize(conn)
+        row = conn.execute(
+            "SELECT requested_at FROM tracker_refresh_jobs WHERE requested_by = ? ORDER BY requested_at DESC LIMIT 1",
+            (requested_by,),
+        ).fetchone()
+    if not row:
+        return None
+    value = datetime.fromisoformat(str(row["requested_at"]))
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
 def get(job_id: str) -> dict[str, Any] | None:
     with db.connect() as conn:
         initialize(conn)
