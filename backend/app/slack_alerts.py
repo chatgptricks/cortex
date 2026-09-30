@@ -76,6 +76,10 @@ _SLACK_PROFILE_IMAGES_BY_USER_ID = {
     "U0000000004": "",
 }
 
+# Dashboard DEVs. The auth middleware grants `is_dev` from this same tuple, so
+# operational alerts meant "only for DEVs" can never reach anyone else.
+DEV_EMAILS = ("user03@example.com",)
+
 # The placeholder Trainee has no Slack account yet. Assignment DMs are
 # deliberately routed to User 03 for testing, while profile/avatar lookups
 # remain empty so Queue does not present User 03 as the trainee.
@@ -517,6 +521,46 @@ def notify_new_account_request(*, ticket_id: int, handle: str, requester: str, r
     except Exception:
         logger.exception("New account request notification failed for ticket %s", ticket_id)
         return False
+
+
+def notify_devs(title: str, body: str) -> int:
+    """DM an operational alert to each DEV. Returns how many were delivered.
+
+    Same never-raises contract as the other alerts: a monitoring message must
+    not be able to crash the scheduler or the API that is sending it.
+    """
+    token = os.getenv("SLACK_BOT_TOKEN", "").strip()
+    if not token:
+        logger.warning("DEV alert not sent (SLACK_BOT_TOKEN missing): %s", title)
+        return 0
+    delivered = 0
+    try:
+        import httpx
+        with httpx.Client(timeout=15.0) as client:
+            headers = {"Authorization": f"Bearer {token}"}
+            for email in DEV_EMAILS:
+                recipient = slack_user_id_for_email(email)
+                if not recipient:
+                    continue
+                opened = client.post("https://slack.com/api/conversations.open", headers=headers, json={"users": recipient})
+                opened.raise_for_status()
+                channel = (opened.json().get("channel") or {}).get("id")
+                if not channel:
+                    continue
+                result = client.post("https://slack.com/api/chat.postMessage", headers=headers, json={
+                    "channel": channel,
+                    "text": f"{title}\n{body}",
+                    "blocks": [
+                        {"type": "header", "text": {"type": "plain_text", "text": title[:150], "emoji": False}},
+                        {"type": "section", "text": {"type": "mrkdwn", "text": body[:2900]}},
+                    ],
+                    "unfurl_links": False,
+                })
+                result.raise_for_status()
+                delivered += int(bool(result.json().get("ok")))
+    except Exception:
+        logger.exception("DEV alert failed: %s", title)
+    return delivered
 
 
 def notify_queue_assignment(**assignment: Any) -> bool:

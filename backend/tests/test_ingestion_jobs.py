@@ -160,3 +160,111 @@ def test_long_daily_work_does_not_block_short_collection(monkeypatch):
     scheduler._launch('short', short.set)
     assert short.wait(1)
     release.set()
+
+
+def test_resumed_slot_watermark_is_its_frozen_time_not_completion(database):
+    # A slot resumed hours after a stall must not claim the gap as covered.
+    with database() as conn:
+        jobs.initialize(conn)
+        conn.execute(
+            "INSERT INTO ingestion_jobs VALUES ('short','01','running','dead',0,?,NULL,'old')",
+            (json.dumps({'last_success_at': '2026-09-29T22:45:00+00:00', 'now': '2026-09-29T23:30:00+00:00'}),),
+        )
+    seen = []
+    assert jobs.run('short', '02', lambda: seen.append(jobs.now()))
+    assert seen == [datetime(2026, 9, 29, 23, 30, tzinfo=UTC)]
+    with database() as conn:
+        state = json.loads(conn.execute("SELECT state FROM ingestion_jobs").fetchone()['state'])
+    assert state['last_success_at'] == '2026-09-29T23:30:00+00:00'
+
+
+def _scheduler_state(database):
+    with database() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+
+
+def _stuck_short_job(monkeypatch, *, import_running):
+    from app import slack_alerts
+    release = threading.Event()
+    alerts, restarts = [], []
+    monkeypatch.setattr(scheduler, '_jobs', {})
+    monkeypatch.setattr(scheduler, '_jobs_started', {})
+    monkeypatch.setattr(scheduler, '_account_import_running', lambda: import_running)
+    monkeypatch.setattr(scheduler, '_restart_worker', lambda: restarts.append(True))
+    monkeypatch.setattr(slack_alerts, 'notify_devs', lambda title, body: alerts.append(title) or 1)
+    scheduler._launch('short', lambda: release.wait(3))
+    scheduler._jobs_started['short'] -= scheduler._JOB_TIME_LIMITS['short'] + 1
+    return release, alerts, restarts
+
+
+def test_stuck_short_pass_alerts_devs_once_and_restarts_worker(database, monkeypatch):
+    _scheduler_state(database)
+    release, alerts, restarts = _stuck_short_job(monkeypatch, import_running=False)
+    try:
+        scheduler._check_stuck_jobs()
+        scheduler._check_stuck_jobs()
+    finally:
+        release.set()
+    assert len(alerts) == 1 and 'short' in alerts[0]
+    assert restarts == [True, True]
+
+
+def test_stuck_pass_waits_for_running_account_import(database, monkeypatch):
+    _scheduler_state(database)
+    release, alerts, restarts = _stuck_short_job(monkeypatch, import_running=True)
+    try:
+        scheduler._check_stuck_jobs()
+    finally:
+        release.set()
+    assert len(alerts) == 1
+    assert restarts == []
+
+
+def test_long_daily_pass_is_never_treated_as_stuck(database, monkeypatch):
+    _scheduler_state(database)
+    release = threading.Event()
+    monkeypatch.setattr(scheduler, '_jobs', {})
+    monkeypatch.setattr(scheduler, '_jobs_started', {})
+    monkeypatch.setattr(scheduler, '_restart_worker', lambda: pytest.fail('daily must not restart'))
+    scheduler._launch('daily', lambda: release.wait(3))
+    scheduler._jobs_started['daily'] -= 24 * 3600
+    try:
+        scheduler._check_stuck_jobs()
+    finally:
+        release.set()
+
+
+def test_monitor_alerts_devs_once_when_discovery_is_stale_then_recovers(database, monkeypatch):
+    from app import ingestion_monitor, slack_alerts
+    _scheduler_state(database)
+    alerts = []
+    monkeypatch.setattr(slack_alerts, 'notify_devs', lambda title, body: alerts.append(title) or 1)
+    with database() as conn:
+        jobs.initialize(conn)
+        conn.execute("INSERT INTO ingestion_jobs VALUES ('scheduled-posts','s','running','w',0,?,NULL,'t')",
+                     (json.dumps({'last_success_at': '2026-09-29T23:30:00+00:00'}),))
+    late = datetime(2026, 9, 30, 2, 0, tzinfo=UTC)
+    assert ingestion_monitor.check_once(late) == 'alerted'
+    assert ingestion_monitor.check_once(late) == 'ok'
+    assert len(alerts) == 1 and 'No new posts' in alerts[0]
+    with database() as conn:
+        conn.execute("UPDATE ingestion_jobs SET state = ?", (json.dumps({'last_success_at': '2026-09-30T01:45:00+00:00'}),))
+    assert ingestion_monitor.check_once(late) == 'recovered'
+    assert ingestion_monitor.check_once(late) == 'ok'
+    assert alerts[-1] == 'New-post discovery recovered'
+
+
+def test_dev_alerts_only_reach_dev_accounts(monkeypatch):
+    import httpx
+    from app import slack_alerts
+    monkeypatch.setenv('SLACK_BOT_TOKEN', 'test')
+    opened = []
+    def handler(req):
+        if req.url.path.endswith('conversations.open'):
+            opened.append(json.loads(req.content)['users'])
+            return httpx.Response(200, json={'ok': True, 'channel': {'id': 'D1'}})
+        return httpx.Response(200, json={'ok': True})
+    real_client = httpx.Client
+    monkeypatch.setattr(httpx, 'Client', lambda **kw: real_client(transport=httpx.MockTransport(handler)))
+    assert slack_alerts.notify_devs('t', 'b') == len(slack_alerts.DEV_EMAILS)
+    assert opened == [slack_alerts.slack_user_id_for_email(e) for e in slack_alerts.DEV_EMAILS]
