@@ -302,3 +302,74 @@ def test_monitor_alerts_quickly_when_a_slot_keeps_retrying(database, monkeypatch
     ingestion_monitor.check_once(datetime(2026, 9, 30, 13, 25, tzinfo=UTC))
     ingestion_monitor.check_once(datetime(2026, 9, 30, 13, 35, tzinfo=UTC))
     assert len(alerts) == 1 and 'stuck retrying' in alerts[0][0] and 'posts failed' in alerts[0][1]
+
+
+def test_repeatedly_failing_slot_is_abandoned_without_advancing_the_watermark(database):
+    with database() as conn:
+        jobs.initialize(conn)
+        conn.execute("INSERT INTO ingestion_jobs VALUES ('short','01','done','old',0,?,NULL,'t')",
+                     (json.dumps({'last_success_at': '2026-09-30T12:15:00+00:00'}),))
+    def poison():
+        jobs.now()
+        raise RuntimeError('same bad row every time')
+    for _ in range(3):
+        assert not jobs.run('short', '02', poison, max_attempts=3)
+    with database() as conn:
+        row = conn.execute("SELECT * FROM ingestion_jobs").fetchone()
+        state = json.loads(row['state'])
+    assert row['status'] == 'done' and row['slot'] == '02'
+    assert state['last_success_at'] == '2026-09-30T12:15:00+00:00'
+    assert state['abandoned']['attempts'] == 3
+    seen = []
+    assert jobs.run('short', '03', lambda: seen.append(jobs.current().state['last_success_at']), max_attempts=3)
+    assert seen == ['2026-09-30T12:15:00+00:00']
+
+
+def test_failures_below_the_cap_keep_retrying_the_same_paid_slot(database):
+    def fail():
+        raise RuntimeError('transient')
+    assert not jobs.run('short', '01', fail, max_attempts=5)
+    assert not jobs.run('short', '02', fail, max_attempts=5)
+    with database() as conn:
+        row = conn.execute("SELECT * FROM ingestion_jobs").fetchone()
+    assert row['status'] == 'retry' and row['slot'] == '01'
+    assert json.loads(row['state'])['attempts'] == 2
+
+
+def test_partial_account_failure_finishes_the_slot_and_widens_the_next_window(database, monkeypatch):
+    from app import slack_alerts
+    _scheduler_state(database)
+    alerts, captured = [], []
+    monkeypatch.setattr(slack_alerts, 'notify_devs', lambda title, body: alerts.append(title) or 1)
+    monkeypatch.setattr(scheduler, '_active_account_handles', lambda: ['a', 'b'])
+    monkeypatch.setattr(jobs, 'now', lambda: datetime(2026, 9, 30, 14, 0, tzinfo=UTC))
+
+    class Journal:
+        state = {"last_success_at": "2026-09-30T13:00:00+00:00"}
+
+    monkeypatch.setattr(jobs, 'current', lambda: Journal())
+    outcome = {'a': {}, 'b': {'error': 'processing failed: b'}}
+    monkeypatch.setattr(apify_sync, 'run_short_term_cycle_batch', lambda accounts, **kw: captured.append(kw['lookback_hours']) or outcome)
+    scheduler._run_short_term_jobs()  # no exception: 'a' is kept
+    assert len(alerts) == 1 and '1 of 2' in alerts[0]
+    Journal.state = {"last_success_at": "2026-09-30T13:45:00+00:00"}
+    outcome = {'a': {}, 'b': {}}
+    scheduler._run_short_term_jobs()
+    assert captured[1] == pytest.approx(1 + 5 / 60)  # back to 13:00, not 13:45
+    assert scheduler._state_get(scheduler._DISCOVERY_RETRY_KEY) == ''
+
+
+def test_monitor_alerts_once_when_a_slot_is_abandoned(database, monkeypatch):
+    from app import ingestion_monitor, slack_alerts
+    _scheduler_state(database)
+    alerts = []
+    monkeypatch.setattr(slack_alerts, 'notify_devs', lambda title, body: alerts.append(title) or 1)
+    with database() as conn:
+        jobs.initialize(conn)
+        conn.execute("INSERT INTO ingestion_jobs VALUES ('scheduled-posts','s','done','w',0,?,NULL,'t')",
+                     (json.dumps({'last_success_at': '2026-09-30T13:50:00+00:00',
+                                  'abandoned': {'attempts': 5, 'error': 'boom', 'at': '2026-09-30T14:00:00+00:00'}}),))
+    now = datetime(2026, 9, 30, 14, 5, tzinfo=UTC)
+    ingestion_monitor.check_once(now)
+    ingestion_monitor.check_once(now)
+    assert alerts == ['A discovery slot was skipped after repeated failures']

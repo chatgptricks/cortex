@@ -133,6 +133,37 @@ def _active_account_handles() -> list[str]:
         raise
 
 
+_DISCOVERY_RETRY_KEY = "discovery_retry_since"
+_PARTIAL_ALERT_KEY = "partial_failure_alert"
+# Scheduled passes give up on a slot after this many failed attempts (about
+# ten minutes at RETRY_SECONDS=120). The next slot then covers its window.
+_SCHEDULED_MAX_ATTEMPTS = 5
+
+
+def _aware(value: str) -> datetime:
+    parsed = datetime.fromisoformat(str(value))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _alert_partial_failure(label: str, failures: dict, total: int) -> None:
+    """Log and DM the DEVs once per distinct set of failing accounts."""
+    summary = ", ".join(f"{account}: {str(result.get('error'))[:120]}" for account, result in sorted(failures.items())[:8])
+    logger.error("%s: %s of %s accounts failed and were skipped: %s", label, len(failures), total, summary)
+    marker = f"{label}|{','.join(sorted(failures))}"
+    try:
+        if _state_get(_PARTIAL_ALERT_KEY) == marker:
+            return
+        _state_set(_PARTIAL_ALERT_KEY, marker)
+        from .slack_alerts import notify_devs
+
+        notify_devs(
+            f"{label}: {len(failures)} of {total} accounts failed",
+            f"The other accounts were processed normally; failed accounts are retried automatically.\n{summary}",
+        )
+    except Exception:
+        logger.exception("Partial-failure alert failed")
+
+
 def _run_short_term_jobs() -> None:
     from .apify_sync import ApifySyncError, run_short_term_cycle_batch
 
@@ -149,7 +180,14 @@ def _run_short_term_jobs() -> None:
     import math
     journal = current()
     since = journal.state.get("last_success_at") if journal else None
-    gap = max(0.0, (now() - datetime.fromisoformat(since)).total_seconds() / 3600) if since else 22
+    # Accounts that failed in an earlier slot are recovered by starting this
+    # window where theirs started (a shared Apify run has one window).
+    try:
+        retry_since = _state_get(_DISCOVERY_RETRY_KEY) or None
+    except Exception:
+        retry_since = None  # auxiliary state must never block discovery
+    window_start = min(filter(None, (since, retry_since)), key=_aware, default=None)
+    gap = max(0.0, (now() - _aware(window_start)).total_seconds() / 3600) if window_start else 22
     # The discovery window begins just before the last successful scan. This
     # gives Instagram/Apify five minutes of timestamp overlap without paying
     # to fetch the same two hours of posts on every cycle. After an outage the
@@ -159,8 +197,24 @@ def _run_short_term_jobs() -> None:
     results = run_short_term_cycle_batch(accounts, lookback_hours=lookback,
                                         results_limit=max(10, min(100, math.ceil(lookback * 10))))
     failures = {account: result for account, result in results.items() if result.get("error")}
-    if failures:
+    if failures and len(failures) == len(results):
+        # Nothing succeeded: likely global (Apify, database). Retry the slot;
+        # the attempt cap in ingestion_jobs.run keeps this from stopping ingestion.
         raise ApifySyncError(str(failures))
+    if failures:
+        # Keep every account that succeeded and let the slot finish; the next
+        # slot widens its window back to `window_start` for the failed ones.
+        if window_start and (not retry_since or _aware(window_start) < _aware(retry_since)):
+            try:
+                _state_set(_DISCOVERY_RETRY_KEY, window_start)
+            except Exception:
+                logger.exception("Could not record the discovery retry window")
+        _alert_partial_failure("New-post discovery", failures, len(results))
+    elif retry_since:
+        try:
+            _state_set(_DISCOVERY_RETRY_KEY, "")
+        except Exception:
+            logger.exception("Could not clear the discovery retry window")
     logger.info("Short-term engagement cycle: %s", results)
 
 
@@ -173,8 +227,12 @@ def _run_day_engagement_jobs() -> None:
         return
     results = run_day_engagement_cycle_batch(accounts)
     failures = {account: result for account, result in results.items() if result.get("error")}
-    if failures:
+    if failures and len(failures) == len(results):
         raise ApifySyncError(str(failures))
+    if failures:
+        # Engagement counts refresh again on the next pass; one account must
+        # not hold every other account's counts back.
+        _alert_partial_failure("Eight-hour engagement refresh", failures, len(results))
     logger.info("Eight-hour engagement cycle: %s", results)
 
 
@@ -393,7 +451,7 @@ def _tick() -> None:
     bucket = _bucket_key(now_cst)
     from .ingestion_jobs import run
     def short_pass():
-        if run("scheduled-posts", bucket, _run_short_term_jobs):
+        if run("scheduled-posts", bucket, _run_short_term_jobs, max_attempts=_SCHEDULED_MAX_ATTEMPTS):
             _check_disk()
             _run_ocr_job()
     _launch("short", short_pass)
@@ -401,7 +459,8 @@ def _tick() -> None:
     engagement_bucket = _engagement_bucket_key(now_cst)
     _launch(
         "day-engagement",
-        lambda: run("scheduled-day-engagement", engagement_bucket, _run_day_engagement_jobs),
+        lambda: run("scheduled-day-engagement", engagement_bucket, _run_day_engagement_jobs,
+                    max_attempts=_SCHEDULED_MAX_ATTEMPTS),
     )
 
     daily_trigger = now_cst.replace(hour=_DAILY_JOB_AT[0], minute=_DAILY_JOB_AT[1], second=0, microsecond=0)
