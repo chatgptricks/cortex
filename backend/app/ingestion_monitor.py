@@ -44,7 +44,8 @@ def _discovery_job() -> dict | None:
     except ValueError:
         state = {}
     return {"slot": row["slot"], "status": row["status"], "error": row["error"], "updated_at": row["updated_at"],
-            "last_success_at": state.get("last_success_at"), "frozen_now": state.get("now")}
+            "last_success_at": state.get("last_success_at"), "frozen_now": state.get("now"),
+            "abandoned": state.get("abandoned")}
 
 
 def _cst(value: datetime) -> str:
@@ -80,6 +81,26 @@ def _check_retry_loop(job: dict, now: datetime) -> None:
     logger.warning("Discovery slot %s stuck retrying for %.0f min; DEVs alerted", job["slot"], minutes)
 
 
+ABANDON_ALERT_KEY = "posts_abandon_alert"
+
+
+def _check_abandoned(job: dict) -> None:
+    """Tell the DEVs once when a discovery slot was given up after repeated
+    failures (ingestion continued; the next slot covers its window)."""
+    from .scheduler import _state_get, _state_set
+    from .slack_alerts import notify_devs
+
+    abandoned = job.get("abandoned") or {}
+    if not abandoned.get("at") or _state_get(ABANDON_ALERT_KEY) == abandoned["at"]:
+        return
+    _state_set(ABANDON_ALERT_KEY, abandoned["at"])
+    notify_devs(
+        "A discovery slot was skipped after repeated failures",
+        f"After {abandoned.get('attempts')} failed attempts the slot was abandoned so ingestion keeps running; "
+        f"the next slot re-covers its window.\nError: `{str(abandoned.get('error') or 'unknown')[:400]}`",
+    )
+
+
 def check_once(now: datetime | None = None) -> str:
     """Return 'alerted', 'recovered' or 'ok' (used by tests and logs)."""
     from .scheduler import _state_get, _state_set
@@ -90,6 +111,7 @@ def check_once(now: datetime | None = None) -> str:
         return "ok"
     now = now or datetime.now(UTC)
     _check_retry_loop(job, now)
+    _check_abandoned(job)
     last = datetime.fromisoformat(job["last_success_at"])
     if last.tzinfo is None:
         last = last.replace(tzinfo=UTC)

@@ -60,7 +60,14 @@ def now():
     return datetime.fromisoformat(journal.frozen('now', value.isoformat())) if journal else value
 
 
-def run(key, slot, callback, *, retain_result=False):
+def run(key, slot, callback, *, retain_result=False, max_attempts=None):
+    """Run `callback` for `slot` under a durable lease and journal.
+
+    With `max_attempts`, a slot that keeps failing is abandoned instead of
+    retried forever: it is marked done WITHOUT advancing `last_success_at`,
+    so the next slot starts and its window covers the abandoned one. A
+    deterministic failure can then delay a scheduled pass, never stop it.
+    """
     owner = uuid.uuid4().hex
     epoch = time.time()
     with db.connect() as conn:
@@ -114,10 +121,24 @@ def run(key, slot, callback, *, retain_result=False):
                          (json.dumps(completed_state), db.utc_now(), key, owner))
         return True
     except Exception as exc:
+        error = re.sub(r"token=[^&\s]+", "token=REDACTED", str(exc))[:2000]
+        attempts = int(journal.state.get("attempts") or 0) + 1
+        if max_attempts and attempts >= max_attempts:
+            abandoned_state = {
+                "last_success_at": journal.state.get("last_success_at"),
+                "abandoned": {"attempts": attempts, "error": error[:500], "at": db.utc_now(),
+                              "window_end": journal.state.get("now")},
+            }
+            with db.connect() as conn:
+                conn.execute("UPDATE ingestion_jobs SET status = 'done', lease_until = 0, error = ?, state = ?, updated_at = ? WHERE job_key = ? AND owner = ?",
+                             (error, json.dumps(abandoned_state), db.utc_now(), key, owner))
+            logging.error('Ingestion %s abandoned after %s attempts; next slot covers its window: %s', key, attempts, error[:300])
+            return False
+        journal.state["attempts"] = attempts
         with db.connect() as conn:
-            conn.execute("UPDATE ingestion_jobs SET status = 'retry', lease_until = ?, error = ?, updated_at = ? WHERE job_key = ? AND owner = ?",
-                         (time.time() + RETRY_SECONDS, re.sub(r"token=[^&\s]+", "token=REDACTED", str(exc))[:2000], db.utc_now(), key, owner))
-        logging.exception('Ingestion %s pending retry; saved runs retained', key)
+            conn.execute("UPDATE ingestion_jobs SET status = 'retry', lease_until = ?, error = ?, state = ?, updated_at = ? WHERE job_key = ? AND owner = ?",
+                         (time.time() + RETRY_SECONDS, error, json.dumps(journal.state), db.utc_now(), key, owner))
+        logging.exception('Ingestion %s pending retry (attempt %s); saved runs retained', key, attempts)
         return False
     finally:
         _current.reset(token)
