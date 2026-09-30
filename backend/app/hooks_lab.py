@@ -568,8 +568,17 @@ def _tokens(value: Any) -> list[str]:
     return words
 
 
+_MENTION_RE = re.compile(r"@[\w.]+", re.UNICODE)
+
+
+def _match_fold(value: Any) -> str:
+    """Folded text for word matching. @handles are removed: "@luma_ai" or
+    "Follow @excel_india" are not the words "ai" or "excel"."""
+    return _fold(_MENTION_RE.sub(" ", str(value or "")))
+
+
 def _search_text(hook: Any, context: Any) -> str:
-    return f" {_fold(hook)} \n {_fold(context)} "
+    return f" {_match_fold(hook)} \n {_match_fold(context)} "
 
 
 def _term_variants(term: str) -> set[str]:
@@ -593,8 +602,8 @@ def _word_match(query: str, row: dict[str, Any]) -> tuple[float, float]:
     terms = _tokens(query) or phrase.split()
     if not phrase or not terms:
         return 0.0, 0.0
-    hook = _fold(row.get("hook_text"))
-    context = _fold(row.get("context_text"))
+    hook = _match_fold(row.get("hook_text"))
+    context = _match_fold(row.get("context_text"))
     hook_words, context_words = set(hook.split()), set(context.split())
     in_hook = [term for term in terms if _has_term(hook_words, term)]
     in_any = [term for term in terms if term in in_hook or _has_term(context_words, term)]
@@ -646,7 +655,11 @@ def _public_hook(item: dict[str, Any]) -> dict[str, Any]:
     } | {"contextExcerpt": str(item.get("context_text") or "")[:700]}
 
 
-_HOOK_SELECT = """SELECT h.*, CASE WHEN s.hook_id IS NULL THEN 0 ELSE 1 END AS saved
+# Every column except raw_text: search never returns it and it is the largest.
+_HOOK_SELECT = """SELECT h.id, h.source_table, h.source_id, h.source_kind, h.account, h.shortcode,
+                      h.permalink, h.published_at, h.likes, h.context_text, h.hook_text,
+                      h.primary_topic, h.categories_json, h.category_scores_json, h.categorized_at,
+                      h.search_text, CASE WHEN s.hook_id IS NULL THEN 0 ELSE 1 END AS saved
                FROM hook_sources h
                LEFT JOIN hook_saves s ON s.hook_id = h.id AND s.owner_email = ?"""
 
