@@ -30,6 +30,7 @@ router = APIRouter(prefix="/api/dashboard/hooks", tags=["hooks"])
 
 _SOURCE_SYNC_LOCK = threading.Lock()
 _CATEGORY_LOCK = threading.Lock()
+_REMOTE_SOURCE_BASE = os.getenv("HOOKS_REMOTE_SOURCE_BASE", "").strip().rstrip("/")
 
 TOPICS = {
     "ai_tools": "AI products, prompts, models, agents, automation, or practical AI use",
@@ -78,8 +79,37 @@ _WORD_RE = re.compile(r"[\wáéíóúüñç]+", re.IGNORECASE | re.UNICODE)
 
 
 def require_dev(request: Request) -> None:
-    if not getattr(request.state, "is_dev", False) or getattr(request.state, "queue_role_preview_active", False):
+    if getattr(request.state, "is_dev", False) and not getattr(request.state, "queue_role_preview_active", False):
+        return
+    if not _REMOTE_SOURCE_BASE:
         raise HTTPException(status_code=403, detail="Hooks is available in DEV full access only.")
+
+    # A local-only Hooks server does not carry the production Firebase secret.
+    # Validate the browser's existing bearer token against Cortex instead of
+    # weakening the DEV boundary or duplicating credentials on disk.
+    import httpx
+
+    authorization = request.headers.get("authorization", "").strip()
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Sign in required.")
+    try:
+        result = httpx.get(
+            f"{_REMOTE_SOURCE_BASE}/api/dashboard/me",
+            headers={"Authorization": authorization},
+            timeout=20.0,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="Could not verify DEV access with Cortex.") from exc
+    if result.status_code in {401, 403}:
+        raise HTTPException(status_code=result.status_code, detail=(result.json().get("detail") or "DEV access denied."))
+    if not result.is_success:
+        raise HTTPException(status_code=503, detail="Could not verify DEV access with Cortex.")
+    viewer = result.json()
+    if not viewer.get("is_dev") or viewer.get("queue_role_preview_active"):
+        raise HTTPException(status_code=403, detail="Hooks is available in DEV full access only.")
+    request.state.user_email = str(viewer.get("email") or "").strip().lower()
+    request.state.is_dev = True
+    request.state.queue_role_preview_active = False
 
 
 def ensure_schema(conn: Any) -> None:
@@ -131,6 +161,13 @@ def ensure_schema(conn: Any) -> None:
         )"""
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_hook_drafts_owner ON hook_drafts(owner_email, updated_at DESC)")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS hook_sync_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )"""
+    )
 
 
 def _normalize_spaces(value: str) -> str:
@@ -243,6 +280,66 @@ def _source_rows(conn: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def _index_source_rows(conn: Any, source_rows: list[dict[str, Any]]) -> dict[str, int]:
+    existing = {
+        (row["source_table"], int(row["source_id"]), row["source_kind"]): row["content_hash"]
+        for row in conn.execute(
+            "SELECT source_table, source_id, source_kind, content_hash FROM hook_sources"
+        ).fetchall()
+    }
+    now = utc_now()
+    inserted = updated = 0
+    for row in source_rows:
+        for kind, field in (("caption", "caption"), ("ocr", "hook_text")):
+            raw = str(row.get(field) or "").strip()
+            context, hook = extract_hook(raw, kind)
+            if not hook:
+                continue
+            key = (row["source_table"], int(row["id"]), kind)
+            digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            hook_id = f"{row['source_table']}:{row['id']}:{kind}"
+            metadata = (
+                str(row.get("account") or "").strip().lstrip("@").lower(),
+                str(row.get("shortcode") or "").strip(),
+                str(row.get("permalink") or "").strip(),
+                row.get("published_at"),
+                row.get("likes"),
+                now,
+            )
+            if existing.get(key) == digest:
+                conn.execute(
+                    """UPDATE hook_sources SET account = ?, shortcode = ?, permalink = ?,
+                              published_at = ?, likes = ?, updated_at = ? WHERE id = ?""",
+                    (*metadata, hook_id),
+                )
+                continue
+            if key in existing:
+                conn.execute(
+                    """UPDATE hook_sources SET account = ?, shortcode = ?, permalink = ?,
+                              published_at = ?, likes = ?, raw_text = ?, context_text = ?, hook_text = ?,
+                              content_hash = ?, primary_topic = '', categories_json = '[]',
+                              category_scores_json = '{}', category_model_version = '', categorized_at = NULL,
+                              updated_at = ? WHERE id = ?""",
+                    (*metadata[:5], raw, context, hook, digest, now, hook_id),
+                )
+                updated += 1
+            else:
+                conn.execute(
+                    """INSERT INTO hook_sources (
+                           id, source_table, source_id, source_kind, account, shortcode, permalink,
+                           published_at, likes, raw_text, context_text, hook_text, content_hash,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        hook_id, row["source_table"], int(row["id"]), kind,
+                        metadata[0], metadata[1], metadata[2], metadata[3], metadata[4],
+                        raw, context, hook, digest, now, now,
+                    ),
+                )
+                inserted += 1
+    return {"scanned": len(source_rows), "inserted": inserted, "updated": updated, "busy": 0}
+
+
 def sync_sources() -> dict[str, int]:
     """Refresh the derived index so existing and newly-ingested posts appear."""
     if not _SOURCE_SYNC_LOCK.acquire(blocking=False):
@@ -250,64 +347,88 @@ def sync_sources() -> dict[str, int]:
     try:
         with connect() as conn:
             ensure_schema(conn)
-            existing = {
-                (row["source_table"], int(row["source_id"]), row["source_kind"]): row["content_hash"]
-                for row in conn.execute(
-                    "SELECT source_table, source_id, source_kind, content_hash FROM hook_sources"
-                ).fetchall()
-            }
-            now = utc_now()
-            inserted = updated = 0
             source_rows = _source_rows(conn)
-            for row in source_rows:
-                for kind, field in (("caption", "caption"), ("ocr", "hook_text")):
-                    raw = str(row.get(field) or "").strip()
-                    context, hook = extract_hook(raw, kind)
-                    if not hook:
-                        continue
-                    key = (row["source_table"], int(row["id"]), kind)
-                    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-                    hook_id = f"{row['source_table']}:{row['id']}:{kind}"
-                    metadata = (
-                        str(row.get("account") or "").strip().lstrip("@").lower(),
-                        str(row.get("shortcode") or "").strip(),
-                        str(row.get("permalink") or "").strip(),
-                        row.get("published_at"),
-                        row.get("likes"),
-                        now,
-                    )
-                    if existing.get(key) == digest:
-                        conn.execute(
-                            """UPDATE hook_sources SET account = ?, shortcode = ?, permalink = ?,
-                                      published_at = ?, likes = ?, updated_at = ? WHERE id = ?""",
-                            (*metadata, hook_id),
-                        )
-                        continue
-                    if key in existing:
-                        conn.execute(
-                            """UPDATE hook_sources SET account = ?, shortcode = ?, permalink = ?,
-                                      published_at = ?, likes = ?, raw_text = ?, context_text = ?, hook_text = ?,
-                                      content_hash = ?, primary_topic = '', categories_json = '[]',
-                                      category_scores_json = '{}', category_model_version = '', categorized_at = NULL,
-                                      updated_at = ? WHERE id = ?""",
-                            (*metadata[:5], raw, context, hook, digest, now, hook_id),
-                        )
-                        updated += 1
-                    else:
-                        conn.execute(
-                            """INSERT INTO hook_sources (
-                                   id, source_table, source_id, source_kind, account, shortcode, permalink,
-                                   published_at, likes, raw_text, context_text, hook_text, content_hash,
-                                   created_at, updated_at
-                               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (
-                                hook_id, row["source_table"], int(row["id"]), kind,
-                                metadata[0], metadata[1], metadata[2], metadata[3], metadata[4],
-                                raw, context, hook, digest, now, now,
-                            ),
-                        )
-                        inserted += 1
-            return {"scanned": len(source_rows), "inserted": inserted, "updated": updated, "busy": 0}
+            return _index_source_rows(conn, source_rows)
+    finally:
+        _SOURCE_SYNC_LOCK.release()
+
+
+def sync_remote_sources(request: Request) -> dict[str, int]:
+    """Mirror the authenticated production catalogue into the local index.
+
+    Production remains read-only. Only normalized hooks, saves, drafts, and a
+    response ETag are persisted in the local Hooks SQLite database.
+    """
+    if not _REMOTE_SOURCE_BASE:
+        return sync_sources()
+    if not _SOURCE_SYNC_LOCK.acquire(blocking=False):
+        return {"scanned": 0, "inserted": 0, "updated": 0, "busy": 1}
+
+    import httpx
+
+    try:
+        authorization = request.headers.get("authorization", "").strip()
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Sign in required.")
+        with connect() as conn:
+            ensure_schema(conn)
+            state = conn.execute("SELECT value FROM hook_sync_state WHERE key = 'remote_etag'").fetchone()
+            headers = {"Authorization": authorization}
+            if state and state["value"]:
+                headers["If-None-Match"] = str(state["value"])
+            try:
+                response = httpx.get(
+                    f"{_REMOTE_SOURCE_BASE}/api/dashboard/posts",
+                    headers=headers,
+                    timeout=httpx.Timeout(180.0, connect=20.0),
+                )
+            except httpx.HTTPError as exc:
+                raise HTTPException(status_code=503, detail="Could not read the live Cortex post catalogue.") from exc
+            if response.status_code == 304:
+                return {"scanned": 0, "inserted": 0, "updated": 0, "busy": 0, "not_modified": 1}
+            if response.status_code in {401, 403}:
+                detail = "Production catalogue access denied."
+                try:
+                    detail = response.json().get("detail") or detail
+                except ValueError:
+                    pass
+                raise HTTPException(status_code=response.status_code, detail=detail)
+            if not response.is_success:
+                raise HTTPException(status_code=503, detail="Could not read the live Cortex post catalogue.")
+            payload = response.json()
+            remote_posts = payload.get("posts") if isinstance(payload, dict) else None
+            if not isinstance(remote_posts, list):
+                raise HTTPException(status_code=502, detail="Cortex returned an invalid post catalogue.")
+
+            rows: list[dict[str, Any]] = []
+            for index, post in enumerate(remote_posts):
+                if not isinstance(post, dict):
+                    continue
+                account = str(post.get("account") or "").strip().lstrip("@").lower()
+                shortcode = str(post.get("shortcode") or "").strip()
+                identity = f"{account}:{shortcode or post.get('rank') or index}"
+                source_id = int.from_bytes(hashlib.sha256(identity.encode("utf-8")).digest()[:8], "big") & ((1 << 63) - 1)
+                rows.append(
+                    {
+                        "id": source_id,
+                        "source_table": "remote_posts",
+                        "account": account,
+                        "shortcode": shortcode,
+                        "permalink": str(post.get("permalink") or "").strip(),
+                        "published_at": post.get("postDate"),
+                        "likes": post.get("likes"),
+                        "caption": post.get("caption") or "",
+                        "hook_text": post.get("ocrText") or "",
+                    }
+                )
+            result = _index_source_rows(conn, rows)
+            etag = response.headers.get("ETag") or hashlib.sha256(response.content).hexdigest()
+            conn.execute(
+                """INSERT INTO hook_sync_state(key, value, updated_at) VALUES ('remote_etag', ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+                (etag, utc_now()),
+            )
+            return {**result, "remote": 1}
     finally:
         _SOURCE_SYNC_LOCK.release()
 
@@ -472,7 +593,14 @@ def search_hooks(query: str, mode: str, owner_email: str, limit: int = 24) -> tu
             item["rankScore"] = item["contextScore"] * 0.45 + word_relevance * 0.40 + performance * 0.15
         else:
             item["rankScore"] = item["contextScore"] * 0.78 + performance * 0.22
-    candidates.sort(key=lambda item: (-item["rankScore"], -(item.get("likes") or -1), item["id"]))
+    candidates.sort(
+        key=lambda item: (
+            0 if float(item.get("wordScore") or 0) > 0 else 1,
+            -item["rankScore"],
+            -(item.get("likes") or -1),
+            item["id"],
+        )
+    )
     return candidates[:limit], None
 
 
@@ -597,7 +725,7 @@ def list_hooks(
 ) -> dict[str, Any]:
     response.headers["Cache-Control"] = "private, no-store"
     owner = _owner(request)
-    sync = sync_sources()
+    sync = sync_remote_sources(request) if _REMOTE_SOURCE_BASE else sync_sources()
     results, warning = search_hooks(q.strip(), mode, owner, limit)
     status = _status(owner)
     if status["pending"]:
@@ -832,7 +960,10 @@ def generate_hooks(item: GenerateInput, request: Request, response: Response) ->
     owner = _owner(request)
     if not any((item.topic.strip(), item.manual_input.strip(), item.current_text.strip(), item.source_hook_ids)):
         raise HTTPException(status_code=422, detail="Enter a topic, a manual draft, or select a source hook.")
-    sync_sources()
+    if _REMOTE_SOURCE_BASE:
+        sync_remote_sources(request)
+    else:
+        sync_sources()
     sources = _load_hook_ids(item.source_hook_ids)
     warning = None
     if not sources and item.topic.strip():
