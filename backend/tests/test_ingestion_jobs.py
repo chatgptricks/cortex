@@ -286,3 +286,19 @@ def test_ingestion_status_is_dev_only_and_summarizes_journal(database, monkeypat
     job = body['jobs'][0]
     assert job['runs'] == [{'step': 'run:0', 'run_id': 'r1', 'run_status': 'SUCCEEDED', 'dataset_count': None, 'starting_at': None}]
     assert 'secret' not in json.dumps(body) and job['frozen_now'] == 'y'
+
+
+def test_monitor_alerts_quickly_when_a_slot_keeps_retrying(database, monkeypatch):
+    from app import ingestion_monitor, slack_alerts
+    _scheduler_state(database)
+    alerts = []
+    monkeypatch.setattr(slack_alerts, 'notify_devs', lambda title, body: alerts.append((title, body)) or 1)
+    with database() as conn:
+        jobs.initialize(conn)
+        conn.execute("INSERT INTO ingestion_jobs VALUES ('scheduled-posts','2026-09-30T07:00','retry','w',0,?,'account: 1 posts failed','t')",
+                     (json.dumps({'last_success_at': '2026-09-30T12:15:00+00:00', 'now': '2026-09-30T13:00:00+00:00'}),))
+    assert ingestion_monitor.check_once(datetime(2026, 9, 30, 13, 10, tzinfo=UTC)) == 'ok'
+    assert alerts == []
+    ingestion_monitor.check_once(datetime(2026, 9, 30, 13, 25, tzinfo=UTC))
+    ingestion_monitor.check_once(datetime(2026, 9, 30, 13, 35, tzinfo=UTC))
+    assert len(alerts) == 1 and 'stuck retrying' in alerts[0][0] and 'posts failed' in alerts[0][1]

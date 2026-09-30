@@ -1174,26 +1174,27 @@ def _insert_new_chatgptricks_posts(
             shortcode = str(item["shortCode"]).strip()
             source_ref = f"instagram:{shortcode}"
             image_url = item.get("displayUrl") or next(iter(item.get("images") or []), None)
-            if not image_url:
-                summary["failed"] += 1
-                summary["items"].append({"shortcode": shortcode, "status": "failed", "error": "no cover image"})
-                _tick(index, shortcode)
-                continue
-
-            try:
-                image_response = image_client.get(image_url)
-                image_response.raise_for_status()
-                image_bytes = image_response.content
-                image_bytes, suffix = _compress_cover(image_bytes)
-                # Keyed by shortcode rather than random bytes: re-importing a
-                # post overwrites its own cover instead of orphaning the old
-                # file on disk with no way to ever find or clean it up.
-                image_path = store_uploaded_media(f"cover-{shortcode}{suffix}", image_bytes)
-            except Exception as exc:  # a bad cover must not abort the paid import
-                summary["failed"] += 1
-                summary["items"].append({"shortcode": shortcode, "status": "failed", "error": str(exc)})
-                _tick(index, shortcode)
-                continue
+            # A cover that cannot be fetched (Instagram's signed CDN URLs expire
+            # within hours, and a retried slot reuses the same dataset) must not
+            # drop the post or block the cycle: 2026-09-30 one expired cover
+            # stopped new-post discovery for every account. Store the post
+            # without a cover; "Reload" (refresh_single_post) repairs it.
+            image_path, suffix, cover_error = "", ".jpg", "no cover image" if not image_url else ""
+            if image_url:
+                try:
+                    image_response = image_client.get(image_url)
+                    image_response.raise_for_status()
+                    image_bytes = image_response.content
+                    image_bytes, suffix = _compress_cover(image_bytes)
+                    # Keyed by shortcode rather than random bytes: re-importing a
+                    # post overwrites its own cover instead of orphaning the old
+                    # file on disk with no way to ever find or clean it up.
+                    image_path = store_uploaded_media(f"cover-{shortcode}{suffix}", image_bytes)
+                except Exception as exc:
+                    cover_error = str(exc)
+            if cover_error:
+                summary["missing_covers"] = summary.get("missing_covers", 0) + 1
+                logger.warning("Stored %s without a cover (repair with Reload): %s", shortcode, cover_error[:200])
 
             caption = _clean_text(item.get("caption"))
             title = _title_from_caption(caption) or f"Instagram post {shortcode}"
@@ -1234,7 +1235,11 @@ def _insert_new_chatgptricks_posts(
                 )
 
             summary["added"] += 1
-            summary["items"].append({"shortcode": shortcode, "status": "added", "published_at": _published_at(item)})
+            summary["items"].append({
+                "shortcode": shortcode,
+                "status": "added_without_cover" if cover_error else "added",
+                "published_at": _published_at(item),
+            })
             _tick(index, shortcode)
 
     return summary
@@ -1687,7 +1692,11 @@ def _process_short_term_items(
     new_items.sort(key=lambda it: it.get("timestamp") or "")
     insert_summary = _insert_new_posts(account, cfg, new_items) if insert_new else {"added": 0, "failed": 0}
     if insert_summary.get("failed"):
-        raise ApifySyncError(f"{account}: {insert_summary['failed']} posts failed to persist")
+        # One unsavable post must not fail the account's whole slot: the slot
+        # would retry the same dataset forever and block every later cycle.
+        failed = [item for item in insert_summary.get("items", []) if item.get("status") == "failed"]
+        logger.error("%s: %s new post(s) could not be stored and were skipped: %s",
+                     account, insert_summary["failed"], failed[:5])
     transcript_updates = _store_existing_reel_transcripts(account, cfg, items) if insert_new else 0
 
     # Re-read so freshly-inserted posts are also eligible for the engagement
