@@ -364,3 +364,79 @@ def test_restricted_profile_error_does_not_block_the_paid_batch(monkeypatch, cap
     assert [item['shortCode'] for item in result['active']] == ['saved']
     assert 'skipped unavailable profile private: restricted_page' in caplog.text
     assert 'skipped an unattributed account error: restricted_page' in caplog.text
+
+
+def test_expired_cover_stores_canonical_post_without_blocking(monkeypatch, tmp_path) -> None:
+    # 2026-09-30: an expired Instagram CDN cover made one post "fail to
+    # persist", which failed the whole slot on every retry of the same dataset.
+    import httpx
+
+    path = tmp_path / "canonical.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE posts (
+                id INTEGER PRIMARY KEY, section TEXT, title TEXT, caption TEXT, published_at TEXT,
+                likes INTEGER, comments INTEGER, post_type_label TEXT, source_ref TEXT, shortcode TEXT,
+                image_path TEXT NOT NULL, original_filename TEXT, status TEXT, progress_percent INTEGER,
+                progress_message TEXT, is_animated INTEGER, created_at TEXT, updated_at TEXT
+            )"""
+        )
+
+    @contextmanager
+    def connect():
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    monkeypatch.setattr(db, "connect", connect)
+    real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kw: real_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(403)), **{k: v for k, v in kw.items() if k != "transport"}
+    ))
+    summary = apify_sync._insert_new_chatgptricks_posts([
+        {"shortCode": "EXPIRED", "caption": "New post", "displayUrl": "https://cdn.example/expired.jpg",
+         "timestamp": "2026-09-30T12:40:00Z", "likesCount": 10},
+        {"shortCode": "NOCOVER", "caption": "Another", "timestamp": "2026-09-30T12:41:00Z"},
+    ])
+    assert summary["added"] == 2 and summary["failed"] == 0 and summary["missing_covers"] == 2
+    with connect() as connection:
+        rows = connection.execute("SELECT shortcode, image_path FROM posts ORDER BY shortcode").fetchall()
+    assert [(row["shortcode"], row["image_path"]) for row in rows] == [("EXPIRED", ""), ("NOCOVER", "")]
+
+
+def test_unsavable_post_does_not_fail_the_account_slot(monkeypatch, tmp_path) -> None:
+    now = datetime(2026, 9, 30, 13, 0, tzinfo=UTC)
+    path = tmp_path / "slot.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE dashboard_posts (
+                id INTEGER PRIMARY KEY, account TEXT, shortcode TEXT, published_at TEXT,
+                likes INTEGER, comments INTEGER, hot_checked INTEGER NOT NULL DEFAULT 1,
+                likes_at_8h INTEGER, comments_at_8h INTEGER,
+                refreshed_8h INTEGER NOT NULL DEFAULT 0, updated_at TEXT
+            )"""
+        )
+
+    @contextmanager
+    def connect():
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    monkeypatch.setattr(db, "connect", connect)
+    monkeypatch.setattr(apify_sync, "_insert_new_posts", lambda account, cfg, items: {
+        "added": 0, "failed": 1, "items": [{"shortcode": "BAD", "status": "failed", "error": "boom"}],
+    })
+    result = apify_sync._process_short_term_items(
+        "account", {"table": "dashboard_posts", "group": "sentient", "hot_threshold": 600, "is_canonical": False},
+        [{"shortCode": "BAD", "likesCount": 1}], now,
+    )
+    assert "error" not in result

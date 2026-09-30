@@ -20,6 +20,10 @@ STALE_AFTER_SECONDS = 2 * 60 * 60
 CHECK_EVERY_SECONDS = 10 * 60
 DISCOVERY_JOB_KEY = "scheduled-posts"
 ALERT_STATE_KEY = "posts_stale_alert"
+RETRY_ALERT_KEY = "posts_retry_alert"
+# A slot retrying the same error this long is almost certainly stuck on a
+# deterministic failure; tell the DEVs long before the 2-hour stale alert.
+RETRY_ALERT_AFTER_SECONDS = 20 * 60
 
 _started = False
 _lock = threading.Lock()
@@ -30,7 +34,7 @@ def _discovery_job() -> dict | None:
 
     with connect() as conn:
         row = conn.execute(
-            "SELECT status, state, error, updated_at FROM ingestion_jobs WHERE job_key = ?",
+            "SELECT slot, status, state, error, updated_at FROM ingestion_jobs WHERE job_key = ?",
             (DISCOVERY_JOB_KEY,),
         ).fetchone()
     if not row:
@@ -39,14 +43,41 @@ def _discovery_job() -> dict | None:
         state = json.loads(row["state"] or "{}")
     except ValueError:
         state = {}
-    return {"status": row["status"], "error": row["error"], "updated_at": row["updated_at"],
-            "last_success_at": state.get("last_success_at")}
+    return {"slot": row["slot"], "status": row["status"], "error": row["error"], "updated_at": row["updated_at"],
+            "last_success_at": state.get("last_success_at"), "frozen_now": state.get("now")}
 
 
 def _cst(value: datetime) -> str:
     from datetime import timedelta, timezone
 
     return value.astimezone(timezone(timedelta(hours=-6))).strftime("%b %d, %I:%M %p CST")
+
+
+def _check_retry_loop(job: dict, now: datetime) -> None:
+    """Alert once per (slot, error) when discovery keeps failing the same slot."""
+    from .scheduler import _state_get, _state_set
+    from .slack_alerts import notify_devs
+
+    if job["status"] != "retry" or not job.get("frozen_now"):
+        return
+    started = datetime.fromisoformat(job["frozen_now"])
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    minutes = (now - started).total_seconds() / 60
+    if minutes * 60 < RETRY_ALERT_AFTER_SECONDS:
+        return
+    marker = f"{job['slot']}|{(job.get('error') or '')[:200]}"
+    if _state_get(RETRY_ALERT_KEY) == marker:
+        return
+    _state_set(RETRY_ALERT_KEY, marker)
+    notify_devs(
+        "New-post discovery is stuck retrying",
+        f"The discovery slot `{job['slot']}` has been retrying for {minutes:.0f} minutes and blocks every "
+        f"later cycle.\nError: `{(job.get('error') or 'unknown')[:400]}`\n"
+        "Paid Apify runs are reused on every retry, so this costs nothing extra, but no new posts arrive "
+        "until the cause is fixed.",
+    )
+    logger.warning("Discovery slot %s stuck retrying for %.0f min; DEVs alerted", job["slot"], minutes)
 
 
 def check_once(now: datetime | None = None) -> str:
@@ -58,6 +89,7 @@ def check_once(now: datetime | None = None) -> str:
     if not job or not job["last_success_at"]:
         return "ok"
     now = now or datetime.now(UTC)
+    _check_retry_loop(job, now)
     last = datetime.fromisoformat(job["last_success_at"])
     if last.tzinfo is None:
         last = last.replace(tzinfo=UTC)
