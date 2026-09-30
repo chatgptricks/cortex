@@ -370,3 +370,13 @@ def test_position_never_lifts_a_partial_match_above_an_exact_one(monkeypatch):
     ]
     results, _, _ = _search(monkeypatch, rows, "chatgpt prompts", mode="words")
     assert [item["id"] for item in results] == ["exact-late", "partial-early"]
+
+
+def test_ocr_fragments_rank_below_complete_hooks(monkeypatch):
+    rows = [
+        _hook("fragment", "PROMPTS", 90_000),
+        _hook("short", "Prompts para", 80_000),
+        _hook("hook", "Prompts that quietly save me ten hours a week", 50),
+    ]
+    results, _, _ = _search(monkeypatch, rows, "prompts", mode="words")
+    assert results[0]["id"] == "hook"
