@@ -250,7 +250,9 @@ def _canonical_account(conn: Any) -> str:
     return "chatgptricks"
 
 
-def _source_rows(conn: Any) -> list[dict[str, Any]]:
+def _source_rows(conn: Any, since: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """All source posts, or with `since` only rows added or changed after the
+    previous sync's watermark ({table: {"updated_at": str, "id": int}})."""
     canonical = _canonical_account(conn)
     rows: list[dict[str, Any]] = []
     for table, query in (
@@ -267,8 +269,13 @@ def _source_rows(conn: Any) -> list[dict[str, Any]]:
                FROM dashboard_posts ORDER BY id""",
         ),
     ):
+        mark = (since or {}).get(table)
+        params: tuple[Any, ...] = ()
+        if mark:
+            query = query.replace(" ORDER BY id", " WHERE (updated_at > ? OR id > ?) ORDER BY id")
+            params = (str(mark.get("updated_at") or ""), int(mark.get("id") or 0))
         try:
-            fetched = conn.execute(query).fetchall()
+            fetched = conn.execute(query, params).fetchall()
         except Exception:
             logger.exception("Hooks could not read %s", table)
             continue
@@ -280,15 +287,42 @@ def _source_rows(conn: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def _index_source_rows(conn: Any, source_rows: list[dict[str, Any]]) -> dict[str, int]:
-    existing = {
-        (row["source_table"], int(row["source_id"]), row["source_kind"]): row["content_hash"]
-        for row in conn.execute(
-            "SELECT source_table, source_id, source_kind, content_hash FROM hook_sources"
-        ).fetchall()
-    }
+def _existing_hooks(conn: Any, source_rows: list[dict[str, Any]], *, full: bool) -> dict[tuple, tuple]:
+    columns = "source_table, source_id, source_kind, content_hash, account, shortcode, permalink, published_at, likes"
+    def key_value(row: Any) -> tuple[tuple, tuple]:
+        return ((row["source_table"], int(row["source_id"]), row["source_kind"]),
+                (row["content_hash"], row["account"], row["shortcode"], row["permalink"],
+                 str(row["published_at"] or ""), row["likes"]))
+    if full:
+        return dict(key_value(row) for row in conn.execute(f"SELECT {columns} FROM hook_sources").fetchall())
+    existing: dict[tuple, tuple] = {}
+    by_table: dict[str, list[int]] = {}
+    for row in source_rows:
+        by_table.setdefault(row["source_table"], []).append(int(row["id"]))
+    for table, ids in by_table.items():
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            marks = ",".join("?" for _ in chunk)
+            existing.update(key_value(row) for row in conn.execute(
+                f"SELECT {columns} FROM hook_sources WHERE source_table = ? AND source_id IN ({marks})",
+                (table, *chunk),
+            ).fetchall())
+    return existing
+
+
+def _index_source_rows(conn: Any, source_rows: list[dict[str, Any]], *, full: bool = True) -> dict[str, int]:
+    """Upsert derived hooks in batches, writing only rows that changed.
+
+    Production runs this against Postgres over the network: one UPDATE per
+    unchanged row (~150k per search) made every Hooks request take minutes.
+    """
+    if not source_rows:
+        return {"scanned": 0, "inserted": 0, "updated": 0, "busy": 0}
+    existing = _existing_hooks(conn, source_rows, full=full)
     now = utc_now()
-    inserted = updated = 0
+    inserts: list[tuple] = []
+    content_updates: list[tuple] = []
+    metadata_updates: list[tuple] = []
     for row in source_rows:
         for kind, field in (("caption", "caption"), ("ocr", "hook_text")):
             raw = str(row.get(field) or "").strip()
@@ -304,40 +338,78 @@ def _index_source_rows(conn: Any, source_rows: list[dict[str, Any]]) -> dict[str
                 str(row.get("permalink") or "").strip(),
                 row.get("published_at"),
                 row.get("likes"),
-                now,
             )
-            if existing.get(key) == digest:
-                conn.execute(
-                    """UPDATE hook_sources SET account = ?, shortcode = ?, permalink = ?,
-                              published_at = ?, likes = ?, updated_at = ? WHERE id = ?""",
-                    (*metadata, hook_id),
-                )
-                continue
-            if key in existing:
-                conn.execute(
-                    """UPDATE hook_sources SET account = ?, shortcode = ?, permalink = ?,
-                              published_at = ?, likes = ?, raw_text = ?, context_text = ?, hook_text = ?,
-                              content_hash = ?, primary_topic = '', categories_json = '[]',
-                              category_scores_json = '{}', category_model_version = '', categorized_at = NULL,
-                              updated_at = ? WHERE id = ?""",
-                    (*metadata[:5], raw, context, hook, digest, now, hook_id),
-                )
-                updated += 1
-            else:
-                conn.execute(
-                    """INSERT INTO hook_sources (
-                           id, source_table, source_id, source_kind, account, shortcode, permalink,
-                           published_at, likes, raw_text, context_text, hook_text, content_hash,
-                           created_at, updated_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        hook_id, row["source_table"], int(row["id"]), kind,
-                        metadata[0], metadata[1], metadata[2], metadata[3], metadata[4],
-                        raw, context, hook, digest, now, now,
-                    ),
-                )
-                inserted += 1
-    return {"scanned": len(source_rows), "inserted": inserted, "updated": updated, "busy": 0}
+            current = existing.get(key)
+            if current is None:
+                inserts.append((hook_id, row["source_table"], int(row["id"]), kind, *metadata,
+                                raw, context, hook, digest, now, now))
+            elif current[0] != digest:
+                content_updates.append((*metadata, raw, context, hook, digest, now, hook_id))
+            elif current[1:] != (*metadata[:3], str(metadata[3] or ""), metadata[4]):
+                metadata_updates.append((*metadata, now, hook_id))
+    for offset in range(0, len(inserts), 1000):
+        conn.executemany(
+            """INSERT INTO hook_sources (
+                   id, source_table, source_id, source_kind, account, shortcode, permalink,
+                   published_at, likes, raw_text, context_text, hook_text, content_hash,
+                   created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            inserts[offset:offset + 1000],
+        )
+    if content_updates:
+        conn.executemany(
+            """UPDATE hook_sources SET account = ?, shortcode = ?, permalink = ?,
+                      published_at = ?, likes = ?, raw_text = ?, context_text = ?, hook_text = ?,
+                      content_hash = ?, primary_topic = '', categories_json = '[]',
+                      category_scores_json = '{}', category_model_version = '', categorized_at = NULL,
+                      updated_at = ? WHERE id = ?""",
+            content_updates,
+        )
+    if metadata_updates:
+        conn.executemany(
+            """UPDATE hook_sources SET account = ?, shortcode = ?, permalink = ?,
+                      published_at = ?, likes = ?, updated_at = ? WHERE id = ?""",
+            metadata_updates,
+        )
+    return {"scanned": len(source_rows), "inserted": len(inserts),
+            "updated": len(content_updates), "busy": 0}
+
+
+_LOCAL_MARK_KEY = "local_watermark"
+# A first build over the whole library takes minutes in production; run it in
+# the background instead of inside the request that happened to trigger it.
+_BACKGROUND_BUILD_THRESHOLD = 5000
+
+
+def _local_mark(conn: Any) -> dict[str, Any] | None:
+    row = conn.execute("SELECT value FROM hook_sync_state WHERE key = ?", (_LOCAL_MARK_KEY,)).fetchone()
+    mark = _parse_json(row["value"], {}) if row and row["value"] else {}
+    return mark or None
+
+
+def _save_local_mark(conn: Any, previous: dict[str, Any] | None, source_rows: list[dict[str, Any]]) -> None:
+    mark = dict(previous or {})
+    for row in source_rows:
+        table_mark = dict(mark.get(row["source_table"]) or {"updated_at": "", "id": 0})
+        table_mark["updated_at"] = max(str(table_mark.get("updated_at") or ""), str(row.get("updated_at") or ""))
+        table_mark["id"] = max(int(table_mark.get("id") or 0), int(row["id"]))
+        mark[row["source_table"]] = table_mark
+    conn.execute(
+        """INSERT INTO hook_sync_state(key, value, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+        (_LOCAL_MARK_KEY, json.dumps(mark), utc_now()),
+    )
+
+
+def _run_local_sync(since: dict[str, Any] | None) -> dict[str, int]:
+    try:
+        with connect() as conn:
+            source_rows = _source_rows(conn, since)
+            result = _index_source_rows(conn, source_rows, full=since is None)
+            _save_local_mark(conn, since, source_rows)
+            return result
+    finally:
+        _SOURCE_SYNC_LOCK.release()
 
 
 def sync_sources() -> dict[str, int]:
@@ -347,10 +419,19 @@ def sync_sources() -> dict[str, int]:
     try:
         with connect() as conn:
             ensure_schema(conn)
-            source_rows = _source_rows(conn)
-            return _index_source_rows(conn, source_rows)
-    finally:
+            since = _local_mark(conn)
+            if since is None:
+                count = sum(conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+                            for table in ("posts", "dashboard_posts"))
+            else:
+                count = 0
+    except Exception:
         _SOURCE_SYNC_LOCK.release()
+        raise
+    if since is None and count > _BACKGROUND_BUILD_THRESHOLD:
+        threading.Thread(target=_run_local_sync, args=(None,), daemon=True, name="hooks-index-build").start()
+        return {"scanned": 0, "inserted": 0, "updated": 0, "busy": 1, "building": 1}
+    return _run_local_sync(since)
 
 
 def sync_remote_sources(request: Request) -> dict[str, int]:

@@ -270,3 +270,29 @@ def test_generation_uses_selected_sources(client, monkeypatch):
     ).json()
     assert len(payload["hooks"]) == 6
     assert captured["sources"][0]["id"] == hook_id
+
+
+def test_repeat_reads_only_index_changed_posts(client):
+    # Production runs this against Postgres: re-writing every hook on every
+    # search made each Hooks request take minutes.
+    test_client, connection = client
+    test_client.get("/api/dashboard/hooks")
+    assert hooks_lab.sync_sources() == {"scanned": 0, "inserted": 0, "updated": 0, "busy": 0}
+    with connection() as conn:
+        conn.execute("UPDATE dashboard_posts SET likes = 7000, updated_at = '2026-09-03T00:00:00Z' WHERE id = 2")
+    assert hooks_lab.sync_sources()["scanned"] == 1
+    with connection() as conn:
+        likes = {row["likes"] for row in conn.execute("SELECT likes FROM hook_sources WHERE source_id = 2")}
+    assert likes == {7000}
+
+
+def test_large_first_build_runs_in_background(client, monkeypatch):
+    test_client, _connection = client
+    started = []
+    monkeypatch.setattr(hooks_lab, "_BACKGROUND_BUILD_THRESHOLD", 1)
+    monkeypatch.setattr(hooks_lab.threading, "Thread", lambda **kw: type("T", (), {"start": lambda self: started.append(kw["name"])})())
+    try:
+        assert hooks_lab.sync_sources()["building"] == 1
+        assert started == ["hooks-index-build"]
+    finally:
+        hooks_lab._SOURCE_SYNC_LOCK.release()
