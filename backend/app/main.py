@@ -92,6 +92,7 @@ from .jev_features import (
     review_promo,
     verify_caption,
 )
+from .hooks_lab import router as hooks_router
 from .tracker_refresh_queue import enqueue as enqueue_tracker_refresh, get as get_tracker_refresh
 from .tracker_refresh_queue import last_requested_at as last_tracker_refresh_request
 from .queue_rules import (
@@ -9414,3 +9415,6 @@ def reset_hot_check(password: Annotated[str, Form()], account: Annotated[str, Fo
             )
 
     return {"account": account, "reset": len(reset_ids)}
+
+
+app.include_router(hooks_router)
