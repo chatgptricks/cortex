@@ -626,7 +626,14 @@ def _word_match(query: str, row: dict[str, Any]) -> tuple[float, float]:
         first = [next((i for i, word in enumerate(ordered) if _has_term({word}, term)), len(ordered))
                  for term in in_hook]
         score += 25.0 * max(0.0, 1.0 - (sum(first) / len(first)) / 40.0)
-        score += 8.0 * max(0.0, 1.0 - len(ordered) / 60.0)
+        length = len(ordered)
+        if length < 5:
+            # Cover-OCR fragments ("PROMPTS", "Prompts para") are not usable hooks.
+            score -= 15.0
+        elif length <= 25:
+            score += 8.0
+        else:
+            score += 8.0 * max(0.0, 1.0 - (length - 25) / 35.0)
     return round(score, 2), len(in_any) / total
 
 
