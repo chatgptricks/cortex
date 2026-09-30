@@ -118,44 +118,84 @@ def test_context_search_falls_back_with_warning(client, monkeypatch):
     assert "keyword" in payload["warning"].lower()
 
 
-def test_default_search_combines_words_and_jev_context(client, monkeypatch):
-    test_client, _ = client
-    seen = {}
+def _hook(hook_id, hook, likes, context=None):
+    return {
+        "id": hook_id, "hook_text": hook, "context_text": context or hook,
+        "primary_topic": "ai_tools", "categories": [], "likes": likes, "saved": False,
+    }
 
-    def rerank(query, candidates):
-        seen["query"] = query
-        seen["word_scores"] = [item["wordScore"] for item in candidates]
-        return {item["id"]: 0.75 for item in candidates}
+
+def _search(monkeypatch, rows, query, *, jev=None, limit=10, mode="hybrid"):
+    calls = []
+    monkeypatch.setattr(hooks_lab, "_all_hooks", lambda owner, terms=None: [dict(row) for row in rows])
+    monkeypatch.setattr(hooks_lab, "_top_liked_hooks", lambda owner, limit, exclude=None: [
+        dict(row) for row in sorted(rows, key=lambda r: -r["likes"]) if row["id"] not in (exclude or set())
+    ][:limit])
+
+    def rerank(q, candidates):
+        calls.append([item["id"] for item in candidates])
+        return {item["id"]: (jev or {}).get(item["id"], 0.0) for item in candidates}
 
     monkeypatch.setattr(hooks_lab, "_jev_rerank", rerank)
-    payload = test_client.get("/api/dashboard/hooks?q=prompts").json()
-
-    assert payload["mode"] == "hybrid"
-    assert seen["query"] == "prompts"
-    assert any(score > 0 for score in seen["word_scores"])
-    assert payload["results"]
-    assert all(item["contextScore"] == 0.75 for item in payload["results"])
-    assert all(item["rankScore"] > 0 for item in payload["results"])
+    results, warning = hooks_lab.search_hooks(query, mode, "dev@example.com", limit)
+    return results, warning, calls
 
 
-def test_hybrid_search_keeps_literal_matches_ahead_of_semantic_expansion(monkeypatch):
-    exact = {
-        "id": "exact", "hook_text": "One prompt changed everything", "context_text": "One prompt changed everything",
-        "primary_topic": "ai_tools", "categories": [], "likes": 10, "saved": False,
-    }
-    semantic_only = {
-        "id": "semantic", "hook_text": "The most popular post ever", "context_text": "A broad AI story",
-        "primary_topic": "ai_tools", "categories": [], "likes": 10_000_000, "saved": False,
-    }
-    monkeypatch.setattr(hooks_lab, "_all_hooks", lambda owner: [exact, semantic_only])
-    monkeypatch.setattr(hooks_lab, "_jev_rerank", lambda query, candidates: {"exact": 0.1, "semantic": 1.0})
+def test_exact_phrase_beats_partial_matches_with_far_more_likes(monkeypatch):
+    rows = [
+        _hook("viral-partial", "The best free tools nobody uses", 9_000_000, "Tools you need. Prompts inside."),
+        _hook("exact", "These ChatGPT prompts save hours", 120),
+        _hook("both-words", "Prompts that make ChatGPT better", 3_000),
+    ]
+    results, _, _ = _search(monkeypatch, rows, "chatgpt prompts")
+    assert [item["id"] for item in results] == ["exact", "both-words", "viral-partial"]
+    assert [item["matchType"] for item in results] == ["exact", "exact", "partial"]
 
-    results, warning = hooks_lab.search_hooks("prompt", "hybrid", "dev@example.com", 10)
 
+def test_likes_only_break_ties_between_equally_exact_hooks(monkeypatch):
+    rows = [_hook("low", "Claude just changed everything", 10), _hook("high", "Claude just changed everything", 50_000)]
+    results, _, _ = _search(monkeypatch, rows, "claude")
+    assert [item["id"] for item in results] == ["high", "low"]
+
+
+def test_jev_never_reorders_or_displaces_exact_matches(monkeypatch):
+    rows = [
+        _hook("exact", "One prompt changed everything", 10),
+        _hook("semantic", "The most popular post ever", 10_000_000),
+        _hook("weak", "Unrelated cooking video", 5_000_000),
+    ]
+    results, warning, calls = _search(monkeypatch, rows, "prompt", jev={"semantic": 0.9, "weak": 0.2})
     assert warning is None
-    assert results[0]["id"] == "exact"
-    assert results[0]["wordScore"] > 0
-    assert results[1]["wordScore"] == 0
+    assert [item["id"] for item in results] == ["exact", "semantic"]
+    assert results[1]["matchType"] == "related"
+    assert calls == [["semantic", "weak"]]
+
+
+def test_jev_is_skipped_when_exact_matches_fill_the_page(monkeypatch):
+    rows = [_hook(f"p{i}", f"Prompt number {i}", i) for i in range(5)] + [_hook("viral", "Something else", 10**8)]
+    results, _, calls = _search(monkeypatch, rows, "prompt", limit=5)
+    assert all(item["id"].startswith("p") for item in results)
+    assert calls == []
+
+
+def test_short_and_partial_words_do_not_create_false_matches(monkeypatch):
+    rows = [
+        _hook("ai", "AI tools that feel illegal", 1),
+        _hook("said", "He said nothing about it", 10**6),
+        _hook("pro", "Go pro in one week", 10**6),
+        _hook("automation", "Automation saved my team", 5),
+    ]
+    assert [r["id"] for r in _search(monkeypatch, rows, "ai")[0]] == ["ai"]
+    assert [r["id"] for r in _search(monkeypatch, rows, "prompts", mode="words")[0]] == []
+    assert [r["id"] for r in _search(monkeypatch, rows, "automat", mode="words")[0]] == ["automation"]
+
+
+def test_sql_prefilter_matches_folded_words(client):
+    test_client, _ = client
+    test_client.get("/api/dashboard/hooks")
+    rows = hooks_lab._all_hooks("dev@example.com", ["prompts"])
+    assert rows and all(row["search_text"] and " prompt" in row["search_text"] for row in rows)
+    assert hooks_lab._all_hooks("dev@example.com", ["nonexistentword"]) == []
 
 
 def test_local_bridge_verifies_dev_and_indexes_live_catalogue(client, monkeypatch):

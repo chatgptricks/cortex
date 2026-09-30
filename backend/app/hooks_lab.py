@@ -138,6 +138,11 @@ def ensure_schema(conn: Any) -> None:
             UNIQUE(source_table, source_id, source_kind)
         )"""
     )
+    # Folded, space-padded "hook + context" text so exact-word search can be
+    # prefiltered in SQL instead of scoring every hook in Python per request.
+    from .db import _ensure_column
+
+    _ensure_column(conn, "hook_sources", "search_text", "search_text TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_hook_sources_likes ON hook_sources(likes DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_hook_sources_topic ON hook_sources(primary_topic)")
     conn.execute(
@@ -342,9 +347,9 @@ def _index_source_rows(conn: Any, source_rows: list[dict[str, Any]], *, full: bo
             current = existing.get(key)
             if current is None:
                 inserts.append((hook_id, row["source_table"], int(row["id"]), kind, *metadata,
-                                raw, context, hook, digest, now, now))
+                                raw, context, hook, digest, _search_text(hook, context), now, now))
             elif current[0] != digest:
-                content_updates.append((*metadata, raw, context, hook, digest, now, hook_id))
+                content_updates.append((*metadata, raw, context, hook, digest, _search_text(hook, context), now, hook_id))
             elif current[1:] != (*metadata[:3], str(metadata[3] or ""), metadata[4]):
                 metadata_updates.append((*metadata, now, hook_id))
     for offset in range(0, len(inserts), 1000):
@@ -352,15 +357,15 @@ def _index_source_rows(conn: Any, source_rows: list[dict[str, Any]], *, full: bo
             """INSERT INTO hook_sources (
                    id, source_table, source_id, source_kind, account, shortcode, permalink,
                    published_at, likes, raw_text, context_text, hook_text, content_hash,
-                   created_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   search_text, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             inserts[offset:offset + 1000],
         )
     if content_updates:
         conn.executemany(
             """UPDATE hook_sources SET account = ?, shortcode = ?, permalink = ?,
                       published_at = ?, likes = ?, raw_text = ?, context_text = ?, hook_text = ?,
-                      content_hash = ?, primary_topic = '', categories_json = '[]',
+                      content_hash = ?, search_text = ?, primary_topic = '', categories_json = '[]',
                       category_scores_json = '{}', category_model_version = '', categorized_at = NULL,
                       updated_at = ? WHERE id = ?""",
             content_updates,
@@ -401,13 +406,35 @@ def _save_local_mark(conn: Any, previous: dict[str, Any] | None, source_rows: li
     )
 
 
-def _run_local_sync(since: dict[str, Any] | None) -> dict[str, int]:
+def _backfill_search_text(batch: int = 2000, max_batches: int | None = None) -> int:
+    """Fill the folded search column for hooks indexed before it existed.
+    Each batch commits on its own so progress survives a restart."""
+    filled = 0
+    batches = 0
+    while max_batches is None or batches < max_batches:
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT id, hook_text, context_text FROM hook_sources WHERE search_text IS NULL LIMIT ?", (batch,)
+            ).fetchall()
+            if not rows:
+                break
+            conn.executemany(
+                "UPDATE hook_sources SET search_text = ? WHERE id = ?",
+                [(_search_text(row["hook_text"], row["context_text"]), row["id"]) for row in rows],
+            )
+        filled += len(rows)
+        batches += 1
+    return filled
+
+
+def _run_local_sync(since: dict[str, Any] | None, *, backfill_all: bool = False) -> dict[str, int]:
     try:
         with connect() as conn:
             source_rows = _source_rows(conn, since)
             result = _index_source_rows(conn, source_rows, full=since is None)
             _save_local_mark(conn, since, source_rows)
-            return result
+        _backfill_search_text(max_batches=None if backfill_all else 1)
+        return result
     finally:
         _SOURCE_SYNC_LOCK.release()
 
@@ -425,11 +452,13 @@ def sync_sources() -> dict[str, int]:
                             for table in ("posts", "dashboard_posts"))
             else:
                 count = 0
+            unfolded = conn.execute("SELECT COUNT(*) AS n FROM hook_sources WHERE search_text IS NULL").fetchone()["n"]
     except Exception:
         _SOURCE_SYNC_LOCK.release()
         raise
-    if since is None and count > _BACKGROUND_BUILD_THRESHOLD:
-        threading.Thread(target=_run_local_sync, args=(None,), daemon=True, name="hooks-index-build").start()
+    if (since is None and count > _BACKGROUND_BUILD_THRESHOLD) or unfolded > _BACKGROUND_BUILD_THRESHOLD:
+        threading.Thread(target=_run_local_sync, args=(since,), kwargs={"backfill_all": True},
+                         daemon=True, name="hooks-index-build").start()
         return {"scanned": 0, "inserted": 0, "updated": 0, "busy": 1, "building": 1}
     return _run_local_sync(since)
 
@@ -522,33 +551,69 @@ def _fold(value: Any) -> str:
     ).strip()
 
 
+_STOP_WORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "your", "you", "are", "how",
+    "que", "los", "las", "una", "uno", "para", "con", "por", "del", "como", "este", "esta",
+    "de", "la", "el", "en", "to", "of", "in", "on", "is", "it", "an", "or", "y", "a",
+}
+
+
 def _tokens(value: Any) -> list[str]:
-    stop = {
-        "the", "and", "for", "with", "that", "this", "from", "your", "you", "are", "how",
-        "que", "los", "las", "una", "uno", "para", "con", "por", "del", "como", "este", "esta",
-    }
-    return [word for word in _fold(value).split() if len(word) > 2 and word not in stop]
+    """Distinct query words. Two-letter words such as "AI" are kept: they are
+    often the most important word and only ever match whole words."""
+    words: list[str] = []
+    for word in _fold(value).split():
+        if len(word) >= 2 and word not in _STOP_WORDS and word not in words:
+            words.append(word)
+    return words
+
+
+def _search_text(hook: Any, context: Any) -> str:
+    return f" {_fold(hook)} \n {_fold(context)} "
+
+
+def _term_variants(term: str) -> set[str]:
+    if len(term) > 3 and term.endswith("s"):
+        return {term, term[:-1]}
+    return {term, f"{term}s"}
+
+
+def _has_term(words: set[str], term: str) -> bool:
+    """Whole-word match, singular/plural, or a word that starts with a long
+    term ("automat" -> "automation"). Never a shorter word inside the term."""
+    if _term_variants(term) & words:
+        return True
+    return len(term) >= 5 and any(word.startswith(term) for word in words)
+
+
+def _word_match(query: str, row: dict[str, Any]) -> tuple[float, float]:
+    """(score, coverage) for the typed words. Exact wording dominates: the
+    phrase itself, then every word in the hook, then every word anywhere."""
+    phrase = _fold(query)
+    terms = _tokens(query) or phrase.split()
+    if not phrase or not terms:
+        return 0.0, 0.0
+    hook = _fold(row.get("hook_text"))
+    context = _fold(row.get("context_text"))
+    hook_words, context_words = set(hook.split()), set(context.split())
+    in_hook = [term for term in terms if _has_term(hook_words, term)]
+    in_any = [term for term in terms if term in in_hook or _has_term(context_words, term)]
+    phrase_in_hook = f" {phrase} " in f" {hook} "
+    phrase_in_context = f" {phrase} " in f" {context} "
+    if not in_any and not phrase_in_context:
+        return 0.0, 0.0
+    total = len(terms)
+    score = 100.0 if phrase_in_hook else 50.0 if phrase_in_context else 0.0
+    score += 40.0 * len(in_hook) / total + 15.0 * len(in_any) / total
+    if len(in_hook) == total:
+        score += 30.0
+    elif len(in_any) == total:
+        score += 10.0
+    return round(score, 2), len(in_any) / total
 
 
 def _word_score(query: str, row: dict[str, Any]) -> float:
-    phrase = _fold(query)
-    wanted = _tokens(query)
-    hook = _fold(row.get("hook_text"))
-    context = _fold(row.get("context_text"))
-    metadata = _fold(f"{row.get('primary_topic', '')} {' '.join(row.get('categories', []))}")
-    if not phrase:
-        return 0.0
-    score = 10.0 if phrase in hook else 4.0 if phrase in context else 0.0
-    hook_words, context_words, metadata_words = hook.split(), context.split(), metadata.split()
-    for term in wanted:
-        variants = {term, term[:-1] if len(term) > 4 and term.endswith("s") else term}
-        if any(word in variants or (len(term) >= 5 and (word.startswith(term) or term.startswith(word))) for word in hook_words):
-            score += 4.0
-        elif any(word in variants or (len(term) >= 5 and (word.startswith(term) or term.startswith(word))) for word in context_words):
-            score += 1.5
-        if term in metadata_words:
-            score += 1.0
-    return score
+    return _word_match(query, row)[0]
 
 
 def _parse_json(value: Any, fallback: Any) -> Any:
@@ -576,20 +641,46 @@ def _public_hook(item: dict[str, Any]) -> dict[str, Any]:
             "id", "source_table", "source_id", "source_kind", "account", "shortcode",
             "permalink", "published_at", "likes", "hook_text", "primary_topic",
             "categories", "categorized_at", "saved", "wordScore", "contextScore", "rankScore",
+            "matchType",
         )
     } | {"contextExcerpt": str(item.get("context_text") or "")[:700]}
 
 
-def _all_hooks(owner_email: str) -> list[dict[str, Any]]:
+_HOOK_SELECT = """SELECT h.*, CASE WHEN s.hook_id IS NULL THEN 0 ELSE 1 END AS saved
+               FROM hook_sources h
+               LEFT JOIN hook_saves s ON s.hook_id = h.id AND s.owner_email = ?"""
+
+
+def _all_hooks(owner_email: str, terms: list[str] | None = None) -> list[dict[str, Any]]:
+    """Hooks that could contain any of `terms` (all hooks when no terms).
+
+    The SQL filter is a superset of `_has_term` on the folded search text;
+    rows not yet backfilled (NULL) are always included so nothing is missed.
+    """
+    where, params = "", []
+    if terms:
+        clauses = []
+        for term in terms:
+            stem = term[:-1] if len(term) > 3 and term.endswith("s") else term
+            clauses.append("h.search_text LIKE ?")
+            # Short words must be whole words; longer ones may be a word prefix.
+            params.append(f"% {stem} %" if len(stem) < 4 else f"% {stem}%")
+        where = " WHERE h.search_text IS NULL OR " + " OR ".join(clauses)
+    with connect() as conn:
+        ensure_schema(conn)
+        rows = conn.execute(_HOOK_SELECT + where, (owner_email, *params)).fetchall()
+    return [_row_dict(row) for row in rows]
+
+
+def _top_liked_hooks(owner_email: str, limit: int, exclude: set[str] | None = None) -> list[dict[str, Any]]:
+    exclude = exclude or set()
     with connect() as conn:
         ensure_schema(conn)
         rows = conn.execute(
-            """SELECT h.*, CASE WHEN s.hook_id IS NULL THEN 0 ELSE 1 END AS saved
-               FROM hook_sources h
-               LEFT JOIN hook_saves s ON s.hook_id = h.id AND s.owner_email = ?""",
-            (owner_email,),
+            _HOOK_SELECT + " ORDER BY COALESCE(h.likes, -1) DESC, h.id LIMIT ?",
+            (owner_email, limit + len(exclude)),
         ).fetchall()
-    return [_row_dict(row) for row in rows]
+    return [item for item in (_row_dict(row) for row in rows) if item["id"] not in exclude][:limit]
 
 
 def _jev_rerank(query: str, candidates: list[dict[str, Any]]) -> dict[str, float]:
@@ -630,28 +721,58 @@ def _jev_rerank(query: str, candidates: list[dict[str, Any]]) -> dict[str, float
     }
 
 
+# Jev may only add "related" hooks after every exact-word match, and only
+# when it is confident; it never reorders or displaces exact matches.
+_RELATED_MIN_CONTEXT = 0.6
+_RELATED_POOL = 24
+
+
 def search_hooks(query: str, mode: str, owner_email: str, limit: int = 24) -> tuple[list[dict[str, Any]], str | None]:
-    rows = _all_hooks(owner_email)
+    phrase = _fold(query)
+    if not phrase:
+        return _top_liked_hooks(owner_email, limit), None
+    terms = _tokens(query) or phrase.split()
+    rows = _all_hooks(owner_email, terms)
+    word_matches = []
     for row in rows:
-        row["wordScore"] = _word_score(query, row)
-    if not query.strip():
-        selected = sorted(rows, key=lambda item: (-(item.get("likes") or -1), item["id"]))[:limit]
-        return selected, None
-    word_matches = [item for item in rows if item["wordScore"] > 0]
+        row["wordScore"], row["wordCoverage"] = _word_match(query, row)
+        if row["wordScore"] > 0:
+            row["matchType"] = "exact" if row["wordCoverage"] == 1 else "partial"
+            word_matches.append(row)
+    # Exact wording first; likes only break ties between equally exact hooks.
     word_matches.sort(key=lambda item: (-item["wordScore"], -(item.get("likes") or -1), item["id"]))
     if mode == "words":
         return word_matches[:limit], None
 
-    # Jev is a re-ranker, not the full-corpus scan.  Exact retrieval owns the
-    # first half of the shortlist; high-performing categorized hooks keep the
-    # semantic half broad enough to surface adjacent wording.
+    if mode == "hybrid":
+        results = word_matches[:limit]
+        missing = limit - len(results)
+        if missing <= 0:
+            return results, None
+        pool = _top_liked_hooks(owner_email, _RELATED_POOL, {item["id"] for item in word_matches})
+        if not pool:
+            return results, None
+        try:
+            semantic = _jev_rerank(query, pool)
+        except JevFeatureUnavailable as exc:
+            return results, None if results else f"Jev context search is unavailable. {exc}"
+        related = []
+        for item in pool:
+            item["contextScore"] = semantic.get(item["id"], 0.0)
+            if item["contextScore"] >= _RELATED_MIN_CONTEXT:
+                item["matchType"] = "related"
+                item["rankScore"] = item["contextScore"]
+                related.append(item)
+        related.sort(key=lambda item: (-item["contextScore"], -(item.get("likes") or -1), item["id"]))
+        return results + related[:missing], None
+
+    # "context": broad meaning search, explicitly requested.
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in word_matches[:16] + sorted(rows, key=lambda row: (-(row.get("likes") or -1), row["id"])):
-        if item["id"] in seen:
-            continue
-        seen.add(item["id"])
-        candidates.append(item)
+    for item in word_matches[:16] + _top_liked_hooks(owner_email, 28):
+        if item["id"] not in seen:
+            seen.add(item["id"])
+            candidates.append(item)
         if len(candidates) >= 28:
             break
     if not candidates:
@@ -662,26 +783,12 @@ def search_hooks(query: str, mode: str, owner_email: str, limit: int = 24) -> tu
         fallback = word_matches or candidates
         return fallback[:limit], f"Jev context search is unavailable. Showing keyword and high-like fallback results. {exc}"
     max_log_likes = max((math.log1p(max(0, item.get("likes") or 0)) for item in candidates), default=1.0) or 1.0
-    max_word_score = max((float(item.get("wordScore") or 0) for item in candidates), default=1.0) or 1.0
     for item in candidates:
         item["contextScore"] = semantic.get(item["id"], 0.0)
+        item.setdefault("matchType", "related")
         performance = math.log1p(max(0, item.get("likes") or 0)) / max_log_likes
-        word_relevance = float(item.get("wordScore") or 0) / max_word_score
-        if mode == "hybrid":
-            # The default Hooks search treats the typed words and their broader
-            # meaning as one signal. Exact matches stay prominent, Jev can add
-            # adjacent inspiration, and likes break close calls.
-            item["rankScore"] = item["contextScore"] * 0.45 + word_relevance * 0.40 + performance * 0.15
-        else:
-            item["rankScore"] = item["contextScore"] * 0.78 + performance * 0.22
-    candidates.sort(
-        key=lambda item: (
-            0 if float(item.get("wordScore") or 0) > 0 else 1,
-            -item["rankScore"],
-            -(item.get("likes") or -1),
-            item["id"],
-        )
-    )
+        item["rankScore"] = item["contextScore"] * 0.85 + performance * 0.15
+    candidates.sort(key=lambda item: (-item["rankScore"], -(item.get("likes") or -1), item["id"]))
     return candidates[:limit], None
 
 
