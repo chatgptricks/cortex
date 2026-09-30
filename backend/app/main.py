@@ -4000,6 +4000,9 @@ def _queue_v2_hot_source_rows_uncached(conn: Any, *, include_historic: bool = Fa
     # those databases are upgraded in place.
     post_columns = {row["name"] for row in conn.execute("PRAGMA table_info(posts)").fetchall()}
     dashboard_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dashboard_posts)").fetchall()}
+    # Leads-only accounts (Research disabled) are tracked but never feed HOT routing.
+    account_columns = {row["name"] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+    research_filter = " AND COALESCE(research_enabled, 1) = 1" if "research_enabled" in account_columns else ""
     routing_start = _queue_v2_hot_routing_start(conn)
     published_cutoff = (datetime.now(UTC) - timedelta(hours=QUEUE_V2_HOT_MAX_AGE_HOURS)).isoformat(timespec="seconds")
     post_cutoff = "" if include_historic else (" AND hot_marked_at >= ?" if "hot_marked_at" in post_columns else "")
@@ -4028,7 +4031,7 @@ def _queue_v2_hot_source_rows_uncached(conn: Any, *, include_historic: bool = Fa
                   dp.is_hot, dp.hot_rate_multiplier
            FROM dashboard_posts dp
            JOIN accounts a ON a.handle = dp.account
-           WHERE a.is_active = 1 AND dp.is_hot = 1 AND dp.hot_rate_multiplier > ?
+           WHERE a.is_active = 1{research_filter} AND dp.is_hot = 1 AND dp.hot_rate_multiplier > ?
              AND dp.published_at IS NOT NULL AND dp.published_at >= ?
              AND dp.shortcode IS NOT NULL AND dp.shortcode != ''{dashboard_cutoff}""",
         (QUEUE_V2_HOT_MULTIPLIER, published_cutoff, routing_start)
