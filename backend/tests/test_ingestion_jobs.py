@@ -268,3 +268,21 @@ def test_dev_alerts_only_reach_dev_accounts(monkeypatch):
     monkeypatch.setattr(httpx, 'Client', lambda **kw: real_client(transport=httpx.MockTransport(handler)))
     assert slack_alerts.notify_devs('t', 'b') == len(slack_alerts.DEV_EMAILS)
     assert opened == [slack_alerts.slack_user_id_for_email(e) for e in slack_alerts.DEV_EMAILS]
+
+
+def test_ingestion_status_is_dev_only_and_summarizes_journal(database, monkeypatch):
+    from types import SimpleNamespace
+    from fastapi import HTTPException
+    from app import main
+    monkeypatch.setattr(main, 'connect', database)
+    _scheduler_state(database)
+    with database() as conn:
+        jobs.initialize(conn)
+        conn.execute("INSERT INTO ingestion_jobs VALUES ('scheduled-posts','s','running','w',0,?,NULL,'t')",
+                     (json.dumps({'last_success_at': 'x', 'now': 'y', 'run:0': {'run': {'id': 'r1', 'status': 'SUCCEEDED', 'token': 'secret'}, 'items': [1]}}),))
+    with pytest.raises(HTTPException):
+        main.admin_ingestion_status(SimpleNamespace(state=SimpleNamespace(is_dev=False)))
+    body = main.admin_ingestion_status(SimpleNamespace(state=SimpleNamespace(is_dev=True)))
+    job = body['jobs'][0]
+    assert job['runs'] == [{'step': 'run:0', 'run_id': 'r1', 'run_status': 'SUCCEEDED', 'dataset_count': None, 'starting_at': None}]
+    assert 'secret' not in json.dumps(body) and job['frozen_now'] == 'y'
