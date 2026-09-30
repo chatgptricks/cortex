@@ -346,3 +346,21 @@ def test_reload_counts_marks_post_deleted_after_two_empty_direct_checks(monkeypa
     assert result["deleted"] is True
     with connect() as connection:
         assert tuple(connection.execute("SELECT likes, comments, is_deleted FROM dashboard_posts").fetchone()) == (100, 10, 1)
+
+
+def test_restricted_profile_error_does_not_block_the_paid_batch(monkeypatch, caplog):
+    # 2026-09-29: one restricted profile row failed the whole batch on every
+    # retry of the same paid run, stopping new-post discovery for ~11 hours.
+    monkeypatch.setattr(apify_sync, '_fetch_apify_items', lambda *a, **k: [
+        {'error': 'restricted_page', 'errorDescription': 'Page is private or restricted'},
+        {'error': 'restricted_page', 'username': 'Private'},
+        {'shortCode': 'saved', 'ownerUsername': 'active', 'type': 'Image'},
+    ])
+    configs = {name: {'handle': name, 'scrape_mode': 'posts'} for name in ('private', 'active')}
+
+    result = apify_sync._collect_short_term_items(configs, 20, datetime.now(UTC), include_reels=False)
+
+    assert result['private'] == []
+    assert [item['shortCode'] for item in result['active']] == ['saved']
+    assert 'skipped unavailable profile private: restricted_page' in caplog.text
+    assert 'skipped an unattributed account error: restricted_page' in caplog.text
