@@ -152,7 +152,7 @@ def test_hot_posts_above_three_x_are_auto_pooled_once(tmp_path):
     conn.row_factory = sqlite3.Row
     conn.executescript(
         """
-        CREATE TABLE accounts (handle TEXT, is_canonical INTEGER, is_active INTEGER);
+        CREATE TABLE accounts (handle TEXT, is_canonical INTEGER, is_active INTEGER, research_enabled INTEGER);
         CREATE TABLE posts (
             id INTEGER PRIMARY KEY, shortcode TEXT, caption TEXT, title TEXT,
             post_type_label TEXT, published_at TEXT, likes INTEGER, comments INTEGER,
@@ -191,13 +191,15 @@ def test_hot_posts_above_three_x_are_auto_pooled_once(tmp_path):
     recent = (now - timedelta(hours=2)).isoformat(timespec="seconds")
     old = (now - timedelta(days=5)).isoformat(timespec="seconds")
     marked_now = now.isoformat(timespec="seconds")
-    conn.execute("INSERT INTO accounts VALUES ('chatgptricks', 1, 1)")
-    conn.execute("INSERT INTO accounts VALUES ('competitor', 0, 1)")
+    conn.execute("INSERT INTO accounts VALUES ('chatgptricks', 1, 1, 1)")
+    conn.execute("INSERT INTO accounts VALUES ('competitor', 0, 1, 1)")
+    conn.execute("INSERT INTO accounts VALUES ('leads_only', 0, 1, 0)")
     conn.execute("INSERT INTO posts VALUES (1, 'HOT1', 'caption', 'title', 'Image', ?, 10, 1, 1, 3.4, ?)", (recent, marked_now))
     conn.execute("INSERT INTO posts VALUES (2, 'EDGE', 'caption', 'title', 'Image', ?, 10, 1, 1, 3.0, ?)", (recent, marked_now))
     conn.execute("INSERT INTO dashboard_posts VALUES (3, 'competitor', 'HOT2', 'caption', 'Video', ?, 10, 1, 'https://instagram.com/p/HOT2', 1, 4.2, ?)", (recent, marked_now))
     # A recent HOT mark must not revive an old publication.
     conn.execute("INSERT INTO dashboard_posts VALUES (4, 'competitor', 'OLDHOT', 'old', 'Image', ?, 10, 1, 'https://instagram.com/p/OLDHOT', 1, 9.0, ?)", (old, marked_now))
+    conn.execute("INSERT INTO dashboard_posts VALUES (5, 'leads_only', 'LEADHOT', 'lead', 'Image', ?, 10, 1, 'https://instagram.com/p/LEADHOT', 1, 9.0, ?)", (recent, marked_now))
     conn.commit()
 
     assert main._queue_v2_auto_pool_hot(conn) == [1, 2]
