@@ -7590,6 +7590,48 @@ def _require_paid_refresh_access(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Admin or Dev access is required to run a paid refresh.")
 
 
+@app.get("/api/admin/ingestion/status")
+def admin_ingestion_status(request: Request) -> dict[str, Any]:
+    """Read-only DEV view of the worker's durable ingestion state.
+
+    The worker has no HTTP listener, so this is the only way to tell from the
+    dashboard whether a pass is running, stuck behind a live lease, waiting to
+    retry, or done. Journal payloads are summarized; no tokens or items leave.
+    """
+    if not getattr(request.state, "is_dev", False):
+        raise HTTPException(status_code=403, detail="Dev access is required.")
+    from .ingestion_jobs import initialize
+
+    now = time.time()
+    with connect() as conn:
+        initialize(conn)
+        rows = conn.execute(
+            "SELECT job_key, slot, status, owner, lease_until, state, error, updated_at FROM ingestion_jobs ORDER BY updated_at DESC"
+        ).fetchall()
+        markers = conn.execute("SELECT key, value, updated_at FROM scheduler_state ORDER BY key").fetchall()
+    jobs = []
+    for row in rows:
+        try:
+            state = json.loads(row["state"] or "{}")
+        except ValueError:
+            state = {}
+        runs = []
+        for key in sorted(k for k in state if k.startswith("run:")):
+            saved = state[key] if isinstance(state[key], dict) else {}
+            run = saved.get("run") if isinstance(saved.get("run"), dict) else {}
+            runs.append({"step": key, "run_id": run.get("id"), "run_status": run.get("status"),
+                         "dataset_count": saved.get("dataset_count"), "starting_at": saved.get("starting_at")})
+        jobs.append({
+            "job_key": row["job_key"], "slot": row["slot"], "status": row["status"],
+            "lease_seconds_left": round(float(row["lease_until"] or 0) - now),
+            "updated_at": row["updated_at"], "error": (row["error"] or "")[:500] or None,
+            "last_success_at": state.get("last_success_at"), "frozen_now": state.get("now"),
+            "runs": runs,
+        })
+    return {"server_time": utc_now(), "jobs": jobs,
+            "scheduler_state": [dict(marker) for marker in markers]}
+
+
 @app.post("/api/dashboard/refresh")
 def dashboard_refresh(request: Request) -> dict[str, Any]:
     """Role-gated manual override: runs the short-term (<=24h + HOT
