@@ -153,7 +153,7 @@ def test_exact_phrase_beats_partial_matches_with_far_more_likes(monkeypatch):
 
 
 def test_likes_only_break_ties_between_equally_exact_hooks(monkeypatch):
-    rows = [_hook("low", "Claude just changed everything", 10), _hook("high", "Claude just changed my work", 50_000)]
+    rows = [_hook("low", "Claude just changed my life", 10), _hook("high", "Claude just changed my work", 50_000)]
     results, _, _ = _search(monkeypatch, rows, "claude")
     assert [item["id"] for item in results] == ["high", "low"]
 
@@ -342,7 +342,7 @@ def test_the_same_post_appears_once(monkeypatch):
     canonical = {**_hook("posts:1:caption", "These ChatGPT prompts help", 105_157), "shortcode": "ABC", "source_kind": "caption"}
     mirrored = {**_hook("dashboard_posts:9:caption", "These ChatGPT prompts help", 104_440), "shortcode": "ABC", "source_kind": "caption"}
     collab = {**_hook("dashboard_posts:7:caption", "These ChatGPT prompts help", 104_421), "shortcode": "ABC", "source_kind": "caption"}
-    other = {**_hook("dashboard_posts:5:caption", "More ChatGPT prompts", 10), "shortcode": "XYZ", "source_kind": "caption"}
+    other = {**_hook("dashboard_posts:5:caption", "Those ChatGPT prompts rock", 10), "shortcode": "XYZ", "source_kind": "caption"}
     results, _, _ = _search(monkeypatch, [mirrored, collab, canonical, other], "chatgpt prompts", mode="words")
     assert [item["id"] for item in results] == ["posts:1:caption", "dashboard_posts:5:caption"]
 
@@ -354,3 +354,19 @@ def test_account_mentions_are_not_search_words(monkeypatch):
     ]
     assert [r["id"] for r in _search(monkeypatch, rows, "ai", mode="words")[0]] == ["word"]
     assert [r["id"] for r in _search(monkeypatch, rows, "excel", mode="words")[0]] == ["word"]
+
+
+def test_hooks_that_lead_with_the_word_beat_more_liked_late_mentions(monkeypatch):
+    late = " ".join(["word"] * 30) + " prompts at the very end of a long caption"
+    rows = [_hook("late", late, 5_000_000), _hook("early", "Prompts that save hours every week", 50)]
+    results, _, _ = _search(monkeypatch, rows, "prompts", mode="words")
+    assert [item["id"] for item in results] == ["early", "late"]
+
+
+def test_position_never_lifts_a_partial_match_above_an_exact_one(monkeypatch):
+    rows = [
+        _hook("partial-early", "Prompts are here", 10),
+        _hook("exact-late", " ".join(["word"] * 35) + " chatgpt prompts", 10),
+    ]
+    results, _, _ = _search(monkeypatch, rows, "chatgpt prompts", mode="words")
+    assert [item["id"] for item in results] == ["exact-late", "partial-early"]
