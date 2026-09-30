@@ -1527,6 +1527,10 @@ def _item_requested_account(item: dict[str, Any], handle_to_account: dict[str, s
         match = _INSTAGRAM_PROFILE_URL.fullmatch(str(item.get(field) or "").strip())
         if match:
             return handle_to_account.get(match.group(1).lower())
+    # Error rows (restricted_page, not_found, ...) often carry only the handle.
+    if item.get("error"):
+        username = str(item.get("username") or item.get("ownerUsername") or "").strip().lstrip("@").lower()
+        return handle_to_account.get(username)
     return None
 
 
@@ -1603,7 +1607,13 @@ def _collect_short_term_items(
                         item.get("error"),
                     )
                     continue
-                raise ApifySyncError(f"Apify returned an account error: {item.get('error')}")
+                # An error row never contains posts. Raising here made one
+                # restricted profile fail the whole paid batch on every retry,
+                # and the retry loop blocked every later discovery slot
+                # (2026-09-29: ~11h without new posts). Skip it loudly instead.
+                logger.warning("Short-term collection skipped an unattributed account error: %s (%s)",
+                               item.get("error"), {k: item.get(k) for k in ("inputUrl", "url", "username")})
+                continue
             account = source_account or post_owner_to_account.get(_item_owner_username(item))
             if _item_shortcode(item) and not account:
                 # A shared actor run can contain a stray neighboring-profile
@@ -2119,7 +2129,9 @@ def run_short_term_cycle_batch_paged(
                     if requested:
                         results[requested] = {"error": f"Apify account error: {item.get('error')}"}
                         continue
-                    raise ApifySyncError(f"Apify returned an account error: {item.get('error')}")
+                    # Error rows carry no posts; never let one block the batch.
+                    logger.warning("Paged collection skipped an unattributed account error: %s", item.get("error"))
+                    continue
                 account = requested or owner_to_account.get(_item_owner_username(item))
                 if _item_shortcode(item) and not account:
                     # Match the non-paged collector: one malformed or foreign
