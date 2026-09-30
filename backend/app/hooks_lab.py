@@ -721,6 +721,23 @@ def _jev_rerank(query: str, candidates: list[dict[str, Any]]) -> dict[str, float
     }
 
 
+def _dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One result per post and per identical hook text, keeping the first
+    (best ranked). The canonical account is indexed from `posts` and again
+    from `dashboard_posts`, and collab accounts republish the same post."""
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for item in items:
+        keys = {f"text:{item.get('source_kind')}:{_fold(item.get('hook_text'))}"}
+        if item.get("shortcode"):
+            keys.add(f"post:{item.get('source_kind')}:{item['shortcode']}")
+        if keys & seen:
+            continue
+        seen |= keys
+        unique.append(item)
+    return unique
+
+
 # Jev may only add "related" hooks after every exact-word match, and only
 # when it is confident; it never reorders or displaces exact matches.
 _RELATED_MIN_CONTEXT = 0.6
@@ -730,7 +747,7 @@ _RELATED_POOL = 24
 def search_hooks(query: str, mode: str, owner_email: str, limit: int = 24) -> tuple[list[dict[str, Any]], str | None]:
     phrase = _fold(query)
     if not phrase:
-        return _top_liked_hooks(owner_email, limit), None
+        return _dedupe(_top_liked_hooks(owner_email, limit * 3))[:limit], None
     terms = _tokens(query) or phrase.split()
     rows = _all_hooks(owner_email, terms)
     word_matches = []
@@ -741,6 +758,7 @@ def search_hooks(query: str, mode: str, owner_email: str, limit: int = 24) -> tu
             word_matches.append(row)
     # Exact wording first; likes only break ties between equally exact hooks.
     word_matches.sort(key=lambda item: (-item["wordScore"], -(item.get("likes") or -1), item["id"]))
+    word_matches = _dedupe(word_matches)
     if mode == "words":
         return word_matches[:limit], None
 
@@ -764,7 +782,7 @@ def search_hooks(query: str, mode: str, owner_email: str, limit: int = 24) -> tu
                 item["rankScore"] = item["contextScore"]
                 related.append(item)
         related.sort(key=lambda item: (-item["contextScore"], -(item.get("likes") or -1), item["id"]))
-        return results + related[:missing], None
+        return _dedupe(results + related)[:limit], None
 
     # "context": broad meaning search, explicitly requested.
     candidates: list[dict[str, Any]] = []
@@ -789,7 +807,7 @@ def search_hooks(query: str, mode: str, owner_email: str, limit: int = 24) -> tu
         performance = math.log1p(max(0, item.get("likes") or 0)) / max_log_likes
         item["rankScore"] = item["contextScore"] * 0.85 + performance * 0.15
     candidates.sort(key=lambda item: (-item["rankScore"], -(item.get("likes") or -1), item["id"]))
-    return candidates[:limit], None
+    return _dedupe(candidates)[:limit], None
 
 
 def _choice_value(answer: Any) -> str:
