@@ -289,7 +289,80 @@ def _check_disk() -> None:
 
 
 _jobs = {}
+_jobs_started = {}
 _jobs_lock = threading.Lock()
+
+# Hard ceilings for passes that normally finish in minutes. A Python thread
+# cannot be killed, and a hung pass keeps renewing its ingestion lease, so
+# `_launch` skips every later slot forever. On 2026-09-29 one hung "short"
+# pass stopped new-post discovery for ~11 hours with no error anywhere.
+# Past a ceiling the worker alerts the DEVs and exits so Render restarts it;
+# the ingestion journal then resumes any already-paid Apify run instead of
+# paying for it again. The daily pass is excluded: it legitimately runs long.
+_JOB_TIME_LIMITS = {"short": 30 * 60, "day-engagement": 90 * 60}
+_STUCK_ALERT_KEY = "stuck_job_alert"
+
+
+def _account_import_running() -> bool:
+    """Imports survive a restart (stale heartbeats are requeued), but an
+    in-flight paid import is still not interrupted by the watchdog."""
+    from .db import connect
+
+    try:
+        with connect() as conn:
+            return conn.execute(
+                "SELECT 1 FROM account_backfill_jobs WHERE status = 'running' LIMIT 1"
+            ).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _stuck_frame(thread: threading.Thread) -> str:
+    import sys
+    import traceback
+
+    frame = sys._current_frames().get(thread.ident or -1)
+    return "".join(traceback.format_stack(frame)[-6:]) if frame else "(no frame)"
+
+
+def _restart_worker() -> None:
+    logging.shutdown()
+    os._exit(70)
+
+
+def _check_stuck_jobs() -> None:
+    """Restart the worker when a bounded pass has been running too long."""
+    now = time.monotonic()
+    with _jobs_lock:
+        stuck = [
+            (name, thread, now - _jobs_started.get(name, now))
+            for name, thread in _jobs.items()
+            if name in _JOB_TIME_LIMITS and thread.is_alive()
+            and now - _jobs_started.get(name, now) > _JOB_TIME_LIMITS[name]
+        ]
+    if not stuck:
+        return
+    name, thread, elapsed = stuck[0]
+    logger.error("Scheduled %s pass stuck for %.0f min; stack:\n%s", name, elapsed / 60, _stuck_frame(thread))
+    waiting = _account_import_running()
+    # One alert per stuck pass (per state), even across worker restarts.
+    marker = f"{name}:{int(_jobs_started.get(name, 0))}:{'wait' if waiting else 'restart'}"
+    if _state_get(_STUCK_ALERT_KEY) != marker:
+        _state_set(_STUCK_ALERT_KEY, marker)
+        from .slack_alerts import notify_devs
+
+        action = (
+            "An account import is running, so the worker will restart as soon as it finishes."
+            if waiting else
+            "Restarting the ingestion worker now; paid Apify runs resume without being charged again."
+        )
+        notify_devs(
+            f"Ingestion '{name}' pass stuck for {elapsed / 60:.0f} min",
+            f"The scheduled *{name}* pass has been running for {elapsed / 60:.0f} minutes "
+            f"(limit {_JOB_TIME_LIMITS[name] // 60}). While it hangs, no new passes start.\n{action}",
+        )
+    if not waiting:
+        _restart_worker()
 
 
 def _launch(name, callback):
@@ -304,6 +377,7 @@ def _launch(name, callback):
                 logger.exception("Scheduled %s pass failed", name)
         thread = threading.Thread(target=guarded, daemon=True, name=f"ingestion-{name}")
         _jobs[name] = thread
+        _jobs_started[name] = time.monotonic()
         thread.start()
 
 
@@ -351,6 +425,10 @@ def _tick() -> None:
 
 def _loop() -> None:
     while not _stop_event.is_set():
+        try:
+            _check_stuck_jobs()
+        except Exception:
+            logger.exception("Stuck-job watchdog failed")
         try:
             _tick()
         except Exception:

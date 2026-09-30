@@ -233,7 +233,8 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     # UI role. Esteban can preview every restricted role; Ivan can switch only
     # between roles he already has, never into Dev or an unassigned privilege.
     request.state.available_operating_roles = list(dict.fromkeys(request.state.operating_roles))
-    request.state.is_dev = email == "esteban@sentientagency.io"
+    from .slack_alerts import DEV_EMAILS
+    request.state.is_dev = email in DEV_EMAILS
     # News is a DEV tool by default. Ivan has a deliberately narrow exception
     # so he can use News and its Jev review without receiving the broader Dev
     # capabilities checked by request.state.is_dev elsewhere.
@@ -401,6 +402,11 @@ def startup() -> None:
         ).start()
         _startup_ready.set()
         logging.getLogger(__name__).info("Web startup maintenance disabled; public API is request-only")
+    # Read-only watchdog over the worker's discovery watermark: the worker
+    # cannot report its own hang or death, so the API alerts the DEVs.
+    from .ingestion_monitor import start_monitor
+
+    start_monitor()
 
 
 ensure_directories()

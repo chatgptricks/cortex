@@ -102,7 +102,11 @@ def run(key, slot, callback, *, retain_result=False):
     try:
         result = callback()
         journal.save()
-        completed_state = {"last_success_at": db.utc_now()}
+        # The watermark is the moment the collected data describes (the frozen
+        # `now` of this slot), not when processing finished. A slot resumed
+        # hours after a stall must not claim the gap as covered, or the next
+        # discovery window starts after it and those posts are never fetched.
+        completed_state = {"last_success_at": journal.state.get("now") or db.utc_now()}
         if retain_result:
             completed_state["result"] = result
         with db.connect() as conn:
