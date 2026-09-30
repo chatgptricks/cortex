@@ -7632,6 +7632,85 @@ def admin_ingestion_status(request: Request) -> dict[str, Any]:
             "scheduler_state": [dict(marker) for marker in markers]}
 
 
+_DISCOVERY_RESCUE: dict[str, Any] = {"running": False, "log": []}
+
+
+def _discovery_rescue_worker() -> None:
+    """Complete stalled discovery slots with this process's (fixed) code.
+
+    One-off DEV rescue for when the worker still runs code that cannot finish
+    a slot. It uses the same leased journal as the worker, so a slot is only
+    ever run by one process and an already-paid Apify run is reused, never
+    bought again. Deliberately bounded: at most two slots, then it stops.
+    """
+    from datetime import timedelta as _td
+    from . import ingestion_jobs, scheduler
+
+    log = _DISCOVERY_RESCUE["log"]
+    try:
+        # Name the profiles behind error rows in the stalled paid dataset
+        # (reading a dataset is free) so they can be reviewed.
+        import httpx
+
+        with connect() as conn:
+            row = conn.execute("SELECT state FROM ingestion_jobs WHERE job_key = 'scheduled-posts'").fetchone()
+        state = json.loads(row["state"] or "{}") if row else {}
+        dataset_id = ((state.get("run:0") or {}).get("dataset_id")
+                      or ((state.get("run:0") or {}).get("run") or {}).get("defaultDatasetId"))
+        if dataset_id:
+            with httpx.Client(timeout=60.0) as client:
+                items = client.get(f"https://api.apify.com/v2/datasets/{dataset_id}/items",
+                                   params={"token": os.getenv("APIFY_TOKEN", "").strip(), "format": "json"}).json()
+            for item in items if isinstance(items, list) else []:
+                if isinstance(item, dict) and item.get("error") and item.get("error") != "no_items":
+                    log.append("error row: " + json.dumps({k: item.get(k) for k in (
+                        "error", "errorDescription", "inputUrl", "url", "username", "ownerUsername") if item.get(k)})[:300])
+    except Exception as exc:
+        log.append(f"could not inspect stalled dataset: {exc}")
+    deadline = time.time() + 8 * 60
+    completed = 0
+    try:
+        while completed < 2 and time.time() < deadline:
+            slot = scheduler._bucket_key(datetime.now(timezone(_td(hours=-6))))
+            if ingestion_jobs.run("scheduled-posts", slot, scheduler._run_short_term_jobs):
+                completed += 1
+                log.append(f"{utc_now()} completed a discovery slot (requested {slot})")
+                continue
+            with connect() as conn:
+                row = conn.execute(
+                    "SELECT slot, status, lease_until, error FROM ingestion_jobs WHERE job_key = 'scheduled-posts'"
+                ).fetchone()
+            if row and row["status"] == "done" and row["slot"] >= slot:
+                log.append(f"{utc_now()} current slot {slot} already done")
+                break
+            wait = max(1.0, min(15.0, float(row["lease_until"] or 0) - time.time() + 0.5)) if row else 5.0
+            time.sleep(wait)
+        log.append(f"{utc_now()} rescue finished: {completed} slot(s) completed")
+    except Exception as exc:  # pragma: no cover - surfaced through the status endpoint
+        log.append(f"{utc_now()} rescue failed: {exc}")
+        logging.getLogger(__name__).exception("Discovery rescue failed")
+    finally:
+        _DISCOVERY_RESCUE["running"] = False
+
+
+@app.post("/api/admin/ingestion/rescue-discovery")
+def admin_rescue_discovery(request: Request) -> dict[str, Any]:
+    if not getattr(request.state, "is_dev", False):
+        raise HTTPException(status_code=403, detail="Dev access is required.")
+    if _DISCOVERY_RESCUE["running"]:
+        return {"started": False, **_DISCOVERY_RESCUE}
+    _DISCOVERY_RESCUE.update(running=True, log=[f"{utc_now()} rescue started"])
+    threading.Thread(target=_discovery_rescue_worker, daemon=True, name="discovery-rescue").start()
+    return {"started": True, **_DISCOVERY_RESCUE}
+
+
+@app.get("/api/admin/ingestion/rescue-discovery")
+def admin_rescue_discovery_status(request: Request) -> dict[str, Any]:
+    if not getattr(request.state, "is_dev", False):
+        raise HTTPException(status_code=403, detail="Dev access is required.")
+    return dict(_DISCOVERY_RESCUE)
+
+
 @app.post("/api/dashboard/refresh")
 def dashboard_refresh(request: Request) -> dict[str, Any]:
     """Role-gated manual override: runs the short-term (<=24h + HOT
