@@ -618,6 +618,15 @@ def _word_match(query: str, row: dict[str, Any]) -> tuple[float, float]:
         score += 30.0
     elif len(in_any) == total:
         score += 10.0
+    if in_hook:
+        # Within the same tier, prefer hooks that lead with the searched words
+        # and stay focused on them; otherwise most matches tied and likes alone
+        # decided the order. Neither bonus can lift a hook into a higher tier.
+        ordered = hook.split()
+        first = [next((i for i, word in enumerate(ordered) if _has_term({word}, term)), len(ordered))
+                 for term in in_hook]
+        score += 25.0 * max(0.0, 1.0 - (sum(first) / len(first)) / 40.0)
+        score += 8.0 * max(0.0, 1.0 - len(ordered) / 60.0)
     return round(score, 2), len(in_any) / total
 
 
