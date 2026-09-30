@@ -138,6 +138,83 @@ def test_default_search_combines_words_and_jev_context(client, monkeypatch):
     assert all(item["rankScore"] > 0 for item in payload["results"])
 
 
+def test_hybrid_search_keeps_literal_matches_ahead_of_semantic_expansion(monkeypatch):
+    exact = {
+        "id": "exact", "hook_text": "One prompt changed everything", "context_text": "One prompt changed everything",
+        "primary_topic": "ai_tools", "categories": [], "likes": 10, "saved": False,
+    }
+    semantic_only = {
+        "id": "semantic", "hook_text": "The most popular post ever", "context_text": "A broad AI story",
+        "primary_topic": "ai_tools", "categories": [], "likes": 10_000_000, "saved": False,
+    }
+    monkeypatch.setattr(hooks_lab, "_all_hooks", lambda owner: [exact, semantic_only])
+    monkeypatch.setattr(hooks_lab, "_jev_rerank", lambda query, candidates: {"exact": 0.1, "semantic": 1.0})
+
+    results, warning = hooks_lab.search_hooks("prompt", "hybrid", "dev@example.com", 10)
+
+    assert warning is None
+    assert results[0]["id"] == "exact"
+    assert results[0]["wordScore"] > 0
+    assert results[1]["wordScore"] == 0
+
+
+def test_local_bridge_verifies_dev_and_indexes_live_catalogue(client, monkeypatch):
+    test_client, _ = client
+    monkeypatch.setattr(hooks_lab, "_REMOTE_SOURCE_BASE", "https://cortex.test")
+    calls = []
+
+    class RemoteResponse:
+        def __init__(self, status_code, body=None, headers=None):
+            self.status_code = status_code
+            self._body = body or {}
+            self.headers = headers or {}
+            self.content = b"catalogue"
+
+        @property
+        def is_success(self):
+            return 200 <= self.status_code < 300
+
+        def json(self):
+            return self._body
+
+    def remote_get(url, headers=None, timeout=None):
+        calls.append((url, dict(headers or {})))
+        if url.endswith("/api/dashboard/me"):
+            return RemoteResponse(200, {"email": "user03@example.com", "is_dev": True})
+        if (headers or {}).get("If-None-Match") == '"live-v1"':
+            return RemoteResponse(304)
+        return RemoteResponse(
+            200,
+            {
+                "posts": [
+                    {
+                        "rank": 99,
+                        "account": "liveaccount",
+                        "shortcode": "live123",
+                        "permalink": "https://instagram.com/p/live123",
+                        "postDate": "2026-09-30T10:00:00Z",
+                        "likes": 54321,
+                        "caption": "This live caption came from Cortex. More context follows.",
+                        "ocrText": "LIVE OCR HOOK",
+                    }
+                ]
+            },
+            {"ETag": '"live-v1"'},
+        )
+
+    monkeypatch.setattr("httpx.get", remote_get)
+    headers = {"x-role": "admin", "authorization": "Bearer real-token"}
+    first = test_client.get("/api/dashboard/hooks", headers=headers).json()
+    second = test_client.get("/api/dashboard/hooks", headers=headers).json()
+
+    assert first["status"]["total"] == 2
+    assert {item["source_kind"] for item in first["results"]} == {"caption", "ocr"}
+    assert first["sync"]["remote"] == 1
+    assert second["sync"]["not_modified"] == 1
+    assert any(url.endswith("/api/dashboard/me") for url, _ in calls)
+    assert any(headers.get("If-None-Match") == '"live-v1"' for _, headers in calls)
+
+
 def test_jev_categorization_is_multilabel(client, monkeypatch):
     test_client, connection = client
     test_client.get("/api/dashboard/hooks")
