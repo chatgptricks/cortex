@@ -345,3 +345,12 @@ def test_the_same_post_appears_once(monkeypatch):
     other = {**_hook("dashboard_posts:5:caption", "More ChatGPT prompts", 10), "shortcode": "XYZ", "source_kind": "caption"}
     results, _, _ = _search(monkeypatch, [mirrored, collab, canonical, other], "chatgpt prompts", mode="words")
     assert [item["id"] for item in results] == ["posts:1:caption", "dashboard_posts:5:caption"]
+
+
+def test_account_mentions_are_not_search_words(monkeypatch):
+    rows = [
+        _hook("mention", "Made with the new @luma_ai model. Follow @excel_india", 10**7),
+        _hook("word", "AI can now build Excel sheets", 5),
+    ]
+    assert [r["id"] for r in _search(monkeypatch, rows, "ai", mode="words")[0]] == ["word"]
+    assert [r["id"] for r in _search(monkeypatch, rows, "excel", mode="words")[0]] == ["word"]
