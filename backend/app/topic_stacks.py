@@ -46,6 +46,8 @@ def timestamp(post):
 
 def automatic_match(shared, score, coverage, age_seconds):
     """Use time proximity as evidence that two captions describe one story."""
+    if shared >= 3 and score == 1.0:
+        return True
     hours = age_seconds / 3600
     if hours <= 8:
         return shared >= 3 and (score >= .16 or coverage >= .45)
@@ -69,33 +71,31 @@ def attach(posts):
         if unseen:
             representatives = {}
             for row in conn.execute('SELECT post_key, stack_id, words, posted_at FROM topic_stack_members ORDER BY post_key').fetchall():
-                representatives.setdefault(row['stack_id'], (set(json.loads(row['words'])), row['posted_at']))
+                representatives[row['post_key']] = (row['stack_id'], set(json.loads(row['words'])), row['posted_at'])
             docs = [(post, words(post)) for post in sorted(unseen, key=key)]
-            frequency = Counter(w for ws, _ in representatives.values() for w in ws)
-            frequency.update(w for _, ws in docs for w in ws)
             index = defaultdict(list)
             def index_group(group, ws):
-                for word in sorted(ws, key=lambda w: (frequency[w], w))[:8]:
-                    if len(index[word]) < 400:
-                        index[word].append(group)
-            for group, (ws, _) in representatives.items():
+                for word in ws:
+                    index[word].append(group)
+            for group, (_, ws, _) in representatives.items():
                 index_group(group, ws)
             additions = []
             for post, ws in docs:
                 ws = set(ws); date = timestamp(post); winner = None; best = 0
-                candidates = {group for word in sorted(ws, key=lambda w: (frequency[w], w))[:8] for group in index[word]} if len(ws) >= 3 else set()
+                shared_counts = Counter(member for word in ws for member in index[word]) if len(ws) >= 3 else {}
+                candidates = [member for member, shared in shared_counts.items() if shared >= 3]
                 for group in sorted(candidates):
-                    other, other_date = representatives[group]
+                    stack_id, other, other_date = representatives[group]
                     shared = len(ws & other)
                     score = shared / len(ws | other) if ws | other else 0
                     coverage = shared / min(len(ws), len(other)) if ws and other else 0
                     if automatic_match(shared, score, coverage, abs(date - other_date)) and score > best:
-                        winner, best = group, score
+                        winner, best = stack_id, score
                 if winner is None:
                     winner = uuid.uuid4().hex
-                    representatives[winner] = (ws, date)
-                    index_group(winner, ws)
                 post_key = key(post)
+                representatives[post_key] = (winner, ws, date)
+                index_group(post_key, ws)
                 additions.append((post_key, winner, json.dumps(sorted(ws)), date))
                 membership[post_key] = winner
             conn.executemany('INSERT INTO topic_stack_members (post_key, stack_id, words, posted_at) VALUES (?, ?, ?, ?)', additions)
@@ -347,7 +347,7 @@ def find_similar(post_key):
         raise ValueError('Choose a valid post.')
     with connect() as conn:
         initialize(conn)
-        reference = conn.execute('SELECT stack_id, words FROM topic_stack_members WHERE post_key = ?', (post_key,)).fetchone()
+        reference = conn.execute('SELECT stack_id, words, posted_at FROM topic_stack_members WHERE post_key = ?', (post_key,)).fetchone()
         if not reference:
             # Research deliberately renders a singleton fallback for legacy or
             # freshly imported rows whose durable membership has not arrived
@@ -383,7 +383,7 @@ def find_similar(post_key):
                     'postDate': source['published_at'],
                 })), timestamp({'postDate': source['published_at']})),
             )
-            reference = conn.execute('SELECT stack_id, words FROM topic_stack_members WHERE post_key = ?', (post_key,)).fetchone()
+            reference = conn.execute('SELECT stack_id, words, posted_at FROM topic_stack_members WHERE post_key = ?', (post_key,)).fetchone()
             if not reference:
                 raise ValueError('This post is no longer available. Refresh and try again.')
         try:
@@ -394,14 +394,39 @@ def find_similar(post_key):
         matching_groups = set()
         candidate_limit = _semantic_int('TYPESAFE_FIND_SIMILAR_CANDIDATE_LIMIT', 100, 10, 500)
         batch_size = _semantic_int('TYPESAFE_FIND_SIMILAR_BATCH_SIZE', 25, 5, 50)
-        # Recency only controls the bounded input volume. Jev makes the actual
-        # similarity decision; no keyword/Jaccard filter is applied here.
-        candidate_rows = conn.execute(
-            'SELECT post_key, stack_id, words FROM topic_stack_members '
+        # Reserve candidates for lexical overlap across history, publication
+        # proximity to the reference, and recent posts. Jev alone accepts matches.
+        all_candidates = conn.execute(
+            'SELECT post_key, stack_id, words, posted_at FROM topic_stack_members '
             'WHERE post_key != ? AND stack_id != ? '
-            'ORDER BY posted_at DESC, post_key DESC LIMIT ?',
-            (post_key, reference['stack_id'], candidate_limit),
+            'ORDER BY posted_at DESC, post_key DESC',
+            (post_key, reference['stack_id']),
         ).fetchall()
+        reference_set = set(words({'caption': reference_text})) or set(reference_words)
+        def overlap(row):
+            candidate_words = set(json.loads(row['words']))
+            shared = len(reference_set & candidate_words)
+            return (shared / min(len(reference_set), len(candidate_words))
+                    if reference_set and candidate_words else 0, shared)
+        ranked = sorted(all_candidates, key=overlap, reverse=True)
+        nearby = sorted(all_candidates, key=lambda row: abs(row['posted_at'] - reference['posted_at']))
+        candidate_rows = []
+        seen = set()
+        def include(rows, count):
+            if count <= 0:
+                return
+            added = 0
+            for row in rows:
+                if row['post_key'] in seen:
+                    continue
+                seen.add(row['post_key'])
+                candidate_rows.append(row)
+                added += 1
+                if added >= count:
+                    break
+        include(ranked, candidate_limit // 2)
+        include(nearby, candidate_limit // 4)
+        include(all_candidates, candidate_limit - len(candidate_rows))
         candidate_texts = {
             row['post_key']: _source_text(conn, row['post_key']) or ' '.join(
                 json.loads(row['words']) if isinstance(row['words'], str) else []
