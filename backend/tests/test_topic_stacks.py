@@ -283,3 +283,42 @@ def test_regroup_recent_rebuilds_only_last_72_hours():
     topic_stacks.apply_memberships(fresh)
     assert fresh[0]['stackId'] == fresh[1]['stackId']
     assert fresh[2]['stackId'] == old_stack
+
+
+def test_candidate_index_does_not_drop_matching_caption_with_extra_words():
+    caption = 'aurora borealis expedition telescope observatory scientist research discovery'
+    items = [post('a', caption), post('b', caption + ' quantum satellite launch mission astronaut rocket capsule orbit')]
+    topic_stacks.attach(items)
+    assert items[0]['stackId'] == items[1]['stackId']
+
+
+def test_short_identical_captions_match_across_days():
+    items = [post('a', 'quantum robot mars'), post('b', 'quantum robot mars', date='2026-09-07T00:00:00Z')]
+    topic_stacks.attach(items)
+    assert items[0]['stackId'] == items[1]['stackId']
+
+
+def test_new_post_can_match_nonrepresentative_stack_member():
+    first = post('a', 'aurora borealis expedition telescope observatory scientist research discovery')
+    second = post('b', 'quantum satellite launch mission astronaut rocket capsule orbit')
+    topic_stacks.attach([first, second])
+    topic_stacks.merge(['test:a', 'test:b'])
+    newest = post('c', second['caption'])
+    topic_stacks.attach([newest])
+    assert 'test:c' in topic_stacks.stack_keys('test:b')
+
+
+def test_find_similar_evaluates_obvious_old_match_beyond_recent_limit(monkeypatch):
+    items = [post('a', CAPTION), post('b', CAPTION)]
+    topic_stacks.attach(items)
+    topic_stacks.separate(['test:a', 'test:b'])
+    topic_stacks.attach([post(f'noise{i}', f'cooking tomatoes basil recipe pasta dinner kitchen {i}', date='2026-09-10T00:00:00Z') for i in range(120)])
+    evaluated = set()
+    def scores(reference, candidates):
+        evaluated.update(candidates)
+        return {key: .95 if key == 'test:b' else .1 for key in candidates}
+    monkeypatch.setattr(topic_stacks, '_semantic_similarity_scores', scores)
+    result = topic_stacks.find_similar('test:a')
+    assert 'test:b' in evaluated
+    assert len(evaluated) == 100
+    assert set(result['postKeys']) == {'test:a', 'test:b'}
