@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import unicodedata
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -61,13 +62,22 @@ def _row_item(row: dict[str, Any]) -> dict[str, Any]:
     stack_id = row.get("stack_id") or analysis.get("stack_id")
     stack_size = row.get("stack_size") or analysis.get("stack_size") or 1
     result = {**analysis, "account": row["account"], "shortcode": row["shortcode"], "classification": row["classification"], "client": row.get("client"), "product": row.get("product"), "review_status": row.get("review_status") or "new", "published_at": row.get("published_at"), "first_detected_at": row.get("first_detected_at"), "last_analyzed_at": row.get("last_analyzed_at"), "stack_id": stack_id, "stack_size": int(stack_size), "account_group": row.get("account_group"), "account_group_label": row.get("account_group_label")}
+    result["detector_classification"] = analysis.get("detector_classification") or analysis.get("classification") or row["classification"]
+    result["reviewer"] = override.get("reviewer") or row.get("reviewer")
+    result["reviewed_at"] = override.get("reviewed_at") or row.get("reviewed_at")
     if override:
         result["overrides"] = override
         result["jev_review"] = override.get("jev_review")
         result.update({key: value for key, value in override.items() if key in {"client", "product", "classification"} and value is not None})
     else:
         result["jev_review"] = None
+    result["is_promo"] = result["classification"] != "not_promo"
     return result
+
+
+def _has_human_decision(row: dict[str, Any]) -> bool:
+    override = json.loads(row.get("review_override_json") or "{}")
+    return row.get("review_status") in {"reviewed", "dismissed"} or any(key in override for key in ("classification", "client", "product"))
 
 
 def analyze_post(post: dict[str, Any]) -> dict[str, Any]:
@@ -80,23 +90,24 @@ def analyze_post(post: dict[str, Any]) -> dict[str, Any]:
     with connect() as conn:
         _initialize_topic_stacks(conn)
         _ensure_jev_scans_table(conn)
-        stack = _promo_stack_context(conn, account, shortcode)
+        stack = _promo_stack_context(conn, account, shortcode, analysis.get("client"))
         analysis["stack_id"] = stack["stack_id"]
         analysis["stack_size"] = stack["stack_size"]
         analysis["stack_support_count"] = stack["support_count"]
         # A stack is corroborating evidence only after the detector has found
         # a real brand relationship. It can move a relationship-only signal
-        # from needs_review to likely when another post in the same stack is
-        # already a confirmed promotion; a generic topic match alone never
+        # from needs_review to likely when another post in the same stack
+        # has an explicit offer, disclosure or human-reviewed decision for
+        # that brand; a generic topic match alone never
         # creates a Promo opportunity.
-        if analysis["classification"] == "needs_review" and stack["support_count"]:
+        if analysis["classification"] == "needs_review" and stack["support_count"] and not any(item.get("family") == "negation" for item in analysis.get("evidence", [])):
             analysis["classification"] = "likely"
             analysis["is_promo"] = True
             analysis.setdefault("evidence", []).append({
                 "family": "stack",
                 "rule": "promo cluster support",
                 "source": "topic_stack",
-                "text": f"Another post in this {stack['stack_size']}-post stack is a confirmed promotion.",
+                "text": f"Another post in this {stack['stack_size']}-post stack has a promotion signal for the same brand.",
             })
             analysis["signals"] = sorted(set(analysis.get("signals") or []) | {"promo cluster support"})
         existing = conn.execute("SELECT input_hash FROM promo_scans WHERE account = ? AND shortcode = ?", (account, shortcode)).fetchone()
@@ -110,9 +121,17 @@ def analyze_post(post: dict[str, Any]) -> dict[str, Any]:
                 (account, shortcode),
             ).fetchone()
             previous_opportunity = conn.execute(
-                "SELECT analysis_json, review_status, first_detected_at FROM promo_opportunities WHERE account = ? AND shortcode = ?",
+                "SELECT * FROM promo_opportunities WHERE account = ? AND shortcode = ?",
                 (account, shortcode),
             ).fetchone()
+            if previous_opportunity:
+                previous = dict(previous_opportunity)
+                if _has_human_decision(previous):
+                    # Keep a person's decision and its attribution, even when
+                    # newer caption/rule evidence no longer finds a signal.
+                    analysis["detector_classification"] = "not_promo"
+                    conn.execute("UPDATE promo_opportunities SET analysis_json = ?, published_at = ?, last_analyzed_at = ? WHERE account = ? AND shortcode = ?", (_json(analysis), post.get("published_at"), now, account, shortcode))
+                    return _row_item({**previous, "analysis_json": _json(analysis), "published_at": post.get("published_at"), "last_analyzed_at": now})
             if (
                 semantic and semantic["input_hash"] == _hash_jev_post(post) and semantic["model_version"] == JEV_PROMO_MODEL_VERSION
                 and semantic["is_candidate"] and previous_opportunity
@@ -134,8 +153,12 @@ def analyze_post(post: dict[str, Any]) -> dict[str, Any]:
     return {**analysis, "account": account, "shortcode": shortcode, "published_at": post.get("published_at"), "first_detected_at": first, "last_analyzed_at": now, "review_status": review_status}
 
 
-def _promo_stack_context(conn: Any, account: str, shortcode: str) -> dict[str, Any]:
-    """Return persisted stack metadata and confirmed promo corroboration."""
+def _client_key(value: Any) -> str:
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().strip().lstrip("@").split())
+
+
+def _promo_stack_context(conn: Any, account: str, shortcode: str, client: str | None = None) -> dict[str, Any]:
+    """Corroborate only the same known brand, without inferred-signal cascades."""
     post_key = f"{account}:{shortcode}"
     row = conn.execute("SELECT stack_id FROM topic_stack_members WHERE post_key = ?", (post_key,)).fetchone()
     if not row:
@@ -147,10 +170,28 @@ def _promo_stack_context(conn: Any, account: str, shortcode: str) -> dict[str, A
         return {"stack_id": stack_id, "stack_size": 1, "support_count": 0}
     marks = ",".join("?" for _ in member_keys)
     peer_rows = conn.execute(
-        f"SELECT classification, client FROM promo_opportunities WHERE account || ':' || shortcode IN ({marks}) AND NOT (account = ? AND shortcode = ?)",
+        f"SELECT classification, client, review_status, analysis_json, review_override_json FROM promo_opportunities WHERE account || ':' || shortcode IN ({marks}) AND NOT (account = ? AND shortcode = ?)",
         (*member_keys, account, shortcode),
     ).fetchall()
-    support_count = sum(1 for peer in peer_rows if peer["classification"] in {"disclosed", "likely"})
+    support_count = 0
+    client_key = _client_key(client)
+    for peer in peer_rows:
+        peer = dict(peer)
+        analysis = json.loads(peer.get("analysis_json") or "{}")
+        override = json.loads(peer.get("review_override_json") or "{}")
+        peer_classification = override.get("classification", peer["classification"])
+        peer_client = override.get("client", peer["client"])
+        if not client_key or _client_key(peer_client) != client_key or peer.get("review_status") == "dismissed":
+            continue
+        if peer_classification not in {"disclosed", "likely"}:
+            continue
+        # A likely result created only by another stack cannot confirm a third
+        # post. Explicit disclosures, actual offers and human reviews can.
+        detector_classification = analysis.get("detector_classification") or analysis.get("classification") or peer["classification"]
+        has_offer = any(item.get("family") == "affiliate" for item in analysis.get("evidence", []) if isinstance(item, dict))
+        credible = peer.get("review_status") == "reviewed" or (detector_classification == "disclosed" and analysis.get("classification_source") != "jev_semantic_scan") or (has_offer and detector_classification == "likely")
+        if credible:
+            support_count += 1
     return {"stack_id": stack_id, "stack_size": len(member_keys), "support_count": support_count}
 
 
@@ -210,9 +251,9 @@ def process_jev_posts(*, limit: int = 2000, job_id: str | None = None, batch_siz
             if previous_scan and previous_scan["input_hash"] == _hash_jev_post(post) and previous_scan["model_version"] == JEV_PROMO_MODEL_VERSION:
                 continue
             previous_promo = conn.execute(
-                "SELECT review_status FROM promo_opportunities WHERE account = ? AND shortcode = ?", key
+                "SELECT review_status, review_override_json FROM promo_opportunities WHERE account = ? AND shortcode = ?", key
             ).fetchone()
-            if previous_promo and previous_promo["review_status"] in {"reviewed", "dismissed"}:
+            if previous_promo and _has_human_decision(dict(previous_promo)):
                 continue
             pending.append(post)
         if job_id:
@@ -405,9 +446,7 @@ def start_worker() -> None:
 
 def list_opportunities(*, client: str | None = None, account: str | None = None, classification: str | None = None, review: str | None = None, limit: int = 40, cursor: str | None = None) -> dict[str, Any]:
     clauses, params = ["1=1"], []
-    if client: clauses.append("LOWER(COALESCE(o.client, '')) LIKE ?"); params.append(f"%{client.casefold()}%")
     if account: clauses.append("o.account = ?"); params.append(account)
-    if classification: clauses.append("o.classification = ?"); params.append(classification)
     if review: clauses.append("o.review_status = ?"); params.append(review)
     if cursor:
         stamp, cur_account, cur_shortcode = (cursor.split("|", 2) + ["", ""])[:3]
@@ -415,6 +454,13 @@ def list_opportunities(*, client: str | None = None, account: str | None = None,
         params.extend([stamp, stamp, cur_account, cur_shortcode])
     with connect() as conn:
         _initialize_topic_stacks(conn)
+        # Filtering must use the same effective values returned by _row_item,
+        # including corrections kept across a later automatic reanalysis.
+        def effective(field: str) -> str:
+            override = f"o.review_override_json::jsonb ->> '{field}'" if isinstance(conn, db.PostgresConnection) else f"json_extract(o.review_override_json, '$.{field}')"
+            return f"COALESCE({override}, o.{field})"
+        if client: clauses.append(f"LOWER(COALESCE({effective('client')}, '')) LIKE ?"); params.append(f"%{client.casefold()}%")
+        if classification: clauses.append(f"{effective('classification')} = ?"); params.append(classification)
         rows = conn.execute(f"{_opportunity_select()} WHERE {' AND '.join(clauses)} ORDER BY o.first_detected_at DESC, o.account, o.shortcode LIMIT ?", (*params, max(1, min(limit, 100)))).fetchall()
         account_metadata = {row["account"]: _account_metadata(conn, row["account"]) for row in rows}
     items = []
@@ -487,7 +533,9 @@ def update_opportunity(account: str, shortcode: str, payload: dict[str, Any], re
         if not row: return None
         current = json.loads(dict(row).get("review_override_json") or "{}")
         current.update(allowed)
-        conn.execute("UPDATE promo_opportunities SET review_status = COALESCE(?, review_status), review_override_json = ?, client = COALESCE(?, client), product = COALESCE(?, product), classification = COALESCE(?, classification), last_analyzed_at = ? WHERE account = ? AND shortcode = ?", (review, _json({**current, "reviewer": reviewer, "reviewed_at": utc_now()}), allowed.get("client"), allowed.get("product"), allowed.get("classification"), utc_now(), account, shortcode))
+        if review is not None or any(key in allowed for key in ("classification", "client", "product")):
+            current.update({"reviewer": reviewer, "reviewed_at": utc_now()})
+        conn.execute("UPDATE promo_opportunities SET review_status = COALESCE(?, review_status), review_override_json = ?, client = COALESCE(?, client), product = COALESCE(?, product), classification = COALESCE(?, classification), last_analyzed_at = ? WHERE account = ? AND shortcode = ?", (review, _json(current), allowed.get("client"), allowed.get("product"), allowed.get("classification"), utc_now(), account, shortcode))
     return get_opportunity(account, shortcode)
 
 
