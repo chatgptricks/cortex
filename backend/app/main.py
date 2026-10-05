@@ -3984,18 +3984,81 @@ def _queue_v2_post_snapshot_cache(conn: Any, rows: list[Any]) -> dict[tuple[str,
     return cache
 
 
-def _queue_v2_existing_dashboard_post_from_url(source_url: str) -> dict[str, str] | None:
-    """Resolve an Instagram permalink to an already-indexed Dashboard post."""
-    match = re.match(r"^https?://(?:www\.)?instagram\.com/(?:p|reel)/([^/?#]+)", str(source_url or "").strip(), re.I)
-    if not match:
+def _queue_v2_instagram_shortcode(source_url: str) -> str | None:
+    parsed = urlsplit(str(source_url or "").strip())
+    if parsed.scheme.lower() not in {"http", "https"} or (parsed.hostname or "").lower() not in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
         return None
-    shortcode = match.group(1)
-    with connect() as conn:
+    match = re.fullmatch(r"/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)/?", parsed.path)
+    return match.group(1) if match else None
+
+
+def _queue_v2_existing_dashboard_post_from_url(source_url: str, conn: Any | None = None) -> dict[str, str] | None:
+    """Resolve an Instagram permalink to an already-indexed Dashboard post."""
+    shortcode = _queue_v2_instagram_shortcode(source_url)
+    if not shortcode:
+        return None
+    with (nullcontext(conn) if conn is not None else connect()) as conn:
         canonical = conn.execute("SELECT 1 FROM posts WHERE shortcode = ?", (shortcode,)).fetchone()
         if canonical:
-            return {"account": "chatgptricks", "shortcode": shortcode}
+            account = conn.execute("SELECT handle FROM accounts WHERE is_canonical = 1 ORDER BY is_active DESC LIMIT 1").fetchone()
+            return {"account": account["handle"] if account else "chatgptricks", "shortcode": shortcode}
         row = conn.execute("SELECT account FROM dashboard_posts WHERE shortcode = ? ORDER BY id DESC LIMIT 1", (shortcode,)).fetchone()
     return {"account": row["account"], "shortcode": shortcode} if row else None
+
+
+def _queue_v2_create_source_context(source_url: str, *, caller: str, coordinator: bool) -> dict[str, Any]:
+    """Recognize a source or published delivery without altering previous work."""
+    if not source_url:
+        return {}
+    source_key = _queue_v2_suggestion_source_key(source_url)
+    shortcode = _queue_v2_instagram_shortcode(source_url)
+    with connect() as conn:
+        dashboard_post = _queue_v2_existing_dashboard_post_from_url(source_url, conn)
+        snapshot = _queue_v2_post_snapshot(dashboard_post["account"], dashboard_post["shortcode"], conn) if dashboard_post else {}
+        # Limit candidates in SQL, then compare normalized identities so
+        # similarly-prefixed shortcodes and URL query strings cannot match.
+        if shortcode:
+            candidate = f"%/{shortcode}%"
+            condition = "(post_permalink LIKE ? OR final_permalink LIKE ? OR final_permalinks LIKE ?)"
+            params: list[Any] = [candidate, candidate, candidate]
+        else:
+            condition = "(post_permalink = ? OR final_permalink = ? OR final_permalinks LIKE ?)"
+            params = [source_url, source_url, f"%{source_url}%"]
+        if not coordinator:
+            condition += " AND (coordinator_email = ? OR designer_email = ?)"
+            params.extend([caller, caller])
+        candidates = conn.execute(f"SELECT * FROM queue_requests WHERE {condition} ORDER BY updated_at DESC, id DESC", params).fetchall()
+    matches: list[dict[str, Any]] = []
+    original_sources: list[dict[str, Any]] = []
+    for item in candidates:
+        row = dict(item)
+        original = str(row.get("post_permalink") or "")
+        original_matches = bool(original and _queue_v2_suggestion_source_key(original) == source_key)
+        published_matches = any(_queue_v2_suggestion_source_key(link["url"]) == source_key for link in _queue_v2_final_permalinks(row))
+        if original_matches or published_matches:
+            matches.append(row)
+        if original_matches:
+            original_sources.append(row)
+    result: dict[str, Any] = {}
+    if dashboard_post:
+        result["dashboardPost"] = dashboard_post
+    if matches:
+        latest = matches[0]
+        result["queueHistory"] = {"count": len(matches), "latestRequestId": latest["id"], "latestStatus": latest["status"], "lastUsedAt": latest.get("updated_at") or latest.get("created_at")}
+    if snapshot:
+        result["metadata"] = {
+            "title": _queue_v2_trim_source_text(snapshot.get("caption"), 160),
+            "description": snapshot.get("caption") or "", "postType": snapshot.get("type") or "Image",
+            "imageUrl": f"/api/dashboard/covers/{dashboard_post['account']}/{snapshot['id']}" if snapshot.get("id") is not None else "",
+        }
+    elif original_sources:
+        source = original_sources[0]
+        result["metadata"] = {
+            "title": _queue_v2_trim_source_text(source.get("post_title") or source.get("post_caption"), 160),
+            "description": source.get("post_caption") or "", "postType": source.get("post_type") or "Image",
+            "imageUrl": source.get("cover_url") or "",
+        }
+    return result
 
 
 def _queue_v2_hot_source_rows_uncached(conn: Any, *, include_historic: bool = False) -> list[dict[str, Any]]:
@@ -5674,11 +5737,27 @@ def dashboard_queue_v2_source_preview(
     source_url: Annotated[str, Form()],
 ) -> dict[str, Any]:
     """Return the public title, description and thumbnail for a Queue source."""
-    _queue_v2_creator_access(request)
-    preview = _queue_v2_fetch_source_preview(source_url)
-    existing = _queue_v2_existing_dashboard_post_from_url(preview.get("sourceUrl") or source_url)
-    if existing:
-        preview["dashboardPost"] = existing
+    caller, is_admin, roles = _queue_v2_creator_access(request)
+    clean_url = _queue_v2_suggestion_url(source_url)
+    context = _queue_v2_create_source_context(clean_url, caller=caller, coordinator=is_admin or "vc" in roles)
+    if context.get("metadata"):
+        preview = {"sourceUrl": clean_url, "platform": _queue_v2_source_platform(clean_url), **context["metadata"]}
+    else:
+        try:
+            preview = _queue_v2_fetch_source_preview(clean_url)
+        except HTTPException:
+            if not context.get("queueHistory"):
+                raise
+            # A known delivered post may no longer expose public metadata.
+            # Its history still helps a VC deliberately create another task.
+            preview = {"sourceUrl": clean_url, "platform": _queue_v2_source_platform(clean_url), "title": "", "description": "", "imageUrl": ""}
+        resolved_url = preview.get("sourceUrl") or clean_url
+        if resolved_url != clean_url:
+            resolved = _queue_v2_create_source_context(resolved_url, caller=caller, coordinator=is_admin or "vc" in roles)
+            context = {**context, **resolved}
+    for key in ("dashboardPost", "queueHistory"):
+        if key in context:
+            preview[key] = context[key]
     return {"ok": True, "preview": preview}
 
 
@@ -5698,15 +5777,16 @@ def dashboard_queue_v2_create(
     source_title: Annotated[str | None, Form()] = None,
     source_description: Annotated[str | None, Form()] = None,
     source_image_url: Annotated[str | None, Form()] = None,
+    idempotency_key: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
-    """Create a Queue request without a source post from the dashboard.
+    """Create independent Pool work, including a previously used source.
 
     The request still uses the normal Queue lifecycle and scheduler. A
     generated shortcode gives it a stable identity for attachments, history,
     deep links, and live updates while keeping it out of the Instagram post
     tables entirely.
     """
-    caller, _, _ = _queue_v2_creator_access(request)
+    caller, is_admin, roles = _queue_v2_creator_access(request)
     # A manually-created request has no publishing account yet. The VC picks
     # the designer's recommended account when scheduling it, just like any
     # other pooled request. Validate an account only when one was supplied.
@@ -5731,41 +5811,79 @@ def dashboard_queue_v2_create(
     shortcode = f"manual-{secrets.token_hex(8)}"
     clean_brief = str(brief or "").strip()
     clean_notes = str(notes or "").strip()
-    clean_source_url = _queue_v2_public_url(source_url) if str(source_url or "").strip() else ""
+    clean_source_url = _queue_v2_suggestion_url(source_url) if str(source_url or "").strip() else ""
     clean_source_title = _queue_v2_trim_source_text(source_title, 160)
-    clean_source_description = _queue_v2_trim_source_text(source_description, 2_000)
-    clean_source_image = _queue_v2_safe_image_url(source_image_url, clean_source_url) if clean_source_url else ""
+    context = _queue_v2_create_source_context(clean_source_url, caller=caller, coordinator=is_admin or "vc" in roles)
+    metadata = context.get("metadata") or {}
+    clean_source_description = _queue_v2_trim_source_text(metadata.get("description") if source_description is None else source_description, 2_000)
+    selected_image = str((metadata.get("imageUrl") if source_image_url is None else source_image_url) or "").strip()
+    # Only a server-resolved cover can use the internal authenticated route.
+    if selected_image.startswith("/api/dashboard/covers/") and selected_image == metadata.get("imageUrl"):
+        clean_source_image = selected_image
+    else:
+        clean_source_image = _queue_v2_safe_image_url(selected_image, clean_source_url) if clean_source_url else ""
     if clean_source_url and clean_source_url not in clean_refs:
         clean_refs.insert(0, clean_source_url)
+    attempt_key = str(idempotency_key or "").strip()
+    if attempt_key and (len(attempt_key) > 128 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", attempt_key)):
+        raise HTTPException(status_code=400, detail="The creation attempt key is invalid. Reopen Create Post and try again.")
+    # Fingerprint caller input, not a changing source snapshot. A retry must
+    # recover the same task even when its original source or task has changed.
+    fingerprint = hashlib.sha256(json.dumps({
+        "account": clean_account, "title": clean_title, "postType": clean_type,
+        "productionPoints": production_points, "priority": clean_priority, "tags": clean_tags,
+        "brief": clean_brief, "notes": clean_notes, "references": clean_refs,
+        "sourceUrl": clean_source_url, "sourceTitle": clean_source_title,
+        "sourceDescription": source_description, "sourceImageUrl": source_image_url,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    already_created = False
     with connect() as conn:
-        cursor = conn.execute(
-            """INSERT INTO queue_requests (
-                   post_account, post_shortcode, post_title, is_custom,
-                   post_permalink, post_caption, post_type, cover_url,
-                   production_points, priority, deadline_at, tags, brief, notes,
-                   reference_links, coordinator_email, created_at, updated_at
-               ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                clean_account, shortcode, clean_title, clean_source_url, clean_source_description or clean_brief, clean_type, clean_source_image,
-                production_points, clean_priority, json.dumps(clean_tags),
-                clean_brief, clean_notes, json.dumps(clean_refs), caller, now, now,
-            ),
+        if attempt_key:
+            _queue_v2_lock_schedule(conn)
+            prior = conn.execute("SELECT * FROM queue_create_attempts WHERE requester_email = ? AND idempotency_key = ?", (caller, attempt_key)).fetchone()
+            if prior:
+                if prior["payload_hash"] != fingerprint:
+                    raise HTTPException(status_code=409, detail="This creation attempt was already used with different details. Reopen Create Post to start a new task.")
+                existing = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (prior["request_id"],)).fetchone()
+                if not existing:
+                    raise HTTPException(status_code=410, detail="This creation attempt already succeeded, but that task is no longer retained. Reopen Create Post to create another task.")
+                row = dict(existing)
+                request_id = int(row["id"])
+                already_created = True
+        if not already_created:
+            cursor = conn.execute(
+                """INSERT INTO queue_requests (
+                       post_account, post_shortcode, post_title, is_custom,
+                       post_permalink, post_caption, post_type, cover_url,
+                       production_points, priority, deadline_at, tags, brief, notes,
+                       reference_links, coordinator_email, created_at, updated_at
+                   ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    clean_account, shortcode, clean_title, clean_source_url,
+                    clean_source_description if source_description is not None else (clean_source_description or clean_brief),
+                    clean_type, clean_source_image, production_points, clean_priority, json.dumps(clean_tags),
+                    clean_brief, clean_notes, json.dumps(clean_refs), caller, now, now,
+                ),
+            )
+            request_id = int(cursor.lastrowid)
+            if attempt_key:
+                conn.execute("INSERT INTO queue_create_attempts (requester_email,idempotency_key,payload_hash,request_id,created_at) VALUES (?, ?, ?, ?, ?)", (caller, attempt_key, fingerprint, request_id, now))
+            _queue_v2_log(conn, request_id, caller, "created", {
+                "account": clean_account, "title": clean_title, "postType": clean_type,
+                "productionPoints": production_points, "priority": clean_priority,
+                "sourceUrl": clean_source_url, "sourceTitle": clean_source_title,
+                "reusedFromRequestId": (context.get("queueHistory") or {}).get("latestRequestId"),
+            })
+            _queue_v2_publish(conn, "created", caller, [request_id])
+            row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
+    if not already_created:
+        _queue_v2_slack_log(
+            event_type="created", task_id=request_id, actor_email=caller,
+            account=clean_account, shortcode=shortcode, status="pool",
+            production_points=production_points, priority=clean_priority,
+            tags=clean_tags, brief=clean_brief, post_title=clean_title,
         )
-        request_id = int(cursor.lastrowid)
-        _queue_v2_log(conn, request_id, caller, "created", {
-            "account": clean_account, "title": clean_title, "postType": clean_type,
-            "productionPoints": production_points, "priority": clean_priority,
-            "sourceUrl": clean_source_url, "sourceTitle": clean_source_title,
-        })
-        _queue_v2_publish(conn, "created", caller, [request_id])
-        row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
-    _queue_v2_slack_log(
-        event_type="created", task_id=request_id, actor_email=caller,
-        account=clean_account, shortcode=shortcode, status="pool",
-        production_points=production_points, priority=clean_priority,
-        tags=clean_tags, brief=clean_brief, post_title=clean_title,
-    )
-    return {"ok": True, "request": _queue_v2_project(row)}
+    return {"ok": True, "request": _queue_v2_project(row), "alreadyCreated": already_created}
 
 
 @app.post("/api/dashboard/queue/v2/pool")
@@ -6012,12 +6130,9 @@ def _queue_v2_suggestion_url(value: str) -> str:
 
 
 def _queue_v2_suggestion_source_key(url: str) -> str:
-    parsed = urlsplit(url)
-    host = (parsed.hostname or "").lower()
-    if host in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
-        post = re.fullmatch(r"/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)/?", parsed.path)
-        if post:
-            url = f"https://www.instagram.com/p/{post.group(1)}/"
+    shortcode = _queue_v2_instagram_shortcode(url)
+    if shortcode:
+        url = f"https://www.instagram.com/p/{shortcode}/"
     return hashlib.sha256(url.encode()).hexdigest()
 
 

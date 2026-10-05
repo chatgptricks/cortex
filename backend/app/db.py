@@ -973,6 +973,21 @@ def _ensure_account_snapshot_day_schema(conn: Any) -> None:
     )
 
 
+def _ensure_queue_create_attempts_schema(conn: Any) -> None:
+    """Give an explicit Create Post attempt durable, retry-safe identity."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS queue_create_attempts (
+               requester_email TEXT NOT NULL,
+               idempotency_key TEXT NOT NULL,
+               payload_hash TEXT NOT NULL,
+               request_id INTEGER,
+               created_at TEXT NOT NULL,
+               PRIMARY KEY(requester_email, idempotency_key),
+               FOREIGN KEY(request_id) REFERENCES queue_requests(id) ON DELETE SET NULL
+           )"""
+    )
+
+
 def _ensure_queue_post_suggestions_schema(conn: Any) -> None:
     """Keep suggestion retries durable across workers, restarts and retention."""
     conn.execute(
@@ -1066,6 +1081,7 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     # post feed and Queue reads fail before they can return the existing data.
     if conn.execute("PRAGMA table_info(queue_requests)").fetchall():
         _ensure_column(conn, "queue_requests", "final_permalinks", "final_permalinks TEXT NOT NULL DEFAULT '[]'")
+        _ensure_queue_create_attempts_schema(conn)
     # The first Queue V2 schema shipped before trainee Canva review requests.
     # Keep both the additive fields and its constrained ticket type current
     # on managed Postgres and any existing SQLite development database.

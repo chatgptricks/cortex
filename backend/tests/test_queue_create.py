@@ -28,7 +28,7 @@ def test_vc_can_create_custom_queue_post(monkeypatch, tmp_path):
             status TEXT NOT NULL DEFAULT 'pool', designer_email TEXT, coordinator_email TEXT,
             recommended_accounts TEXT NOT NULL DEFAULT '[]', scheduled_date TEXT,
             scheduled_start_minutes INTEGER, actual_started_at TEXT, completed_at TEXT,
-            closed_at TEXT, final_permalink TEXT, cancellation_reason TEXT,
+            closed_at TEXT, final_permalink TEXT, final_permalinks TEXT DEFAULT '[]', cancellation_reason TEXT,
             created_at TEXT, updated_at TEXT
         );
         CREATE TABLE queue_request_events (
