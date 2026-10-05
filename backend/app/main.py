@@ -14,13 +14,14 @@ import socket
 import threading
 import time
 from collections import Counter
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from statistics import median
 from typing import Annotated, Any, Callable
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -2872,7 +2873,7 @@ def _queue_post_exists(account: str, shortcode: str) -> tuple[str, str]:
     return clean_account, clean_shortcode
 
 
-def _queue_post_id(account: str, shortcode: str) -> int | None:
+def _queue_post_id(account: str, shortcode: str, conn: Any | None = None) -> int | None:
     """Returns the ID used by the public cover route for a Queue post."""
     # Manually-created Queue posts do not have a publishing account until a
     # coordinator assigns them. They still need to flow through the normal
@@ -2880,8 +2881,8 @@ def _queue_post_id(account: str, shortcode: str) -> int | None:
     # no cover ID rather than being treated as an unknown account.
     if not str(account or "").strip() or not str(shortcode or "").strip():
         return None
-    table = _resolve_post_table(account)
-    with connect() as conn:
+    table = _resolve_post_table(account, conn) if conn is not None else _resolve_post_table(account)
+    with (nullcontext(conn) if conn is not None else connect()) as conn:
         if table == "posts":
             row = conn.execute("SELECT id FROM posts WHERE shortcode = ?", (shortcode,)).fetchone()
         else:
@@ -3868,13 +3869,13 @@ def _queue_v2_require_visible(row: dict[str, Any], caller: str, is_admin: bool, 
         raise HTTPException(status_code=403, detail="Not allowed to view this request.")
 
 
-def _queue_v2_post_snapshot(account: str | None, shortcode: str | None) -> dict[str, Any]:
+def _queue_v2_post_snapshot(account: str | None, shortcode: str | None, conn: Any | None = None) -> dict[str, Any]:
     # Custom Queue requests intentionally have no source account or post. Do
     # not resolve an empty account against the dashboard account registry.
     if not str(account or "").strip() or not str(shortcode or "").strip():
         return {}
-    table = _resolve_post_table(account)
-    with connect() as conn:
+    table = _resolve_post_table(account, conn) if conn is not None else _resolve_post_table(account)
+    with (nullcontext(conn) if conn is not None else connect()) as conn:
         if table == "posts":
             row = conn.execute(
                 """SELECT id, caption, title, post_type_label, published_at, likes, comments,
@@ -4432,10 +4433,25 @@ def _queue_v2_ticket_rows(conn: Any, *, requester_email: str | None = None, pend
     return [dict(row) for row in rows]
 
 
+def _queue_v2_lock_schedule(conn: Any) -> None:
+    """Serialize short schedule transactions across API workers.
+
+    One Queue-wide lock also covers moves between designers and completion
+    reflows, avoiding cross-owner lock ordering. Take it before placement
+    reads or mutations; release is automatic on commit/rollback.
+    """
+    if getattr(conn, "is_postgres", False):
+        key = int.from_bytes(hashlib.sha256(b"sentient-queue-schedule").digest()[:8], "big", signed=True)
+        conn.execute("SELECT pg_advisory_xact_lock(?)", (key,))
+    elif isinstance(conn, sqlite3.Connection) and not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+
+
 def _queue_v2_time_occupied(
     conn: Any, user_email: str, scheduled_date: str | None, *,
     exclude_ticket_id: int | None = None, exclude_request_id: int | None = None,
 ) -> list[dict[str, Any]]:
+    _queue_v2_lock_schedule(conn)
     date_scope = " AND d.scheduled_date = ?" if scheduled_date else ""
     date_params: list[Any] = [scheduled_date] if scheduled_date else []
     drafts = [dict(row) for row in conn.execute(
@@ -4493,6 +4509,7 @@ def _queue_v2_reflow_scheduled(conn: Any, designer: str, actor: str, priority_id
     active block is advanced. Scheduled work is then placed after all active
     work. Every move uses the shared ten-minute handoff buffer.
     """
+    _queue_v2_lock_schedule(conn)
     rows = [dict(row) for row in conn.execute(
         """SELECT * FROM queue_requests
            WHERE designer_email = ? AND status IN ('scheduled','in_progress','completed','closed')
@@ -4534,6 +4551,7 @@ def _queue_v2_compact_after_completion(conn: Any, designer: str, completed_id: i
     should close the newly available gap while preserving every ten-minute
     handoff buffer and every fixed personal-time/active block.
     """
+    _queue_v2_lock_schedule(conn)
     rows = [dict(row) for row in conn.execute(
         """SELECT * FROM queue_requests
            WHERE designer_email = ? AND status IN ('scheduled','in_progress','completed','closed')
@@ -4602,6 +4620,7 @@ def _queue_v2_compact_after_completion(conn: Any, designer: str, completed_id: i
 def _queue_v2_reflow_all_schedules() -> int:
     """One startup pass repairs overlaps saved by older Queue releases."""
     with connect() as conn:
+        _queue_v2_lock_schedule(conn)
         designers = [row["designer_email"] for row in conn.execute(
             """SELECT DISTINCT designer_email FROM queue_requests
                WHERE designer_email IS NOT NULL AND status IN ('scheduled','in_progress','completed','closed')
@@ -4953,6 +4972,7 @@ def _queue_v2_prepare_schedule_changes(
     """Validate and collision-resolve provisional or committed placements."""
     if not isinstance(entries, list) or not entries:
         raise HTTPException(status_code=400, detail="Add at least one schedule change before submitting.")
+    _queue_v2_lock_schedule(conn)
     prepared: list[dict[str, Any]] = []
     changed_ids: set[int] = set()
     for entry in entries:
@@ -5077,6 +5097,7 @@ def _queue_v2_prepare_schedule_changes(
 
 def _queue_v2_reflow_drafts(conn: Any, designer: str) -> int:
     """Keep shared provisional placements collision-free after firm changes."""
+    _queue_v2_lock_schedule(conn)
     drafts = [dict(row) for row in conn.execute(
             """SELECT d.request_id, d.scheduled_date, d.scheduled_start_minutes,
                       COALESCE(d.production_points, r.production_points) AS production_points,
@@ -5418,6 +5439,7 @@ def dashboard_queue_v2_pick(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
     with connect() as conn:
+        _queue_v2_lock_schedule(conn)
         row = None
         if request_id is None and not (hot_account and hot_shortcode):
             raise HTTPException(status_code=400, detail="Choose a pooled request or a HOT post.")
@@ -5840,6 +5862,7 @@ def dashboard_queue_v2_clear_drafts(
     parsed = _queue_v2_json(request_ids, []) if request_ids else []
     clean_ids = {int(value) for value in parsed if str(value).isdigit()} if isinstance(parsed, list) else set()
     with connect() as conn:
+        _queue_v2_lock_schedule(conn)
         if clean_ids:
             placeholders = ",".join("?" for _ in clean_ids)
             owned = {int(row["request_id"]) for row in conn.execute(
@@ -5923,7 +5946,7 @@ def dashboard_queue_v2_submit(request: Request, changes: Annotated[str, Form()])
             final_date, final_start = row["scheduled_date"], int(row["scheduled_start_minutes"])
             adjustments.append({"id": item["id"], "designerEmail": item["designer"], "scheduledDate": final_date, "scheduledStartMinutes": final_start})
             notifications.append({"task_id": item["id"], "assignee_email": item["designer"], "assigned_by_email": caller,
-                                  "account": row["post_account"], "post_id": _queue_post_id(row["post_account"], row["post_shortcode"]),
+                                  "account": row["post_account"], "post_id": _queue_post_id(row["post_account"], row["post_shortcode"], conn),
                                   "cover_url": row.get("cover_url") or "",
                                   "note": row["brief"], "notes": row["notes"], "references": _queue_v2_json(row["reference_links"], []),
                                   "priority": row["priority"], "tags": _queue_v2_json(row["tags"], []),
@@ -5962,49 +5985,191 @@ def dashboard_queue_v2_tickets(request: Request) -> dict[str, Any]:
     return {"tickets": [_queue_v2_ticket(row) for row in rows]}
 
 
+def _queue_v2_suggestion_url(value: str) -> str:
+    """Validate a link for storage only; never fetch a suggested website."""
+    raw = str(value or "").strip()
+    if not raw or len(raw) > 2000 or re.search(r"[\s\\\x00-\x1f\x7f]", raw):
+        raise HTTPException(status_code=400, detail="Paste a valid http(s) source link.")
+    try:
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").rstrip(".").lower()
+        port = parsed.port
+        if parsed.scheme.lower() not in {"http", "https"} or not host or parsed.username or parsed.password:
+            raise ValueError("Invalid URL")
+        if host == "localhost" or host.endswith((".localhost", ".local", ".internal")) or "." not in host:
+            raise ValueError("Non-public host")
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_global:
+            raise ValueError("Non-public address")
+        normalized_host = f"[{host}]" if ":" in host else host.encode("idna").decode("ascii")
+        authority = normalized_host if port is None or (parsed.scheme == "https" and port == 443) or (parsed.scheme == "http" and port == 80) else f"{normalized_host}:{port}"
+        return urlunsplit((parsed.scheme.lower(), authority, parsed.path or "/", parsed.query, parsed.fragment))
+    except (ValueError, UnicodeError) as exc:
+        raise HTTPException(status_code=400, detail="Paste a valid public http(s) source link.") from exc
+
+
+def _queue_v2_suggestion_source_key(url: str) -> str:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    if host in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+        post = re.fullmatch(r"/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)/?", parsed.path)
+        if post:
+            url = f"https://www.instagram.com/p/{post.group(1)}/"
+    return hashlib.sha256(url.encode()).hexdigest()
+
+
 @app.post("/api/dashboard/queue/v2/tickets/post-suggestion")
 def dashboard_queue_v2_create_post_suggestion(
     request: Request,
     source_url: Annotated[str, Form()],
     reason: Annotated[str, Form()],
+    account: Annotated[str | None, Form()] = None,
+    title: Annotated[str | None, Form()] = None,
+    post_type: Annotated[str, Form()] = "Image",
+    source_account: Annotated[str | None, Form()] = None,
+    source_shortcode: Annotated[str | None, Form()] = None,
+    idempotency_key: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
-    """Let a PD propose a source without gaining Pool/Create permissions."""
+    """Schedule the caller's suggestion without granting Pool/Create access."""
     caller, _, roles = _queue_v2_access(request)
     if "pd" not in roles:
         raise HTTPException(status_code=403, detail="Only PD users can suggest posts.")
-    clean_url = _queue_v2_public_url(source_url)
-    if not clean_url:
-        raise HTTPException(status_code=400, detail="Paste a valid public Instagram post link.")
-    parsed = urlsplit(clean_url)
-    if not (parsed.hostname or "").lower().endswith("instagram.com"):
-        raise HTTPException(status_code=400, detail="Suggestions must link to an Instagram post.")
-    clean_reason = reason.strip()[:1000]
-    if not clean_reason:
-        raise HTTPException(status_code=400, detail="Explain why this post should work.")
-    now = utc_now()
+    clean_url = _queue_v2_suggestion_url(source_url)
+    clean_account = str(account or "").strip().lstrip("@").lower()
+    if not clean_account:
+        raise HTTPException(status_code=400, detail="Choose one of your Sentient accounts.")
+    clean_reason = str(reason or "").strip()
+    if not clean_reason or len(clean_reason) > 1000:
+        raise HTTPException(status_code=400, detail="Explain why this post should work in 1–1000 characters.")
+    clean_title = str(title or "").strip()
+    if len(clean_title) > 160:
+        raise HTTPException(status_code=400, detail="Post title must be 160 characters or fewer.")
+    clean_type = str(post_type or "Image").strip()
+    if clean_type not in QUEUE_V2_POST_TYPES:
+        raise HTTPException(status_code=400, detail="Choose a valid post format.")
+    source_key = _queue_v2_suggestion_source_key(clean_url)
+    retry_key = str(idempotency_key or "").strip() or f"source:{source_key}:{clean_account}"
+    if len(retry_key) > 128 or not re.fullmatch(r"[A-Za-z0-9:_-]+", retry_key):
+        raise HTTPException(status_code=400, detail="Invalid suggestion retry key.")
+
     with connect() as conn:
-        pending = conn.execute(
-            """SELECT 1 FROM queue_tickets
-               WHERE ticket_type = 'time_block' AND block_category = 'post_suggestion'
-                 AND requester_email = ? AND title = ? AND status = 'pending'""",
-            (caller, clean_url),
+        _queue_v2_lock_schedule(conn)
+        # Check durable retries before current account access/source state:
+        # a timeout followed by a role/account change must not create a copy.
+        previous = conn.execute(
+            "SELECT * FROM queue_post_suggestions WHERE requester_email = ? AND idempotency_key = ?",
+            (caller, retry_key),
         ).fetchone()
-        if pending:
-            raise HTTPException(status_code=409, detail="This post is already awaiting review.")
-        cursor = conn.execute(
-            """INSERT INTO queue_tickets
-               (ticket_type, requester_email, status, block_category, title, reason, created_at, updated_at)
-               VALUES ('time_block', ?, 'pending', 'post_suggestion', ?, ?, ?, ?)""",
-            (caller, clean_url, clean_reason, now, now),
-        )
-        ticket_id = int(cursor.lastrowid)
-        _queue_v2_publish(conn, "post_suggestion_created", caller)
-        row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
-    _queue_v2_slack_log(
-        event_type="post_suggestion_created", task_id=None, ticket_id=ticket_id,
-        actor_email=caller, reason=clean_reason,
-    )
-    return {"ok": True, "ticket": _queue_v2_ticket(row)}
+        if previous and (previous["source_key"] != source_key or previous["account_handle"] != clean_account):
+            raise HTTPException(status_code=409, detail="This retry key was already used for a different suggestion.")
+        if not previous:
+            previous = conn.execute(
+                """SELECT * FROM queue_post_suggestions
+                   WHERE requester_email = ? AND source_key = ? AND account_handle = ? AND request_id IS NOT NULL
+                   ORDER BY created_at LIMIT 1""",
+                (caller, source_key, clean_account),
+            ).fetchone()
+        if previous:
+            existing = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (previous["request_id"],)).fetchone()
+            if not existing:
+                raise HTTPException(status_code=410, detail="This suggestion was already processed and its Queue history has expired.")
+            if previous["idempotency_key"] != retry_key:
+                conn.execute(
+                    """INSERT INTO queue_post_suggestions
+                       (requester_email, idempotency_key, source_key, account_handle, request_id, ticket_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (caller, retry_key, source_key, clean_account, previous["request_id"], previous["ticket_id"], utc_now()),
+                )
+            ticket = conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (previous["ticket_id"],)).fetchone()
+            row = dict(existing)
+            # Retry is read-only even if a coordinator later reassigned it.
+            result = {"ok": True, "alreadyScheduled": True, "request": row, "ticket": dict(ticket) if ticket else None}
+        else:
+            owned = conn.execute(
+                """SELECT 1 FROM queue_designer_accounts d JOIN accounts a ON a.handle = d.account_handle
+                   WHERE d.designer_email = ? AND d.account_handle = ? AND a.is_active = 1 AND a.group_name = 'sentient'""",
+                (caller, clean_account),
+            ).fetchone()
+            if not owned:
+                raise HTTPException(status_code=403, detail="Choose an active Sentient account you manage.")
+            user = conn.execute("SELECT * FROM dashboard_users WHERE email = ?", (caller,)).fetchone()
+            if not user:
+                raise HTTPException(status_code=403, detail="Queue user access is required.")
+            minutes_per_pp = _queue_v2_minutes_per_pp_for_user(dict(user))
+            snapshot: dict[str, Any] = {}
+            verified_account = ""
+            verified_shortcode = ""
+            if bool(source_account) != bool(source_shortcode):
+                raise HTTPException(status_code=400, detail="Choose a complete Research source post.")
+            if source_account and source_shortcode:
+                verified_account = str(source_account).strip().lstrip("@").lower()
+                verified_shortcode = str(source_shortcode).strip()
+                snapshot = _queue_v2_post_snapshot(verified_account, verified_shortcode, conn)
+                if not snapshot or source_key != _queue_v2_suggestion_source_key(f"https://www.instagram.com/p/{verified_shortcode}/"):
+                    raise HTTPException(status_code=400, detail="The source link does not match the selected Research post.")
+                clean_url = snapshot.get("permalink") or f"https://www.instagram.com/p/{verified_shortcode}/"
+            clean_title = clean_title or _queue_v2_trim_source_text(snapshot.get("caption"), 160) or f"Suggested post · {_queue_v2_source_platform(clean_url)}"
+            # Independent Queue identity permits the same source to be worked
+            # on for different destinations without changing Research data.
+            shortcode = verified_shortcode or f"manual-{secrets.token_hex(8)}"
+            now = utc_now()
+            local_now = datetime.now(SCHEDULER_TIMEZONE)
+            start = ((local_now.hour * 60 + local_now.minute + int(bool(local_now.second or local_now.microsecond)) + 9) // 10) * 10
+            target_date, target_start = next_available_slot(
+                local_now.date().isoformat(), start, 3 * minutes_per_pp,
+                _queue_v2_time_occupied(conn, caller, None),
+            )
+            cover = f"/api/dashboard/covers/{verified_account}/{snapshot['id']}" if snapshot.get("id") is not None else ""
+            for _ in range(3):
+                cursor = conn.execute(
+                    """INSERT INTO queue_requests
+                       (post_account, post_shortcode, post_title, is_custom, post_permalink, post_caption, post_type, cover_url,
+                        production_points, minutes_per_pp, priority, deadline_at, tags, brief, notes, reference_links,
+                        designer_email, coordinator_email, recommended_accounts, status, scheduled_date,
+                        scheduled_start_minutes, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 3, ?, 'medium', '', '[]', ?, '', ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?)
+                       ON CONFLICT(post_account, post_shortcode) DO NOTHING""",
+                    (verified_account, shortcode, clean_title, int(not bool(verified_account)), clean_url,
+                     snapshot.get("caption") or clean_reason, clean_type, cover, minutes_per_pp, clean_reason,
+                     json.dumps([clean_url]), caller, caller, json.dumps([clean_account]), target_date, target_start, now, now),
+                )
+                if cursor.rowcount:
+                    break
+                # A simultaneous suggestion for another user/account may
+                # consume the native source key. Keep an independent copy.
+                shortcode = f"{verified_shortcode[:80] or 'manual'}--copy-{secrets.token_hex(8)}"
+            else:
+                raise HTTPException(status_code=409, detail="Could not create the suggestion. Please retry.")
+            request_id = int(cursor.lastrowid)
+            cursor = conn.execute(
+                """INSERT INTO queue_tickets
+                   (ticket_type, requester_email, request_id, status, block_category, title, reason, requested_accounts,
+                    scheduled_date, scheduled_start_minutes, duration_minutes, review_note, reviewed_at, created_at, updated_at)
+                   VALUES ('time_block', ?, ?, 'approved', 'post_suggestion', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (caller, request_id, clean_url, clean_reason, json.dumps([clean_account]), target_date, target_start,
+                 3 * minutes_per_pp, "Automatically scheduled for the suggesting user.", now, now, now),
+            )
+            ticket_id = int(cursor.lastrowid)
+            conn.execute(
+                """INSERT INTO queue_post_suggestions
+                   (requester_email, idempotency_key, source_key, account_handle, request_id, ticket_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (caller, retry_key, source_key, clean_account, request_id, ticket_id, now),
+            )
+            _queue_v2_log(conn, request_id, caller, "post_suggestion_scheduled", {
+                "sourceUrl": clean_url, "sourceAccount": verified_account, "sourceShortcode": verified_shortcode,
+                "account": clean_account, "date": target_date, "start": target_start,
+            })
+            _queue_v2_publish(conn, "post_suggestion_scheduled", caller, [request_id])
+            row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
+            ticket = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
+            result = {"ok": True, "alreadyScheduled": False, "request": row, "ticket": ticket}
+    result["request"] = _queue_v2_project(result["request"])
+    result["ticket"] = _queue_v2_ticket(result["ticket"]) if result["ticket"] else None
+    return result
 
 
 @app.post("/api/dashboard/queue/v2/tickets/time-block")
@@ -6089,6 +6254,7 @@ def dashboard_queue_v2_update_time_block(
     caller, is_admin, roles = _queue_v2_access(request)
     coordinator = is_admin or "vc" in roles
     with connect() as conn:
+        _queue_v2_lock_schedule(conn)
         row = conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone()
         non_personal = bool(row) and (
             str(row["block_category"] or "").lower()
@@ -6543,6 +6709,7 @@ def dashboard_queue_v2_review_ticket(
     previous_production_points: int | None = None
     queue_change_event: str | None = None
     with connect() as conn:
+        _queue_v2_lock_schedule(conn)
         ticket_row = conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone()
         if not ticket_row:
             raise HTTPException(status_code=404, detail="Queue ticket not found.")
@@ -6712,6 +6879,7 @@ def dashboard_queue_v2_start(
     current_date = local_now.date().isoformat()
     designer = str(row["designer_email"] or "")
     with connect() as conn:
+        _queue_v2_lock_schedule(conn)
         scheduled_date = str(row["scheduled_date"] or current_date)
         scheduled_start = int(row["scheduled_start_minutes"] if row["scheduled_start_minutes"] is not None else current_slot)
         if move_to_now:
@@ -6760,6 +6928,7 @@ def dashboard_queue_v2_return_to_not_started(request_id: int, request: Request) 
         raise HTTPException(status_code=409, detail="Only in-progress work can return to Not Started.")
     now = utc_now()
     with connect() as conn:
+        _queue_v2_lock_schedule(conn)
         conn.execute(
             "UPDATE queue_requests SET status = 'scheduled', actual_started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?",
             (now, request_id),
@@ -6803,6 +6972,7 @@ def dashboard_queue_v2_edit(
     selected_accounts = _queue_v2_clean_account_handles(submitted_accounts)
     now = utc_now()
     with connect() as conn:
+        _queue_v2_lock_schedule(conn)
         conn.execute(
             """UPDATE queue_requests SET production_points = ?, priority = ?, tags = ?, brief = ?, notes = ?,
                reference_links = ?, recommended_accounts = ?, updated_at = ? WHERE id = ?""",
@@ -6950,6 +7120,10 @@ def dashboard_queue_v2_assign_multiple_accounts(
     # Every dashboard user is PD-capable, but only users with an explicit
     # account mapping are eligible for this automatic assignment.
     with connect() as conn:
+        _queue_v2_lock_schedule(conn)
+        current_source = conn.execute("SELECT status FROM queue_requests WHERE id = ?", (request_id,)).fetchone()
+        if not current_source or current_source["status"] != "pool":
+            raise HTTPException(status_code=409, detail="That request is no longer available in the pool.")
         roster = [dict(row) for row in conn.execute(
             "SELECT email, slack_user_id, operating_role, operating_roles FROM dashboard_users"
         ).fetchall()]
@@ -7161,6 +7335,7 @@ def dashboard_queue_v2_complete(request_id: int, request: Request) -> dict[str, 
         raise HTTPException(status_code=409, detail="Start the request before completing it.")
     now = utc_now()
     with connect() as conn:
+        _queue_v2_lock_schedule(conn)
         conn.execute("UPDATE queue_requests SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?", (now, now, request_id))
         row["status"] = "completed"
         row["completed_at"] = now
@@ -7416,12 +7591,13 @@ def dashboard_lists_delete(request: Request, list_id: Annotated[int, Form()]) ->
     return {"deleted": list_id}
 
 
-def _resolve_post_table(account: str) -> str:
+def _resolve_post_table(account: str, conn: Any | None = None) -> str:
     """Which table holds this account's posts. The canonical account lives in
     the legacy `posts` table and everyone else in `dashboard_posts`; the card
     menu has to work on either, so every post-level write goes through here.
     """
-    row = next((a for a in list_accounts(active_only=False) if a["handle"] == account), None)
+    row = (conn.execute("SELECT handle, is_canonical FROM accounts WHERE handle = ?", (account,)).fetchone()
+           if conn is not None else next((a for a in list_accounts(active_only=False) if a["handle"] == account), None))
     if row is None:
         raise HTTPException(status_code=404, detail=f"Unknown account: {account}")
     return "posts" if row["is_canonical"] else "dashboard_posts"

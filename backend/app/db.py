@@ -973,6 +973,27 @@ def _ensure_account_snapshot_day_schema(conn: Any) -> None:
     )
 
 
+def _ensure_queue_post_suggestions_schema(conn: Any) -> None:
+    """Keep suggestion retries durable across workers, restarts and retention."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS queue_post_suggestions (
+               requester_email TEXT NOT NULL,
+               idempotency_key TEXT NOT NULL,
+               source_key TEXT NOT NULL,
+               account_handle TEXT NOT NULL,
+               request_id INTEGER,
+               ticket_id INTEGER,
+               created_at TEXT NOT NULL,
+               PRIMARY KEY(requester_email, idempotency_key),
+               FOREIGN KEY(request_id) REFERENCES queue_requests(id) ON DELETE SET NULL
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_queue_post_suggestions_source "
+        "ON queue_post_suggestions(requester_email, source_key, account_handle)"
+    )
+
+
 def _ensure_runtime_schema_extensions(conn: Any) -> None:
     """Apply additive schema introduced after the managed-Postgres import.
 
@@ -1052,6 +1073,7 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
         _ensure_column(conn, "queue_tickets", "block_category", "block_category TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "queue_tickets", "requested_accounts", "requested_accounts TEXT NOT NULL DEFAULT '[]'")
         _ensure_queue_ticket_type_schema(conn)
+        _ensure_queue_post_suggestions_schema(conn)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS queue_scheduler_preferences (
                viewer_email TEXT PRIMARY KEY,

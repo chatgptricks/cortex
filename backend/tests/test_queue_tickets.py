@@ -417,31 +417,29 @@ def test_account_access_ticket_assigns_active_sentient_accounts(monkeypatch, tmp
     assert [row["account_handle"] for row in assigned] == ["chatgptricks"]
 
 
-def test_pd_post_suggestion_requires_review_without_pool_access(monkeypatch, tmp_path):
+def test_legacy_post_suggestion_remains_reviewable(monkeypatch, tmp_path):
     database = tmp_path / "post-suggestion.sqlite3"
     _ticket_database(database)
-    _isolate(monkeypatch, database)
-    monkeypatch.setattr(main, "_queue_v2_public_url", lambda value: str(value).strip())
+    connect = _isolate(monkeypatch, database)
     monkeypatch.setattr(main, "_queue_v2_slack_log", lambda **kwargs: True)
-
-    created = main.dashboard_queue_v2_create_post_suggestion(
-        request=None,
-        source_url="https://www.instagram.com/reel/CODEX123/",
-        reason="Strong hook and a format our audience has not seen yet.",
-    )
-    assert created["ticket"]["type"] == "post_suggestion"
-    assert created["ticket"]["status"] == "pending"
-    assert created["ticket"]["title"] == "https://www.instagram.com/reel/CODEX123/"
-
+    with connect() as conn:
+        cursor = conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, status, block_category, title, reason, created_at, updated_at)
+               VALUES ('time_block', 'pd@example.com', 'pending', 'post_suggestion',
+                       'https://www.instagram.com/reel/CODEX123/', 'Strong hook', '', '')"""
+        )
+        ticket_id = cursor.lastrowid
     reviewed = main.dashboard_queue_v2_review_ticket(
-        ticket_id=created["ticket"]["id"], request=None, action="approve", review_note=None,
+        ticket_id=ticket_id, request=None, action="approve", review_note=None,
     )
     assert reviewed["ticket"]["type"] == "post_suggestion"
     assert reviewed["ticket"]["status"] == "approved"
-
+    # An old frontend must ask for an account instead of silently creating
+    # an unassigned request in the new workflow.
     with pytest.raises(HTTPException) as error:
         main.dashboard_queue_v2_create_post_suggestion(
-            request=None, source_url="https://example.com/post", reason="Wrong source.",
+            request=None, source_url="https://example.com/post", reason="Useful source.",
         )
     assert error.value.status_code == 400
 
