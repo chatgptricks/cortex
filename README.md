@@ -76,3 +76,12 @@ codes reject mutation methods server-side. Management API:
 `GET/POST /api/dashboard/me/agent-connections`,
 `DELETE /api/dashboard/me/agent-connections/{connection_id}`.
 These endpoints require the owner's signed-in browser identity.
+
+Hosted MCP is served at `/mcp` on the same Cortex HTTPS origin. Clients
+supply `Authorization: Bearer <agent-connection-code>` on each request.
+The stateless MCP server discovers tools from the running API schema and
+routes calls internally through the existing authentication/authorization
+middleware. Full-access codes expose action tools with `confirm=true`;
+read-only codes hide those tools and reject direct mutation calls.
+Browser Origin requests and unexpected Host headers are rejected.
+Custom hostnames require `SENTIENT_MCP_ALLOWED_HOSTS`. OAuth is not advertised.

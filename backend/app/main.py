@@ -9433,3 +9433,7 @@ def reset_hot_check(password: Annotated[str, Form()], account: Annotated[str, Fo
 
 
 app.include_router(hooks_router)
+
+# Hosted agent access shares the API process and its authentication boundary.
+from .product_mcp import install as install_product_mcp
+install_product_mcp(app)

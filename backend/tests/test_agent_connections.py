@@ -122,3 +122,55 @@ def test_middleware_loads_current_owner_permissions_and_rejects_removed_users(cl
     assert test_client.get('/api/admin/users', headers=headers).status_code == 200
     monkeypatch.setattr(main, 'get_dashboard_user_access', lambda email: None)
     assert test_client.get('/api/dashboard/me', headers=headers).status_code == 403
+
+
+def test_hosted_mcp_authentication_discovery_and_actions(client, monkeypatch):
+    from typing import Annotated
+    from fastapi import Form
+    from app import main
+    from app.product_mcp import install
+    full = create(client)['key']
+    read = create(client, access_mode='read')['key']
+    monkeypatch.setattr(main, 'FIREBASE_APP', object())
+    monkeypatch.setattr(main, 'get_dashboard_user_access', lambda email: {'is_admin':False,'operating_role':'pd','operating_roles':'["pd"]'})
+    monkeypatch.setattr(main, 'log_usage_event', lambda *args: None)
+    app = FastAPI()
+    app.middleware('http')(main._require_firebase_user)
+
+    @app.get('/api/dashboard/me')
+    def me(request: Request):
+        return main.dashboard_me(request)
+
+    @app.post('/api/dashboard/test-action')
+    def action(accounts: Annotated[str, Form()]):
+        return {'accounts':accounts}
+
+    install(app)
+
+    def rpc(host, key, method, params=None):
+        return host.post('/mcp', headers={'Authorization':'Bearer '+key,'Accept':'application/json, text/event-stream'}, json={'jsonrpc':'2.0','id':1,'method':method,'params':params or {}})
+
+    with TestClient(app) as host:
+        assert host.post('/mcp').status_code == 401
+        assert rpc(host, 'sad_agent_'+'x'*43, 'tools/list').status_code == 401
+        init = rpc(host, full, 'initialize', {'protocolVersion':'2025-06-18','capabilities':{},'clientInfo':{'name':'test-agent','version':'1.0'}})
+        assert init.status_code == 200, init.text
+        assert init.json()['result']['serverInfo']['name'] == 'sentient-dash'
+        names = [t['name'] for t in rpc(host, full, 'tools/list').json()['result']['tools']]
+        assert 'post_dashboard_test_action' in names
+        assert 'post_dashboard_test_action' not in [t['name'] for t in rpc(host, read, 'tools/list').json()['result']['tools']]
+        me = rpc(host, full, 'tools/call', {'name':'product_me','arguments':{}}).json()['result']
+        import json
+        assert json.loads(me['content'][0]['text'])['data']['email'] == 'ana@example.com'
+        args = {'name':'post_dashboard_test_action','arguments':{'body':{'accounts':'[]'},'confirm':True}}
+        result = rpc(host, full, 'tools/call', args).json()['result']
+        assert not result.get('isError'), result
+        assert json.loads(result['content'][0]['text'])['data'] == {'accounts':'[]'}
+        denied = rpc(host, read, 'tools/call', args).json()
+        assert denied.get('error') or denied['result'].get('isError')
+        resource = rpc(host, full, 'resources/read', {'uri':'sentient://guide'}).json()
+        assert 'contents' in resource['result']
+        assert host.post('/mcp',headers={'Authorization':'Bearer '+full,'Origin':'https://evil.example'}).status_code == 403
+        with agent.connect() as conn:
+            conn.execute('UPDATE agent_connections SET revoked_at = ?', (agent.utc_now(),))
+        assert rpc(host, full, 'tools/list').status_code == 401

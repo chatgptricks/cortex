@@ -6,3 +6,6 @@ httpx>=0.27,<1.0
 firebase-admin>=7.0,<8.0
 psycopg[binary]>=3.2,<4.0
 psycopg-pool>=3.2,<4.0
+
+# Hosted Streamable HTTP MCP and typed tool validation.
+mcp==1.30.0
