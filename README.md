@@ -65,3 +65,14 @@ The active Modal worker is a **standalone, GPU-free cover-image OCR worker**
 (`workers/`, client in `backend/app/sentient_ocr.py`, configured via
 `SENTIENT_OCR_URL` / `SENTIENT_OCR_TOKEN`) — it reads text baked into
 Instagram cover images for search indexing and hook display.
+
+## Agent connection credentials
+
+Authenticated users can create and revoke their own agent connection codes
+at the frontend's `/agents.html` page. Cortex stores hashes, expiry and last
+use metadata; codes inherit the owner's current roles on each request.
+Agent codes cannot manage credentials or mint Firebase sessions. Read-only
+codes reject mutation methods server-side. Management API:
+`GET/POST /api/dashboard/me/agent-connections`,
+`DELETE /api/dashboard/me/agent-connections/{connection_id}`.
+These endpoints require the owner's signed-in browser identity.

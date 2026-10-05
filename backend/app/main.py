@@ -115,6 +115,9 @@ from .golden_nuggets import router as golden_nuggets_router
 app.include_router(golden_nuggets_router)
 from .user_preferences import router as user_preferences_router
 app.include_router(user_preferences_router)
+from .agent_connections import router as agent_connections_router
+from .agent_connections import authenticate as authenticate_agent_connection
+app.include_router(agent_connections_router)
 
 DEFAULT_PERSON_OPTIONS = [
     "Elon Musk",
@@ -184,7 +187,7 @@ _FIREBASE_OPEN_PATHS = {"/api/health", "/", "/docs", "/openapi.json", "/redoc", 
 
 @app.middleware("http")
 async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped-def]
-    if FIREBASE_APP is None:
+    if FIREBASE_APP is None and not (request.headers.get("authorization") or "").startswith("Bearer sad_agent_"):
         # No credentials configured (e.g. local dev without the secret
         # file) -- stay open rather than lock everyone out.
         return await call_next(request)
@@ -199,7 +202,14 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         return JSONResponse({"detail": "Sign in required."}, status_code=401)
     token = header[len("Bearer ") :].strip()
     try:
-        decoded = await run_in_threadpool(firebase_auth.verify_id_token, token)
+        if token.startswith("sad_agent_"):
+            decoded = await run_in_threadpool(authenticate_agent_connection, token, path, request.method)
+            request.state.agent_connection_id = decoded["agent_connection_id"]
+            request.state.agent_access_mode = decoded["agent_access_mode"]
+        else:
+            decoded = await run_in_threadpool(firebase_auth.verify_id_token, token)
+    except HTTPException as exc:
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
     except Exception:
         return JSONResponse({"detail": "Your session expired -- please sign in again."}, status_code=401)
     email = (decoded.get("email") or "").strip().lower()
@@ -520,6 +530,8 @@ def dashboard_me(request: Request) -> dict[str, Any]:
     """
     return {
         "email": getattr(request.state, "user_email", None),
+        "agent_connection_id": getattr(request.state, "agent_connection_id", None),
+        "agent_access_mode": getattr(request.state, "agent_access_mode", None),
         "is_admin": bool(getattr(request.state, "is_admin", False)),
         "operating_role": getattr(request.state, "operating_role", "sales"),
         "operating_roles": getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]),
