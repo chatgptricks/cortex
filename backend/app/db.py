@@ -556,6 +556,8 @@ def init_db() -> None:
         # non-canonical account (previously only chatgptricks had this).
         _ensure_column(conn, "dashboard_posts", "hook_text", "hook_text TEXT")
         _ensure_column(conn, "dashboard_posts", "ocr_checked", "ocr_checked INTEGER NOT NULL DEFAULT 0")
+        _ensure_ocr_queue_schema(conn)
+
 
         # Apify returns ~36 fields per post and we were persisting 8, throwing
         # away data we'd already paid for (reel views/plays, carousel slide
@@ -1013,6 +1015,18 @@ def _ensure_queue_post_suggestions_schema(conn: Any) -> None:
     )
 
 
+def _ensure_ocr_queue_schema(conn: Any) -> None:
+    if not conn.execute("PRAGMA table_info(dashboard_posts)").fetchall():
+        return
+    _ensure_column(conn, "dashboard_posts", "ocr_checked", "ocr_checked INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "dashboard_posts", "ocr_attempts", "ocr_attempts INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "dashboard_posts", "ocr_lease_until", "ocr_lease_until DOUBLE PRECISION NOT NULL DEFAULT 0")
+    _ensure_column(conn, "dashboard_posts", "ocr_retry_at", "ocr_retry_at DOUBLE PRECISION NOT NULL DEFAULT 0")
+    _ensure_column(conn, "dashboard_posts", "ocr_owner", "ocr_owner TEXT")
+    _ensure_column(conn, "dashboard_posts", "ocr_error", "ocr_error TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_ocr_queue ON dashboard_posts(ocr_checked, ocr_retry_at)")
+
+
 def _ensure_runtime_schema_extensions(conn: Any) -> None:
     """Apply additive schema introduced after the managed-Postgres import.
 
@@ -1021,6 +1035,7 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     Postgres. Keep post-cutover additions here as well as in SQLite's full
     bootstrap above so a newly deployed backend cannot outrun its database.
     """
+    _ensure_ocr_queue_schema(conn)
     from .agent_connections import ensure_schema as ensure_agent_connections_schema
     ensure_agent_connections_schema(conn)
     from .vault import ensure_schema as ensure_vault_schema

@@ -9408,7 +9408,22 @@ def temp_ocr_status() -> dict[str, Any]:
             "SELECT COUNT(*) AS c FROM dashboard_posts "
             "WHERE TRIM(COALESCE(hook_text,'')) NOT IN ('','-','~')"
         ).fetchone()["c"]
-    return {"remaining": remaining, "with_text_total": done, **_OCR_RUN}
+        queue = conn.execute(
+            "SELECT SUM(CASE WHEN ocr_checked = 2 THEN 1 ELSE 0 END) AS in_flight, "
+            "SUM(CASE WHEN ocr_checked = 3 THEN 1 ELSE 0 END) AS failed, "
+            "SUM(CASE WHEN ocr_checked = 0 AND ocr_retry_at > ? THEN 1 ELSE 0 END) AS retry_waiting, "
+            "MIN(CASE WHEN ocr_checked IN (0,2) THEN published_at ELSE NULL END) AS oldest_pending_at "
+            "FROM dashboard_posts WHERE TRIM(COALESCE(hook_text,'')) = ''",
+            (time.time(),),
+        ).fetchone()
+    in_flight = int(queue["in_flight"] or 0)
+    return {"remaining": remaining, "with_text_total": done, **_OCR_RUN,
+            "running": bool(_OCR_RUN["running"] or in_flight),
+            "in_flight": in_flight, "failed": int(queue["failed"] or 0),
+            "retry_waiting": int(queue["retry_waiting"] or 0),
+            "oldest_pending_at": queue["oldest_pending_at"],
+            "automatic": True, "interval_seconds": 60}
+
 
 
 # The preview endpoint is deliberately unauthenticated -- the add-account wizard

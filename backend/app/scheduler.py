@@ -44,9 +44,7 @@ _thread: threading.Thread | None = None
 _SHORT_BUCKET_KEY = "last_short_bucket"
 _DAILY_DATE_KEY = "last_daily_date"
 
-# Covers OCR'd per hourly tick. New posts arrive at a few per account per day,
-# so this keeps up easily while also chipping away at any backlog without
-# making one tick run long.
+# Covers per independent minute pass; one pass at a time under a durable lease.
 _OCR_PER_TICK = 30
 
 
@@ -280,10 +278,7 @@ def _run_account_snapshot_job() -> dict:
 
 
 def _run_ocr_job() -> None:
-    """Keeps cover OCR current without anyone running it by hand: each hourly
-    tick tops up a bounded number of covers still missing hook_text, so posts
-    that arrived since the last tick become text-searchable on their own.
-    """
+    """Process pending covers independently once per minute."""
     from .apify_sync import run_ocr_sweep
     from .sentient_ocr import sentient_ocr_status
 
@@ -294,7 +289,7 @@ def _run_ocr_job() -> None:
 
     try:
         result = run_ocr_sweep(limit=_OCR_PER_TICK)
-        if result.get("sent") or result.get("skipped"):
+        if result.get("sent") or result.get("skipped") or result.get("retried"):
             logger.info("Cover OCR sweep: %s", result)
     except Exception:
         logger.exception("Cover OCR sweep crashed")
@@ -453,8 +448,11 @@ def _tick() -> None:
     def short_pass():
         if run("scheduled-posts", bucket, _run_short_term_jobs, max_attempts=_SCHEDULED_MAX_ATTEMPTS):
             _check_disk()
-            _run_ocr_job()
     _launch("short", short_pass)
+
+    # OCR has its own lease/cadence, independent from Apify completion.
+    ocr_slot = str(int(time.time()) // 60)
+    _launch("ocr", lambda: run("scheduled-ocr", ocr_slot, _run_ocr_job))
 
     engagement_bucket = _engagement_bucket_key(now_cst)
     _launch(

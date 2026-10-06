@@ -273,7 +273,7 @@ def reset_stuck_ocr_claims() -> int:
     from .db import connect
 
     with connect() as conn:
-        a = conn.execute("UPDATE dashboard_posts SET ocr_checked = 0 WHERE ocr_checked = 2").rowcount
+        a = conn.execute("UPDATE dashboard_posts SET ocr_checked = 0, ocr_owner = NULL WHERE ocr_checked = 2 AND ocr_lease_until <= ?", (__import__("time").time(),)).rowcount
         b = conn.execute("UPDATE posts SET hook_text = '' WHERE hook_text = '~'").rowcount
     return int(a or 0) + int(b or 0)
 
@@ -308,123 +308,128 @@ def ensure_cover(cover_source_url: str | None, dest_stem: str) -> tuple[str, Pat
 
 
 def run_ocr_sweep(limit: int = 30) -> dict[str, Any]:
-    """Fills in cover OCR text (hook_text) for posts that don't have it yet.
+    """Drain a bounded, durable OCR queue; reserve half the batch for old posts.
 
-    Scoped to dashboard_posts only. The canonical `posts` table is frozen, so
-    scanning it on every tick would process rows the dashboard never reads.
-
-    Newest first, so freshly-arrived posts become text-searchable right away.
-    Every row touched is marked checked, including blank results, so a cover with
-    genuinely no text is never re-sent (and re-billed) on a later pass.
-
-    Runs through Sentient Dash's own standalone OCR worker (sentient_ocr.py /
-    workers/modal_ocr_worker.py) -- always the full cover image, no crop, no
-    GPU. See that
-    worker's module docstring for why (it replaced a setup that paid for an
-    L40S GPU it never used, and a fixed crop that missed text sitting outside
-    it on some accounts' cover templates).
+    Expired claims recover automatically. Temporary failures back off, with
+    five attempts maximum. Blank successful readings remain completed.
     """
+    import time
+    import uuid
     from .db import connect, utc_now
     from .media_storage import cleanup_materialized_path, materialize_local_path
-
     from .sentient_ocr import extract_images_text_sentient
 
-    summary: dict[str, Any] = {"sent": 0, "with_text": 0, "skipped": 0, "remaining": 0}
+    limit = max(1, min(int(limit), 100))
+    epoch = time.time()
+    owner = uuid.uuid4().hex
+    # Covers are downloaded sequentially (30s each), then OCR requests can
+    # each take 300s. Renewing the lease is necessary during long batches.
+    lease_seconds = 180
+    summary = {"sent": 0, "with_text": 0, "skipped": 0, "remaining": 0, "retried": 0}
+    with connect() as conn:
+        conn.execute("UPDATE dashboard_posts SET ocr_checked = 0, ocr_owner = NULL "
+                     "WHERE ocr_checked = 2 AND ocr_lease_until <= ?", (epoch,))
+        eligible = "TRIM(COALESCE(hook_text, '')) = '' AND ocr_checked = 0 AND ocr_retry_at <= ?"
+        oldest = conn.execute(
+            f"SELECT id FROM dashboard_posts WHERE {eligible} ORDER BY published_at ASC, id ASC LIMIT ?",
+            (epoch, max(1, limit // 2)),
+        ).fetchall()
+        newest = conn.execute(
+            f"SELECT id FROM dashboard_posts WHERE {eligible} ORDER BY published_at DESC, id DESC LIMIT ?",
+            (epoch, limit),
+        ).fetchall()
+        ids = list(dict.fromkeys(int(row["id"]) for row in [*oldest, *newest]))[:limit]
+        claimed = []
+        for row_id in ids:
+            changed = conn.execute(
+                "UPDATE dashboard_posts SET ocr_checked = 2, ocr_owner = ?, ocr_lease_until = ? "
+                "WHERE id = ? AND ocr_checked = 0 AND ocr_retry_at <= ?",
+                (owner, epoch + lease_seconds, row_id, epoch),
+            ).rowcount
+            if changed:
+                claimed.append(row_id)
+        rows = [conn.execute("SELECT * FROM dashboard_posts WHERE id = ?", (row_id,)).fetchone()
+                for row_id in claimed]
 
-    # Claim rows under a process-wide lock so several sweep threads can run in
-    # parallel without two of them grabbing the same cover -- that would OCR
-    # (and bill) the same image twice. ocr_checked=2 means "in flight"; the
-    # slow Modal call happens outside the lock so threads actually overlap.
-    with _OCR_CLAIM_LOCK:
+    stop = __import__("threading").Event()
+    def renew():
+        while not stop.wait(30):
+            try:
+                with connect() as conn:
+                    conn.execute("UPDATE dashboard_posts SET ocr_lease_until = ? WHERE ocr_owner = ? AND ocr_checked = 2",
+                                 (time.time() + lease_seconds, owner))
+            except Exception:
+                logger.exception("OCR lease renewal failed")
+    thread = __import__("threading").Thread(target=renew, daemon=True, name="ocr-lease")
+    thread.start()
+    paths = []
+    def fail(row, reason):
+        attempts = int(row["ocr_attempts"] or 0) + 1
         with connect() as conn:
-            dash = conn.execute(
-                "SELECT id, account, shortcode, cover_image_path, cover_source_url FROM dashboard_posts "
-                "WHERE TRIM(COALESCE(hook_text, '')) = '' AND ocr_checked = 0 "
-                "ORDER BY published_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-            if dash:
-                conn.executemany(
-                    "UPDATE dashboard_posts SET ocr_checked = 2 WHERE id = ?",
-                    [(int(r["id"]),) for r in dash],
-                )
-
+            conn.execute(
+                "UPDATE dashboard_posts SET ocr_checked = ?, ocr_attempts = ?, ocr_retry_at = ?, "
+                "ocr_error = ?, ocr_owner = NULL, ocr_lease_until = 0 WHERE id = ? AND ocr_owner = ?",
+                (3 if attempts >= 5 else 0, attempts, time.time() + min(3600, 60 * 2 ** (attempts - 1)),
+                 reason, row["id"], owner),
+            )
+        summary["retried"] += 1
+    try:
+        jobs = []
+        for row in rows:
+            try:
+                path = materialize_local_path(row["cover_image_path"])
+                if path is None:
+                    restored = ensure_cover(row["cover_source_url"], f"dash-{row['account']}-{row['shortcode'] or row['id']}")
+                    if restored is None:
+                        fail(row, "cover_unavailable")
+                        summary["skipped"] += 1
+                        continue
+                    reference, path = restored
+                    paths.append(path)
+                    with connect() as conn:
+                        conn.execute("UPDATE dashboard_posts SET cover_image_path = ? WHERE id = ? AND ocr_owner = ?",
+                                     (reference, row["id"], owner))
+                else:
+                    paths.append(path)
+                jobs.append((row, path))
+            except Exception:
+                fail(row, "cover_processing_failed")
+        if jobs:
+            try:
+                results = extract_images_text_sentient([path for _, path in jobs])
+                # Never silently strand unmatched claims or assign text by a
+                # shifted response order. The worker echoes each filename.
+                if len(results) != len(jobs) or any(
+                    not isinstance(result, dict) or result.get("filename") != path.name or "text" not in result
+                    for (_, path), result in zip(jobs, results)
+                ):
+                    raise ValueError("Invalid OCR batch response")
+            except Exception:
+                for row, _ in jobs:
+                    fail(row, "ocr_request_failed")
+                logger.exception("OCR batch failed; queued with bounded backoff")
+            else:
+                summary["sent"] = len(jobs)
+                with connect() as conn:
+                    for (row, _), result in zip(jobs, results):
+                        text = str(result["text"] or "").strip()
+                        changed = conn.execute(
+                            "UPDATE dashboard_posts SET hook_text = ?, ocr_checked = 1, ocr_error = NULL, "
+                            "ocr_attempts = 0, ocr_retry_at = 0, ocr_owner = NULL, ocr_lease_until = 0, updated_at = ? "
+                            "WHERE id = ? AND ocr_owner = ?",
+                            (text or None, utc_now(), row["id"], owner),
+                        ).rowcount
+                        if changed and text:
+                            summary["with_text"] += 1
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        for path in paths:
+            cleanup_materialized_path(path)
     with connect() as conn:
         summary["remaining"] = conn.execute(
-            # Counts only what this sweep will actually work on -- the frozen
-            # `posts` table is out of scope, so including it would report a
-            # backlog that never drains.
-            "SELECT COUNT(*) AS c FROM dashboard_posts "
-            "WHERE TRIM(COALESCE(hook_text,''))='' AND ocr_checked=0"
+            "SELECT COUNT(*) AS c FROM dashboard_posts WHERE TRIM(COALESCE(hook_text,''))='' AND ocr_checked = 0"
         ).fetchone()["c"]
-
-    jobs: list[tuple[str, int, Path]] = []
-    give_up: list[tuple[str, int]] = []
-
-    for row in dash:
-        path = materialize_local_path(row["cover_image_path"])
-        if path is None:
-            stem = f"dash-{row['account']}-{str(row['shortcode'] or row['id']).strip()}"
-            restored = ensure_cover(row["cover_source_url"], stem)
-            if restored is None:
-                give_up.append(("dashboard_posts", int(row["id"])))
-                continue
-            reference, path = restored
-            with connect() as conn:
-                conn.execute(
-                    "UPDATE dashboard_posts SET cover_image_path = ? WHERE id = ?", (reference, int(row["id"]))
-                )
-        jobs.append(("dashboard_posts", int(row["id"]), path))
-
-    # Rows we can never OCR (no file, dead CDN link) get marked so they don't
-    # clog the queue forever. posts has no ocr_checked column, so a sentinel
-    # keeps it out of the "blank hook_text" set without faking real text.
-    if give_up:
-        with connect() as conn:
-            for table, row_id in give_up:
-                if table == "dashboard_posts":
-                    conn.execute("UPDATE dashboard_posts SET ocr_checked = 1 WHERE id = ?", (row_id,))
-                else:
-                    conn.execute("UPDATE posts SET hook_text = '-' WHERE id = ?", (row_id,))
-        summary["skipped"] = len(give_up)
-
-    if not jobs:
-        return summary
-
-    try:
-        results = extract_images_text_sentient([p for _, _, p in jobs])
-    except Exception:
-        # Release the claims so a later pass retries these instead of leaving
-        # them stranded in the in-flight state.
-        with connect() as conn:
-            for table, row_id, _ in jobs:
-                if table == "dashboard_posts":
-                    conn.execute("UPDATE dashboard_posts SET ocr_checked = 0 WHERE id = ?", (row_id,))
-                else:
-                    conn.execute("UPDATE posts SET hook_text = '' WHERE id = ?", (row_id,))
-        for _, _, path in jobs:
-            cleanup_materialized_path(path)
-        raise
-
-    now_iso = utc_now()
-    with connect() as conn:
-        for (table, row_id, _), result in zip(jobs, results, strict=False):
-            text = str(result.get("text") or "").strip() if isinstance(result, dict) else ""
-            if text:
-                summary["with_text"] += 1
-            if table == "dashboard_posts":
-                conn.execute(
-                    "UPDATE dashboard_posts SET hook_text = ?, ocr_checked = 1, updated_at = ? WHERE id = ?",
-                    (text or None, now_iso, row_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE posts SET hook_text = ?, updated_at = ? WHERE id = ?",
-                    (text or "-", now_iso, row_id),
-                )
-    summary["sent"] = len(jobs)
-    for _, _, path in jobs:
-        cleanup_materialized_path(path)
     return summary
 
 
