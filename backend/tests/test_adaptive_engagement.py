@@ -174,3 +174,19 @@ def test_hidden_final_snapshot_waits_normal_interval(database):
     add(database, now, 'crossing-eight', age=8.1, refreshed=.5)
     picked, _ = refresh.candidates(['a'], now)
     assert [p['shortcode'] for p in picked] == ['crossing-eight']
+
+
+def test_metrics_delta_is_bounded_and_revisits_equal_timestamp_updates(database):
+    stamp = datetime.now(UTC).replace(microsecond=0).isoformat()
+    with database() as conn:
+        for code in ['a', 'b', 'c']:
+            refresh.observe(conn, code, {'shortCode': code, 'likesCount': 80, 'commentsCount': 4}, stamp)
+    first = refresh.metric_updates(limit=2)
+    assert first['hasMore'] and [p['shortcode'] for p in first['updates']] == ['a', 'b']
+    last = refresh.metric_updates(first['cursor']['at'], first['cursor']['code'], limit=2)
+    assert not last['hasMore'] and [p['shortcode'] for p in last['updates']] == ['c']
+    # The next poll revisits the whole final second, including newly changed
+    # shortcodes that sort before the previous pagination cursor.
+    with database() as conn:
+        refresh.observe(conn, 'a', {'shortCode': 'a', 'likesCount': 90}, stamp)
+    assert refresh.metric_updates(stamp)['updates'][0]['likes'] == 90

@@ -15,6 +15,7 @@ _CST = timezone(timedelta(hours=-6))
 def initialize(conn):
     conn.execute('''CREATE TABLE IF NOT EXISTS engagement_observations (
         shortcode TEXT PRIMARY KEY, observed_at TEXT NOT NULL, raw_json TEXT NOT NULL)''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_engagement_observed ON engagement_observations(observed_at, shortcode)')
     conn.execute('''CREATE TABLE IF NOT EXISTS engagement_budget (
         day TEXT PRIMARY KEY, reserved_items INTEGER NOT NULL DEFAULT 0,
         reserved_milliusd INTEGER NOT NULL DEFAULT 0)''')
@@ -194,3 +195,24 @@ def status():
         'reserved_items': budget['reserved_items'] if budget else 0,
         'observations': dict(observation),
         'last_job': {**dict(job), 'state': json.loads(job['state'])} if job else None}
+
+
+def metric_updates(after_at='', after_code='', limit=500):
+    """An indexed, bounded delta for cached cards; no Apify calls."""
+    from .apify_sync import _likes_or_none
+    with db.connect() as conn:
+        initialize(conn)
+        rows = conn.execute("""SELECT shortcode, observed_at, raw_json FROM engagement_observations
+            WHERE observed_at > ? OR (observed_at = ? AND shortcode > ?)
+            ORDER BY observed_at, shortcode LIMIT ?""", (after_at, after_at, after_code, limit + 1)).fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    updates = []
+    for row in rows:
+        item = json.loads(row['raw_json'])
+        comments = item.get('commentsCount')
+        updates.append({'shortcode': row['shortcode'], 'likes': _likes_or_none(item.get('likesCount')),
+            'comments': comments if isinstance(comments, int) and comments >= 0 else None,
+            'likesUpdatedAt': row['observed_at']})
+    cursor = {'at': rows[-1]['observed_at'], 'code': rows[-1]['shortcode']} if rows else {'at': after_at, 'code': after_code}
+    return {'updates': updates, 'cursor': cursor, 'hasMore': has_more}

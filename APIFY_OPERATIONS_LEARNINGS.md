@@ -296,3 +296,10 @@ También: liberar los reclamos si el lote falla, para que las filas no queden tr
   los refrescos posteriores modifican los conteos actuales, no ese snapshot.
 - `/api/admin/engagement/status` muestra presupuesto reservado, lecturas y resultado
   del worker con su commit. El tope solo cubre este ciclo, no la factura total de Apify.
+
+- La revisión del catálogo basada en MAX(id) no detecta cambios de likes en filas
+  existentes. `/api/dashboard/posts/metrics` entrega deltas indexados y paginados
+  desde `engagement_observations`, sin otro scrape ni descargar toda la biblioteca.
+  Research aplica esos deltas incluso si el manifiesto responde 304 o si trae posts
+  nuevos; conserva el checkpoint en la caché personal. Relee el último segundo
+  para no perder conteos que cambian dentro del mismo timestamp.

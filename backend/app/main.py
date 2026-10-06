@@ -1289,6 +1289,7 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
     return {
         "revision": revision,
         "sources": sources,
+        "metricsAvailable": True,
     }
 
 
@@ -9835,3 +9836,10 @@ install_product_mcp(app)
 def engagement_refresh_status() -> dict[str, Any]:
     from .engagement_refresh import status
     return status()
+
+
+@app.get("/api/dashboard/posts/metrics")
+def dashboard_metric_updates(after_at: str = Query('', max_length=64), after_code: str = Query('', max_length=128),
+                             limit: int = Query(500, ge=1, le=1000)) -> dict[str, Any]:
+    from .engagement_refresh import metric_updates
+    return metric_updates(after_at, after_code, limit)
