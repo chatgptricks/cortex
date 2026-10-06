@@ -417,7 +417,7 @@ def test_account_access_ticket_assigns_active_sentient_accounts(monkeypatch, tmp
     assert [row["account_handle"] for row in assigned] == ["chatgptricks"]
 
 
-def test_legacy_post_suggestion_remains_reviewable(monkeypatch, tmp_path):
+def test_legacy_post_suggestion_cannot_approve_without_an_account(monkeypatch, tmp_path):
     database = tmp_path / "post-suggestion.sqlite3"
     _ticket_database(database)
     connect = _isolate(monkeypatch, database)
@@ -430,11 +430,17 @@ def test_legacy_post_suggestion_remains_reviewable(monkeypatch, tmp_path):
                        'https://www.instagram.com/reel/CODEX123/', 'Strong hook', '', '')"""
         )
         ticket_id = cursor.lastrowid
-    reviewed = main.dashboard_queue_v2_review_ticket(
-        ticket_id=ticket_id, request=None, action="approve", review_note=None,
-    )
-    assert reviewed["ticket"]["type"] == "post_suggestion"
-    assert reviewed["ticket"]["status"] == "approved"
+    with pytest.raises(HTTPException) as approval_error:
+        main.dashboard_queue_v2_review_ticket(
+            ticket_id=ticket_id, request=None, action="approve", review_note=None,
+        )
+    assert approval_error.value.status_code == 409
+    assert "Choose an account" in approval_error.value.detail
+    with connect() as conn:
+        assert conn.execute("SELECT status FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone()[0] == "pending"
+    reviewed = main.dashboard_queue_v2_review_ticket(ticket_id=ticket_id, request=None, action="reject", review_note=None)
+    assert reviewed["ticket"]["status"] == "rejected"
+    assert reviewed["request"] is None
     # An old frontend must ask for an account instead of silently creating
     # an unassigned request in the new workflow.
     with pytest.raises(HTTPException) as error:

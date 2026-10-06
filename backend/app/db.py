@@ -403,6 +403,7 @@ def init_db() -> None:
                 duration_minutes INTEGER,
                 requested_production_points INTEGER,
                 requested_accounts TEXT NOT NULL DEFAULT '[]',
+                suggestion_payload TEXT NOT NULL DEFAULT '{}',
                 reason TEXT NOT NULL DEFAULT '',
                 reviewer_email TEXT,
                 review_note TEXT NOT NULL DEFAULT '',
@@ -812,6 +813,7 @@ _QUEUE_TICKET_COLUMNS = (
     "duration_minutes",
     "requested_production_points",
     "requested_accounts",
+    "suggestion_payload",
     "reason",
     "reviewer_email",
     "review_note",
@@ -847,6 +849,7 @@ def _create_queue_tickets_table(conn: Any) -> None:
                duration_minutes INTEGER,
                requested_production_points INTEGER,
                requested_accounts TEXT NOT NULL DEFAULT '[]',
+               suggestion_payload TEXT NOT NULL DEFAULT '{}',
                reason TEXT NOT NULL DEFAULT '',
                reviewer_email TEXT,
                review_note TEXT NOT NULL DEFAULT '',
@@ -989,7 +992,8 @@ def _ensure_queue_create_attempts_schema(conn: Any) -> None:
 
 
 def _ensure_queue_post_suggestions_schema(conn: Any) -> None:
-    """Keep suggestion retries durable across workers, restarts and retention."""
+    """Keep suggestion retries and approval payloads durable across workers."""
+    _ensure_column(conn, "queue_tickets", "suggestion_payload", "suggestion_payload TEXT NOT NULL DEFAULT '{}'")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS queue_post_suggestions (
                requester_email TEXT NOT NULL,

@@ -4290,11 +4290,11 @@ def _queue_v2_purge_expired(conn: Any) -> list[int]:
             (cutoff,),
         ).fetchall()
     ids = [int(row["id"]) for row in rows]
-    # Suggestions and personal-time tickets have no request id. They are
-    # Queue operational data too, so do not let reviewed (or abandoned)
-    # tickets become an unbounded hidden history beside the 10-day post log.
+    # Reviewed operational tickets expire with the post log. Unreviewed
+    # suggestions/account requests remain visible until a reviewer decides;
+    # waiting for approval must not silently discard a submitted proposal.
     conn.execute(
-        "DELETE FROM queue_tickets WHERE request_id IS NULL AND created_at < ? AND NOT (COALESCE(block_category, '') = 'new_account' AND status = 'pending')",
+        "DELETE FROM queue_tickets WHERE request_id IS NULL AND created_at < ? AND NOT (COALESCE(block_category, '') IN ('new_account', 'post_suggestion') AND status = 'pending')",
         (cutoff,),
     )
     if not ids:
@@ -4450,6 +4450,7 @@ def _queue_v2_ticket(row: dict[str, Any]) -> dict[str, Any]:
         "reason": row.get("reason") or "", "reviewerEmail": row.get("reviewer_email"),
         "reviewNote": row.get("review_note") or "", "reviewedAt": row.get("reviewed_at"),
         "createdAt": row["created_at"], "updatedAt": row["updated_at"], "request": request_summary,
+        "suggestion": _queue_v2_suggestion_details(row) if ticket_type == "post_suggestion" else None,
     }
 
 
@@ -6136,6 +6137,98 @@ def _queue_v2_suggestion_source_key(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()
 
 
+def _queue_v2_suggestion_details(ticket: dict[str, Any]) -> dict[str, Any]:
+    """Public review fields, with a safe fallback for pre-payload tickets."""
+    payload = _queue_v2_json(ticket.get("suggestion_payload"), {})
+    accounts = _queue_v2_json(ticket.get("requested_accounts"), [])
+    return {
+        "sourceUrl": payload.get("sourceUrl") or ticket.get("title") or "",
+        "account": payload.get("account") or (accounts[0] if len(accounts) == 1 else ""),
+        "title": payload.get("title") or "",
+        "postType": payload.get("postType") or "Image",
+        "sourceAccount": payload.get("sourceAccount") or "",
+        "sourceShortcode": payload.get("sourceShortcode") or "",
+    }
+
+
+def _queue_v2_schedule_approved_suggestion(
+    conn: Any, ticket: dict[str, Any], reviewer: str, account: str | None = None,
+) -> dict[str, Any]:
+    """Create one approved assignment inside the review's scheduler transaction."""
+    # Never reinterpret an already linked task, including historical tasks
+    # from the old automatically-approved flow.
+    if ticket.get("request_id"):
+        raise HTTPException(status_code=409, detail="This suggestion already has a Queue task.")
+    details = _queue_v2_suggestion_details(ticket)
+    requested_account = str(account or "").strip().lstrip("@").lower()
+    clean_account = str(details["account"] or requested_account).strip().lstrip("@").lower()
+    if requested_account and requested_account != clean_account:
+        raise HTTPException(status_code=409, detail="Approve the account selected by the suggester; it cannot be changed during review.")
+    if not clean_account:
+        raise HTTPException(status_code=409, detail="Choose an account managed by the suggester before approving this older suggestion.")
+    requester = str(ticket["requester_email"])
+    user_row = conn.execute("SELECT * FROM dashboard_users WHERE email = ?", (requester,)).fetchone()
+    if not user_row or "pd" not in _queue_v2_user_roles(dict(user_row)):
+        raise HTTPException(status_code=409, detail="The suggester no longer has Queue access. This suggestion remains pending.")
+    owned = conn.execute(
+        """SELECT 1 FROM queue_designer_accounts d JOIN accounts a ON a.handle = d.account_handle
+           WHERE d.designer_email = ? AND d.account_handle = ? AND a.is_active = 1 AND a.group_name = 'sentient'""",
+        (requester, clean_account),
+    ).fetchone()
+    if not owned:
+        raise HTTPException(status_code=409, detail="The suggester no longer manages this active Sentient account. Restore access or reject the suggestion.")
+    clean_url = _queue_v2_suggestion_url(details["sourceUrl"])
+    clean_type = str(details["postType"])
+    if clean_type not in QUEUE_V2_POST_TYPES:
+        raise HTTPException(status_code=409, detail="The suggestion has an invalid post format. Reject it and ask the user to submit it again.")
+    payload = _queue_v2_json(ticket.get("suggestion_payload"), {})
+    snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    source_account, source_shortcode = details["sourceAccount"], details["sourceShortcode"]
+    clean_title = str(details["title"] or f"Suggested post · {_queue_v2_source_platform(clean_url)}")[:160]
+    minutes_per_pp = _queue_v2_minutes_per_pp_for_user(dict(user_row))
+    now = utc_now()
+    local_now = datetime.now(SCHEDULER_TIMEZONE)
+    start = ((local_now.hour * 60 + local_now.minute + int(bool(local_now.second or local_now.microsecond)) + 9) // 10) * 10
+    target_date, target_start = next_available_slot(
+        local_now.date().isoformat(), start, 3 * minutes_per_pp,
+        _queue_v2_time_occupied(conn, requester, None),
+    )
+    shortcode = source_shortcode or f"manual-{secrets.token_hex(8)}"
+    cover = f"/api/dashboard/covers/{source_account}/{snapshot['id']}" if source_account and snapshot.get("id") is not None else ""
+    for _ in range(3):
+        cursor = conn.execute(
+            """INSERT INTO queue_requests
+               (post_account, post_shortcode, post_title, is_custom, post_permalink, post_caption, post_type, cover_url,
+                production_points, minutes_per_pp, priority, deadline_at, tags, brief, notes, reference_links,
+                designer_email, coordinator_email, recommended_accounts, status, scheduled_date,
+                scheduled_start_minutes, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 3, ?, 'medium', '', '[]', ?, '', ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?)
+               ON CONFLICT(post_account, post_shortcode) DO NOTHING""",
+            (source_account, shortcode, clean_title, int(not bool(source_account)), clean_url,
+             snapshot.get("caption") or ticket["reason"], clean_type, cover, minutes_per_pp, ticket["reason"],
+             json.dumps([clean_url]), requester, reviewer, json.dumps([clean_account]), target_date, target_start, now, now),
+        )
+        if cursor.rowcount:
+            break
+        shortcode = f"{source_shortcode[:80] or 'manual'}--copy-{secrets.token_hex(8)}"
+    else:
+        raise HTTPException(status_code=409, detail="Could not schedule the approved suggestion. Please retry.")
+    request_id = int(cursor.lastrowid)
+    payload.update({**details, "account": clean_account, "title": clean_title})
+    conn.execute(
+        """UPDATE queue_tickets SET request_id = ?, requested_accounts = ?, suggestion_payload = ?,
+                  scheduled_date = ?, scheduled_start_minutes = ?, duration_minutes = ? WHERE id = ?""",
+        (request_id, json.dumps([clean_account]), json.dumps(payload), target_date, target_start, 3 * minutes_per_pp, ticket["id"]),
+    )
+    conn.execute("UPDATE queue_post_suggestions SET request_id = ? WHERE ticket_id = ?", (request_id, ticket["id"]))
+    _queue_v2_log(conn, request_id, reviewer, "post_suggestion_approved", {
+        "ticketId": ticket["id"], "requesterEmail": requester, "sourceUrl": clean_url,
+        "sourceAccount": source_account, "sourceShortcode": source_shortcode,
+        "account": clean_account, "date": target_date, "start": target_start,
+    })
+    return dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
+
+
 @app.post("/api/dashboard/queue/v2/tickets/post-suggestion")
 def dashboard_queue_v2_create_post_suggestion(
     request: Request,
@@ -6148,8 +6241,8 @@ def dashboard_queue_v2_create_post_suggestion(
     source_shortcode: Annotated[str | None, Form()] = None,
     idempotency_key: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
-    """Schedule the caller's suggestion without granting Pool/Create access."""
-    caller, _, roles = _queue_v2_access(request)
+    """Submit for VC approval; reserve no task or calendar time beforehand."""
+    caller, is_admin, roles = _queue_v2_access(request)
     if "pd" not in roles:
         raise HTTPException(status_code=403, detail="Only PD users can suggest posts.")
     clean_url = _queue_v2_suggestion_url(source_url)
@@ -6172,8 +6265,7 @@ def dashboard_queue_v2_create_post_suggestion(
 
     with connect() as conn:
         _queue_v2_lock_schedule(conn)
-        # Check durable retries before current account access/source state:
-        # a timeout followed by a role/account change must not create a copy.
+        # Resolve durable retries before checking current source/account access.
         previous = conn.execute(
             "SELECT * FROM queue_post_suggestions WHERE requester_email = ? AND idempotency_key = ?",
             (caller, retry_key),
@@ -6182,14 +6274,15 @@ def dashboard_queue_v2_create_post_suggestion(
             raise HTTPException(status_code=409, detail="This retry key was already used for a different suggestion.")
         if not previous:
             previous = conn.execute(
-                """SELECT * FROM queue_post_suggestions
-                   WHERE requester_email = ? AND source_key = ? AND account_handle = ? AND request_id IS NOT NULL
-                   ORDER BY created_at LIMIT 1""",
+                """SELECT s.* FROM queue_post_suggestions s JOIN queue_tickets t ON t.id = s.ticket_id
+                   WHERE s.requester_email = ? AND s.source_key = ? AND s.account_handle = ?
+                     AND t.status IN ('pending', 'approved') ORDER BY s.created_at, t.id LIMIT 1""",
                 (caller, source_key, clean_account),
             ).fetchone()
         if previous:
-            existing = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (previous["request_id"],)).fetchone()
-            if not existing:
+            ticket = conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (previous["ticket_id"],)).fetchone()
+            existing = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (previous["request_id"],)).fetchone() if previous["request_id"] else None
+            if not ticket or (ticket["status"] == "approved" and not existing):
                 raise HTTPException(status_code=410, detail="This suggestion was already processed and its Queue history has expired.")
             if previous["idempotency_key"] != retry_key:
                 conn.execute(
@@ -6198,10 +6291,8 @@ def dashboard_queue_v2_create_post_suggestion(
                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (caller, retry_key, source_key, clean_account, previous["request_id"], previous["ticket_id"], utc_now()),
                 )
-            ticket = conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (previous["ticket_id"],)).fetchone()
-            row = dict(existing)
-            # Retry is read-only even if a coordinator later reassigned it.
-            result = {"ok": True, "alreadyScheduled": True, "request": row, "ticket": dict(ticket) if ticket else None}
+            result = {"ok": True, "alreadySubmitted": True, "alreadyScheduled": bool(existing),
+                      "request": dict(existing) if existing else None, "ticket": dict(ticket)}
         else:
             owned = conn.execute(
                 """SELECT 1 FROM queue_designer_accounts d JOIN accounts a ON a.handle = d.account_handle
@@ -6210,10 +6301,8 @@ def dashboard_queue_v2_create_post_suggestion(
             ).fetchone()
             if not owned:
                 raise HTTPException(status_code=403, detail="Choose an active Sentient account you manage.")
-            user = conn.execute("SELECT * FROM dashboard_users WHERE email = ?", (caller,)).fetchone()
-            if not user:
+            if not conn.execute("SELECT 1 FROM dashboard_users WHERE email = ?", (caller,)).fetchone():
                 raise HTTPException(status_code=403, detail="Queue user access is required.")
-            minutes_per_pp = _queue_v2_minutes_per_pp_for_user(dict(user))
             snapshot: dict[str, Any] = {}
             verified_account = ""
             verified_shortcode = ""
@@ -6227,63 +6316,35 @@ def dashboard_queue_v2_create_post_suggestion(
                     raise HTTPException(status_code=400, detail="The source link does not match the selected Research post.")
                 clean_url = snapshot.get("permalink") or f"https://www.instagram.com/p/{verified_shortcode}/"
             clean_title = clean_title or _queue_v2_trim_source_text(snapshot.get("caption"), 160) or f"Suggested post · {_queue_v2_source_platform(clean_url)}"
-            # Independent Queue identity permits the same source to be worked
-            # on for different destinations without changing Research data.
-            shortcode = verified_shortcode or f"manual-{secrets.token_hex(8)}"
+            payload = {
+                "sourceUrl": clean_url, "account": clean_account, "title": clean_title, "postType": clean_type,
+                "sourceAccount": verified_account, "sourceShortcode": verified_shortcode,
+                "snapshot": {"id": snapshot.get("id"), "caption": snapshot.get("caption") or ""},
+            }
             now = utc_now()
-            local_now = datetime.now(SCHEDULER_TIMEZONE)
-            start = ((local_now.hour * 60 + local_now.minute + int(bool(local_now.second or local_now.microsecond)) + 9) // 10) * 10
-            target_date, target_start = next_available_slot(
-                local_now.date().isoformat(), start, 3 * minutes_per_pp,
-                _queue_v2_time_occupied(conn, caller, None),
-            )
-            cover = f"/api/dashboard/covers/{verified_account}/{snapshot['id']}" if snapshot.get("id") is not None else ""
-            for _ in range(3):
-                cursor = conn.execute(
-                    """INSERT INTO queue_requests
-                       (post_account, post_shortcode, post_title, is_custom, post_permalink, post_caption, post_type, cover_url,
-                        production_points, minutes_per_pp, priority, deadline_at, tags, brief, notes, reference_links,
-                        designer_email, coordinator_email, recommended_accounts, status, scheduled_date,
-                        scheduled_start_minutes, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 3, ?, 'medium', '', '[]', ?, '', ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?)
-                       ON CONFLICT(post_account, post_shortcode) DO NOTHING""",
-                    (verified_account, shortcode, clean_title, int(not bool(verified_account)), clean_url,
-                     snapshot.get("caption") or clean_reason, clean_type, cover, minutes_per_pp, clean_reason,
-                     json.dumps([clean_url]), caller, caller, json.dumps([clean_account]), target_date, target_start, now, now),
-                )
-                if cursor.rowcount:
-                    break
-                # A simultaneous suggestion for another user/account may
-                # consume the native source key. Keep an independent copy.
-                shortcode = f"{verified_shortcode[:80] or 'manual'}--copy-{secrets.token_hex(8)}"
-            else:
-                raise HTTPException(status_code=409, detail="Could not create the suggestion. Please retry.")
-            request_id = int(cursor.lastrowid)
             cursor = conn.execute(
                 """INSERT INTO queue_tickets
-                   (ticket_type, requester_email, request_id, status, block_category, title, reason, requested_accounts,
-                    scheduled_date, scheduled_start_minutes, duration_minutes, review_note, reviewed_at, created_at, updated_at)
-                   VALUES ('time_block', ?, ?, 'approved', 'post_suggestion', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (caller, request_id, clean_url, clean_reason, json.dumps([clean_account]), target_date, target_start,
-                 3 * minutes_per_pp, "Automatically scheduled for the suggesting user.", now, now, now),
+                   (ticket_type, requester_email, status, block_category, title, reason, requested_accounts,
+                    suggestion_payload, created_at, updated_at)
+                   VALUES ('time_block', ?, 'pending', 'post_suggestion', ?, ?, ?, ?, ?, ?)""",
+                (caller, clean_url, clean_reason, json.dumps([clean_account]), json.dumps(payload), now, now),
             )
             ticket_id = int(cursor.lastrowid)
             conn.execute(
                 """INSERT INTO queue_post_suggestions
                    (requester_email, idempotency_key, source_key, account_handle, request_id, ticket_id, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (caller, retry_key, source_key, clean_account, request_id, ticket_id, now),
+                   VALUES (?, ?, ?, ?, NULL, ?, ?)""",
+                (caller, retry_key, source_key, clean_account, ticket_id, now),
             )
-            _queue_v2_log(conn, request_id, caller, "post_suggestion_scheduled", {
-                "sourceUrl": clean_url, "sourceAccount": verified_account, "sourceShortcode": verified_shortcode,
-                "account": clean_account, "date": target_date, "start": target_start,
-            })
-            _queue_v2_publish(conn, "post_suggestion_scheduled", caller, [request_id])
-            row = dict(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
+            _queue_v2_publish(conn, "ticket_created", caller)
             ticket = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
-            result = {"ok": True, "alreadyScheduled": False, "request": row, "ticket": ticket}
-    result["request"] = _queue_v2_project(result["request"])
-    result["ticket"] = _queue_v2_ticket(result["ticket"]) if result["ticket"] else None
+            result = {"ok": True, "alreadySubmitted": False, "alreadyScheduled": False, "request": None, "ticket": ticket}
+        result["pendingTicketCount"] = int(conn.execute(
+            "SELECT COUNT(*) AS c FROM queue_tickets WHERE status = 'pending'" + ("" if (is_admin or "vc" in roles) else " AND requester_email = ?"),
+            [] if (is_admin or "vc" in roles) else [caller],
+        ).fetchone()["c"])
+    result["request"] = _queue_v2_project(result["request"]) if result["request"] else None
+    result["ticket"] = _queue_v2_ticket(result["ticket"])
     return result
 
 
@@ -6812,6 +6873,7 @@ def dashboard_queue_v2_review_ticket(
     request: Request,
     action: Annotated[str, Form()],
     review_note: Annotated[str | None, Form()] = None,
+    account: Annotated[str | None, Form()] = None,
     _notify_slack: bool = True,
 ) -> dict[str, Any]:
     caller, _, _ = _queue_v2_access(request, coordinator=True)
@@ -6823,6 +6885,7 @@ def dashboard_queue_v2_review_ticket(
     affected_ids: set[int] = set()
     previous_production_points: int | None = None
     queue_change_event: str | None = None
+    approved_request: dict[str, Any] | None = None
     with connect() as conn:
         _queue_v2_lock_schedule(conn)
         ticket_row = conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone()
@@ -6837,127 +6900,146 @@ def dashboard_queue_v2_review_ticket(
                 if not handles or not conn.execute("SELECT 1 FROM accounts WHERE handle = ? AND is_active = 1", (handles[0],)).fetchone():
                     raise HTTPException(status_code=409, detail="Add the account in Settings first, then mark this request as added.")
         if ticket["status"] != "pending":
-            raise HTTPException(status_code=409, detail="This ticket has already been reviewed.")
-        if clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "account_request":
-            requested_handles = _queue_v2_json(ticket.get("requested_accounts"), [])
-            active_handles = {
-                str(item["handle"])
-                for item in conn.execute(
-                    "SELECT handle FROM accounts WHERE is_active = 1 AND group_name = 'sentient'"
-                ).fetchall()
-            }
-            approved_handles = [
-                handle for handle in _queue_v2_clean_account_handles(requested_handles)
-                if handle in active_handles
-            ]
-            conn.executemany(
-                "INSERT OR IGNORE INTO queue_designer_accounts (designer_email, account_handle, created_at) VALUES (?, ?, ?)",
-                [(ticket["requester_email"], handle, now) for handle in approved_handles],
-            )
-            queue_change_event = "account_access_approved"
-        elif clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "move":
-            queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
-            if not queue_row or queue_row["status"] != "scheduled":
-                raise HTTPException(status_code=409, detail="The Queue request can no longer be moved.")
-            queue_item = dict(queue_row)
-            occupied = _queue_v2_time_occupied(conn, queue_item["designer_email"], ticket["scheduled_date"])
-            current_start = int(queue_item["scheduled_start_minutes"])
-            current_duration = _queue_v2_duration(queue_item)
-            occupied = [item for item in occupied if not (
-                item["date"] == queue_item["scheduled_date"]
-                and int(item["start"]) == current_start
-                and int(item["duration"]) == current_duration
-            )]
-            if any(intervals_conflict(
-                int(ticket["scheduled_start_minutes"]), current_duration,
-                int(item["start"]), int(item["duration"]),
-                other_buffer_minutes=int(item.get("buffer_minutes", SCHEDULER_BUFFER_MINUTES)),
-            ) for item in occupied):
-                raise HTTPException(status_code=409, detail="The requested move overlaps another Queue block.")
-            conn.execute(
-                "UPDATE queue_requests SET scheduled_date = ?, scheduled_start_minutes = ?, updated_at = ? WHERE id = ?",
-                (ticket["scheduled_date"], int(ticket["scheduled_start_minutes"]), now, ticket["request_id"]),
-            )
-            _queue_v2_log(conn, ticket["request_id"], caller, "move_approved", {
-                "scheduledDate": ticket["scheduled_date"], "scheduledStartMinutes": int(ticket["scheduled_start_minutes"]),
-            })
-            _queue_v2_reflow_scheduled(conn, queue_item["designer_email"], caller, ticket["request_id"])
-            queue_change_event = "move_approved"
-            affected_ids.add(int(ticket["request_id"]))
-        elif clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "post_suggestion":
-            # Approval deliberately leaves the proposed source as a ticket.
-            # The VC/Admin uses its populated Create Post form next, which is
-            # the only operation that can create a Pool item.
-            queue_change_event = "post_suggestion_approved"
-        elif clean_action == "approve" and ticket.get("block_category") == "new_account":
-            queue_change_event = "new_account_added"
-        elif clean_action == "approve" and ticket["ticket_type"] == "time_block":
-            _queue_v2_assert_time_available(
-                conn, ticket["requester_email"], ticket["scheduled_date"],
-                int(ticket["scheduled_start_minutes"]), int(ticket["duration_minutes"]), exclude_ticket_id=ticket_id,
-            )
-        elif clean_action == "approve" and ticket["ticket_type"] == "pp_revision":
-            queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
-            if not queue_row or queue_row["status"] not in {"scheduled", "in_progress"}:
-                raise HTTPException(status_code=409, detail="The Queue request can no longer receive a PP revision.")
-            queue_item = dict(queue_row)
-            previous_production_points = int(queue_item["production_points"])
-            new_points = int(ticket["requested_production_points"])
-            conn.execute("UPDATE queue_requests SET production_points = ?, updated_at = ? WHERE id = ?", (new_points, now, ticket["request_id"]))
-            _queue_v2_log(conn, ticket["request_id"], caller, "pp_revision_approved", {"from": queue_item["production_points"], "to": new_points})
-            queue_change_event = "pp_revision_approved"
-            if queue_item.get("designer_email"):
+            if ticket.get("block_category") == "post_suggestion" and ticket["status"] == new_status:
+                # A lost approval response is safe to retry without creating
+                # another task or recalculating its placement.
+                existing = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone() if ticket.get("request_id") else None
+                if existing:
+                    approved_request = dict(existing)
+                    ticket.update({"post_account": existing["post_account"], "post_shortcode": existing["post_shortcode"],
+                                   "designer_email": existing["designer_email"], "request_status": existing["status"],
+                                   "current_production_points": existing["production_points"]})
+                # Project after releasing the scheduler lock/connection.
+                replay = {"ok": True, "ticket": _queue_v2_ticket(ticket), "request": approved_request}
+            else:
+                raise HTTPException(status_code=409, detail="This ticket has already been reviewed.")
+        else:
+            replay = None
+        if replay is None:
+            if clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "account_request":
+                requested_handles = _queue_v2_json(ticket.get("requested_accounts"), [])
+                active_handles = {
+                    str(item["handle"])
+                    for item in conn.execute(
+                        "SELECT handle FROM accounts WHERE is_active = 1 AND group_name = 'sentient'"
+                    ).fetchall()
+                }
+                approved_handles = [
+                    handle for handle in _queue_v2_clean_account_handles(requested_handles)
+                    if handle in active_handles
+                ]
+                conn.executemany(
+                    "INSERT OR IGNORE INTO queue_designer_accounts (designer_email, account_handle, created_at) VALUES (?, ?, ?)",
+                    [(ticket["requester_email"], handle, now) for handle in approved_handles],
+                )
+                queue_change_event = "account_access_approved"
+            elif clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "move":
+                queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
+                if not queue_row or queue_row["status"] != "scheduled":
+                    raise HTTPException(status_code=409, detail="The Queue request can no longer be moved.")
+                queue_item = dict(queue_row)
+                occupied = _queue_v2_time_occupied(conn, queue_item["designer_email"], ticket["scheduled_date"])
+                current_start = int(queue_item["scheduled_start_minutes"])
+                current_duration = _queue_v2_duration(queue_item)
+                occupied = [item for item in occupied if not (
+                    item["date"] == queue_item["scheduled_date"]
+                    and int(item["start"]) == current_start
+                    and int(item["duration"]) == current_duration
+                )]
+                if any(intervals_conflict(
+                    int(ticket["scheduled_start_minutes"]), current_duration,
+                    int(item["start"]), int(item["duration"]),
+                    other_buffer_minutes=int(item.get("buffer_minutes", SCHEDULER_BUFFER_MINUTES)),
+                ) for item in occupied):
+                    raise HTTPException(status_code=409, detail="The requested move overlaps another Queue block.")
+                conn.execute(
+                    "UPDATE queue_requests SET scheduled_date = ?, scheduled_start_minutes = ?, updated_at = ? WHERE id = ?",
+                    (ticket["scheduled_date"], int(ticket["scheduled_start_minutes"]), now, ticket["request_id"]),
+                )
+                _queue_v2_log(conn, ticket["request_id"], caller, "move_approved", {
+                    "scheduledDate": ticket["scheduled_date"], "scheduledStartMinutes": int(ticket["scheduled_start_minutes"]),
+                })
                 _queue_v2_reflow_scheduled(conn, queue_item["designer_email"], caller, ticket["request_id"])
-                _queue_v2_reflow_drafts(conn, queue_item["designer_email"])
-            affected_ids.add(int(ticket["request_id"]))
-        elif clean_action == "approve" and ticket["ticket_type"] == "cancellation":
-            queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
-            if not queue_row or queue_row["status"] not in {"scheduled", "in_progress", "completed"}:
-                raise HTTPException(status_code=409, detail="The Queue request can no longer be cancelled.")
-            conn.execute("DELETE FROM queue_schedule_drafts WHERE request_id = ?", (ticket["request_id"],))
+                queue_change_event = "move_approved"
+                affected_ids.add(int(ticket["request_id"]))
+            elif clean_action == "approve" and ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "post_suggestion":
+                approved_request = _queue_v2_schedule_approved_suggestion(conn, ticket, caller, account)
+                queue_change_event = "post_suggestion_approved"
+                affected_ids.add(int(approved_request["id"]))
+            elif clean_action == "approve" and ticket.get("block_category") == "new_account":
+                queue_change_event = "new_account_added"
+            elif clean_action == "approve" and ticket["ticket_type"] == "time_block":
+                _queue_v2_assert_time_available(
+                    conn, ticket["requester_email"], ticket["scheduled_date"],
+                    int(ticket["scheduled_start_minutes"]), int(ticket["duration_minutes"]), exclude_ticket_id=ticket_id,
+                )
+            elif clean_action == "approve" and ticket["ticket_type"] == "pp_revision":
+                queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
+                if not queue_row or queue_row["status"] not in {"scheduled", "in_progress"}:
+                    raise HTTPException(status_code=409, detail="The Queue request can no longer receive a PP revision.")
+                queue_item = dict(queue_row)
+                previous_production_points = int(queue_item["production_points"])
+                new_points = int(ticket["requested_production_points"])
+                conn.execute("UPDATE queue_requests SET production_points = ?, updated_at = ? WHERE id = ?", (new_points, now, ticket["request_id"]))
+                _queue_v2_log(conn, ticket["request_id"], caller, "pp_revision_approved", {"from": queue_item["production_points"], "to": new_points})
+                queue_change_event = "pp_revision_approved"
+                if queue_item.get("designer_email"):
+                    _queue_v2_reflow_scheduled(conn, queue_item["designer_email"], caller, ticket["request_id"])
+                    _queue_v2_reflow_drafts(conn, queue_item["designer_email"])
+                affected_ids.add(int(ticket["request_id"]))
+            elif clean_action == "approve" and ticket["ticket_type"] == "cancellation":
+                queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
+                if not queue_row or queue_row["status"] not in {"scheduled", "in_progress", "completed"}:
+                    raise HTTPException(status_code=409, detail="The Queue request can no longer be cancelled.")
+                conn.execute("DELETE FROM queue_schedule_drafts WHERE request_id = ?", (ticket["request_id"],))
+                conn.execute(
+                    "UPDATE queue_requests SET status = 'cancelled', cancellation_reason = ?, updated_at = ? WHERE id = ?",
+                    (ticket["reason"], now, ticket["request_id"]),
+                )
+                _queue_v2_log(conn, ticket["request_id"], caller, "cancellation_approved", {"reason": ticket["reason"]})
+                queue_change_event = "cancellation_approved"
+                affected_ids.add(int(ticket["request_id"]))
+            elif clean_action == "approve" and ticket["ticket_type"] == "trainee_review":
+                queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
+                if not queue_row or queue_row["status"] != "completed":
+                    raise HTTPException(status_code=409, detail="The Queue request is no longer ready for trainee review.")
+                _queue_v2_log(conn, ticket["request_id"], caller, "trainee_review_approved", {"canvaLink": ticket.get("reason") or ""})
+                queue_change_event = "trainee_review_approved"
+                affected_ids.add(int(ticket["request_id"]))
+            if ticket.get("request_id") and clean_action == "reject":
+                _queue_v2_log(conn, ticket["request_id"], caller, f"{ticket['ticket_type']}_rejected", {"reviewNote": (review_note or "").strip()})
+                queue_change_event = "move_rejected" if ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "move" else f"{ticket['ticket_type']}_rejected"
+                affected_ids.add(int(ticket["request_id"]))
             conn.execute(
-                "UPDATE queue_requests SET status = 'cancelled', cancellation_reason = ?, updated_at = ? WHERE id = ?",
-                (ticket["reason"], now, ticket["request_id"]),
+                """UPDATE queue_tickets SET status = ?, reviewer_email = ?, review_note = ?, reviewed_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (new_status, caller, (review_note or "").strip()[:500], now, now, ticket_id),
             )
-            _queue_v2_log(conn, ticket["request_id"], caller, "cancellation_approved", {"reason": ticket["reason"]})
-            queue_change_event = "cancellation_approved"
-            affected_ids.add(int(ticket["request_id"]))
-        elif clean_action == "approve" and ticket["ticket_type"] == "trainee_review":
-            queue_row = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (ticket["request_id"],)).fetchone()
-            if not queue_row or queue_row["status"] != "completed":
-                raise HTTPException(status_code=409, detail="The Queue request is no longer ready for trainee review.")
-            _queue_v2_log(conn, ticket["request_id"], caller, "trainee_review_approved", {"canvaLink": ticket.get("reason") or ""})
-            queue_change_event = "trainee_review_approved"
-            affected_ids.add(int(ticket["request_id"]))
-        if ticket.get("request_id") and clean_action == "reject":
-            _queue_v2_log(conn, ticket["request_id"], caller, f"{ticket['ticket_type']}_rejected", {"reviewNote": (review_note or "").strip()})
-            queue_change_event = "move_rejected" if ticket["ticket_type"] == "time_block" and ticket.get("block_category") == "move" else f"{ticket['ticket_type']}_rejected"
-            affected_ids.add(int(ticket["request_id"]))
-        conn.execute(
-            """UPDATE queue_tickets SET status = ?, reviewer_email = ?, review_note = ?, reviewed_at = ?, updated_at = ?
-               WHERE id = ?""",
-            (new_status, caller, (review_note or "").strip()[:500], now, now, ticket_id),
-        )
-        _queue_v2_publish(conn, "ticket_reviewed", caller, affected_ids)
-        reviewed = dict(conn.execute(
-            """SELECT t.*, r.post_account, r.post_shortcode, r.designer_email,
-                      r.status AS request_status, r.production_points AS current_production_points
-               FROM queue_tickets t LEFT JOIN queue_requests r ON r.id = t.request_id WHERE t.id = ?""",
-            (ticket_id,),
-        ).fetchone())
-        # A few isolated Queue migration databases predate the optional
-        # metadata columns. Enrich the production response when available but
-        # keep ticket approval compatible with those older schemas/tests.
-        if reviewed.get("request_id"):
-            try:
-                extra = conn.execute(
-                    "SELECT priority, tags, scheduled_date, scheduled_start_minutes FROM queue_requests WHERE id = ?",
-                    (reviewed["request_id"],),
-                ).fetchone()
-            except Exception:
-                extra = None
-            if extra:
-                reviewed.update(dict(extra))
+            _queue_v2_publish(conn, "ticket_reviewed", caller, affected_ids)
+            reviewed = dict(conn.execute(
+                """SELECT t.*, r.post_account, r.post_shortcode, r.designer_email,
+                          r.status AS request_status, r.production_points AS current_production_points
+                   FROM queue_tickets t LEFT JOIN queue_requests r ON r.id = t.request_id WHERE t.id = ?""",
+                (ticket_id,),
+            ).fetchone())
+            # A few isolated Queue migration databases predate the optional
+            # metadata columns. Enrich the production response when available but
+            # keep ticket approval compatible with those older schemas/tests.
+            if reviewed.get("request_id"):
+                try:
+                    extra = conn.execute(
+                        "SELECT priority, tags, scheduled_date, scheduled_start_minutes FROM queue_requests WHERE id = ?",
+                        (reviewed["request_id"],),
+                    ).fetchone()
+                except Exception:
+                    extra = None
+                if extra:
+                    reviewed.update(dict(extra))
+        pending_ticket_count = int(conn.execute("SELECT COUNT(*) AS c FROM queue_tickets WHERE status = 'pending'").fetchone()["c"])
+    if replay is not None:
+        replay["pendingTicketCount"] = pending_ticket_count
+        replay["request"] = _queue_v2_project(replay["request"]) if replay["request"] else None
+        return replay
     if _notify_slack and queue_change_event and reviewed.get("request_id"):
         requested_points = reviewed.get("requested_production_points")
         current_points = reviewed.get("current_production_points")
@@ -6973,7 +7055,7 @@ def dashboard_queue_v2_review_ticket(
             reason=(ticket.get("reason") or review_note or "").strip(),
             scheduled_date=reviewed.get("scheduled_date"), scheduled_start_minutes=reviewed.get("scheduled_start_minutes"),
         )
-    return {"ok": True, "ticket": _queue_v2_ticket(reviewed)}
+    return {"ok": True, "ticket": _queue_v2_ticket(reviewed), "request": _queue_v2_project(approved_request) if approved_request else None, "pendingTicketCount": pending_ticket_count}
 
 
 @app.post("/api/dashboard/queue/v2/requests/{request_id}/start")
