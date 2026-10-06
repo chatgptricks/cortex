@@ -58,12 +58,12 @@ def test_scheduler_uses_requested_45_minute_window():
     assert scheduler._bucket_key(datetime(2026, 9, 5, 6, 14, tzinfo=cst)) == "2026-09-05T06:00"
 
 
-def test_scheduler_refreshes_first_eight_hour_engagement_every_three_hours():
+def test_scheduler_checks_budgeted_engagement_every_hour():
     from datetime import datetime, timedelta, timezone
 
     cst = timezone(timedelta(hours=-6))
     assert scheduler._engagement_bucket_key(datetime(2026, 9, 5, 0, 1, tzinfo=cst)) == "2026-09-05T00:00"
-    assert scheduler._engagement_bucket_key(datetime(2026, 9, 5, 5, 59, tzinfo=cst)) == "2026-09-05T03:00"
+    assert scheduler._engagement_bucket_key(datetime(2026, 9, 5, 5, 59, tzinfo=cst)) == "2026-09-05T05:00"
     assert scheduler._engagement_bucket_key(datetime(2026, 9, 5, 21, 0, tzinfo=cst)) == "2026-09-05T21:00"
 
 

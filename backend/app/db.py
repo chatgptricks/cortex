@@ -1076,6 +1076,9 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     account_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
     }
+    from .engagement_refresh import initialize as initialize_engagement
+    initialize_engagement(conn)
+
     if {"handle", "is_canonical"}.issubset(account_columns):
         conn.execute(
             "UPDATE accounts "

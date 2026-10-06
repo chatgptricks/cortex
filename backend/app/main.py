@@ -1536,6 +1536,8 @@ def _dashboard_catalogue_page(
                 "transcriptAvailable": bool(str(post.get("transcript") or "").strip()),
             })
 
+    from .engagement_refresh import attach_freshness
+    attach_freshness(posts)
     _annotate_dashboard_queue(posts, decoration["queue_by_source"], decoration["queue_by_final"])
     stack_by_post = decoration["stack_by_post"]
     stack_sizes = decoration["stack_sizes"]
@@ -1816,6 +1818,8 @@ def _dashboard_posts_payload() -> dict[str, Any]:
     # Posts with an unknown like count are null now, so they're excluded from
     # both the total and the average -- averaging them in as 0 would drag the
     # figure down with data we simply don't have.
+    from .engagement_refresh import attach_freshness
+    attach_freshness(posts)
     known_likes = [post["likes"] for post in posts if post["likes"] is not None]
     total_likes = sum(known_likes)
     return {
@@ -9825,3 +9829,9 @@ app.include_router(hooks_router)
 # Hosted agent access shares the API process and its authentication boundary.
 from .product_mcp import install as install_product_mcp
 install_product_mcp(app)
+
+
+@app.get("/api/admin/engagement/status")
+def engagement_refresh_status() -> dict[str, Any]:
+    from .engagement_refresh import status
+    return status()

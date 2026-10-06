@@ -936,6 +936,8 @@ def _run_apify_actor_and_fetch(
     on_progress: ProgressFn = None,
     actor_id: str = APIFY_ACTOR_ID,
     on_page: DatasetPageFn = None,
+    run_limits: dict[str, Any] | None = None,
+    accept_partial: bool = False,
 ) -> list[dict[str, Any]]:
     """Starts the actor run and polls for completion with short, separate
     requests instead of holding one long-lived connection open for the
@@ -970,6 +972,8 @@ def _run_apify_actor_and_fetch(
             on_page(saved["items"])
             return []
         return saved["items"]
+    run_limits = saved.setdefault("limits", run_limits or {})
+    accept_partial = saved.setdefault("accept_partial", accept_partial)
     actor_id = saved.get("actor", actor_id)
     payload = saved.get("payload", payload)
     _emit(on_progress, phase="starting_apify_run")
@@ -1010,7 +1014,7 @@ def _run_apify_actor_and_fetch(
             journal.save()
         try:
             with httpx.Client(timeout=30.0) as client:
-                start_response = client.post(start_url, params={"token": token}, json=payload)
+                start_response = client.post(start_url, params={"token": token, **run_limits}, json=payload)
                 start_response.raise_for_status()
                 run = start_response.json().get("data", {})
         except httpx.HTTPError as exc:
@@ -1056,7 +1060,12 @@ def _run_apify_actor_and_fetch(
             elapsed_seconds=round(time.monotonic() - poll_started_at),
         )
 
-    if status != "SUCCEEDED":
+    if accept_partial and status in {"FAILED", "ABORTED", "TIMED-OUT"} and not dataset_id:
+        saved["items"] = []
+        if journal:
+            journal.save()
+        return []
+    if status != "SUCCEEDED" and not (accept_partial and status in {"FAILED", "ABORTED", "TIMED-OUT"} and dataset_id):
         if journal and status in {"FAILED", "ABORTED", "TIMED-OUT"}:
             saved.pop("run", None)
             saved.pop("starting_at", None)
@@ -1676,6 +1685,7 @@ def _process_short_term_items(
     insert_new: bool = True,
     refresh_window_hours: float | None = None,
     finalize_after_hours: float | None = None,
+    hot_check_window_hours: float | None = None,
 ) -> dict[str, Any]:
     """Shared per-account logic: insert brand-new posts from `items`, then
     refresh likes/comments (and do the one-time HOT check) on every existing
@@ -1728,6 +1738,7 @@ def _process_short_term_items(
             finalize_after_hours is not None
             and age_hours >= finalize_after_hours
             and not bool(row["refreshed_8h"])
+            and age_hours <= 24
         )
         if refresh_window_hours is not None and age_hours > refresh_window_hours and not finalize_8h:
             continue
@@ -1770,6 +1781,7 @@ def _process_short_term_items(
         if (
             not info["hot_checked"]
             and info["age_hours"] >= _HOT_MIN_AGE_HOURS
+            and (hot_check_window_hours is None or info["age_hours"] <= hot_check_window_hours)
             and _likes_are_known(item.get("likesCount"))
         ):
             # The rate is always likes / real elapsed hours, so the check is
@@ -1820,6 +1832,8 @@ def _process_short_term_items(
         params.append(info["id"])
         with connect() as conn:
             conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE id = ?", params)
+            from .engagement_refresh import observe
+            observe(conn, shortcode, item, now_iso)
         engagement_summary["updated"] += 1
 
     if pending_alerts:
@@ -2322,6 +2336,8 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
         params.append(info["id"])
         with connect() as conn:
             conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE id = ?", params)
+            from .engagement_refresh import observe
+            observe(conn, shortcode, item, now_iso)
         summary["updated"] += 1
 
     return summary
@@ -2615,7 +2631,10 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
     # made the client wait until its proxy timed out and then incorrectly hid
     # a perfectly live post. Prefer the documented detail shape and retain the
     # old request only as a narrow compatibility fallback.
-    items = _fetch_apify_items(
+    from .engagement_refresh import cached, observe
+    shared = cached(clean)
+    observed_at = shared[1] if shared else utc_now()
+    items = [shared[0]] if shared else _fetch_apify_items(
         {"directUrls": [url], "resultsType": "details"},
         timeout=80.0,
     )
@@ -2679,6 +2698,7 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
 
     with connect() as conn:
         conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE {where}", [*params, *where_params])
+        observe(conn, clean, item, observed_at)
 
     before = dict(row)
     return {
@@ -2690,6 +2710,8 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
         "comments_before": before.get("comments"),
         "deleted": False,
         "cover_refreshed": cover_refreshed,
+        "likesUpdatedAt": observed_at,
+        "cached": bool(shared),
     }
 
 

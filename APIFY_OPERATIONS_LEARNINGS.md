@@ -275,3 +275,24 @@ También: liberar los reclamos si el lote falla, para que las filas no queden tr
 - Validación: tests de límites 8h/11h, cuentas vacías, selección congelada,
   reintentos tras pago, redelivery de resultados, caché tras reinicios,
   expiración, tipos MIME y orden de carruseles. Ningún test inicia scrapes.
+
+## 14. Engagement adaptativo con presupuesto (2026-10-06)
+
+- El worker revisa cada hora los posts vencidos: <8h objetivo 1h; 8–24h objetivo
+  3h; HOT/Queue activos de hasta 7 días objetivo 3h. Las frecuencias son objetivos
+  sujetos al presupuesto, no garantías para todas las cuentas.
+- Conserva `scheduled-day-engagement` cada 3h para no reducir la cobertura de las
+  primeras 8h; el nuevo ciclo mejora frescura con un gasto adicional acotado.
+  Discovery y el ciclo diario se conservan.
+- Consulta URLs únicas, aplica el resultado a sus cuentas y guarda el payload completo
+  en `engagement_observations`. Discovery, el ciclo diario y Reload Counts alimentan
+  esa caché compartida; Reload Counts reutiliza lecturas de menos de 15 minutos.
+- Reserva en DB ANTES de iniciar Apify, congela la selección y usa
+  `maxTotalChargeUsd` en la API. Default $0.50/día CST y hasta 250 URLs/día,
+  reservando $0.003 por URL; distribuye las reservas por hora para no agotar el día
+  temprano. Las reservas no se reembolsan tras un fallo/reinicio.
+- Un run terminado parcialmente se recupera del mismo dataset, sin relanzarlo.
+  El snapshot de las 8h se completa una sola vez hasta 24h, nunca con likes desconocidos;
+  los refrescos posteriores modifican los conteos actuales, no ese snapshot.
+- `/api/admin/engagement/status` muestra presupuesto reservado, lecturas y resultado
+  del worker con su commit. El tope solo cubre este ciclo, no la factura total de Apify.

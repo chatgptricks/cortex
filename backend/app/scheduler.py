@@ -34,7 +34,7 @@ _SHORT_START_MINUTES = 6 * 60 + 15
 _SHORT_END_MINUTES = 24 * 60
 _SHORT_INTERVAL_MINUTES = 45
 _DISCOVERY_OVERLAP_MINUTES = 5
-_DAY_ENGAGEMENT_INTERVAL_HOURS = 3
+_DAY_ENGAGEMENT_INTERVAL_HOURS = 1
 
 _started = False
 _lock = threading.Lock()
@@ -112,7 +112,7 @@ def _bucket_key(now_cst: datetime) -> str:
 
 
 def _engagement_bucket_key(now_cst: datetime) -> str:
-    """Three-hour CST slot used by the rolling first-eight-hours refresh."""
+    """Hourly CST slot for budgeted post-metric refresh."""
     slot_hour = (now_cst.hour // _DAY_ENGAGEMENT_INTERVAL_HOURS) * _DAY_ENGAGEMENT_INTERVAL_HOURS
     return f"{now_cst:%Y-%m-%d}T{slot_hour:02d}:00"
 
@@ -216,22 +216,24 @@ def _run_short_term_jobs() -> None:
     logger.info("Short-term engagement cycle: %s", results)
 
 
-def _run_day_engagement_jobs() -> None:
-    from .apify_sync import ApifySyncError, run_day_engagement_cycle_batch
+def _run_day_engagement_jobs() -> dict:
+    from .engagement_refresh import run_cycle
+    results = run_cycle(_active_account_handles())
+    logger.info("Adaptive engagement cycle: %s", results)
+    return results
 
+
+def _run_baseline_engagement_jobs() -> dict:
+    # Preserve first-eight-hours coverage when the extra freshness budget is exhausted.
+    from .apify_sync import ApifySyncError, run_day_engagement_cycle_batch
     accounts = _active_account_handles()
-    if not accounts:
-        logger.warning("Eight-hour engagement cycle skipped: no active accounts")
-        return
     results = run_day_engagement_cycle_batch(accounts)
     failures = {account: result for account, result in results.items() if result.get("error")}
     if failures and len(failures) == len(results):
         raise ApifySyncError(str(failures))
     if failures:
-        # Engagement counts refresh again on the next pass; one account must
-        # not hold every other account's counts back.
         _alert_partial_failure("Eight-hour engagement refresh", failures, len(results))
-    logger.info("Eight-hour engagement cycle: %s", results)
+    return results
 
 
 def _run_daily_jobs() -> None:
@@ -352,7 +354,7 @@ _jobs_lock = threading.Lock()
 # Past a ceiling the worker alerts the DEVs and exits so Render restarts it;
 # the ingestion journal then resumes any already-paid Apify run instead of
 # paying for it again. The daily pass is excluded: it legitimately runs long.
-_JOB_TIME_LIMITS = {"short": 30 * 60, "day-engagement": 90 * 60}
+_JOB_TIME_LIMITS = {"short": 30 * 60, "day-engagement": 90 * 60, "adaptive-engagement": 20 * 60}
 _STUCK_ALERT_KEY = "stuck_job_alert"
 
 
@@ -454,11 +456,18 @@ def _tick() -> None:
     ocr_slot = str(int(time.time()) // 60)
     _launch("ocr", lambda: run("scheduled-ocr", ocr_slot, _run_ocr_job))
 
-    engagement_bucket = _engagement_bucket_key(now_cst)
+    baseline_hour = (now_cst.hour // 3) * 3
+    baseline_bucket = f"{now_cst:%Y-%m-%d}T{baseline_hour:02d}:00"
     _launch(
         "day-engagement",
-        lambda: run("scheduled-day-engagement", engagement_bucket, _run_day_engagement_jobs,
+        lambda: run("scheduled-day-engagement", baseline_bucket, _run_baseline_engagement_jobs,
                     max_attempts=_SCHEDULED_MAX_ATTEMPTS),
+    )
+    engagement_bucket = _engagement_bucket_key(now_cst)
+    _launch(
+        "adaptive-engagement",
+        lambda: run("scheduled-engagement-adaptive", engagement_bucket, _run_day_engagement_jobs,
+                    retain_result=True, max_attempts=_SCHEDULED_MAX_ATTEMPTS),
     )
 
     daily_trigger = now_cst.replace(hour=_DAILY_JOB_AT[0], minute=_DAILY_JOB_AT[1], second=0, microsecond=0)
