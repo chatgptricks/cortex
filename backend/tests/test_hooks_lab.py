@@ -70,14 +70,14 @@ def client(tmp_path, monkeypatch):
     return test_client, connection
 
 
-def test_every_post_yields_caption_and_clean_ocr_without_mutating_sources(client):
+def test_only_ocr_is_indexed_without_mutating_sources(client):
     test_client, connection = client
     payload = test_client.get("/api/dashboard/hooks?q=prompts&mode=words").json()
-    assert payload["status"]["total"] == 4
-    assert payload["status"]["captions"] == 2
+    assert payload["status"]["total"] == 2
+    assert payload["status"]["captions"] == 0
     assert payload["status"]["ocr"] == 2
-    assert {item["source_kind"] for item in payload["results"]} == {"caption", "ocr"}
-    assert any(item["hook_text"] == "These 5 ChatGPT prompts save me hours every week." for item in payload["results"])
+    assert {item["source_kind"] for item in payload["results"]} == {"ocr"}
+    assert all("These 5 ChatGPT" not in item["contextExcerpt"] for item in payload["results"])
     assert any(item["hook_text"] == "CHATGPT PROMPTS" for item in payload["results"])
     with connection() as conn:
         source = conn.execute("SELECT caption, hook_text FROM posts WHERE id = 1").fetchone()
@@ -101,17 +101,17 @@ def test_ivan_can_use_hooks_without_dev_permissions(client):
 
 def test_future_posts_are_added_on_next_read(client):
     test_client, connection = client
-    assert test_client.get("/api/dashboard/hooks").json()["status"]["total"] == 4
+    assert test_client.get("/api/dashboard/hooks").json()["status"]["total"] == 2
     with connection() as conn:
         conn.execute(
             """INSERT INTO dashboard_posts VALUES (
-                3, 'future', 'A future hook arrives automatically. More copy.', '',
+                3, 'future', 'Caption must not be used.', 'A future OCR hook arrives automatically.',
                 '2026-10-01T10:00:00Z', 9000, 'new', 'https://instagram.com/p/new', '2026-10-01T11:00:00Z'
             )"""
         )
     payload = test_client.get("/api/dashboard/hooks?q=future&mode=words").json()
-    assert payload["status"]["total"] == 5
-    assert payload["results"][0]["hook_text"] == "A future hook arrives automatically."
+    assert payload["status"]["total"] == 3
+    assert payload["results"][0]["hook_text"] == "A future OCR hook arrives automatically."
 
 
 def test_context_search_falls_back_with_warning(client, monkeypatch):
@@ -255,8 +255,8 @@ def test_local_bridge_verifies_dev_and_indexes_live_catalogue(client, monkeypatc
     first = test_client.get("/api/dashboard/hooks", headers=headers).json()
     second = test_client.get("/api/dashboard/hooks", headers=headers).json()
 
-    assert first["status"]["total"] == 2
-    assert {item["source_kind"] for item in first["results"]} == {"caption", "ocr"}
+    assert first["status"]["total"] == 1
+    assert {item["source_kind"] for item in first["results"]} == {"ocr"}
     assert first["sync"]["remote"] == 1
     assert second["sync"]["not_modified"] == 1
     assert any(url.endswith("/api/dashboard/me") for url, _ in calls)
@@ -278,7 +278,7 @@ def test_jev_categorization_is_multilabel(client, monkeypatch):
 
     monkeypatch.setattr(hooks_lab, "ask_jev", answer)
     result = test_client.post("/api/dashboard/hooks/categorize?limit=4").json()
-    assert result["processed"] == 4
+    assert result["processed"] == 2
     with connection() as conn:
         row = conn.execute("SELECT primary_topic, categories_json FROM hook_sources LIMIT 1").fetchone()
         assert row["primary_topic"] == "ai_tools"
@@ -388,3 +388,38 @@ def test_ocr_fragments_rank_below_complete_hooks(monkeypatch):
     ]
     results, _, _ = _search(monkeypatch, rows, "prompts", mode="words")
     assert results[0]["id"] == "hook"
+
+
+def test_postgres_schema_initializes_once_in_committed_transaction(monkeypatch):
+    from contextlib import contextmanager
+    events = []
+    class Connection:
+        is_postgres = True
+    @contextmanager
+    def connection():
+        events.append("begin")
+        yield Connection()
+        events.append("commit")
+    monkeypatch.setattr(hooks_lab, "_POSTGRES_SCHEMA_READY", False)
+    monkeypatch.setattr(hooks_lab, "connect", connection)
+    monkeypatch.setattr(hooks_lab, "_create_schema", lambda conn: events.append("ddl"))
+    hooks_lab.ensure_schema(Connection())
+    hooks_lab.ensure_schema(Connection())
+    assert events == ["begin", "ddl", "commit"]
+
+
+def test_legacy_caption_sources_are_hidden_and_not_used_for_generation(client):
+    test_client, connection = client
+    test_client.get("/api/dashboard/hooks")
+    with connection() as conn:
+        conn.execute("""INSERT INTO hook_sources SELECT
+            'legacy-caption', source_table, 999, 'caption', account, shortcode,
+            permalink, published_at, likes, 'CAPTION_SECRET', 'CAPTION_SECRET',
+            'CAPTION_SECRET', content_hash, primary_topic, categories_json,
+            category_scores_json, category_model_version, categorized_at,
+            created_at, updated_at, ' caption_secret '
+            FROM hook_sources LIMIT 1""")
+    result = test_client.get("/api/dashboard/hooks?q=CAPTION_SECRET&mode=words").json()
+    assert result["results"] == []
+    assert result["status"]["captions"] == 0
+    assert hooks_lab._load_hook_ids(["legacy-caption"]) == []

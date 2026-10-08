@@ -112,7 +112,26 @@ def require_dev(request: Request) -> None:
     request.state.queue_role_preview_active = False
 
 
+_SCHEMA_LOCK = threading.Lock()
+_POSTGRES_SCHEMA_READY = False
+
+
 def ensure_schema(conn: Any) -> None:
+    # Repeating DDL while the index writer holds a transaction blocks reads
+    # on PostgreSQL. Initialize once in its own committed transaction.
+    global _POSTGRES_SCHEMA_READY
+    if not getattr(conn, "is_postgres", False):
+        _create_schema(conn)
+        return
+    with _SCHEMA_LOCK:
+        if _POSTGRES_SCHEMA_READY:
+            return
+        with connect() as schema_conn:
+            _create_schema(schema_conn)
+        _POSTGRES_SCHEMA_READY = True
+
+
+def _create_schema(conn: Any) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS hook_sources (
             id TEXT PRIMARY KEY,
@@ -263,13 +282,13 @@ def _source_rows(conn: Any, since: dict[str, Any] | None = None) -> list[dict[st
     for table, query in (
         (
             "posts",
-            """SELECT id, caption, hook_text, published_at, likes, shortcode,
+            """SELECT id, hook_text, published_at, likes, shortcode,
                       source_ref AS permalink, title, updated_at
                FROM posts ORDER BY id""",
         ),
         (
             "dashboard_posts",
-            """SELECT id, account, caption, hook_text, published_at, likes, shortcode,
+            """SELECT id, account, hook_text, published_at, likes, shortcode,
                       permalink, '' AS title, updated_at
                FROM dashboard_posts ORDER BY id""",
         ),
@@ -329,7 +348,7 @@ def _index_source_rows(conn: Any, source_rows: list[dict[str, Any]], *, full: bo
     content_updates: list[tuple] = []
     metadata_updates: list[tuple] = []
     for row in source_rows:
-        for kind, field in (("caption", "caption"), ("ocr", "hook_text")):
+        for kind, field in (("ocr", "hook_text"),):
             raw = str(row.get(field) or "").strip()
             context, hook = extract_hook(raw, kind)
             if not hook:
@@ -677,7 +696,8 @@ _HOOK_SELECT = """SELECT h.id, h.source_table, h.source_id, h.source_kind, h.acc
                       h.primary_topic, h.categories_json, h.category_scores_json, h.categorized_at,
                       h.search_text, CASE WHEN s.hook_id IS NULL THEN 0 ELSE 1 END AS saved
                FROM hook_sources h
-               LEFT JOIN hook_saves s ON s.hook_id = h.id AND s.owner_email = ?"""
+               LEFT JOIN hook_saves s ON s.hook_id = h.id AND s.owner_email = ?
+               WHERE h.source_kind = 'ocr'"""
 
 
 def _all_hooks(owner_email: str, terms: list[str] | None = None) -> list[dict[str, Any]]:
@@ -694,7 +714,7 @@ def _all_hooks(owner_email: str, terms: list[str] | None = None) -> list[dict[st
             clauses.append("h.search_text LIKE ?")
             # Short words must be whole words; longer ones may be a word prefix.
             params.append(f"% {stem} %" if len(stem) < 4 else f"% {stem}%")
-        where = " WHERE h.search_text IS NULL OR " + " OR ".join(clauses)
+        where = " AND (h.search_text IS NULL OR " + " OR ".join(clauses) + ")"
     with connect() as conn:
         ensure_schema(conn)
         rows = conn.execute(_HOOK_SELECT + where, (owner_email, *params)).fetchall()
@@ -858,7 +878,7 @@ def categorize_pending(limit: int = 6) -> dict[str, Any]:
             ensure_schema(conn)
             pending = [dict(row) for row in conn.execute(
                 """SELECT id, hook_text, context_text FROM hook_sources
-                   WHERE categorized_at IS NULL ORDER BY COALESCE(likes, -1) DESC, id LIMIT ?""",
+                   WHERE source_kind = 'ocr' AND categorized_at IS NULL ORDER BY COALESCE(likes, -1) DESC, id LIMIT ?""",
                 (max(1, min(limit, 12)),),
             ).fetchall()]
         if not pending:
@@ -927,7 +947,7 @@ def _status(owner_email: str) -> dict[str, Any]:
                       SUM(CASE WHEN categorized_at IS NOT NULL THEN 1 ELSE 0 END) AS categorized,
                       MAX(COALESCE(likes, 0)) AS max_likes,
                       AVG(CASE WHEN likes IS NOT NULL THEN likes END) AS avg_likes
-               FROM hook_sources"""
+               FROM hook_sources WHERE source_kind = 'ocr'"""
         ).fetchone()
         drafts = conn.execute("SELECT COUNT(*) AS total FROM hook_drafts WHERE owner_email = ?", (owner_email,)).fetchone()
     value = dict(counts or {})
@@ -1100,7 +1120,7 @@ def _load_hook_ids(ids: list[str]) -> list[dict[str, Any]]:
         ensure_schema(conn)
         rows = []
         for hook_id in ids[:20]:
-            row = conn.execute("SELECT * FROM hook_sources WHERE id = ?", (hook_id,)).fetchone()
+            row = conn.execute("SELECT * FROM hook_sources WHERE id = ? AND source_kind = 'ocr'", (hook_id,)).fetchone()
             if row:
                 rows.append(_row_dict(row))
     return rows
