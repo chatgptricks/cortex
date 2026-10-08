@@ -250,6 +250,7 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     # News is a DEV tool by default. Ivan has a deliberately narrow exception
     # so he can use News and its Jev review without receiving the broader Dev
     # capabilities checked by request.state.is_dev elsewhere.
+    request.state.can_access_hooks = request.state.is_dev or email == "user05@example.com"
     request.state.can_access_news = request.state.is_dev or email == "user05@example.com"
     request.state.can_role_switch = request.state.is_dev or email == "user05@example.com"
     preview_role = request.headers.get("x-queue-role-preview", "").strip().lower()
@@ -537,6 +538,7 @@ def dashboard_me(request: Request) -> dict[str, Any]:
         "operating_role": getattr(request.state, "operating_role", "sales"),
         "operating_roles": getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]),
         "is_dev": bool(getattr(request.state, "is_dev", False)),
+        "can_access_hooks": bool(getattr(request.state, "can_access_hooks", False)),
         "can_access_news": bool(getattr(request.state, "can_access_news", False)),
         "queue_role_preview_active": bool(getattr(request.state, "queue_role_preview_active", False)),
         # This is intentionally narrower than coordinator access: it only
