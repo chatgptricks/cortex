@@ -91,10 +91,10 @@ def test_only_full_dev_access(client, headers):
     assert test_client.get("/api/dashboard/hooks", headers=headers).status_code == 403
 
 
-def test_ivan_can_use_hooks_without_dev_permissions(client):
+def test_ivan_cannot_use_hooks_without_dev_permissions(client):
     test_client, _ = client
     headers = {"x-role": "admin", "x-user": "user05@example.com"}
-    assert test_client.get("/api/dashboard/hooks", headers=headers).status_code == 200
+    assert test_client.get("/api/dashboard/hooks", headers=headers).status_code == 403
     assert test_client.get("/api/dashboard/hooks", headers={**headers, "x-preview": "1"}).status_code == 403
     assert test_client.get("/api/dashboard/hooks", headers={**headers, "x-user": "other@example.com"}).status_code == 403
 
