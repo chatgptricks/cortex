@@ -42,6 +42,13 @@ repo root.
 - `/api/tracker/*` — daily follower snapshots, calendar-day growth deltas,
   per-account/batch refresh.
 - `/api/insights/*` — aggregate stats for `insights.html`.
+- `GET /api/admin/accounts/{handle}/media-kit` and `media-kit.pdf` — fresh
+  account media-kit data and a downloadable PDF for Admin/Dev Settings.
+  Includes all stored performance metrics with known sample sizes,
+  follower history/growth, publishing breakdowns, and historical/recent
+  top posts. Both read existing data on every call, use private no-store
+  responses, and never initiate a scrape. Historical totals describe the
+  saved sample, and missing/hidden measurements remain unavailable.
 - `/api/auth/custom-token` — mints a short-lived Firebase custom token so
   the several Sentient Dash subdomains/pages can share one signed-in
   session.

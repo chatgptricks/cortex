@@ -96,6 +96,7 @@ from .jev_features import (
 from .hooks_lab import router as hooks_router
 from .tracker_refresh_queue import enqueue as enqueue_tracker_refresh, get as get_tracker_refresh
 from .tracker_refresh_queue import last_requested_at as last_tracker_refresh_request
+from .account_media_kit import build_account_media_kit
 from .queue_rules import (
     SCHEDULER_BUFFER_MINUTES,
     SCHEDULER_END,
@@ -294,7 +295,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["ETag"],
+    expose_headers=["ETag", "Content-Disposition"],
 )
 
 # Research responses contain repeated field names and account metadata across
@@ -8374,6 +8375,47 @@ def admin_list_accounts() -> dict[str, Any]:
         account["oldest_post_at"] = stat["oldest_post_at"] if stat else None
 
     return {"accounts": accounts}
+
+
+@app.get("/api/admin/accounts/{handle}/media-kit")
+def admin_account_media_kit(handle: str) -> Response:
+    """Read the current stored account metrics; never start a paid scrape."""
+    return JSONResponse(
+        build_account_media_kit(handle),
+        headers={"Cache-Control": "private, no-store", "Vary": "Authorization"},
+    )
+
+
+@app.get("/api/admin/accounts/{handle}/media-kit.pdf")
+def admin_account_media_kit_pdf(handle: str) -> Response:
+    """Generate a fresh sales report from stored metrics on every click."""
+    from .account_media_kit import build_account_media_kit
+    from .media_kit_pdf import render_media_kit_pdf
+
+    report = build_account_media_kit(handle)
+    try:
+        from .media_kit_assets import prepare_media_kit_assets
+
+        try:
+            prepare_media_kit_assets(report)
+        except Exception:
+            logging.getLogger(__name__).warning("Media kit images unavailable; generating the metrics report", exc_info=True)
+        pdf = render_media_kit_pdf(report)
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Media kit rendering failed for %s", report["account"]["handle"])
+        raise HTTPException(status_code=500, detail="Could not generate the PDF media kit. Please try again.") from exc
+    report_date = datetime.fromisoformat(report["generated_at"]).astimezone(ZoneInfo("America/Costa_Rica")).date().isoformat()
+    filename = f'{report["account"]["handle"]}-media-kit-{report_date}.pdf'
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "private, no-store, max-age=0",
+            "Vary": "Authorization, X-Queue-Role-Preview",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/api/admin/promos")
