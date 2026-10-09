@@ -525,7 +525,7 @@ def _top(posts: list[dict[str, Any]], key: str = "engagements", limit: int = 6) 
     return [{**post, "caption": post["caption"][:500], "hook_text": post["hook_text"][:240], "rank_metric": key, "rank_value": value(post)} for post in ranked[:limit]]
 
 
-def build_account_media_kit(handle: str, *, now: datetime | None = None) -> dict[str, Any]:
+def build_account_media_kit(handle: str, *, now: datetime | None = None, strict_public_exclusions: bool = False) -> dict[str, Any]:
     """Read an account's current stored data on every invocation."""
     clean = handle.strip().lstrip("@").lower()
     current = now or datetime.now(UTC)
@@ -547,6 +547,12 @@ def build_account_media_kit(handle: str, *, now: datetime | None = None) -> dict
                 batch = codes[start:start + 200]
                 data = conn.execute(f"SELECT shortcode, observed_at, raw_json FROM engagement_observations WHERE shortcode IN ({','.join('?' for _ in batch)})", batch).fetchall()
                 observations.update({row["shortcode"]: dict(row) for row in data})
+    # Website exports conservatively honor a privacy/deletion flag on any
+    # stored copy. A newer unflagged metrics copy must not republish a post
+    # hidden in the canonical table. Internal historical report behavior
+    # stays unchanged unless the external caller explicitly opts in.
+    excluded_public_codes = {str(row.get("shortcode") or "").strip() for row in rows
+                             if strict_public_exclusions and (_bool(row.get("hidden")) or _bool(row.get("is_deleted")))}
     posts, duplicates = _normalize_posts(rows, observations, clean)
     valid = [(post, _date(post["published_at"])) for post in posts]
     dated = [(post, date) for post, date in valid if date and date <= current]
@@ -599,7 +605,7 @@ def build_account_media_kit(handle: str, *, now: datetime | None = None) -> dict
     # hidden/deleted content, future posts, or a private account's posts.
     public_posts = [] if account["private"] else [post for post, date in dated
         if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", post.get("shortcode") or "")
-        and not post["hidden"] and not post["is_deleted"]]
+        and not post["hidden"] and not post["is_deleted"] and post["shortcode"] not in excluded_public_codes]
     public_catalog = [metric for metric in catalog if metric["key"] in ("likes", "comments", "video_views", "video_plays")]
     public_recent = [post for post in public_posts if _date(post["published_at"]) >= current - timedelta(days=30)]
     public_summary = {

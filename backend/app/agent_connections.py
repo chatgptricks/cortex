@@ -107,7 +107,7 @@ def authenticate(key: str, path: str, method: str) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM agent_connections WHERE key_hash = ? AND revoked_at IS NULL AND expires_at > ?", (hashlib.sha256(key.encode()).hexdigest(), now)).fetchone()
         if not row:
             raise HTTPException(401, "Invalid or expired agent connection.")
-        if (not path.startswith("/api/") and path not in {"/mcp", "/mcp/"}) or path == URL or path.startswith(URL + "/") or path.startswith(("/api/auth/", "/api/slack/")):
+        if (not path.startswith("/api/") and path not in {"/mcp", "/mcp/"}) or path == URL or path.startswith(URL + "/") or path == "/api/dashboard/me/api-keys" or path.startswith(("/api/auth/", "/api/slack/", "/api/dashboard/me/api-keys/", "/api/v1/")):
             raise HTTPException(403, "Agent connections cannot access login or credential management.")
         if row["access_mode"] == "read" and path not in {"/mcp", "/mcp/"} and method not in {"GET", "HEAD", "OPTIONS"}:
             raise HTTPException(403, "This agent connection has read-only access.")

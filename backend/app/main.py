@@ -120,6 +120,10 @@ app.include_router(user_preferences_router)
 from .agent_connections import router as agent_connections_router
 from .agent_connections import authenticate as authenticate_agent_connection
 app.include_router(agent_connections_router)
+from .external_api import router as website_api_router, management_router as website_api_management_router
+from .external_api import authenticate as authenticate_website_api_key, MANAGEMENT_URL as WEBSITE_API_MANAGEMENT_URL
+app.include_router(website_api_router)
+app.include_router(website_api_management_router)
 
 DEFAULT_PERSON_OPTIONS = [
     "Elon Musk",
@@ -189,27 +193,46 @@ _FIREBASE_OPEN_PATHS = {"/api/health", "/", "/docs", "/openapi.json", "/redoc", 
 
 @app.middleware("http")
 async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped-def]
-    if FIREBASE_APP is None and not (request.headers.get("authorization") or "").startswith("Bearer sad_agent_"):
+    from fastapi.responses import JSONResponse
+
+    path = request.url.path
+    header = request.headers.get("authorization") or ""
+    token = header[len("Bearer ") :].strip() if header.startswith("Bearer ") else ""
+    website_path = path == "/api/v1" or path.startswith("/api/v1/")
+    key_management = path == WEBSITE_API_MANAGEMENT_URL or path.startswith(WEBSITE_API_MANAGEMENT_URL + "/")
+    # Website credentials are handled before every local-dev and public-asset
+    # exception. They never inherit access to internal routes or MCP, even
+    # when the owner is an administrator and Firebase is not configured.
+    if token.startswith("sad_api_") or website_path:
+        try:
+            if not token.startswith("sad_api_"):
+                raise HTTPException(401, "A website API key is required.")
+            request.state.website_api_key = await run_in_threadpool(authenticate_website_api_key, token, path, request.method)
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
+                                headers={"Cache-Control": "private, no-store", "Vary": "Authorization", **(exc.headers or {})})
+        return await call_next(request)
+    if FIREBASE_APP is None and not token.startswith("sad_agent_") and not key_management:
         # No credentials configured (e.g. local dev without the secret
         # file) -- stay open rather than lock everyone out.
         return await call_next(request)
-    path = request.url.path
     if request.method == "OPTIONS" or path in _FIREBASE_OPEN_PATHS or path.startswith(_FIREBASE_OPEN_PREFIXES):
         return await call_next(request)
-
-    from fastapi.responses import JSONResponse
-
-    header = request.headers.get("authorization") or ""
+    if key_management and token.startswith("sad_agent_"):
+        return JSONResponse({"detail": "Use your signed-in browser to manage website API keys."}, status_code=403,
+                            headers={"Cache-Control": "no-store"})
     if not header.startswith("Bearer "):
         return JSONResponse({"detail": "Sign in required."}, status_code=401)
-    token = header[len("Bearer ") :].strip()
     try:
         if token.startswith("sad_agent_"):
             decoded = await run_in_threadpool(authenticate_agent_connection, token, path, request.method)
             request.state.agent_connection_id = decoded["agent_connection_id"]
             request.state.agent_access_mode = decoded["agent_access_mode"]
         else:
+            if key_management and FIREBASE_APP is None:
+                raise HTTPException(503, "Firebase authentication is not configured.")
             decoded = await run_in_threadpool(firebase_auth.verify_id_token, token)
+            request.state.auth_method = "firebase"
     except HTTPException as exc:
         return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
     except Exception:

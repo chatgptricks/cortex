@@ -1038,6 +1038,8 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     _ensure_ocr_queue_schema(conn)
     from .agent_connections import ensure_schema as ensure_agent_connections_schema
     ensure_agent_connections_schema(conn)
+    from .external_api import ensure_schema as ensure_website_api_schema
+    ensure_website_api_schema(conn)
     from .vault import ensure_schema as ensure_vault_schema
     ensure_vault_schema(conn)
     from .golden_nuggets import ensure_schema as ensure_golden_nugget_schema

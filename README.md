@@ -104,3 +104,41 @@ middleware. Full-access codes expose action tools with `confirm=true`;
 read-only codes hide those tools and reject direct mutation calls.
 Browser Origin requests and unexpected Host headers are rejected.
 Custom hostnames require `SENTIENT_MCP_ALLOWED_HOSTS`. OAuth is not advertised.
+
+## Website data API
+
+Admin/Dev users issue account-scoped, read-only website keys at Sentient
+Dash `/api.html`. Management uses a Firebase browser session:
+`GET/POST /api/dashboard/me/api-keys` and
+`DELETE /api/dashboard/me/api-keys/{key_id}`. Secrets are returned once,
+stored only as SHA-256 hashes, expire after 30/90/365 days, and can be revoked.
+Each owner can have 20 active keys and select up to 100 active accounts per key.
+
+Website requests require `Authorization: Bearer sad_api_…` and can read only:
+
+- `GET /api/v1/accounts`
+- `GET /api/v1/accounts/{handle}`
+- `GET /api/v1/accounts/{handle}/media-kit`
+- `GET /api/v1/accounts/{handle}/posts`
+- `GET /api/v1/accounts/{handle}/followers/history`
+
+The owner's current allowlist/Admin/Dev access, selected account scope, and
+account activity are checked on every request. Keys cannot access internal
+dashboard routes, create credentials, perform writes, or connect to MCP.
+The persistent atomic rate limit is 60 calls per minute per key; excess calls
+return 429 with `Retry-After`. Responses use private no-store caching.
+
+Responses declare `schema_version: "1.0"`. Media kit/profile responses
+distinguish `generated_at` from `data_updated_at.profile` and `.engagement`.
+Posts/history accept `limit` (1–100), `offset` (non-negative), and optional
+inclusive Costa Rica calendar dates `from`/`to`. Posts are newest first;
+history is oldest first with the final valid follower sample for each day.
+Pagination includes total, has_more, and next_offset. Missing readings remain
+null; insufficient recent coverage omits last_30_days. Public projections
+exclude hidden/deleted/private posts, internal labels, contacts and model data.
+Reads never start a scrape or refresh.
+
+The [Spanish integration guide](https://sentientdash.app/api-guide.html)
+includes a downloadable Node website proxy example, private environment
+variables, five-minute website caching, field mapping, and error handling.
+Regression coverage lives in `backend/tests/test_external_api.py`.

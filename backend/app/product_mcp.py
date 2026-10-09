@@ -42,7 +42,7 @@ def resolve(value: Any, spec: dict, seen: frozenset = frozenset()) -> Any:
 def catalogue(spec: dict) -> dict[str, dict]:
     tools = {}
     for path, item in spec.get("paths", {}).items():
-        if not path.startswith("/api/") or path.startswith("/api/dashboard/me/agent-connections") or EXCLUDED.search(path):
+        if not path.startswith("/api/") or path.startswith(("/api/dashboard/me/agent-connections", "/api/dashboard/me/api-keys", "/api/v1/")) or EXCLUDED.search(path):
             continue
         for method in ("get", "post", "put", "patch", "delete"):
             op = item.get(method)
