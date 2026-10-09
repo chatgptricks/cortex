@@ -46,6 +46,9 @@ repo root.
   account media-kit data and a downloadable PDF for Admin/Dev Settings.
   The two-page PDF is a client-shareable sales overview with public profile,
   audience size, selected public performance highlights, and standout posts.
+  Its editorial layout pairs an audience headline with a public profile card,
+  concise performance summaries, and image-led content examples. Prices and
+  commercial packages are excluded.
   A strict public-data projection excludes internal labels, model signals,
   tracking counters, contact details, and granular appendices before rendering.
   Values use at most two decimals and the generating user's selected theme

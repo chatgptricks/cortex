@@ -27,6 +27,7 @@ from reportlab.pdfgen import canvas
 _FONT_DIR = Path(reportlab.__file__).parent / "fonts"
 pdfmetrics.registerFont(TTFont("MediaKit", str(_FONT_DIR / "Vera.ttf")))
 pdfmetrics.registerFont(TTFont("MediaKitBold", str(_FONT_DIR / "VeraBd.ttf")))
+pdfmetrics.registerFont(TTFont("MediaKitDisplay", str(Path(__file__).parent / "assets" / "fonts" / "Anton-Regular.ttf")))
 _GLYPHS = pdfmetrics.getFont("MediaKit").face.charToGlyph
 
 DEFAULT_ACCENT = "#00A991"
@@ -71,8 +72,8 @@ def _make_palette(theme: str, accent: str) -> _Palette:
     dark = theme == "dark"
     accent = accent.upper() if isinstance(accent, str) and re.fullmatch(r"#[0-9A-Fa-f]{6}", accent) else DEFAULT_ACCENT
     palette = {
-        "background": "#0D1723" if dark else "#F7F9FC",
-        "card": "#172638" if dark else "#FFFFFF",
+        "background": "#080F17" if dark else "#F8FAFC",
+        "card": "#102033" if dark else "#FFFFFF",
         "title": "#F0F5FA" if dark else "#11233B",
         "ink": "#DAE5EF" if dark else "#233751",
         "muted": "#A4B6C9" if dark else "#65758A",
@@ -293,6 +294,7 @@ class _Report:
     def image(self, raw: Any, x: float, y: float, width: float, height: float) -> bool:
         if not isinstance(raw, (bytes, bytearray)) or not raw:
             return False
+
         try:
             source = ImageReader(io.BytesIO(raw))
             source.getSize()
@@ -303,6 +305,15 @@ class _Report:
             # prevent users from downloading the measured report.
             return False
 
+    def avatar(self, raw: Any, x: float, y: float, size: float) -> bool:
+        self.c.saveState()
+        clipping = self.c.beginPath()
+        clipping.circle(x + size / 2, y + size / 2, size / 2)
+        self.c.clipPath(clipping, stroke=0, fill=0)
+        drawn = self.image(raw, x, y, size, size)
+        self.c.restoreState()
+        return drawn
+
     def page(self, title: str, subtitle: str) -> None:
         if self.page_number:
             self.pages.append(dict(self.c.__dict__))
@@ -310,9 +321,10 @@ class _Report:
         self.page_number += 1
         self.c.setFillColor(self.p.background)
         self.c.rect(0, 0, W, H, fill=1, stroke=0)
-        self.rect(MARGIN, H - 49, 18, 18, self.p.accent, radius=5)
-        self.text(MARGIN + 5, H - 43, "S", 10, self.p.accent_ink, bold=True)
-        self.text(MARGIN + 27, H - 42, "SENTIENT", 10, self.p.title, bold=True)
+        self.rect(MARGIN, H - 56, 27, 27, self.p.accent_soft, radius=14)
+        if not self.avatar(self.account.get("avatar_bytes"), MARGIN + 2, H - 54, 23):
+            self.icon("people", MARGIN + 5, H - 50, 17)
+        self.text(MARGIN + 36, H - 42, f"@{self.handle}", 10, self.p.title, bold=True)
         self.text(W - MARGIN, H - 42, "MEDIA KIT", 8, self.p.muted, align="right")
         self.text(MARGIN, H - 91, title, 23, self.p.title, bold=True, width=CW)
         self.paragraph(MARGIN, H - 109, subtitle, CW, 8.2, max_lines=2)
@@ -372,68 +384,107 @@ class _Report:
                 return kind
         return "posts"
 
-    def cards(self, items: list[tuple[str, Any, str, str]], y: float, columns: int = 3,
-              height: float = 79, style: str = "average") -> float:
-        gap = 10
-        width = (CW - (columns - 1) * gap) / columns
-        for index, (label, value, unit, detail) in enumerate(items):
-            col, row = index % columns, index // columns
-            x, top = MARGIN + col * (width + gap), y - row * (height + gap)
-            self.rect(x, top - height, width, height)
-            if style == "total":
-                self.icon(self.metric_icon(label), x + 13, top - 44, 26)
-                self.text(x + 50, top - 20, label.upper(), 7.2, self.p.muted, bold=True, width=width - 62)
-                self.text(x + 50, top - 46, _fmt(value, unit, compact=True), 20, self.p.title, bold=True, width=width - 62)
-                self.text(x + 50, top - 61, detail, 6.4, self.p.muted, width=width - 62)
-            else:
-                self.icon(self.metric_icon(label), x + 12, top - 28, 18 if style == "recent" else 21)
-                self.text(x + 38, top - 23, label.upper(), 6.7 if style == "recent" else 7.1,
-                          self.p.muted, bold=True, width=width - 50)
-                self.text(x + 12, top - 51, _fmt(value, unit, compact=True), 19 if style == "recent" else 23,
-                          self.p.title, bold=True, width=width - 24)
-                self.text(x + 12, top - 69, detail, 6.1 if style == "recent" else 6.4,
-                          self.p.muted, width=width - 24)
-        return y - math.ceil(len(items) / columns) * (height + gap)
+    def display(self, x: float, y: float, value: Any, size: float = 35,
+                color: Any = None, width: float | None = None) -> None:
+        """A bundled condensed display face gives headings editorial hierarchy."""
+        value = _text(value)
+        if width:
+            size = min(size, size * width / max(pdfmetrics.stringWidth(value, "MediaKitDisplay", size), 1))
+        self.c.setFillColor(self.p.title if color is None else color)
+        self.c.setFont("MediaKitDisplay", size)
+        self.c.drawString(x, y, value)
 
-    def note(self, text: Any, y: float, height: float = 47) -> float:
-        self.rect(MARGIN, y - height, CW, height, self.p.accent_soft)
-        self.paragraph(MARGIN + 12, y - 16, text, CW - 24, 7.5, self.p.ink, max_lines=4)
-        return y - height - 14
+    def rule(self, x: float, y: float, width: float, color: Any = None) -> None:
+        self.c.setStrokeColor(self.p.line if color is None else color)
+        self.c.setLineWidth(0.6)
+        self.c.line(x, y, x + width, y)
+
+    def editorial_page(self, section: str) -> None:
+        self.page("", "")
+        self.text(MARGIN + 36, H - 57, "INSTAGRAM", 6.5, self.p.muted)
+        self.text(W - MARGIN, H - 57, section.upper(), 7, self.p.accent_text, bold=True, align="right")
+        self.rule(MARGIN, H - 73, CW)
+
+    def strip(self, items: list[tuple[str, Any, str, str]], top: float,
+              height: float = 86, number_size: float = 29) -> float:
+        """Open metrics separated by thin rules, rather than identical tiles."""
+        if not items:
+            return top
+        width = CW / len(items)
+        self.rule(MARGIN, top, CW)
+        self.rule(MARGIN, top - height, CW)
+        for index, (label, value, unit, detail) in enumerate(items):
+            x = MARGIN + index * width
+            if index:
+                self.c.setStrokeColor(self.p.line)
+                self.c.line(x, top, x, top - height)
+            self.icon(self.metric_icon(label), x + 11, top - 27, 13)
+            self.text(x + 31, top - 22, label.upper(), 6.5, self.p.muted, bold=True, width=width - 41)
+            number_y = top - (59 if height > 75 else 53 if detail else 49)
+            self.display(x + 11, number_y,
+                         _fmt(value, unit, compact=True), number_size, self.p.title, width - 22)
+            if detail:
+                self.text(x + 11, top - height + 11, detail, 6, self.p.muted, width=width - 22)
+        return top - height
+
+    def profile_card(self, x: float, top: float, width: float, height: float) -> None:
+        self.rect(x, top - height, width, height, radius=12)
+        self.rect(x + 17, top - 86, 65, 65, self.p.accent_soft, radius=33)
+        if not self.avatar(self.account.get("avatar_bytes"), x + 20, top - 83, 59):
+            self.icon("people", x + 37, top - 66, 26)
+        self.text(x + 94, top - 44, "INSTAGRAM", 6.5, self.p.accent_text, bold=True)
+        if self.account.get("verified") is True:
+            self.text(x + 94, top - 60, "Verified profile", 7.2, self.p.muted)
+        self.text(x + 17, top - 109, f"@{self.handle}", 8.2, self.p.muted, width=width - 34)
+        name = self.account.get("public_name") or f"@{self.handle}"
+        # Names are public identity, not teaser copy. Fit all lines without an
+        # ellipsis, including long names and names with one unbroken word.
+        size = 13
+        while len(self.lines(name, width - 34, size, bold=True)) * size * 1.3 > 71 and size > 6:
+            size -= 0.5
+        bottom = self.paragraph(x + 17, top - 132, name, width - 34,
+                                size, self.p.title, leading=size * 1.3, bold=True)
+        posts = self.account.get("profile_posts")
+        if _number(posts) is not None:
+            self.icon("posts", x + 17, bottom - 20, 12)
+            self.text(x + 35, bottom - 16, f"{_fmt(posts, compact=True)} profile posts", 7.2, self.p.muted)
+        url = _instagram_profile(self.handle)
+        if url:
+            self.rect(x + 17, top - height + 17, width - 34, 27, self.p.accent, radius=6)
+            self.icon("posts", x + 28, top - height + 23, 13, self.p.accent_ink)
+            self.text(x + 49, top - height + 27, "VIEW PUBLIC PROFILE", 6.8, self.p.accent_ink, bold=True)
+            self.c.linkURL(url, (x, top - height, x + width, top), relative=0)
 
     def overview(self) -> None:
-        self.page("Audience & performance", "Public audience and content highlights for brand partnerships.")
-        top = self.y + 2
-        self.rect(MARGIN, top - 156, CW, 156, self.p.hero, radius=12)
-        avatar = self.image(self.account.get("avatar_bytes"), MARGIN + 20, top - 85, 59, 59)
-        hero_x = MARGIN + (95 if avatar else 20)
-        hero_width = CW - (263 if avatar else 188)
-        name = self.account.get("public_name") or f"@{self.handle}"
-        self.text(hero_x, top - 38, name, 21.5, self.p.hero_ink, bold=True, width=hero_width)
-        profile_line = f"@{self.handle} / Instagram" if self.account.get("public_name") != f"@{self.handle}" else "Instagram"
-        self.text(hero_x, top - 62, profile_line, 9.5, self.p.hero_muted, width=hero_width)
-        if _number(self.account.get("followers")) is not None:
-            audience_x = MARGIN + CW - 147
-            self.icon("people", audience_x, top - 40, 21, self.p.hero_muted)
-            self.text(audience_x + 30, top - 32, "FOLLOWERS", 7.5, self.p.hero_muted, bold=True)
-            self.text(audience_x, top - 82, _fmt(self.account["followers"], compact=True), 34,
-                      self.p.hero_ink, bold=True, width=129)
-        bio = self.account.get("public_bio")
-        if bio:
-            self.paragraph(MARGIN + 20, top - 108, bio, CW - 40, 8.2,
-                           self.p.hero_body, max_lines=2, leading=12)
+        self.editorial_page("Audience & performance")
+        hero_top = H - 112
+        profile_width = 191
+        headline_width = CW - profile_width - 25
+        profile_x = W - MARGIN - profile_width
+        self.text(MARGIN, hero_top + 3, "THE AUDIENCE", 7.5, self.p.accent_text, bold=True)
+        followers = _number(self.account.get("followers"))
+        if followers is not None:
+            self.display(MARGIN, hero_top - 73, _fmt(followers, compact=True), 77, width=headline_width)
+            self.display(MARGIN, hero_top - 121, "FOLLOWERS.", 38, width=headline_width)
         else:
-            self.text(MARGIN + 20, top - 110, "Explore the public profile and selected content highlights.",
-                      8.2, self.p.hero_body, width=CW - 40)
-        profile_url = _instagram_profile(self.handle)
-        if profile_url:
-            self.c.linkURL(profile_url, (MARGIN, top - 156, W - MARGIN, top), relative=0)
+            self.display(MARGIN, hero_top - 63, "IN THE", 49, width=headline_width)
+            self.display(MARGIN, hero_top - 121, "PUBLIC EYE.", 42, width=headline_width)
+        self.display(MARGIN, hero_top - 168, "CONTENT THAT", 32, width=headline_width)
+        self.display(MARGIN, hero_top - 209, "CONNECTS.", 36, self.p.accent_text, headline_width)
+        self.profile_card(profile_x, hero_top + 12, profile_width, 275)
+        bio = self.account.get("public_bio")
+        introduction = bio or "Explore the public profile, content performance and standout posts from this Instagram account."
+        self.paragraph(MARGIN, hero_top - 238, introduction, headline_width, 8.2,
+                       self.p.muted, max_lines=3, leading=12)
+        audience_y = 433
         growth = ((self.report.get("follower_growth") or {}).get("30d") or {}).get("pct")
         if _number(growth) is not None:
-            value = _fmt(growth, "percent")
+            change = _fmt(growth, "percent")
             if _number(growth) > 0:
-                value = "+" + value
-            self.text(MARGIN + 20, top - 141, f"{value} audience change / last 30 days",
-                      8, self.p.hero_muted, width=CW - 40)
+                change = "+" + change
+            self.text(MARGIN, audience_y, f"{change} audience change / last 30 days", 8.4, self.p.accent_text, bold=True)
+        elif followers is not None:
+            self.text(MARGIN, audience_y, f"{_fmt(followers)} followers on Instagram", 8.4, self.p.accent_text, bold=True)
         video_key = "video_views" if _number(_stat(self.all_time, "video_views", "average")) is not None else "video_plays"
         video_label = "video views" if video_key == "video_views" else "video plays"
         average_candidates = [
@@ -441,103 +492,118 @@ class _Report:
             ("Average comments", _stat(self.all_time, "comments", "average"), "count", "Per public post"),
             (f"Average {video_label}", _stat(self.all_time, video_key, "average"), "count", "Per video with public counts"),
         ]
-        total_candidates = [
-            ("Total likes", _stat(self.all_time, "likes"), "count", "Analyzed public posts"),
-            (f"Total {video_label}", _stat(self.all_time, video_key), "count", "Analyzed public videos"),
-        ]
         averages = [item for item in average_candidates if _number(item[1]) is not None]
+        self.display(MARGIN, 398, "CONTENT PERFORMANCE", 23)
+        y = self.strip(averages, 380, number_size=31)
+        if not averages:
+            self.paragraph(MARGIN, 367, "Public performance highlights are not available yet.", CW, 10)
+            y = 294
+        total_candidates = [
+            ("Total likes", _stat(self.all_time, "likes"), "count", "Across analyzed public posts"),
+            (f"Total {video_label}", _stat(self.all_time, video_key), "count", "Across analyzed public videos"),
+        ]
         totals = [item for item in total_candidates if _number(item[1]) is not None]
-        y = self.section("Typical content performance", top - 180)
-        if averages:
-            y = self.cards(averages, y, columns=len(averages), height=83 if self.recent_available else 92)
         if totals:
-            y = self.cards(totals, y + 1, columns=len(totals), height=72 if self.recent_available else 84, style="total")
-        if not averages and not totals:
-            y = self.paragraph(MARGIN, y - 15, "Public performance highlights are not available yet.",
-                               CW, 10, self.p.muted) - 40
+            y = self.strip(totals, y - 15, height=75, number_size=23)
         if self.recent_available:
-            y = self.section("Posts published in the last 30 days", y - 8)
+            self.text(MARGIN, 189, "Posts published in the last 30 days", 11, self.p.title, bold=True)
             recent_video = "video_views" if _number(_stat(self.recent, "video_views")) is not None else "video_plays"
             recent_candidates = [
-                ("Public posts", self.recent.get("post_count"), "count", "Published in this period"),
-                ("Likes", _stat(self.recent, "likes"), "count", "Across those posts"),
-                ("Comments", _stat(self.recent, "comments"), "count", "Across those posts"),
-                ("Video views" if recent_video == "video_views" else "Video plays", _stat(self.recent, recent_video), "count", "Across those videos"),
+                ("Public posts", self.recent.get("post_count"), "count", ""),
+                ("Likes", _stat(self.recent, "likes"), "count", ""),
+                ("Comments", _stat(self.recent, "comments"), "count", ""),
+                ("Video views" if recent_video == "video_views" else "Video plays", _stat(self.recent, recent_video), "count", ""),
             ]
             recent_items = [item for item in recent_candidates if _number(item[1]) is not None]
-            if recent_items:
-                y = self.cards(recent_items, y, columns=len(recent_items), height=79, style="recent")
+            self.strip(recent_items, 174, height=57, number_size=22)
             note = "Historical highlights summarize analyzed public posts. Recent figures cover posts published in the last 30 days and their current cumulative public counts. Video views and plays are separate measures; neither represents unique reach."
         else:
+            self.text(MARGIN, 178, "A PUBLIC LOOK AT THE ACCOUNT", 7.3, self.p.accent_text, bold=True)
+            self.paragraph(MARGIN, 161, "See the next page for selected posts and the public activity they generated.",
+                           CW, 9, self.p.muted, max_lines=2)
             note = "Historical highlights summarize analyzed public posts and their current cumulative public counts. Video views and plays are separate measures; neither represents unique reach."
-        self.note(note, min(y - 18, 173 if self.recent_available else 253), height=63)
+        self.paragraph(MARGIN, 94, note, CW, 6.7, self.p.muted, max_lines=3, leading=9.4)
 
-    def post_card(self, post: dict[str, Any] | None, x: float, y: float, width: float, rank: int,
-                  empty_message: str = "Public post highlights are not available for this period.") -> None:
-        wide = width > CW * 0.75
-        self.rect(x, y - (168 if wide else 155), width, 168 if wide else 155)
-        if not post:
-            self.paragraph(x + 15, y - 42, empty_message,
-                           width - 30, 9, self.p.muted, max_lines=3)
-            return
-        self.text(x + 12, y - 18, f"{rank:02}", 8.5, self.p.accent_text, bold=True)
+    def portrait_post(self, post: dict[str, Any], x: float, top: float, width: float,
+                      rank: int, height: float, *, compact: bool = False) -> None:
+        self.rect(x, top - height, width, height, radius=9)
+        self.text(x + 10, top - 17, f"{rank:02}", 8.5, self.p.accent_text, bold=True)
         format_name = post.get("format") if post.get("format") in ("Carousel", "Image", "Reel", "Video", "Post") else "Post"
-        self.text(x + width - 12, y - 18, f"{_date(post.get('published_at'))} / {format_name}",
-                  6.9, self.p.muted, width=width - 50, align="right")
-        caption = post.get("public_caption") or "View this public post"
-        image_size = 108 if wide else 82
-        has_image = self.image(post.get("thumbnail_bytes"), x + 12, y - (135 if wide else 107), image_size, image_size)
-        content_x = x + (140 if has_image and wide else 107 if has_image else 12)
-        self.paragraph(content_x, y - 43, caption,
-                       width - (content_x - x) - 12, 10.3 if wide else 8.3, self.p.title,
-                       max_lines=4 if wide else 5 if has_image else 4, leading=14 if wide else 11.5, bold=True)
+        format_label = f"{_date(post['published_at'])} / {format_name}" if compact and post.get("published_at") else format_name.upper()
+        self.text(x + width - 10, top - 17, format_label, 5.8 if compact else 6.2,
+                  self.p.muted, width=width - 40, align="right")
+        image_height = 133 if compact else 254
+        image_top = top - 29
+        self.rect(x + 9, image_top - image_height, width - 18, image_height, self.p.alternate, radius=4)
+        if not self.image(post.get("thumbnail_bytes"), x + 9, image_top - image_height, width - 18, image_height):
+            self.icon("play" if format_name in ("Video", "Reel") else "posts",
+                      x + width / 2 - 19, image_top - image_height / 2 - 19, 38, self.p.muted)
+            self.text(x + width / 2, image_top - image_height / 2 - 41,
+                      "VIEW ON INSTAGRAM", 5.8, self.p.muted, align="center")
         metrics = post.get("metrics") or {}
-        def badges(keys: tuple[str, str], at: float) -> None:
-            offset = x + (140 if wide and has_image else 12)
-            for key in keys:
-                value = _number(metrics.get(key))
-                if value is None:
-                    continue
-                label = {"likes": "likes", "comments": "comments", "video_views": "views", "video_plays": "plays"}[key]
-                rendered = f"{_fmt(value, compact=True)} {label}"
-                self.icon(self.metric_icon(label), offset, at - 3, 13 if wide else 11)
-                self.text(offset + 17 if wide else offset + 15, at, rendered, 8.3 if wide else 7, self.p.muted)
-                offset += 25 + pdfmetrics.stringWidth(rendered, "MediaKit", 8.3 if wide else 7)
-        badges(("likes", "comments"), y - (113 if wide else 122))
-        badges(("video_views", "video_plays"), y - (130 if wide else 135))
+        primary = next((key for key in ("video_views", "video_plays", "likes", "comments")
+                        if _number(metrics.get(key)) is not None), None)
+        primary_y = image_top - image_height - (25 if compact else 31)
+        labels = {"likes": "likes", "comments": "comments", "video_views": "views", "video_plays": "plays"}
+        if primary:
+            self.display(x + 10, primary_y, _fmt(metrics[primary], compact=True),
+                         27 if compact else 33, self.p.accent_text, width - 20)
+            self.text(x + width - 10, primary_y + 2, labels[primary].upper(), 6.2,
+                      self.p.muted, align="right")
+        secondary = [key for key in ("likes", "comments", "video_views", "video_plays")
+                     if key != primary and _number(metrics.get(key)) is not None]
+        metric_y = primary_y - (18 if compact else 22)
+        cell_width = (width - 20) / max(len(secondary), 1)
+        for index, key in enumerate(secondary):
+            at = x + 10 + index * cell_width
+            self.icon(self.metric_icon(labels[key]), at, metric_y - 1, 10)
+            self.text(at + 13, metric_y + 1, _fmt(metrics[key], compact=True), 7.2,
+                      self.p.ink, bold=True, width=cell_width - 15)
+            self.text(at + 13, metric_y - 9, labels[key], 5.8, self.p.muted, width=cell_width - 15)
+        caption_y = metric_y - (19 if compact else 27)
+        self.paragraph(x + 10, caption_y, post.get("public_caption") or "View this public post",
+                       width - 20, 7.3 if compact else 8.5, self.p.ink,
+                       max_lines=2 if compact else 7, leading=10 if compact else 12)
+        if not compact:
+            self.text(x + 10, top - height + 42, _date(post.get("published_at")), 6.5, self.p.muted)
         url = _instagram_post(post.get("permalink"))
         if url:
-            self.link(x + (140 if wide and has_image else 12), y - (153 if wide else 146), "VIEW PUBLIC POST", url, size=7.5 if wide else 6.9)
+            self.link(x + 10, top - height + 16, "VIEW PUBLIC POST", url, size=6.4 if compact else 6.8)
 
     def strongest_posts(self) -> None:
-        self.page("Content that connects", "Selected public posts that showcase the account's content and engagement.")
+        self.editorial_page("Content examples")
+        self.text(MARGIN, H - 111, "CONTENT EXAMPLES", 7.5, self.p.accent_text, bold=True)
+        self.display(MARGIN, H - 157, "CONTENT THAT CONNECTS.", 35, width=CW)
+        introduction = "Selected public posts, their measured activity and a direct link to explore each one on Instagram."
+        if self.recent_available:
+            introduction += " Displayed public counts are cumulative since publication."
+        self.paragraph(MARGIN, H - 180, introduction,
+                       CW, 8.2, self.p.muted, max_lines=2, leading=12)
         groups = self.report.get("best_posts") or {}
         historical = (groups.get("all_time") or [])[:3]
+        recent = (groups.get("last_30_days") or [])[:3] if self.recent_available else []
+        width = (CW - 24) / 3
         if not self.recent_available:
-            self.text(MARGIN, self.y, "HISTORICAL HIGHLIGHTS", 8, self.p.accent_text, bold=True)
-            y = self.y - 15
-            for index in range(max(len(historical), 1)):
-                self.post_card(historical[index] if index < len(historical) else None, MARGIN, y, CW, index + 1)
-                y -= 181
-            self.note("Highlights are selected by public likes and comments. Displayed public counts include cumulative activity since publication.",
-                      min(y - 5, 170), height=49)
-            return
-        recent = (groups.get("last_30_days") or [])[:3]
-        width = (CW - 13) / 2
-        self.text(MARGIN, self.y, "HISTORICAL HIGHLIGHTS", 8, self.p.accent_text, bold=True)
-        self.text(MARGIN + width + 13, self.y, "PUBLISHED IN THE LAST 30 DAYS", 7.6, self.p.accent_text, bold=True)
-        y = self.y - 15
-        rows = max(len(historical), len(recent), 1)
-        for index in range(rows):
-            for posts, x in ((historical, MARGIN), (recent, MARGIN + width + 13)):
-                if index < len(posts):
-                    self.post_card(posts[index], x, y, width, index + 1)
-                elif index == 0:
+            self.text(MARGIN, 626, "HISTORICAL HIGHLIGHTS", 7.4, self.p.accent_text, bold=True)
+            for index, post in enumerate(historical):
+                self.portrait_post(post, MARGIN + index * (width + 12), 609, width, index + 1, 501)
+            if not historical:
+                self.paragraph(MARGIN, 570, "Public post highlights are not available for this period.", CW, 10)
+            note = "Highlights are selected by public likes and comments. Displayed public counts include cumulative activity since publication."
+        else:
+            top = 626
+            for posts, title in ((historical, "HISTORICAL HIGHLIGHTS"), (recent, "PUBLISHED IN THE LAST 30 DAYS")):
+                self.text(MARGIN, top, title, 7.4, self.p.accent_text, bold=True)
+                for index, post in enumerate(posts):
+                    self.portrait_post(post, MARGIN + index * (width + 12), top - 13,
+                                       width, index + 1, 263, compact=True)
+                if not posts:
                     message = "No public posts were published in this period." if posts is recent and self.recent.get("post_count") == 0 else "Public post highlights are not available for this period."
-                    self.post_card(None, x, y, width, index + 1, empty_message=message)
-            y -= 168
-        self.note("Highlights are selected by public likes and comments. Recent posts were published in the last 30 days; displayed counts include activity since publication.",
-                  min(y - 5, 170), height=49)
+                    self.paragraph(MARGIN, top - 42, message, CW, 9)
+                top -= 288
+            note = "Highlights are selected by public likes and comments. Recent posts were published in the last 30 days; displayed counts include activity since publication."
+        if not self.recent_available:
+            self.paragraph(MARGIN, 85, note, CW, 6.7, self.p.muted, max_lines=2, leading=9.4)
 
     def finish(self) -> bytes:
         self.pages.append(dict(self.c.__dict__))
@@ -548,7 +614,7 @@ class _Report:
             self.c.setLineWidth(0.6)
             self.c.line(MARGIN, 51, W - MARGIN, 51)
             prepared = f" / Prepared {_date(self.report['generated_at'])}" if self.report.get("generated_at") else ""
-            self.text(MARGIN, 33, f"@{self.handle}{prepared}", 6.5, self.p.muted, width=CW - 90)
+            self.text(MARGIN, 33, f"@{self.handle}{prepared} / Sentient", 6.5, self.p.muted, width=CW - 90)
             self.text(W - MARGIN, 33, f"{index:02} / {total:02}", 6.5, self.p.muted, align="right")
             self.c.showPage()
         self.c.save()

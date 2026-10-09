@@ -25,8 +25,28 @@ def test_thumbnail_limits_request_resizes_and_closes_body():
     assert requests[0]["Range"] == "bytes=0-4194303"
     assert body.closed
     with Image.open(io.BytesIO(output)) as thumbnail:
-        assert thumbnail.size == (320, 320)
+        assert thumbnail.size == (400, 200)
         assert thumbnail.format == "JPEG"
+
+
+def test_portrait_creative_preserves_top_and_bottom_in_bounded_thumbnail():
+    original = Image.new("RGB", (1080, 1920), "teal")
+    original.paste("red", (0, 0, 1080, 240))
+    original.paste("blue", (0, 1680, 1080, 1920))
+    payload = io.BytesIO()
+    original.save(payload, format="PNG")
+
+    class Client:
+        def get_object(self, **kwargs):
+            return {"Body": io.BytesIO(payload.getvalue())}
+
+    output = assets._thumbnail(Client(), "r2://uploads/portrait.png")
+    with Image.open(io.BytesIO(output)) as thumbnail:
+        assert thumbnail.size == (360, 640)
+        red = thumbnail.getpixel((180, 20))
+        blue = thumbnail.getpixel((180, 620))
+        assert red[0] > 240 and red[2] < 15
+        assert blue[2] > 240 and blue[0] < 15
 
 
 def test_untrusted_references_never_fetch_and_broken_images_are_optional():

@@ -56,6 +56,7 @@ def test_public_report_is_two_pages_with_links_known_zero_and_no_private_facts()
     assert len(reader.pages) == 2
     assert "Sample Studio" in text
     assert "A useful creative example" in text
+    assert "08 Oct 2026 / Reel" in text
     assert "Posts published in the last 30 days" in text
     assert "current cumulative public counts" in " ".join(text.split())
     assert "Average comments".upper() in text
@@ -80,7 +81,8 @@ def test_owned_images_embed_in_public_profile_and_post_cards_and_bad_images_fall
     report["best_posts"]["all_time"][0]["thumbnail_bytes"] = image.getvalue()
     reader = PdfReader(io.BytesIO(render_media_kit_pdf(report)))
     assert len(reader.pages[0].images) == 1
-    assert len(reader.pages[1].images) == 1
+    assert len(reader.pages[1].images) == 1  # Reused bytes are embedded once.
+    assert sum(operator == b"Do" for _, operator in reader.pages[1].get_contents().operations) == 3  # Header and both cohorts.
     report["account"]["avatar_bytes"] = b"not an image"
     assert render_media_kit_pdf(report).startswith(b"%PDF-")
 
@@ -100,6 +102,8 @@ def test_private_metadata_never_enters_pdf_and_public_highlights_are_capped_at_t
         "subcategory": "SECRET_ROUTE", "name": "SECRET_REGISTRY_NAME", "email": "private-email@secret.test",
         "phone": "PRIVATE_PHONE_VALUE", "bio": "SECRET_BIO_PRIVATE", "id": "SECRET_ACCOUNT_ID",
         "demographics": {"audience": "SECRET_DEMOGRAPHICS"},
+        "pricing": {"reel": "SECRET_COMMERCIAL_RATE"}, "packages": ["SECRET_PREMIUM_PACKAGE"],
+        "upsell": "SECRET_BRAND_PARTNERSHIP_UPSELL",
         "profile_url": "https://www.instagram.com/sample/?tracking=SECRET_PROFILE_QUERY"})
     report["coverage"] = {"notes": ["SECRET_STORAGE_NOTE"], "snapshot_count": 777777}
     report["content"] = {"hashtags": [{"label": "SECRET_HASHTAG"}]}
@@ -136,6 +140,30 @@ def test_private_metadata_never_enters_pdf_and_public_highlights_are_capped_at_t
                       "stored", "source", "demographics", "publishing by weekday", "follower history"):
         assert forbidden not in text.lower()
     assert all(link.startswith("https://www.instagram.com/") and "?" not in link for link in links)
+
+
+def test_full_public_name_wraps_without_ellipsis_and_editorial_font_is_embedded():
+    report = sample_report()
+    full_name = "A public creator studio with an exceptionally long name for artificial intelligence and thoughtful original creative storytelling"
+    report["account"]["public_name"] = full_name
+    reader, text = pdf_text(render_media_kit_pdf(report, theme="dark", accent="#00ac80"))
+    assert full_name in " ".join(text.split())
+    assert len(reader.pages) == 2
+    fonts = reader.pages[0]["/Resources"]["/Font"].get_object().values()
+    display_fonts = [font.get_object() for font in fonts if "Anton" in str(font.get_object().get("/BaseFont", ""))]
+    assert display_fonts, "The PDF must embed its condensed display face for portable rendering"
+    assert all(font["/FontDescriptor"].get_object().get("/FontFile2") for font in display_fonts)
+    assert "CONTENT THAT" in text and "CONNECTS." in text
+
+
+def test_public_caption_about_product_price_is_preserved_without_commercial_package_fields():
+    report = sample_report()
+    report["account"]["pricing"] = "SECRET_PRIVATE_RATE"
+    report["account"]["packages"] = ["SECRET_PRIVATE_CAMPAIGN_BUNDLE"]
+    report["best_posts"]["all_time"][0]["public_caption"] = "A new public AI product costs $20 per month."
+    reader, text = pdf_text(render_media_kit_pdf(report))
+    assert "A new public AI product costs $20 per month." in " ".join(text.split())
+    assert "SECRET" not in text + str(reader.metadata)
 
 
 def test_public_numbers_limit_decimals_preserve_small_averages_and_select_available_video_counts():

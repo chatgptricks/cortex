@@ -23,7 +23,11 @@ def _thumbnail(client: Any, reference: str) -> bytes | None:
         with Image.open(io.BytesIO(payload)) as source:
             if source.width * source.height > _MAX_PIXELS:
                 return None
-            image = ImageOps.fit(ImageOps.exif_transpose(source).convert("RGB"), (320, 320), method=Image.Resampling.LANCZOS)
+            # Keep the entire creative visible, including text near the top
+            # and bottom of portrait posts. A square crop would cut it off in
+            # the client-facing content examples.
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            image.thumbnail((480, 640), resample=Image.Resampling.LANCZOS)
             output = io.BytesIO()
             image.save(output, format="JPEG", quality=85, optimize=True)
             return output.getvalue()
