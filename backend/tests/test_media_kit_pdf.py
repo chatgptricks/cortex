@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import io
+import re
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
 from copy import deepcopy
 
 from PIL import Image
 from pypdf import PdfReader
+import pytest
 
-from app.media_kit_pdf import render_media_kit_pdf
+from app.media_kit_pdf import _contrast, _make_palette, render_media_kit_pdf
 
 
 def sample_report():
@@ -50,13 +54,14 @@ def test_report_handles_missing_growth_and_preserves_samples_contacts_and_local_
     normalized = " ".join(text.split())
     assert "09 Oct 2026, 12:00" in text
     assert "sales@example.test" in text
-    assert "Demographics / countries / Costa Rica" in normalized
+    assert "Audience highlights" in normalized
+    assert "countries: Costa Rica: 75" in normalized
     assert "Measured engagements" in text
     assert "partial engagements" in text
-    assert "Follower delta" in text
+    assert "Follower delta" not in text
     assert "creative (2)" in text
     assert "N/A" in text and "0" in text
-    assert len(reader.pages) >= 5
+    assert 5 <= len(reader.pages) <= 7
     links = [annotation.get_object().get("/A", {}).get("/URI")
              for page in reader.pages for annotation in page.get("/Annots", [])]
     assert report["best_posts"]["all_time"][0]["permalink"] in links
@@ -94,8 +99,11 @@ def test_empty_account_and_every_dynamic_metric_paginate_without_losing_values()
     reader = PdfReader(io.BytesIO(render_media_kit_pdf(report)))
     text = "\n".join(page.extract_text() for page in reader.pages)
     assert "Provider metric 49" in text
-    assert "123,456,838" in text
-    assert any("Complete metric inventory continued" in page.extract_text() for page in reader.pages)
+    assert "123.5M" in text
+    assert any("Observed metric types continued" in page.extract_text() for page in reader.pages)
+    assert "Median" not in text
+    assert "Publishing performance ledger" not in text
+    assert "audience history ledger" not in text
 
 
 def test_rich_creative_signals_keep_source_note_with_content_instead_of_an_orphan_page():
@@ -120,3 +128,91 @@ def test_rich_creative_signals_keep_source_note_with_content_instead_of_an_orpha
     assert len(content_pages) == 1
     assert "Publishing times reflect" in content_pages[0]
     assert "Music / audio" in content_pages[0]
+
+
+def test_compact_overview_keeps_metric_types_filters_helper_rows_and_limits_decimals():
+    report = sample_report()
+    for key, label, unit, average in (
+        ("provider.retention_pct", "Retention", "percent", 37.123456),
+        ("provider.completion_rate", "Completion rate", "ratio", 0.812345),
+        ("analysis.signal", "Model signal example", "model_score", 0.000012345),
+        ("video_duration", "Video duration", "seconds", 23.123456),
+        ("carousel_slide_video_views", "Carousel slide video views (separate from parent)", "count", 543.123456),
+        ("provider.small_metric", "Small measured metric", "count", 0.023809),
+    ):
+        stats = {"total": 123.123456, "average": average, "median": 1, "min": 0, "max": 3,
+                 "count": 2, "coverage_pct": 100}
+        report["metrics_appendix"].append({"key": key, "label": label, "unit": unit,
+                                           "all_time": stats, "last_30_days": stats})
+    report["metrics_appendix"].extend([
+        {"key": "carousel_slide_video_views_measured_slides", "label": "Carousel slides with measured video views",
+         "unit": "count", "all_time": {"total": 7, "count": 2}},
+        {"key": "unobserved", "label": "Unobserved extra metric", "unit": "count",
+         "all_time": {"total": None, "average": None, "count": 0}},
+    ])
+    report["follower_growth"]["30d"] = {"delta": 17, "pct": 1.712345, "observed_days": 32,
+                                      "from": "2026-09-07T18:00:00Z", "to": "2026-10-09T18:00:00Z"}
+    text = "\n".join(page.extract_text() for page in PdfReader(io.BytesIO(render_media_kit_pdf(report))).pages)
+    normalized = " ".join(text.split())
+    for label in ("Retention", "Completion rate", "Model signal example", "Video duration", "Carousel slide video views"):
+        assert label in normalized
+    assert "Carousel slides with measured video views" not in normalized
+    assert "views: 7 slides" in normalized
+    assert "Unobserved extra metric" not in normalized
+    assert "37.12%" in text
+    assert "0.81" in text
+    assert "<0.01" in text
+    assert "23.12" in text
+    assert "0.02" in text
+    assert "1.71%" in text
+    assert not re.findall(r"(?<![\w.])[-+]?\d+\.\d{3,}(?![\w.])", text)
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+@pytest.mark.parametrize("accent", ["#00ac80", "#8838ff", "#d6ff2a", "#ffffff", "#000000", "#777777"])
+def test_report_palette_keeps_exact_accent_and_contrasting_semantic_text(theme, accent):
+    palette = _make_palette(theme, accent)
+    assert palette.values["accent"] == accent.upper()
+    assert _contrast(palette.values["accent_ink"], palette.values["accent"]) >= 4.5
+    assert _contrast(palette.values["accent_text"], palette.values["background"]) >= 4.5
+    assert _contrast(palette.values["accent_text"], palette.values["card"]) >= 4.5
+    assert _contrast(palette.values["ink"], palette.values["card"]) >= 4.5
+    assert _contrast(palette.values["header_ink"], palette.values["header"]) >= 4.5
+    output = render_media_kit_pdf(sample_report(), theme=theme, accent=accent)
+    reader = PdfReader(io.BytesIO(output))
+    fill_colors = [operands for operands, operator in reader.pages[0].get_contents().operations if operator == b"rg"]
+    expected = [int(accent[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+    assert any(tuple(values) == pytest.approx(expected, abs=1e-6) for values in fill_colors)
+    if _contrast(palette.values["accent"], palette.values["card"]) < 3:
+        stroke_colors = [operands for operands, operator in reader.pages[1].get_contents().operations if operator == b"RG"]
+        stroke = palette.values["accent_text"]
+        expected_stroke = [int(stroke[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+        assert any(tuple(values) == pytest.approx(expected_stroke, abs=1e-6) for values in stroke_colors)
+    assert reader.metadata["/CreationDate"].startswith("D:20261009180000")
+
+
+def test_invalid_renderer_palette_falls_back_and_palette_values_cannot_be_mutated():
+    report = sample_report()
+    assert render_media_kit_pdf(report, theme="invalid", accent="url(javascript:bad)") == render_media_kit_pdf(report)
+    palette = _make_palette("dark", "#00ac80")
+    with pytest.raises(TypeError):
+        palette.values["accent"] = "#ffffff"
+    with pytest.raises(FrozenInstanceError):
+        palette.values = {}
+    color = palette.accent
+    color.red = 1
+    assert palette.accent.red == 0
+
+
+def test_parallel_theme_reports_are_deterministic_and_do_not_leak_palette_state():
+    report = sample_report()
+    selections = [("light", "#d6ff2a"), ("dark", "#8838ff"), ("dark", "#00ac80"),
+                  ("light", "#ffffff"), ("dark", "#000000")]
+    reference = {selection: render_media_kit_pdf(report, theme=selection[0], accent=selection[1])
+                 for selection in selections}
+    def render(selection):
+        return selection, render_media_kit_pdf(report, theme=selection[0], accent=selection[1])
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(render, selections * 3))
+    assert all(output == reference[selection] for selection, output in results)
+    assert len(set(reference.values())) == len(selections)

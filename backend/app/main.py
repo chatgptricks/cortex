@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from statistics import median
-from typing import Annotated, Any, Callable
+from typing import Annotated, Any, Callable, Literal
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -8387,7 +8387,11 @@ def admin_account_media_kit(handle: str) -> Response:
 
 
 @app.get("/api/admin/accounts/{handle}/media-kit.pdf")
-def admin_account_media_kit_pdf(handle: str) -> Response:
+def admin_account_media_kit_pdf(
+    handle: str,
+    theme: Literal["light", "dark"] = "light",
+    accent: Annotated[str, Query(pattern="^#[0-9A-Fa-f]{6}$")] = "#00A991",
+) -> Response:
     """Generate a fresh sales report from stored metrics on every click."""
     from .account_media_kit import build_account_media_kit
     from .media_kit_pdf import render_media_kit_pdf
@@ -8400,7 +8404,7 @@ def admin_account_media_kit_pdf(handle: str) -> Response:
             prepare_media_kit_assets(report)
         except Exception:
             logging.getLogger(__name__).warning("Media kit images unavailable; generating the metrics report", exc_info=True)
-        pdf = render_media_kit_pdf(report)
+        pdf = render_media_kit_pdf(report, theme=theme, accent=accent)
     except Exception as exc:
         logging.getLogger(__name__).exception("Media kit rendering failed for %s", report["account"]["handle"])
         raise HTTPException(status_code=500, detail="Could not generate the PDF media kit. Please try again.") from exc

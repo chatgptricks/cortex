@@ -10,7 +10,7 @@ from app import account_media_kit, main
 
 @pytest.fixture
 def report_client(monkeypatch):
-    state = {"calls": [], "renders": [], "role": "admin", "failure": None}
+    state = {"calls": [], "renders": [], "styles": [], "role": "admin", "failure": None}
 
     def build(handle):
         state["calls"].append(handle)
@@ -20,8 +20,9 @@ def report_client(monkeypatch):
 
     renderer = ModuleType("app.media_kit_pdf")
 
-    def render(report):
+    def render(report, *, theme="light", accent="#00A991"):
         state["renders"].append(report)
+        state["styles"].append({"theme": theme, "accent": accent})
         if state["failure"]:
             raise RuntimeError("Internal render details must stay private")
         return b"%PDF-1.4\n" + str(report["revision"]).encode() + b"\n%%EOF"
@@ -57,6 +58,58 @@ def test_pdf_fresh_reads_headers_and_report_local_date(report_client):
     assert first.content != second.content
     assert state["calls"] == ["chatgptricks", "chatgptricks"]
     assert len(state["renders"]) == 2
+    assert state["styles"] == [{"theme": "light", "accent": "#00A991"}] * 2
+
+
+def test_pdf_forwards_each_download_style_without_changing_report_or_defaults(report_client):
+    client, state = report_client
+    headers = {"Authorization": "Bearer test"}
+    path = "/api/admin/accounts/chatgptricks/media-kit.pdf"
+    for preferences in ({"theme": "dark", "accent": "#A855F7"},
+                        {"theme": "light", "accent": "#a3e635"},
+                        {"theme": "dark", "accent": "#000000"},
+                        {"theme": "light", "accent": "#FFFFFF"}, {}):
+        response = client.get(path, params=preferences, headers=headers)
+        assert response.status_code == 200
+        assert response.content.startswith(b"%PDF-")
+        assert "no-store" in response.headers["cache-control"]
+        assert "#" not in response.headers["content-disposition"]
+    assert state["styles"] == [
+        {"theme": "dark", "accent": "#A855F7"},
+        {"theme": "light", "accent": "#a3e635"},
+        {"theme": "dark", "accent": "#000000"},
+        {"theme": "light", "accent": "#FFFFFF"},
+        {"theme": "light", "accent": "#00A991"},
+    ]
+    assert len(state["calls"]) == 5
+    assert all("theme" not in report and "accent" not in report for report in state["renders"])
+    data = client.get("/api/admin/accounts/chatgptricks/media-kit", headers=headers).json()
+    assert "theme" not in data and "accent" not in data
+
+
+@pytest.mark.parametrize("field,value", [
+    ("theme", "Dark"), ("theme", "system"), ("theme", ""),
+    ("accent", "#fff"), ("accent", "FFFFFF"), ("accent", "#12345678"),
+    ("accent", "#12GG56"), ("accent", "red"), ("accent", "#123456\n"),
+])
+def test_invalid_style_is_rejected_before_account_read_or_render(report_client, field, value):
+    client, state = report_client
+    response = client.get("/api/admin/accounts/chatgptricks/media-kit.pdf", params={field: value},
+                          headers={"Authorization": "Bearer test"})
+    assert response.status_code == 422
+    assert any(error["loc"] == ["query", field] for error in response.json()["detail"])
+    assert not state["calls"] and not state["renders"] and not state["styles"]
+
+
+def test_styled_pdf_preserves_auth_before_query_validation(report_client):
+    client, state = report_client
+    path = "/api/admin/accounts/chatgptricks/media-kit.pdf"
+    assert client.get(path, params={"theme": "dark", "accent": "#A855F7"}).status_code == 401
+    state["role"] = "sales"
+    response = client.get(path, params={"theme": "system", "accent": "red"},
+                          headers={"Authorization": "Bearer test"})
+    assert response.status_code == 403
+    assert not state["calls"] and not state["renders"]
 
 
 @pytest.mark.parametrize("extension", ["", ".pdf"])

@@ -44,9 +44,11 @@ repo root.
 - `/api/insights/*` — aggregate stats for `insights.html`.
 - `GET /api/admin/accounts/{handle}/media-kit` and `media-kit.pdf` — fresh
   account media-kit data and a downloadable PDF for Admin/Dev Settings.
-  Includes all stored performance metrics with known sample sizes,
-  follower history/growth, publishing breakdowns, and historical/recent
-  top posts. Both read existing data on every call, use private no-store
+  The PDF presents a compact sales overview with all available metric types,
+  follower trend/growth charts, performance comparisons, and historical/recent
+  top posts, using at most two decimals and the generating user's selected
+  theme and accent. The JSON retains the complete data
+  and sample sizes. Both read existing data on every call, use private no-store
   responses, and never initiate a scrape. Historical totals describe the
   saved sample, and missing/hidden measurements remain unavailable.
 - `/api/auth/custom-token` — mints a short-lived Firebase custom token so
