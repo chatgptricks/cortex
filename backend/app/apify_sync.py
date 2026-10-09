@@ -1585,6 +1585,100 @@ def _dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique
 
 
+def _extract_import_run_items(items: list[dict[str, Any]], account: str) -> list[dict[str, Any]]:
+    """Extract parent posts from flat or explicitly attributed profile rows.
+
+    Profile-details runs keep their public parent posts in ``latestPosts``.
+    The enclosing profile must explicitly identify the requested account;
+    an input URL alone is not proof of ownership. Never recurse into slides,
+    related profiles or arbitrary nested data. The caller must retain the
+    existing account owner filter for flat-post compatibility.
+    """
+    target = str(account or "").strip().lstrip("@").lower()
+    if not re.fullmatch(r"[a-z0-9_.]{1,30}", target):
+        raise ApifySyncError("A valid account handle is required.")
+
+    def identities(item: dict[str, Any], *, profile: bool) -> tuple[list[str], list[str], bool]:
+        raw_owner = item.get("owner")
+        owner = raw_owner
+        owner = owner if isinstance(owner, dict) else {}
+        raw_names = [item.get("ownerUsername"), item.get("username"), owner.get("username")]
+        raw_ids = [item.get("ownerId"), owner.get("id")]
+        if profile:
+            raw_ids.append(item.get("id"))
+        names, identifiers = [], []
+        malformed = raw_owner not in (None, "") and not isinstance(raw_owner, dict)
+        for value in raw_names:
+            if value in (None, ""):
+                continue
+            if not isinstance(value, str):
+                malformed = True
+                continue
+            name = value.strip().lstrip("@").lower()
+            if not re.fullmatch(r"[a-z0-9_.]{1,30}", name):
+                malformed = True
+            else:
+                names.append(name)
+        for value in raw_ids:
+            if value in (None, ""):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                malformed = True
+            elif str(value).strip():
+                identifiers.append(str(value).strip())
+        return names, identifiers, malformed
+
+    extracted = []
+    profile_rows = 0
+    matching_profiles = 0
+    flat_posts = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if _item_shortcode(item):
+            # Flat rows still go through _filter_items_for_account afterward,
+            # including its established ownerless and foreign-row behavior.
+            extracted.append(item)
+            flat_posts += 1
+            continue
+        if "latestPosts" not in item:
+            continue
+        profile_rows += 1
+        names, profile_ids, malformed = identities(item, profile=True)
+        if malformed or not names or any(name != target for name in names) or len(set(profile_ids)) > 1:
+            continue
+        matching_profiles += 1
+        children = item.get("latestPosts")
+        if not isinstance(children, list):
+            continue
+        profile_id = profile_ids[0] if profile_ids else None
+        for child in children:
+            if not isinstance(child, dict) or not _item_shortcode(child):
+                continue
+            child_names, child_ids, malformed = identities(child, profile=False)
+            if malformed or any(name != target for name in child_names):
+                continue
+            if child_ids and (len(set(child_ids)) > 1 or profile_id is not None and any(identity != profile_id for identity in child_ids)):
+                continue
+            # An ID-only child needs a known matching parent ID. A matching
+            # child username is explicit ownership even if the profile ID is
+            # absent; it never overrides a contradictory known parent ID.
+            if child_ids and not child_names and profile_id is None:
+                continue
+            post = {**child, "ownerUsername": target}
+            if profile_id is not None and not child_ids:
+                post["ownerId"] = profile_id
+            extracted.append(post)
+    if profile_rows and not matching_profiles and not flat_posts:
+        raise ApifySyncError(f"Dataset has no profile explicitly matching '{target}'. Refusing to import.")
+    # A foreign flat row must not win a same-code collision before the
+    # caller's owner filter can reject it. Retain foreign rows separately so
+    # that existing filtering and skipped-owner reporting remain authoritative.
+    allowed = [item for item in extracted if _item_owner_username(item) in {"", target}]
+    foreign = [item for item in extracted if _item_owner_username(item) not in {"", target}]
+    return _dedupe_items(allowed) + _dedupe_items(foreign)
+
+
 def _collect_short_term_items(
     configs: dict[str, dict[str, Any]],
     results_limit: int,

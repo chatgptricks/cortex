@@ -9190,7 +9190,7 @@ def temp_import_run(handle: str, run_id: str, request: Request) -> dict[str, Any
     _require_paid_refresh_access(request)
     import httpx
 
-    from .apify_sync import _account_scope, _filter_items_for_account, _insert_new_posts, get_account_config
+    from .apify_sync import _account_scope, _extract_import_run_items, _filter_items_for_account, _insert_new_posts, get_account_config
 
     token = os.getenv("APIFY_TOKEN", "").strip()
     with httpx.Client(timeout=60.0) as client:
@@ -9223,6 +9223,7 @@ def temp_import_run(handle: str, run_id: str, request: Request) -> dict[str, Any
     # `handle`, so a dataset belonging to another profile would silently
     # corrupt this account's history. Items without an owner field are kept.
     try:
+        items = _extract_import_run_items(items, cfg["handle"])
         items, foreign = _filter_items_for_account(items, cfg["handle"])
     except ApifySyncError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
