@@ -21,6 +21,7 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.pdfdoc import PDFString
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
@@ -34,6 +35,84 @@ DEFAULT_ACCENT = "#00A991"
 W, H = A4
 MARGIN = 39
 CW = W - MARGIN * 2
+
+# Copy belongs to the report instance. Public names, biographies and captions
+# are passed through separately and are never used as translation keys.
+_SPANISH = MappingProxyType({
+    "Account": "Cuenta",
+    "Sentient Media Kit": "Media kit de Sentient",
+    "Public account media kit for brand partnerships": "Media kit público para colaboraciones con marcas",
+    "Verified profile": "Perfil verificado",
+    "{count} profile posts": "{count} publicaciones en el perfil",
+    "VIEW PUBLIC PROFILE": "VER PERFIL PÚBLICO",
+    "Audience & performance": "Audiencia y rendimiento",
+    "THE AUDIENCE": "LA AUDIENCIA",
+    "FOLLOWERS.": "SEGUIDORES.",
+    "IN THE": "UNA MIRADA",
+    "PUBLIC EYE.": "PÚBLICA.",
+    "CONTENT THAT": "CONTENIDO QUE",
+    "CONNECTS.": "CONECTA.",
+    "Explore the public profile, content performance and standout posts from this Instagram account.":
+        "Explora el perfil público, el rendimiento del contenido y las publicaciones destacadas de esta cuenta de Instagram.",
+    "{change} audience change / last 30 days": "{change} cambio de audiencia / últimos 30 días",
+    "{count} followers on Instagram": "{count} seguidores en Instagram",
+    "Average likes": "Me gusta promedio",
+    "Average comments": "Comentarios promedio",
+    "Average video views": "Vistas promedio",
+    "Average video plays": "Reproducciones promedio",
+    "Per public post": "Por publicación pública",
+    "Per video with public counts": "Por video con métricas públicas",
+    "CONTENT PERFORMANCE": "RENDIMIENTO DEL CONTENIDO",
+    "Public performance highlights are not available yet.": "Aún no hay datos públicos de rendimiento disponibles.",
+    "Total likes": "Me gusta totales",
+    "Total video views": "Vistas totales",
+    "Total video plays": "Reproducciones totales",
+    "Across analyzed public posts": "En las publicaciones públicas analizadas",
+    "Across analyzed public videos": "En los videos públicos analizados",
+    "Posts published in the last 30 days": "Publicaciones de los últimos 30 días",
+    "Public posts": "Publicaciones públicas",
+    "Likes": "Me gusta",
+    "Comments": "Comentarios",
+    "Video views": "Vistas de video",
+    "Video plays": "Reproducciones",
+    "Historical highlights summarize analyzed public posts. Recent figures cover posts published in the last 30 days and their current cumulative public counts. Video views and plays are separate measures; neither represents unique reach.":
+        "Los datos históricos resumen publicaciones públicas analizadas. Las cifras recientes cubren publicaciones de los últimos 30 días y sus métricas públicas acumuladas actuales. Vistas y reproducciones son medidas distintas; ninguna representa alcance único.",
+    "A PUBLIC LOOK AT THE ACCOUNT": "UNA MIRADA PÚBLICA A LA CUENTA",
+    "See the next page for selected posts and the public activity they generated.":
+        "En la siguiente página encontrarás publicaciones seleccionadas y la actividad pública que generaron.",
+    "Historical highlights summarize analyzed public posts and their current cumulative public counts. Video views and plays are separate measures; neither represents unique reach.":
+        "Los datos históricos resumen publicaciones públicas analizadas y sus métricas públicas acumuladas actuales. Vistas y reproducciones son medidas distintas; ninguna representa alcance único.",
+    "Carousel": "Carrusel",
+    "Image": "Imagen",
+    "Post": "Publicación",
+    "VIEW ON INSTAGRAM": "VER EN INSTAGRAM",
+    "likes": "me gusta",
+    "comments": "comentarios",
+    "views": "vistas",
+    "plays": "reproducciones",
+    "View this public post": "Ver esta publicación pública",
+    "VIEW PUBLIC POST": "VER PUBLICACIÓN",
+    "Content examples": "Ejemplos de contenido",
+    "CONTENT EXAMPLES": "EJEMPLOS DE CONTENIDO",
+    "CONTENT THAT CONNECTS.": "CONTENIDO QUE CONECTA.",
+    "Selected public posts, their measured activity and a direct link to explore each one on Instagram.":
+        "Publicaciones públicas seleccionadas, su actividad medida y un enlace directo para explorar cada una en Instagram.",
+    " Displayed public counts are cumulative since publication.":
+        " Las métricas públicas mostradas se acumulan desde la publicación.",
+    "HISTORICAL HIGHLIGHTS": "PUBLICACIONES DESTACADAS",
+    "PUBLISHED IN THE LAST 30 DAYS": "PUBLICADAS EN LOS ÚLTIMOS 30 DÍAS",
+    "Public post highlights are not available for this period.": "No hay publicaciones públicas destacadas disponibles para este período.",
+    "No public posts were published in this period.": "No se publicaron posts públicos en este período.",
+    "Highlights are selected by public likes and comments. Displayed public counts include cumulative activity since publication.":
+        "Las publicaciones destacadas se seleccionan por sus me gusta y comentarios públicos. Las métricas incluyen la actividad acumulada desde la publicación.",
+    "Highlights are selected by public likes and comments. Recent posts were published in the last 30 days; displayed counts include activity since publication.":
+        "Las publicaciones destacadas se seleccionan por sus me gusta y comentarios públicos. Las recientes se publicaron en los últimos 30 días; sus métricas incluyen la actividad desde la publicación.",
+    "Prepared": "Preparado",
+})
+_MONTHS = {
+    "en": ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"),
+    "es": ("ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"),
+}
 
 
 def _rgb(value: str) -> tuple[float, float, float]:
@@ -119,7 +198,7 @@ def _number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _fmt(value: Any, unit: str = "", compact: bool = False) -> str:
+def _fmt_en(value: Any, unit: str = "", compact: bool = False) -> str:
     number = _number(value)
     if number is None:
         return "N/A"
@@ -141,15 +220,31 @@ def _fmt(value: Any, unit: str = "", compact: bool = False) -> str:
     return f"{number:,.2f}".rstrip("0").rstrip(".")
 
 
-def _date(value: Any, with_time: bool = False, timezone_name: str = "America/Costa_Rica") -> str:
+def _fmt(value: Any, unit: str = "", compact: bool = False, *, lang: str = "en") -> str:
+    value = _fmt_en(value, unit, compact)
+    if lang != "es":
+        return value
+    if value == "N/A":
+        return "N/D"
+    value = value.replace(",", " ").replace(".", ",")
+    if value.endswith("K"):
+        return value[:-1] + " mil"
+    if value.endswith("B"):
+        return value[:-1] + " mil M"
+    return value
+
+
+def _date(value: Any, with_time: bool = False, timezone_name: str = "America/Costa_Rica", *, lang: str = "en") -> str:
     if not value:
-        return "Not available"
+        return "No disponible" if lang == "es" else "Not available"
     try:
         raw = str(value)
         stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         if len(raw) > 10:
             stamp = (stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)).astimezone(ZoneInfo(timezone_name))
-        return stamp.strftime("%d %b %Y, %H:%M" if with_time else "%d %b %Y")
+        month = _MONTHS["es" if lang == "es" else "en"][stamp.month - 1]
+        date = f"{stamp.day:02} {month} {stamp.year}"
+        return f"{date}, {stamp:%H:%M}" if with_time else date
     except (TypeError, ValueError, ZoneInfoNotFoundError):
         return _text(value)[:32]
 
@@ -187,8 +282,9 @@ def _instagram_post(value: Any) -> str | None:
 
 
 class _Report:
-    def __init__(self, report: dict[str, Any], *, theme: str = "light", accent: str = DEFAULT_ACCENT):
+    def __init__(self, report: dict[str, Any], *, theme: str = "light", accent: str = DEFAULT_ACCENT, lang: str = "en"):
         self.p = _make_palette(theme, accent)
+        self.lang = "es" if lang == "es" else "en"
         self.report = report
         self.account = report.get("account") or {}
         self.summary = report.get("summary") or {}
@@ -197,7 +293,7 @@ class _Report:
         # The public projection removes the recent key when its publication
         # window is not complete. Missing is different from an asserted zero.
         self.recent_available = "last_30_days" in self.summary
-        self.handle = _text(self.account.get("handle") or "Account").lstrip("@")
+        self.handle = _text(self.account.get("handle") or self.t("Account")).lstrip("@")
         self.stream = io.BytesIO()
         self.c = canvas.Canvas(self.stream, pagesize=A4, pageCompression=1, invariant=True)
         try:
@@ -211,13 +307,23 @@ class _Report:
             stamp.tzname = "UTC"
         except (TypeError, ValueError, OverflowError):
             pass
-        self.c.setTitle(f"@{self.handle} | Sentient Media Kit")
+        self.c.setTitle(f"@{self.handle} | {self.t('Sentient Media Kit')}")
         self.c.setAuthor("Sentient")
-        self.c.setSubject("Public account media kit for brand partnerships")
+        self.c.setSubject(self.t("Public account media kit for brand partnerships"))
+        self.c._doc.Catalog.Lang = PDFString("es-CR" if self.lang == "es" else "en")
         self.pages: list[dict[str, Any]] = []
         self.page_number = 0
         self.y = H - 100
-        self.generated = _date(report.get("generated_at"), with_time=True, timezone_name=report.get("timezone") or "America/Costa_Rica")
+        self.generated = self.date(report.get("generated_at"), with_time=True)
+
+    def t(self, value: str) -> str:
+        return _SPANISH.get(value, value) if self.lang == "es" else value
+
+    def fmt(self, value: Any, unit: str = "", compact: bool = False) -> str:
+        return _fmt(value, unit, compact, lang=self.lang)
+
+    def date(self, value: Any, with_time: bool = False) -> str:
+        return _date(value, with_time, self.report.get("timezone") or "America/Costa_Rica", lang=self.lang)
 
     def text(self, x: float, y: float, value: Any, size: float = 9,
              color: Any = None, bold: bool = False, width: float | None = None,
@@ -419,12 +525,16 @@ class _Report:
                 self.c.setStrokeColor(self.p.line)
                 self.c.line(x, top, x, top - height)
             self.icon(self.metric_icon(label), x + 11, top - 27, 13)
-            self.text(x + 31, top - 22, label.upper(), 6.5, self.p.muted, bold=True, width=width - 41)
+            label_copy = self.t(label).upper()
+            label_size = 6.5
+            if self.lang == "es":
+                label_size = min(label_size, label_size * (width - 41) / max(pdfmetrics.stringWidth(label_copy, "MediaKitBold", label_size), 1))
+            self.text(x + 31, top - 22, label_copy, label_size, self.p.muted, bold=True, width=width - 41)
             number_y = top - (59 if height > 75 else 53 if detail else 49)
             self.display(x + 11, number_y,
-                         _fmt(value, unit, compact=True), number_size, self.p.title, width - 22)
+                         self.fmt(value, unit, compact=True), number_size, self.p.title, width - 22)
             if detail:
-                self.text(x + 11, top - height + 11, detail, 6, self.p.muted, width=width - 22)
+                self.text(x + 11, top - height + 11, self.t(detail), 6, self.p.muted, width=width - 22)
         return top - height
 
     def profile_card(self, x: float, top: float, width: float, height: float) -> None:
@@ -434,7 +544,7 @@ class _Report:
             self.icon("people", x + 37, top - 66, 26)
         self.text(x + 94, top - 44, "INSTAGRAM", 6.5, self.p.accent_text, bold=True)
         if self.account.get("verified") is True:
-            self.text(x + 94, top - 60, "Verified profile", 7.2, self.p.muted)
+            self.text(x + 94, top - 60, self.t("Verified profile"), 7.2, self.p.muted)
         self.text(x + 17, top - 109, f"@{self.handle}", 8.2, self.p.muted, width=width - 34)
         name = self.account.get("public_name") or f"@{self.handle}"
         # Names are public identity, not teaser copy. Fit all lines without an
@@ -447,44 +557,44 @@ class _Report:
         posts = self.account.get("profile_posts")
         if _number(posts) is not None:
             self.icon("posts", x + 17, bottom - 20, 12)
-            self.text(x + 35, bottom - 16, f"{_fmt(posts, compact=True)} profile posts", 7.2, self.p.muted)
+            self.text(x + 35, bottom - 16, self.t("{count} profile posts").format(count=self.fmt(posts, compact=True)), 7.2, self.p.muted)
         url = _instagram_profile(self.handle)
         if url:
             self.rect(x + 17, top - height + 17, width - 34, 27, self.p.accent, radius=6)
             self.icon("posts", x + 28, top - height + 23, 13, self.p.accent_ink)
-            self.text(x + 49, top - height + 27, "VIEW PUBLIC PROFILE", 6.8, self.p.accent_ink, bold=True)
+            self.text(x + 49, top - height + 27, self.t("VIEW PUBLIC PROFILE"), 6.8, self.p.accent_ink, bold=True)
             self.c.linkURL(url, (x, top - height, x + width, top), relative=0)
 
     def overview(self) -> None:
-        self.editorial_page("Audience & performance")
+        self.editorial_page(self.t("Audience & performance"))
         hero_top = H - 112
         profile_width = 191
         headline_width = CW - profile_width - 25
         profile_x = W - MARGIN - profile_width
-        self.text(MARGIN, hero_top + 3, "THE AUDIENCE", 7.5, self.p.accent_text, bold=True)
+        self.text(MARGIN, hero_top + 3, self.t("THE AUDIENCE"), 7.5, self.p.accent_text, bold=True)
         followers = _number(self.account.get("followers"))
         if followers is not None:
-            self.display(MARGIN, hero_top - 73, _fmt(followers, compact=True), 77, width=headline_width)
-            self.display(MARGIN, hero_top - 121, "FOLLOWERS.", 38, width=headline_width)
+            self.display(MARGIN, hero_top - 73, self.fmt(followers, compact=True), 77, width=headline_width)
+            self.display(MARGIN, hero_top - 121, self.t("FOLLOWERS."), 38, width=headline_width)
         else:
-            self.display(MARGIN, hero_top - 63, "IN THE", 49, width=headline_width)
-            self.display(MARGIN, hero_top - 121, "PUBLIC EYE.", 42, width=headline_width)
-        self.display(MARGIN, hero_top - 168, "CONTENT THAT", 32, width=headline_width)
-        self.display(MARGIN, hero_top - 209, "CONNECTS.", 36, self.p.accent_text, headline_width)
+            self.display(MARGIN, hero_top - 63, self.t("IN THE"), 49, width=headline_width)
+            self.display(MARGIN, hero_top - 121, self.t("PUBLIC EYE."), 42, width=headline_width)
+        self.display(MARGIN, hero_top - 168, self.t("CONTENT THAT"), 32, width=headline_width)
+        self.display(MARGIN, hero_top - 209, self.t("CONNECTS."), 36, self.p.accent_text, headline_width)
         self.profile_card(profile_x, hero_top + 12, profile_width, 275)
         bio = self.account.get("public_bio")
-        introduction = bio or "Explore the public profile, content performance and standout posts from this Instagram account."
+        introduction = bio or self.t("Explore the public profile, content performance and standout posts from this Instagram account.")
         self.paragraph(MARGIN, hero_top - 238, introduction, headline_width, 8.2,
                        self.p.muted, max_lines=3, leading=12)
         audience_y = 433
         growth = ((self.report.get("follower_growth") or {}).get("30d") or {}).get("pct")
         if _number(growth) is not None:
-            change = _fmt(growth, "percent")
+            change = self.fmt(growth, "percent")
             if _number(growth) > 0:
                 change = "+" + change
-            self.text(MARGIN, audience_y, f"{change} audience change / last 30 days", 8.4, self.p.accent_text, bold=True)
+            self.text(MARGIN, audience_y, self.t("{change} audience change / last 30 days").format(change=change), 8.4, self.p.accent_text, bold=True)
         elif followers is not None:
-            self.text(MARGIN, audience_y, f"{_fmt(followers)} followers on Instagram", 8.4, self.p.accent_text, bold=True)
+            self.text(MARGIN, audience_y, self.t("{count} followers on Instagram").format(count=self.fmt(followers)), 8.4, self.p.accent_text, bold=True)
         video_key = "video_views" if _number(_stat(self.all_time, "video_views", "average")) is not None else "video_plays"
         video_label = "video views" if video_key == "video_views" else "video plays"
         average_candidates = [
@@ -493,10 +603,10 @@ class _Report:
             (f"Average {video_label}", _stat(self.all_time, video_key, "average"), "count", "Per video with public counts"),
         ]
         averages = [item for item in average_candidates if _number(item[1]) is not None]
-        self.display(MARGIN, 398, "CONTENT PERFORMANCE", 23)
+        self.display(MARGIN, 398, self.t("CONTENT PERFORMANCE"), 23)
         y = self.strip(averages, 380, number_size=31)
         if not averages:
-            self.paragraph(MARGIN, 367, "Public performance highlights are not available yet.", CW, 10)
+            self.paragraph(MARGIN, 367, self.t("Public performance highlights are not available yet."), CW, 10)
             y = 294
         total_candidates = [
             ("Total likes", _stat(self.all_time, "likes"), "count", "Across analyzed public posts"),
@@ -506,7 +616,7 @@ class _Report:
         if totals:
             y = self.strip(totals, y - 15, height=75, number_size=23)
         if self.recent_available:
-            self.text(MARGIN, 189, "Posts published in the last 30 days", 11, self.p.title, bold=True)
+            self.text(MARGIN, 189, self.t("Posts published in the last 30 days"), 11, self.p.title, bold=True)
             recent_video = "video_views" if _number(_stat(self.recent, "video_views")) is not None else "video_plays"
             recent_candidates = [
                 ("Public posts", self.recent.get("post_count"), "count", ""),
@@ -516,12 +626,12 @@ class _Report:
             ]
             recent_items = [item for item in recent_candidates if _number(item[1]) is not None]
             self.strip(recent_items, 174, height=57, number_size=22)
-            note = "Historical highlights summarize analyzed public posts. Recent figures cover posts published in the last 30 days and their current cumulative public counts. Video views and plays are separate measures; neither represents unique reach."
+            note = self.t("Historical highlights summarize analyzed public posts. Recent figures cover posts published in the last 30 days and their current cumulative public counts. Video views and plays are separate measures; neither represents unique reach.")
         else:
-            self.text(MARGIN, 178, "A PUBLIC LOOK AT THE ACCOUNT", 7.3, self.p.accent_text, bold=True)
-            self.paragraph(MARGIN, 161, "See the next page for selected posts and the public activity they generated.",
+            self.text(MARGIN, 178, self.t("A PUBLIC LOOK AT THE ACCOUNT"), 7.3, self.p.accent_text, bold=True)
+            self.paragraph(MARGIN, 161, self.t("See the next page for selected posts and the public activity they generated."),
                            CW, 9, self.p.muted, max_lines=2)
-            note = "Historical highlights summarize analyzed public posts and their current cumulative public counts. Video views and plays are separate measures; neither represents unique reach."
+            note = self.t("Historical highlights summarize analyzed public posts and their current cumulative public counts. Video views and plays are separate measures; neither represents unique reach.")
         self.paragraph(MARGIN, 94, note, CW, 6.7, self.p.muted, max_lines=3, leading=9.4)
 
     def portrait_post(self, post: dict[str, Any], x: float, top: float, width: float,
@@ -529,7 +639,7 @@ class _Report:
         self.rect(x, top - height, width, height, radius=9)
         self.text(x + 10, top - 17, f"{rank:02}", 8.5, self.p.accent_text, bold=True)
         format_name = post.get("format") if post.get("format") in ("Carousel", "Image", "Reel", "Video", "Post") else "Post"
-        format_label = f"{_date(post['published_at'])} / {format_name}" if compact and post.get("published_at") else format_name.upper()
+        format_label = f"{self.date(post['published_at'])} / {self.t(format_name)}" if compact and post.get("published_at") else self.t(format_name).upper()
         self.text(x + width - 10, top - 17, format_label, 5.8 if compact else 6.2,
                   self.p.muted, width=width - 40, align="right")
         image_height = 133 if compact else 254
@@ -539,16 +649,19 @@ class _Report:
             self.icon("play" if format_name in ("Video", "Reel") else "posts",
                       x + width / 2 - 19, image_top - image_height / 2 - 19, 38, self.p.muted)
             self.text(x + width / 2, image_top - image_height / 2 - 41,
-                      "VIEW ON INSTAGRAM", 5.8, self.p.muted, align="center")
+                      self.t("VIEW ON INSTAGRAM"), 5.8, self.p.muted, align="center")
         metrics = post.get("metrics") or {}
         primary = next((key for key in ("video_views", "video_plays", "likes", "comments")
                         if _number(metrics.get(key)) is not None), None)
         primary_y = image_top - image_height - (25 if compact else 31)
         labels = {"likes": "likes", "comments": "comments", "video_views": "views", "video_plays": "plays"}
         if primary:
-            self.display(x + 10, primary_y, _fmt(metrics[primary], compact=True),
-                         27 if compact else 33, self.p.accent_text, width - 20)
-            self.text(x + width - 10, primary_y + 2, labels[primary].upper(), 6.2,
+            number_width = width - 20
+            if self.lang == "es":
+                number_width -= pdfmetrics.stringWidth(self.t(labels[primary]).upper(), "MediaKit", 6.2) + 8
+            self.display(x + 10, primary_y, self.fmt(metrics[primary], compact=True),
+                         27 if compact else 33, self.p.accent_text, number_width)
+            self.text(x + width - 10, primary_y + 2, self.t(labels[primary]).upper(), 6.2,
                       self.p.muted, align="right")
         secondary = [key for key in ("likes", "comments", "video_views", "video_plays")
                      if key != primary and _number(metrics.get(key)) is not None]
@@ -557,26 +670,31 @@ class _Report:
         for index, key in enumerate(secondary):
             at = x + 10 + index * cell_width
             self.icon(self.metric_icon(labels[key]), at, metric_y - 1, 10)
-            self.text(at + 13, metric_y + 1, _fmt(metrics[key], compact=True), 7.2,
+            number_copy = self.fmt(metrics[key], compact=True)
+            number_size = 7.2
+            if self.lang == "es":
+                number_size = min(number_size, number_size * (cell_width - 15) / max(pdfmetrics.stringWidth(number_copy, "MediaKitBold", number_size), 1))
+            self.text(at + 13, metric_y + 1, number_copy, number_size,
                       self.p.ink, bold=True, width=cell_width - 15)
-            self.text(at + 13, metric_y - 9, labels[key], 5.8, self.p.muted, width=cell_width - 15)
+            label_copy = {"comments": "coment.", "video_plays": "reprod."}.get(key, self.t(labels[key])) if self.lang == "es" else labels[key]
+            self.text(at + 13, metric_y - 9, label_copy, 5.8, self.p.muted, width=cell_width - 15)
         caption_y = metric_y - (19 if compact else 27)
-        self.paragraph(x + 10, caption_y, post.get("public_caption") or "View this public post",
+        self.paragraph(x + 10, caption_y, post.get("public_caption") or self.t("View this public post"),
                        width - 20, 7.3 if compact else 8.5, self.p.ink,
                        max_lines=2 if compact else 7, leading=10 if compact else 12)
         if not compact:
-            self.text(x + 10, top - height + 42, _date(post.get("published_at")), 6.5, self.p.muted)
+            self.text(x + 10, top - height + 42, self.date(post.get("published_at")), 6.5, self.p.muted)
         url = _instagram_post(post.get("permalink"))
         if url:
-            self.link(x + 10, top - height + 16, "VIEW PUBLIC POST", url, size=6.4 if compact else 6.8)
+            self.link(x + 10, top - height + 16, self.t("VIEW PUBLIC POST"), url, size=6.4 if compact else 6.8)
 
     def strongest_posts(self) -> None:
-        self.editorial_page("Content examples")
-        self.text(MARGIN, H - 111, "CONTENT EXAMPLES", 7.5, self.p.accent_text, bold=True)
-        self.display(MARGIN, H - 157, "CONTENT THAT CONNECTS.", 35, width=CW)
-        introduction = "Selected public posts, their measured activity and a direct link to explore each one on Instagram."
+        self.editorial_page(self.t("Content examples"))
+        self.text(MARGIN, H - 111, self.t("CONTENT EXAMPLES"), 7.5, self.p.accent_text, bold=True)
+        self.display(MARGIN, H - 157, self.t("CONTENT THAT CONNECTS."), 35, width=CW)
+        introduction = self.t("Selected public posts, their measured activity and a direct link to explore each one on Instagram.")
         if self.recent_available:
-            introduction += " Displayed public counts are cumulative since publication."
+            introduction += self.t(" Displayed public counts are cumulative since publication.")
         self.paragraph(MARGIN, H - 180, introduction,
                        CW, 8.2, self.p.muted, max_lines=2, leading=12)
         groups = self.report.get("best_posts") or {}
@@ -584,24 +702,24 @@ class _Report:
         recent = (groups.get("last_30_days") or [])[:3] if self.recent_available else []
         width = (CW - 24) / 3
         if not self.recent_available:
-            self.text(MARGIN, 626, "HISTORICAL HIGHLIGHTS", 7.4, self.p.accent_text, bold=True)
+            self.text(MARGIN, 626, self.t("HISTORICAL HIGHLIGHTS"), 7.4, self.p.accent_text, bold=True)
             for index, post in enumerate(historical):
                 self.portrait_post(post, MARGIN + index * (width + 12), 609, width, index + 1, 501)
             if not historical:
-                self.paragraph(MARGIN, 570, "Public post highlights are not available for this period.", CW, 10)
-            note = "Highlights are selected by public likes and comments. Displayed public counts include cumulative activity since publication."
+                self.paragraph(MARGIN, 570, self.t("Public post highlights are not available for this period."), CW, 10)
+            note = self.t("Highlights are selected by public likes and comments. Displayed public counts include cumulative activity since publication.")
         else:
             top = 626
             for posts, title in ((historical, "HISTORICAL HIGHLIGHTS"), (recent, "PUBLISHED IN THE LAST 30 DAYS")):
-                self.text(MARGIN, top, title, 7.4, self.p.accent_text, bold=True)
+                self.text(MARGIN, top, self.t(title), 7.4, self.p.accent_text, bold=True)
                 for index, post in enumerate(posts):
                     self.portrait_post(post, MARGIN + index * (width + 12), top - 13,
                                        width, index + 1, 263, compact=True)
                 if not posts:
-                    message = "No public posts were published in this period." if posts is recent and self.recent.get("post_count") == 0 else "Public post highlights are not available for this period."
+                    message = self.t("No public posts were published in this period.") if posts is recent and self.recent.get("post_count") == 0 else self.t("Public post highlights are not available for this period.")
                     self.paragraph(MARGIN, top - 42, message, CW, 9)
                 top -= 288
-            note = "Highlights are selected by public likes and comments. Recent posts were published in the last 30 days; displayed counts include activity since publication."
+            note = self.t("Highlights are selected by public likes and comments. Recent posts were published in the last 30 days; displayed counts include activity since publication.")
         if not self.recent_available:
             self.paragraph(MARGIN, 85, note, CW, 6.7, self.p.muted, max_lines=2, leading=9.4)
 
@@ -613,7 +731,7 @@ class _Report:
             self.c.setStrokeColor(self.p.line)
             self.c.setLineWidth(0.6)
             self.c.line(MARGIN, 51, W - MARGIN, 51)
-            prepared = f" / Prepared {_date(self.report['generated_at'])}" if self.report.get("generated_at") else ""
+            prepared = f" / {self.t('Prepared')} {self.date(self.report['generated_at'])}" if self.report.get("generated_at") else ""
             self.text(MARGIN, 33, f"@{self.handle}{prepared} / Sentient", 6.5, self.p.muted, width=CW - 90)
             self.text(W - MARGIN, 33, f"{index:02} / {total:02}", 6.5, self.p.muted, align="right")
             self.c.showPage()
@@ -621,13 +739,13 @@ class _Report:
         return self.stream.getvalue()
 
 
-def render_media_kit_pdf(report: dict[str, Any], *, theme: str = "light", accent: str = DEFAULT_ACCENT) -> bytes:
+def render_media_kit_pdf(report: dict[str, Any], *, theme: str = "light", accent: str = DEFAULT_ACCENT, lang: str = "en") -> bytes:
     """Return a two-page, client-shareable account media kit as bytes.
 
     Rendering uses a fixed public-field allowlist and never traverses metric
     inventories, account configuration, contact data or internal post labels.
     """
-    document = _Report(report, theme=theme, accent=accent)
+    document = _Report(report, theme=theme, accent=accent, lang=lang)
     document.overview()
     document.strongest_posts()
     return document.finish()

@@ -10,7 +10,7 @@ from PIL import Image
 from pypdf import PdfReader
 import pytest
 
-from app.media_kit_pdf import _contrast, _make_palette, render_media_kit_pdf
+from app.media_kit_pdf import _contrast, _date, _fmt, _make_palette, render_media_kit_pdf
 
 
 def sample_report():
@@ -276,3 +276,99 @@ def test_parallel_theme_reports_are_deterministic_and_do_not_leak_palette_state(
         results = list(executor.map(render, selections * 3))
     assert all(output == reference[selection] for selection, output in results)
     assert len(set(reference.values())) == len(selections)
+
+
+def test_spanish_pdf_translates_copy_formats_dates_and_preserves_public_content():
+    report = sample_report()
+    report["generated_at"] = "2026-03-03T02:00:00Z"  # March 2 in Costa Rica.
+    report["account"].update({"verified": True, "public_bio": "This public biography stays in its original language."})
+    report["follower_growth"]["30d"] = {"pct": 1.712345}
+    report["summary"]["all_time"]["metrics"]["likes"]["average"] = 0.023809
+    for posts in report["best_posts"].values():
+        if isinstance(posts, list):
+            for post in posts:
+                post.update({"format": "Image", "published_at": "2026-04-03T02:00:00Z"})
+    original = deepcopy(report)
+    reader, text = pdf_text(render_media_kit_pdf(report, lang="es"))
+    flattened = " ".join(text.split())
+    assert len(reader.pages) == 2
+    assert reader.trailer["/Root"]["/Lang"] == "es-CR"
+    for expected in ("AUDIENCIA Y RENDIMIENTO", "SEGUIDORES.", "CONTENIDO QUE", "CONECTA.",
+                     "ME GUSTA PROMEDIO", "COMENTARIOS PROMEDIO", "Perfil verificado",
+                     "Publicaciones de los últimos 30 días", "PUBLICADAS EN LOS ÚLTIMOS 30 DÍAS",
+                     "VER PERFIL PÚBLICO", "VER PUBLICACIÓN", "02 abr 2026 / Imagen",
+                     "Preparado 02 mar 2026", "+1,71%", "0,02"):
+        assert expected in flattened
+    assert "Sample Studio" in text and "A useful creative example" in flattened
+    assert report["account"]["public_bio"] in flattened
+    assert "INTERNAL" not in text + str(reader.metadata)
+    assert "Average comments".upper() not in text and "VIEW PUBLIC POST" not in text
+    assert "0" in text and "N/D" not in text
+    assert report == original
+
+
+def test_public_content_that_matches_interface_copy_is_never_translated():
+    report = sample_report()
+    report["account"].update({"public_name": "Content examples", "public_bio": "Verified profile"})
+    report["best_posts"]["all_time"][0]["public_caption"] = "Average likes"
+    _, text = pdf_text(render_media_kit_pdf(report, lang="es"))
+    for original in ("Content examples", "Verified profile", "Average likes"):
+        assert original in text
+    assert "EJEMPLOS DE CONTENIDO" in text
+
+
+def test_spanish_empty_recent_and_missing_recent_keep_known_zero_distinct():
+    report = sample_report()
+    report["summary"]["last_30_days"] = {"post_count": 0, "metrics": {
+        key: {"total": 0, "average": None} for key in ("likes", "comments", "video_views")}}
+    report["best_posts"]["last_30_days"] = []
+    reader, text = pdf_text(render_media_kit_pdf(report, lang="es"))
+    recent = reader.pages[0].extract_text().split("Publicaciones de los últimos 30 días")[1]
+    assert recent.count("\n0\n") == 4
+    assert "No se publicaron posts públicos en este período." in text
+    del report["summary"]["last_30_days"]
+    _, missing = pdf_text(render_media_kit_pdf(report, lang="es"))
+    assert "Publicaciones de los últimos 30 días" not in missing
+    assert "PUBLICADAS EN LOS ÚLTIMOS 30 DÍAS" not in missing
+    assert "PUBLICACIONES DESTACADAS" in missing
+
+
+def test_localized_formatters_preserve_magnitude_precision_and_calendar_day():
+    assert _fmt(1234.56, lang="es") == "1 234,56"
+    assert _fmt(12500, compact=True, lang="es") == "12,5 mil"
+    assert _fmt(1250000000, compact=True, lang="es") == "1,2 mil M"
+    assert _fmt(-0.001, "percent", lang="es") == ">-0,01%"
+    assert _fmt(None, lang="es") == "N/D"
+    assert _date("2026-03-03T02:00:00Z", lang="es") == "02 mar 2026"
+    assert _date("2026-03-03", lang="es") == "03 mar 2026"
+    assert _date(None, lang="es") == "No disponible"
+    assert _fmt(1234.56) == "1,234.56"
+    assert _date("2026-03-03T02:00:00Z") == "02 Mar 2026"
+
+
+def test_long_spanish_secondary_numbers_are_fitted_without_truncating_magnitude():
+    report = sample_report()
+    for posts in report["best_posts"].values():
+        if isinstance(posts, list):
+            for post in posts:
+                post["metrics"] = {"video_views": 254784, "likes": 12543, "comments": 154, "video_plays": 987654}
+    _, text = pdf_text(render_media_kit_pdf(report, lang="es"))
+    assert "987,7 mil" in text
+    assert "12,5 mil" in text
+    assert "reprod." in text
+    assert "987,7..." not in text
+
+
+def test_language_and_theme_are_report_local_and_default_remains_english():
+    report = sample_report()
+    assert render_media_kit_pdf(report) == render_media_kit_pdf(report, lang="en")
+    assert render_media_kit_pdf(report, lang="invalid") == render_media_kit_pdf(report, lang="en")
+    selections = [(lang, theme) for lang in ("en", "es") for theme in ("light", "dark")]
+    reference = {(lang, theme): render_media_kit_pdf(report, lang=lang, theme=theme) for lang, theme in selections}
+    def render(selection):
+        lang, theme = selection
+        return selection, render_media_kit_pdf(report, lang=lang, theme=theme)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(render, selections * 3))
+    assert all(output == reference[selection] for selection, output in results)
+    assert len(set(reference.values())) == 4

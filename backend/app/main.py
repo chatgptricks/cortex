@@ -8414,6 +8414,7 @@ def admin_account_media_kit_pdf(
     handle: str,
     theme: Literal["light", "dark"] = "light",
     accent: Annotated[str, Query(pattern="^#[0-9A-Fa-f]{6}$")] = "#00A991",
+    lang: Literal["en", "es"] = "en",
 ) -> Response:
     """Generate a client-shareable media kit from public account highlights."""
     from .account_media_kit import build_account_media_kit
@@ -8431,10 +8432,11 @@ def admin_account_media_kit_pdf(
         # Only an explicit public-data allowlist may cross the PDF boundary.
         # Asset preparation needs internal paths, but the renderer never does.
         public_report = project_public_media_kit(report)
-        pdf = render_media_kit_pdf(public_report, theme=theme, accent=accent)
+        pdf = render_media_kit_pdf(public_report, theme=theme, accent=accent, lang=lang)
     except Exception as exc:
         logging.getLogger(__name__).exception("Media kit rendering failed for %s", report["account"]["handle"])
-        raise HTTPException(status_code=500, detail="Could not generate the PDF media kit. Please try again.") from exc
+        detail = "No se pudo generar el media kit en PDF. Intenta de nuevo." if lang == "es" else "Could not generate the PDF media kit. Please try again."
+        raise HTTPException(status_code=500, detail=detail) from exc
     report_date = datetime.fromisoformat(report["generated_at"]).astimezone(ZoneInfo("America/Costa_Rica")).date().isoformat()
     filename = f'{report["account"]["handle"]}-media-kit-{report_date}.pdf'
     return Response(

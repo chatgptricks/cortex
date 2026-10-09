@@ -22,9 +22,9 @@ def report_client(monkeypatch):
 
     renderer = ModuleType("app.media_kit_pdf")
 
-    def render(report, *, theme="light", accent="#00A991"):
+    def render(report, *, theme="light", accent="#00A991", lang="en"):
         state["renders"].append(report)
-        state["styles"].append({"theme": theme, "accent": accent})
+        state["styles"].append({"theme": theme, "accent": accent, "lang": lang})
         if state["failure"]:
             raise RuntimeError("Internal render details must stay private")
         return b"%PDF-1.4\n" + report["generated_at"].encode() + b"\n%%EOF"
@@ -60,7 +60,7 @@ def test_pdf_fresh_reads_headers_and_report_local_date(report_client):
     assert first.content != second.content
     assert state["calls"] == ["chatgptricks", "chatgptricks"]
     assert len(state["renders"]) == 2
-    assert state["styles"] == [{"theme": "light", "accent": "#00A991"}] * 2
+    assert state["styles"] == [{"theme": "light", "accent": "#00A991", "lang": "en"}] * 2
 
 
 def test_pdf_forwards_each_download_style_without_changing_report_or_defaults(report_client):
@@ -77,11 +77,11 @@ def test_pdf_forwards_each_download_style_without_changing_report_or_defaults(re
         assert "no-store" in response.headers["cache-control"]
         assert "#" not in response.headers["content-disposition"]
     assert state["styles"] == [
-        {"theme": "dark", "accent": "#A855F7"},
-        {"theme": "light", "accent": "#a3e635"},
-        {"theme": "dark", "accent": "#000000"},
-        {"theme": "light", "accent": "#FFFFFF"},
-        {"theme": "light", "accent": "#00A991"},
+        {"theme": "dark", "accent": "#A855F7", "lang": "en"},
+        {"theme": "light", "accent": "#a3e635", "lang": "en"},
+        {"theme": "dark", "accent": "#000000", "lang": "en"},
+        {"theme": "light", "accent": "#FFFFFF", "lang": "en"},
+        {"theme": "light", "accent": "#00A991", "lang": "en"},
     ]
     assert len(state["calls"]) == 5
     assert all("theme" not in report and "accent" not in report for report in state["renders"])
@@ -89,7 +89,23 @@ def test_pdf_forwards_each_download_style_without_changing_report_or_defaults(re
     assert "theme" not in data and "accent" not in data
 
 
+def test_pdf_language_is_validated_forwarded_and_kept_out_of_source_data(report_client):
+    client, state = report_client
+    path = "/api/admin/accounts/chatgptricks/media-kit.pdf"
+    for lang in ("es", "en"):
+        response = client.get(path, params={"lang": lang}, headers={"Authorization": "Bearer test"})
+        assert response.status_code == 200
+        assert state["styles"][-1]["lang"] == lang
+        assert "lang" not in state["renders"][-1]
+    state["failure"] = True
+    failed = client.get(path, params={"lang": "es"}, headers={"Authorization": "Bearer test"})
+    assert failed.status_code == 500
+    assert failed.json()["detail"] == "No se pudo generar el media kit en PDF. Intenta de nuevo."
+    assert "Internal" not in failed.text
+
+
 @pytest.mark.parametrize("field,value", [
+    ("lang", "ES"), ("lang", "fr"), ("lang", ""),
     ("theme", "Dark"), ("theme", "system"), ("theme", ""),
     ("accent", "#fff"), ("accent", "FFFFFF"), ("accent", "#12345678"),
     ("accent", "#12GG56"), ("accent", "red"), ("accent", "#123456\n"),
