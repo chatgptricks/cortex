@@ -120,6 +120,9 @@ app.include_router(user_preferences_router)
 from .agent_connections import router as agent_connections_router
 from .agent_connections import authenticate as authenticate_agent_connection
 app.include_router(agent_connections_router)
+from .mcp_oauth import router as mcp_oauth_router
+from .mcp_oauth import authenticate_access_token, enforce_delegated_route
+app.include_router(mcp_oauth_router)
 from .external_api import router as website_api_router, management_router as website_api_management_router
 from .external_api import authenticate as authenticate_website_api_key, MANAGEMENT_URL as WEBSITE_API_MANAGEMENT_URL
 app.include_router(website_api_router)
@@ -189,6 +192,9 @@ _FIREBASE_OPEN_PREFIXES = (
     "/api/admin/alert-image/",
 )
 _FIREBASE_OPEN_PATHS = {"/api/health", "/", "/docs", "/openapi.json", "/redoc", "/api/slack/interactions"}
+_OAUTH_OPEN_PATHS = {"/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp",
+                     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
+                     "/oauth/register", "/oauth/revoke"}
 
 
 @app.middleware("http")
@@ -198,6 +204,41 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     path = request.url.path
     header = request.headers.get("authorization") or ""
     token = header[len("Bearer ") :].strip() if header.startswith("Bearer ") else ""
+    from .product_mcp import internal_oauth_token, oauth_challenge
+    internal_token = internal_oauth_token(request.scope)
+    if internal_token is not None:
+        token = internal_token
+    oauth_identity = None
+
+    def auth_error(detail, status_code, extra_headers=None):
+        headers = {"Cache-Control": "no-store", **(extra_headers or {})}
+        if status_code == 401 and path in {"/mcp", "/mcp/"}:
+            headers["WWW-Authenticate"] = oauth_challenge(error="invalid_token" if token else None)
+        return JSONResponse({"detail": detail}, status_code=status_code, headers=headers)
+
+    # OAuth never falls through to Firebase or the local-development bypass.
+    # Its bearer is accepted only by MCP. Internal tools carry the same token
+    # in an unforgeable ASGI context and revalidate it on every invocation.
+    if token.startswith("sad_oauth_") or internal_token is not None:
+        try:
+            oauth_identity = await run_in_threadpool(authenticate_access_token, token,
+                "/mcp" if internal_token is not None else path, request.method)
+            if internal_token is not None:
+                await run_in_threadpool(enforce_delegated_route, path, request.method, oauth_identity["agent_access_mode"])
+            request.state.oauth_grant_id = oauth_identity["oauth_grant_id"]
+            request.state.oauth_scopes = oauth_identity["oauth_scopes"]
+            request.state.agent_access_mode = oauth_identity["agent_access_mode"]
+            request.state.auth_method = "oauth"
+            request.state.credential_kind = "oauth"
+        except HTTPException as exc:
+            return auth_error(exc.detail, exc.status_code, exc.headers)
+        except Exception:
+            return auth_error("Invalid or expired OAuth access token.", 401)
+    if path in _OAUTH_OPEN_PATHS:
+        response = await call_next(request)
+        response.headers.update({"Cache-Control": "no-store", "Pragma": "no-cache"})
+        return response
+    oauth_browser = path.startswith("/api/dashboard/me/oauth")
     website_path = path == "/api/v1" or path.startswith("/api/v1/")
     key_management = path == WEBSITE_API_MANAGEMENT_URL or path.startswith(WEBSITE_API_MANAGEMENT_URL + "/")
     # Website credentials are handled before every local-dev and public-asset
@@ -212,31 +253,36 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
             return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
                                 headers={"Cache-Control": "private, no-store", "Vary": "Authorization", **(exc.headers or {})})
         return await call_next(request)
-    if FIREBASE_APP is None and not token.startswith("sad_agent_") and not key_management:
+    if FIREBASE_APP is None and not token.startswith("sad_agent_") and not key_management and not oauth_browser and oauth_identity is None:
         # No credentials configured (e.g. local dev without the secret
         # file) -- stay open rather than lock everyone out.
         return await call_next(request)
-    if request.method == "OPTIONS" or path in _FIREBASE_OPEN_PATHS or path.startswith(_FIREBASE_OPEN_PREFIXES):
+    if (request.method == "OPTIONS" or path in _FIREBASE_OPEN_PATHS or path.startswith(_FIREBASE_OPEN_PREFIXES)) and oauth_identity is None:
         return await call_next(request)
     if key_management and token.startswith("sad_agent_"):
         return JSONResponse({"detail": "Use your signed-in browser to manage website API keys."}, status_code=403,
                             headers={"Cache-Control": "no-store"})
-    if not header.startswith("Bearer "):
-        return JSONResponse({"detail": "Sign in required."}, status_code=401)
+    if not header.startswith("Bearer ") and oauth_identity is None:
+        return auth_error("Sign in required.", 401)
     try:
-        if token.startswith("sad_agent_"):
+        if oauth_identity is not None:
+            decoded = oauth_identity
+        elif token.startswith("sad_agent_"):
             decoded = await run_in_threadpool(authenticate_agent_connection, token, path, request.method)
             request.state.agent_connection_id = decoded["agent_connection_id"]
             request.state.agent_access_mode = decoded["agent_access_mode"]
+            request.state.auth_method = "agent_code"
+            request.state.credential_kind = "agent_code"
         else:
-            if key_management and FIREBASE_APP is None:
+            if (key_management or oauth_browser) and FIREBASE_APP is None:
                 raise HTTPException(503, "Firebase authentication is not configured.")
             decoded = await run_in_threadpool(firebase_auth.verify_id_token, token)
             request.state.auth_method = "firebase"
+            request.state.credential_kind = "firebase"
     except HTTPException as exc:
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        return auth_error(exc.detail, exc.status_code, exc.headers)
     except Exception:
-        return JSONResponse({"detail": "Your session expired -- please sign in again."}, status_code=401)
+        return auth_error("Your session expired -- please sign in again.", 401)
     email = (decoded.get("email") or "").strip().lower()
     access = await run_in_threadpool(get_dashboard_user_access, email)
     if access is None:
@@ -306,7 +352,10 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         await run_in_threadpool(log_usage_event, email, path, request.method)
     except Exception:
         logging.getLogger(__name__).warning("usage log insert failed", exc_info=True)
-    return await call_next(request)
+    response = await call_next(request)
+    if oauth_browser or path in {"/mcp", "/mcp/"}:
+        response.headers.update({"Cache-Control": "no-store", "Pragma": "no-cache"})
+    return response
 
 
 app.add_middleware(
@@ -558,6 +607,9 @@ def dashboard_me(request: Request) -> dict[str, Any]:
         "email": getattr(request.state, "user_email", None),
         "agent_connection_id": getattr(request.state, "agent_connection_id", None),
         "agent_access_mode": getattr(request.state, "agent_access_mode", None),
+        "auth_method": getattr(request.state, "auth_method", None),
+        "oauth_grant_id": getattr(request.state, "oauth_grant_id", None),
+        "oauth_scopes": getattr(request.state, "oauth_scopes", []),
         "is_admin": bool(getattr(request.state, "is_admin", False)),
         "operating_role": getattr(request.state, "operating_role", "sales"),
         "operating_roles": getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]),

@@ -103,7 +103,47 @@ routes calls internally through the existing authentication/authorization
 middleware. Full-access codes expose action tools with `confirm=true`;
 read-only codes hide those tools and reject direct mutation calls.
 Browser Origin requests and unexpected Host headers are rejected.
-Custom hostnames require `SENTIENT_MCP_ALLOWED_HOSTS`. OAuth is not advertised.
+Custom hostnames require `SENTIENT_MCP_ALLOWED_HOSTS`.
+
+## ChatGPT MCP OAuth
+
+Hosted MCP also supports OAuth authorization code with PKCE S256 and public
+dynamic client registration. Existing agent codes keep their current format,
+permissions, expiry and management API. OAuth discovery is public at
+`/.well-known/oauth-protected-resource/mcp` (also the root variant) and
+`/.well-known/oauth-authorization-server`. Registration, authorization, token
+exchange and revocation are served by `/oauth/register`, `/oauth/authorize`,
+`/oauth/token` and `/oauth/revoke`.
+
+Only registered HTTPS ChatGPT callbacks are accepted. Authorization redirects
+to SentientDash `/oauth.html`, where the owner signs in with Firebase and
+explicitly approves or declines the requested permissions. Browser APIs are
+`GET/POST /api/dashboard/me/oauth/authorization`,
+`GET /api/dashboard/me/oauth-connections` and
+`DELETE /api/dashboard/me/oauth-connections/{grant_id}`. Delegated credentials
+cannot use these APIs, and consent cannot run under a role preview.
+
+The `sentient:read` scope permits read tools; `sentient:write` adds actions
+within the owner's current roles, with the existing `confirm=true` gate.
+OAuth tool metadata and scope-upgrade challenges let clients request writes
+explicitly. Access tokens last 15 minutes; connections last 90 days. Refresh
+tokens rotate, and reuse revokes the entire connection. All secret values
+are stored as SHA-256 hashes, and OAuth responses use no-store caching.
+
+Tokens are bound to the canonical `/mcp` resource and are rejected on direct
+REST requests. Internal tool dispatch revalidates the token and owner's
+permissions without forwarding it as a REST bearer credential. Revocation
+stops subsequent calls and leaves independently issued agent codes intact.
+
+`SENTIENT_OAUTH_ISSUER` defaults to `https://cortex-api-db2e.onrender.com`.
+An override must be an HTTPS origin and must match the public deployment;
+custom MCP hosts must also be configured above. The frontend consent URL is
+`https://sentientdash.app/oauth.html`. No additional shared OAuth secret is
+required. Schema creation is additive through the existing startup migration.
+
+OAuth protocol, replay, permission isolation and legacy compatibility tests
+are in `backend/tests/test_mcp_oauth.py` and
+`backend/tests/test_mcp_oauth_integration.py`.
 
 ## Website data API
 

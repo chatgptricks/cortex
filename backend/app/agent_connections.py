@@ -39,7 +39,7 @@ def _owner(request: Request) -> str:
     email = str(getattr(request.state, "user_email", "") or "").strip().lower()
     if not email:
         raise HTTPException(401, "Sign in required.")
-    if getattr(request.state, "agent_connection_id", None):
+    if getattr(request.state, "agent_connection_id", None) or getattr(request.state, "oauth_grant_id", None):
         raise HTTPException(403, "Use your signed-in browser to manage agent connections.")
     return email
 
