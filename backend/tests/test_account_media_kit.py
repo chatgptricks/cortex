@@ -71,6 +71,128 @@ def insert(conn, table, **values):
     conn.execute(f"INSERT INTO {table} ({','.join(names)}) VALUES ({','.join('?' for _ in names)})", list(values.values()))
 
 
+def seed_consistent_public_window(connect, mode="posts"):
+    with connect() as conn:
+        conn.execute("UPDATE accounts SET scrape_mode = ?", (mode,))
+        insert(conn, "dashboard_posts", account="sample", shortcode="history", likes=10,
+               comments=1, published_at="2026-09-08T12:00:00Z")
+        insert(conn, "dashboard_posts", account="sample", shortcode="recentA", likes=20,
+               comments=2, product_type="clips", published_at="2026-10-08T11:00:00Z")
+        insert(conn, "dashboard_posts", account="sample", shortcode="recentB", likes=30,
+               comments=3, post_type_label="Video", published_at="2026-10-09T11:00:00Z")
+        for captured, count in (("2026-09-09T17:00:00Z", 50),
+                                ("2026-10-08T12:00:00Z", 51),
+                                ("2026-10-09T12:00:00Z", 52)):
+            insert(conn, "account_snapshots", handle="sample", followers_count=1000,
+                   posts_count=count, private=0, captured_at=captured)
+
+
+@pytest.mark.parametrize("mode", ["posts", "both"])
+def test_recent_public_availability_requires_full_source_and_consistent_window(report_db, mode):
+    connect, _ = report_db
+    seed_consistent_public_window(connect, mode)
+    report = kit.build_account_media_kit("sample", now=NOW)
+    assert report["public_recent_available"] is True
+    assert report["public_recent_availability_reasons"] == []
+    assert report["public_summary"]["last_30_days"]["post_count"] == 2
+    assert report["public_summary"]["last_30_days"]["eligible_video_count"] == 2
+    assert report["public_summary"]["all_time"]["eligible_video_count"] == 2
+    assert report["public_summary"]["all_time"]["post_count"] == 3
+    assert "scrape_mode" not in report["account"]
+
+
+@pytest.mark.parametrize("mode", ["reels", None, "unknown"])
+def test_narrow_or_unconfirmed_sources_never_claim_all_recent_account_posts(report_db, mode):
+    connect, _ = report_db
+    seed_consistent_public_window(connect, mode)
+    report = kit.build_account_media_kit("sample", now=NOW)
+    assert report["public_recent_available"] is False
+    assert "all_post_source_unconfirmed" in report["public_recent_availability_reasons"]
+    # Keep the full internal data, rather than replacing the observed
+    # two-post sample with an inferred publication count or zero metrics.
+    assert report["public_summary"]["last_30_days"]["metrics"]["likes"]["total"] == 50
+
+
+def test_ivan_style_stalled_library_with_later_profile_increases_is_unavailable(report_db):
+    connect, _ = report_db
+    seed_consistent_public_window(connect)
+    with connect() as conn:
+        conn.execute("UPDATE dashboard_posts SET published_at = '2026-09-10T12:00:00Z' WHERE shortcode LIKE 'recent%'")
+        conn.execute("UPDATE account_snapshots SET posts_count = 94 WHERE captured_at = '2026-09-09T17:00:00Z'")
+        conn.execute("UPDATE account_snapshots SET posts_count = 95, captured_at = '2026-09-10T15:00:00Z' WHERE captured_at = '2026-10-08T12:00:00Z'")
+        conn.execute("UPDATE account_snapshots SET posts_count = 107 WHERE captured_at = '2026-10-09T12:00:00Z'")
+    report = kit.build_account_media_kit("sample", now=NOW)
+    assert report["public_recent_available"] is False
+    assert "profile_increase_exceeds_stored_public_posts" in report["public_recent_availability_reasons"]
+    assert report["public_summary"]["last_30_days"]["post_count"] == 2
+    assert report["public_summary"]["last_30_days"]["metrics"]["likes"]["total"] == 50
+
+
+def test_deletions_cannot_mask_a_missing_profile_increase_inside_the_window(report_db):
+    connect, _ = report_db
+    seed_consistent_public_window(connect)
+    with connect() as conn:
+        # First-to-last net growth is exactly two, matching the two known
+        # posts. The earlier +5 interval still proves a missing sample.
+        conn.execute("UPDATE account_snapshots SET posts_count = 55 WHERE captured_at = '2026-10-08T12:00:00Z'")
+    report = kit.build_account_media_kit("sample", now=NOW)
+    assert report["public_recent_available"] is False
+    assert "profile_increase_exceeds_stored_public_posts" in report["public_recent_availability_reasons"]
+
+
+def test_duplicate_hidden_deleted_future_and_undated_rows_cannot_cover_missing_posts(report_db):
+    connect, _ = report_db
+    seed_consistent_public_window(connect)
+    with connect() as conn:
+        conn.execute("UPDATE accounts SET is_canonical = 1")
+        conn.execute("UPDATE account_snapshots SET posts_count = 53 WHERE captured_at = '2026-10-09T12:00:00Z'")
+        insert(conn, "posts", section="historical", shortcode="recentB", likes=30,
+               comments=3, published_at="2026-10-09T11:00:00Z")
+        for code, hidden, deleted, published in (("hidden", 1, 0, "2026-10-09T11:00:00Z"),
+                                                 ("deleted", 0, 1, "2026-10-09T11:00:00Z"),
+                                                 ("future", 0, 0, "2026-10-10T11:00:00Z"),
+                                                 ("undated", 0, 0, None)):
+            insert(conn, "dashboard_posts", account="sample", shortcode=code, likes=500,
+                   comments=5, hidden=hidden, is_deleted=deleted, published_at=published)
+    report = kit.build_account_media_kit("sample", now=NOW)
+    assert report["public_recent_available"] is False
+    assert "profile_increase_exceeds_stored_public_posts" in report["public_recent_availability_reasons"]
+    assert report["public_summary"]["last_30_days"]["post_count"] == 2
+    assert report["summary"]["last_30_days"]["post_count"] == 4
+    assert report["coverage"]["future_posts_excluded"] == 1
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("missing_public_history", "insufficient_public_window_history"),
+    ("missing_baseline", "missing_profile_window_baseline"),
+    ("old_baseline", "missing_profile_window_baseline"),
+    ("stale_current", "missing_or_stale_current_profile"),
+    ("no_recent_posts", "no_confirmed_recent_posts"),
+    ("private", "private_account"),
+])
+def test_unconfirmed_recent_windows_are_unavailable_instead_of_zero_claims(report_db, case, reason):
+    connect, _ = report_db
+    seed_consistent_public_window(connect)
+    with connect() as conn:
+        if case == "missing_public_history":
+            conn.execute("DELETE FROM dashboard_posts WHERE shortcode = 'history'")
+        elif case == "missing_baseline":
+            conn.execute("DELETE FROM account_snapshots WHERE captured_at = '2026-09-09T17:00:00Z'")
+        elif case == "old_baseline":
+            conn.execute("UPDATE account_snapshots SET captured_at = '2026-09-01T17:00:00Z' WHERE captured_at = '2026-09-09T17:00:00Z'")
+        elif case == "stale_current":
+            conn.execute("DELETE FROM account_snapshots WHERE captured_at = '2026-10-08T12:00:00Z'")
+            conn.execute("UPDATE account_snapshots SET captured_at = '2026-10-05T12:00:00Z' WHERE captured_at = '2026-10-09T12:00:00Z'")
+        elif case == "no_recent_posts":
+            conn.execute("DELETE FROM dashboard_posts WHERE shortcode LIKE 'recent%'")
+            conn.execute("UPDATE account_snapshots SET posts_count = 50")
+        elif case == "private":
+            conn.execute("UPDATE account_snapshots SET private = 1")
+    report = kit.build_account_media_kit("sample", now=NOW)
+    assert report["public_recent_available"] is False
+    assert reason in report["public_recent_availability_reasons"]
+
+
 def test_known_samples_zero_and_hidden_likes_are_distinct(report_db):
     connect, _ = report_db
     with connect() as conn:

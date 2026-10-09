@@ -56,7 +56,8 @@ def test_public_report_is_two_pages_with_links_known_zero_and_no_private_facts()
     assert len(reader.pages) == 2
     assert "Sample Studio" in text
     assert "A useful creative example" in text
-    assert "The last 30 days" in text
+    assert "Posts published in the last 30 days" in text
+    assert "current cumulative public counts" in " ".join(text.split())
     assert "Average comments".upper() in text
     assert "0" in text
     assert "N/A" not in text
@@ -153,6 +154,50 @@ def test_public_numbers_limit_decimals_preserve_small_averages_and_select_availa
     assert "AVERAGE VIDEO VIEWS" not in text
     assert "N/A" not in text
     assert not re.findall(r"(?<![\w.])[-+]?\d+\.\d{3,}(?![\w.])", text)
+
+
+def test_missing_recent_period_hides_misleading_two_posts_117_likes_and_recent_links():
+    report = sample_report()
+    incomplete = deepcopy(report["best_posts"]["last_30_days"][0])
+    incomplete.update({"public_caption": "INCOMPLETE_RECENT_ONLY_EXAMPLE",
+                       "permalink": "https://www.instagram.com/p/recent_only/",
+                       "metrics": {"likes": 117, "comments": 0}})
+    report["summary"]["last_30_days"] = {"post_count": 2, "metrics": {"likes": {"total": 117}}}
+    report["best_posts"]["last_30_days"] = [incomplete]
+    _, before = pdf_text(render_media_kit_pdf(report))
+    assert "117" in before
+    assert "INCOMPLETE_RECENT_ONLY_EXAMPLE" in before
+    # The projection's omitted summary key is authoritative, even if a stale
+    # recent-only post list is accidentally retained in the input.
+    del report["summary"]["last_30_days"]
+    reader, text = pdf_text(render_media_kit_pdf(report))
+    assert len(reader.pages) == 2
+    assert "117" not in text
+    assert "Posts published in the last 30 days" not in text
+    assert "PUBLISHED IN THE LAST 30 DAYS" not in text
+    assert "INCOMPLETE_RECENT_ONLY_EXAMPLE" not in text
+    assert "A useful creative example" in text
+    assert "HISTORICAL HIGHLIGHTS" in text
+    for forbidden in ("coverage", "incomplete", "stored", "source", "stale"):
+        assert forbidden not in text.lower()
+    links = [annotation.get_object().get("/A", {}).get("/URI", "")
+             for page in reader.pages for annotation in page.get("/Annots", [])]
+    assert "https://www.instagram.com/p/recent_only/" not in links
+
+
+def test_confirmed_zero_post_period_stays_visible_and_is_not_missing_recent_data():
+    report = sample_report()
+    report["summary"]["last_30_days"] = {"post_count": 0, "metrics": {
+        key: {"total": 0, "average": None} for key in ("likes", "comments", "video_views")}}
+    report["best_posts"]["last_30_days"] = []
+    reader, text = pdf_text(render_media_kit_pdf(report))
+    assert len(reader.pages) == 2
+    assert "Posts published in the last 30 days" in text
+    recent_text = reader.pages[0].extract_text().split("Posts published in the last 30 days")[1]
+    assert recent_text.count("\n0\n") == 4
+    assert "No public posts were published in this period." in text
+    assert "N/A" not in text
+    assert "current cumulative public counts" in " ".join(text.split())
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])

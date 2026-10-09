@@ -193,6 +193,9 @@ class _Report:
         self.summary = report.get("summary") or {}
         self.all_time = self.summary.get("all_time") or {}
         self.recent = self.summary.get("last_30_days") or {}
+        # The public projection removes the recent key when its publication
+        # window is not complete. Missing is different from an asserted zero.
+        self.recent_available = "last_30_days" in self.summary
         self.handle = _text(self.account.get("handle") or "Account").lstrip("@")
         self.stream = io.BytesIO()
         self.c = canvas.Canvas(self.stream, pagesize=A4, pageCompression=1, invariant=True)
@@ -446,33 +449,35 @@ class _Report:
         totals = [item for item in total_candidates if _number(item[1]) is not None]
         y = self.section("Typical content performance", top - 180)
         if averages:
-            y = self.cards(averages, y, columns=len(averages), height=83)
+            y = self.cards(averages, y, columns=len(averages), height=83 if self.recent_available else 92)
         if totals:
-            y = self.cards(totals, y + 1, columns=len(totals), height=72, style="total")
+            y = self.cards(totals, y + 1, columns=len(totals), height=72 if self.recent_available else 84, style="total")
         if not averages and not totals:
             y = self.paragraph(MARGIN, y - 15, "Public performance highlights are not available yet.",
                                CW, 10, self.p.muted) - 40
-        y = self.section("The last 30 days", y - 8)
-        recent_video = "video_views" if _number(_stat(self.recent, "video_views")) is not None else "video_plays"
-        recent_candidates = [
-            ("Public posts", self.recent.get("post_count"), "count", "Published in this period"),
-            ("Likes", _stat(self.recent, "likes"), "count", "Across those posts"),
-            ("Comments", _stat(self.recent, "comments"), "count", "Across those posts"),
-            ("Video views" if recent_video == "video_views" else "Video plays", _stat(self.recent, recent_video), "count", "Across those videos"),
-        ]
-        recent_items = [item for item in recent_candidates if _number(item[1]) is not None]
-        if recent_items:
-            y = self.cards(recent_items, y, columns=len(recent_items), height=79, style="recent")
+        if self.recent_available:
+            y = self.section("Posts published in the last 30 days", y - 8)
+            recent_video = "video_views" if _number(_stat(self.recent, "video_views")) is not None else "video_plays"
+            recent_candidates = [
+                ("Public posts", self.recent.get("post_count"), "count", "Published in this period"),
+                ("Likes", _stat(self.recent, "likes"), "count", "Across those posts"),
+                ("Comments", _stat(self.recent, "comments"), "count", "Across those posts"),
+                ("Video views" if recent_video == "video_views" else "Video plays", _stat(self.recent, recent_video), "count", "Across those videos"),
+            ]
+            recent_items = [item for item in recent_candidates if _number(item[1]) is not None]
+            if recent_items:
+                y = self.cards(recent_items, y, columns=len(recent_items), height=79, style="recent")
+            note = "Historical highlights summarize analyzed public posts. Recent figures cover posts published in the last 30 days and their current cumulative public counts. Video views and plays are separate measures; neither represents unique reach."
         else:
-            y = self.paragraph(MARGIN, y - 15, "Recent public performance is not available yet.",
-                               CW, 9, self.p.muted) - 32
-        self.note("Historical highlights summarize analyzed public posts. Recent figures cover posts published in the last 30 days and their current public counts. Video views and plays are separate measures; neither represents unique reach.",
-                  min(y - 8, 173), height=63)
+            note = "Historical highlights summarize analyzed public posts and their current cumulative public counts. Video views and plays are separate measures; neither represents unique reach."
+        self.note(note, min(y - 18, 173 if self.recent_available else 253), height=63)
 
-    def post_card(self, post: dict[str, Any] | None, x: float, y: float, width: float, rank: int) -> None:
-        self.rect(x, y - 155, width, 155)
+    def post_card(self, post: dict[str, Any] | None, x: float, y: float, width: float, rank: int,
+                  empty_message: str = "Public post highlights are not available for this period.") -> None:
+        wide = width > CW * 0.75
+        self.rect(x, y - (168 if wide else 155), width, 168 if wide else 155)
         if not post:
-            self.paragraph(x + 15, y - 42, "Public post highlights are not available for this period.",
+            self.paragraph(x + 15, y - 42, empty_message,
                            width - 30, 9, self.p.muted, max_lines=3)
             return
         self.text(x + 12, y - 18, f"{rank:02}", 8.5, self.p.accent_text, bold=True)
@@ -480,36 +485,47 @@ class _Report:
         self.text(x + width - 12, y - 18, f"{_date(post.get('published_at'))} / {format_name}",
                   6.9, self.p.muted, width=width - 50, align="right")
         caption = post.get("public_caption") or "View this public post"
-        has_image = self.image(post.get("thumbnail_bytes"), x + 12, y - 107, 82, 82)
-        self.paragraph(x + (107 if has_image else 12), y - 43, caption,
-                       width - (119 if has_image else 24), 8.3, self.p.title,
-                       max_lines=5 if has_image else 4, leading=11.5, bold=True)
+        image_size = 108 if wide else 82
+        has_image = self.image(post.get("thumbnail_bytes"), x + 12, y - (135 if wide else 107), image_size, image_size)
+        content_x = x + (140 if has_image and wide else 107 if has_image else 12)
+        self.paragraph(content_x, y - 43, caption,
+                       width - (content_x - x) - 12, 10.3 if wide else 8.3, self.p.title,
+                       max_lines=4 if wide else 5 if has_image else 4, leading=14 if wide else 11.5, bold=True)
         metrics = post.get("metrics") or {}
         def badges(keys: tuple[str, str], at: float) -> None:
-            offset = x + 12
+            offset = x + (140 if wide and has_image else 12)
             for key in keys:
                 value = _number(metrics.get(key))
                 if value is None:
                     continue
                 label = {"likes": "likes", "comments": "comments", "video_views": "views", "video_plays": "plays"}[key]
                 rendered = f"{_fmt(value, compact=True)} {label}"
-                self.icon(self.metric_icon(label), offset, at - 3, 11)
-                self.text(offset + 15, at, rendered, 7, self.p.muted)
-                offset += 22 + pdfmetrics.stringWidth(rendered, "MediaKit", 7)
-        badges(("likes", "comments"), y - 122)
-        badges(("video_views", "video_plays"), y - 135)
+                self.icon(self.metric_icon(label), offset, at - 3, 13 if wide else 11)
+                self.text(offset + 17 if wide else offset + 15, at, rendered, 8.3 if wide else 7, self.p.muted)
+                offset += 25 + pdfmetrics.stringWidth(rendered, "MediaKit", 8.3 if wide else 7)
+        badges(("likes", "comments"), y - (113 if wide else 122))
+        badges(("video_views", "video_plays"), y - (130 if wide else 135))
         url = _instagram_post(post.get("permalink"))
         if url:
-            self.link(x + 12, y - 146, "VIEW PUBLIC POST", url, size=6.9)
+            self.link(x + (140 if wide and has_image else 12), y - (153 if wide else 146), "VIEW PUBLIC POST", url, size=7.5 if wide else 6.9)
 
     def strongest_posts(self) -> None:
         self.page("Content that connects", "Selected public posts that showcase the account's content and engagement.")
         groups = self.report.get("best_posts") or {}
         historical = (groups.get("all_time") or [])[:3]
+        if not self.recent_available:
+            self.text(MARGIN, self.y, "HISTORICAL HIGHLIGHTS", 8, self.p.accent_text, bold=True)
+            y = self.y - 15
+            for index in range(max(len(historical), 1)):
+                self.post_card(historical[index] if index < len(historical) else None, MARGIN, y, CW, index + 1)
+                y -= 181
+            self.note("Highlights are selected by public likes and comments. Displayed public counts include cumulative activity since publication.",
+                      min(y - 5, 170), height=49)
+            return
         recent = (groups.get("last_30_days") or [])[:3]
         width = (CW - 13) / 2
         self.text(MARGIN, self.y, "HISTORICAL HIGHLIGHTS", 8, self.p.accent_text, bold=True)
-        self.text(MARGIN + width + 13, self.y, "LAST 30 DAYS", 8, self.p.accent_text, bold=True)
+        self.text(MARGIN + width + 13, self.y, "PUBLISHED IN THE LAST 30 DAYS", 7.6, self.p.accent_text, bold=True)
         y = self.y - 15
         rows = max(len(historical), len(recent), 1)
         for index in range(rows):
@@ -517,7 +533,8 @@ class _Report:
                 if index < len(posts):
                     self.post_card(posts[index], x, y, width, index + 1)
                 elif index == 0:
-                    self.post_card(None, x, y, width, index + 1)
+                    message = "No public posts were published in this period." if posts is recent and self.recent.get("post_count") == 0 else "Public post highlights are not available for this period."
+                    self.post_card(None, x, y, width, index + 1, empty_message=message)
             y -= 168
         self.note("Highlights are selected by public likes and comments. Recent posts were published in the last 30 days; displayed counts include activity since publication.",
                   min(y - 5, 170), height=49)

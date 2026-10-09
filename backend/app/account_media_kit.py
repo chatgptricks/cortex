@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from bisect import bisect_right
 from collections import Counter
 from datetime import UTC, datetime, timedelta, timezone
 from statistics import median
@@ -367,6 +368,7 @@ def _period(posts: list[dict[str, Any]], catalog: list[dict[str, Any]], follower
     views = measurements["video_views"]["average"]
     return {
         "post_count": n, "posts_per_week": cadence_count / days * 7 if days else None,
+        "eligible_video_count": sum(post.get("format") in {"Reel", "Video"} for post in posts),
         "cadence_post_count": cadence_count,
         "metrics": measurements, "engagements": engagement,
         "complete_engagement_posts": complete,
@@ -427,6 +429,63 @@ def _growth(baseline: Any, latest: Any, days: int | None) -> dict[str, Any] | No
     return {"delta": delta, "pct": delta / start * 100 if start else None,
             "from": baseline[1]["captured_at"], "to": latest[1]["captured_at"],
             "observed_days": (latest[0] - baseline[0]).days, "requested_days": days}
+
+
+def _public_recent_availability(
+    public_posts: list[dict[str, Any]], snapshots: list[dict[str, Any]],
+    registry: dict[str, Any], current: datetime, private: bool | None,
+) -> tuple[bool, list[str]]:
+    """Permit a recent sales summary only with sufficient, consistent data.
+
+    Profile post-count changes can prove the stored library is missing posts;
+    they cannot supply a publication count or prove the library is complete.
+    These reasons are internal and never enter the public PDF projection.
+    """
+    cutoff = current - timedelta(days=30)
+    tolerance = timedelta(days=3)
+    reasons = []
+    if private:
+        reasons.append("private_account")
+    if registry.get("scrape_mode") not in {"posts", "both"}:
+        reasons.append("all_post_source_unconfirmed")
+    # The normalized report already deduplicates posts. Keep this explicit
+    # because profile increments must be compared with distinct public posts.
+    dates_by_code = {post["shortcode"]: published for post in public_posts
+                     if post.get("shortcode") and (published := _date(post.get("published_at"))) and published <= current}
+    dates = sorted(dates_by_code.values())
+    if not dates or dates[0] > cutoff:
+        reasons.append("insufficient_public_window_history")
+    if not any(date >= cutoff for date in dates):
+        reasons.append("no_confirmed_recent_posts")
+    usable = []
+    for snapshot in snapshots:
+        captured = _date(snapshot.get("captured_at"))
+        count = _number(snapshot.get("posts_count"))
+        if captured and captured <= current and count is not None and count == int(count):
+            usable.append((captured, count))
+    usable.sort()
+    baseline = next((value for value in reversed(usable) if value[0] <= cutoff), None)
+    latest = usable[-1] if usable else None
+    if baseline is None or cutoff - baseline[0] > tolerance:
+        reasons.append("missing_profile_window_baseline")
+    if latest is None or latest[0] <= cutoff or current - latest[0] > tolerance:
+        reasons.append("missing_or_stale_current_profile")
+    # Check all observed intervals, rather than only first vs. last: a
+    # deletion later in the month can conceal an earlier missing increment.
+    observed = ([baseline] if baseline is not None else []) + [value for value in usable if value[0] > cutoff]
+    missing = False
+    for start_index, (start, initial_count) in enumerate(observed):
+        for end, final_count in observed[start_index + 1:]:
+            net_increase = final_count - initial_count
+            if net_increase > 0:
+                stored = bisect_right(dates, end) - bisect_right(dates, start)
+                if net_increase > stored:
+                    missing = True
+                    break
+        if missing:
+            reasons.append("profile_increase_exceeds_stored_public_posts")
+            break
+    return not reasons, reasons
 
 
 def _terms(value: Any) -> list[str]:
@@ -547,6 +606,7 @@ def build_account_media_kit(handle: str, *, now: datetime | None = None) -> dict
         "all_time": _period(public_posts, public_catalog, followers, None),
         "last_30_days": _period(public_recent, public_catalog, followers, 30),
     }
+    recent_available, recent_availability_reasons = _public_recent_availability(public_posts, snapshots, registry, current, account["private"])
     trend = {}
     for name in ("likes", "comments", "video_views", "video_plays"):
         a = summary["last_30_days"]["metrics"][name]["average"]
@@ -598,6 +658,8 @@ def build_account_media_kit(handle: str, *, now: datetime | None = None) -> dict
     return {
         "schema_version": 1, "generated_at": current.isoformat(timespec="seconds"), "timezone": "America/Costa_Rica",
         "account": account, "summary": summary, "public_summary": public_summary,
+        "public_recent_available": recent_available,
+        "public_recent_availability_reasons": recent_availability_reasons,
         "public_best_posts": {"all_time": _top(public_posts, limit=3), "last_30_days": _top(public_recent, limit=3)},
         "periods": {key: {"from": (current - timedelta(days=days)).isoformat(timespec="seconds") if days else coverage["oldest_post_at"], "to": (current - timedelta(days=30)).isoformat(timespec="seconds") if key == "previous_30_days" else current.isoformat(timespec="seconds")} for key, days in (("all_time", None), ("last_30_days", 30), ("previous_30_days", 60), ("last_90_days", 90))},
         "trends_pct": trend, "follower_history": history, "follower_growth": growth,

@@ -41,7 +41,8 @@ def prepare_media_kit_assets(report: dict[str, Any]) -> None:
         return
     account = report.get("account") or {}
     groups = report.get("public_best_posts") if "public_best_posts" in report else report.get("best_posts", {})
-    posts = [post for key in ("all_time", "last_30_days") for post in (groups.get(key) or [])[:6]]
+    keys = ("all_time",) if report.get("public_recent_available") is False else ("all_time", "last_30_days")
+    posts = [post for key in keys for post in (groups.get(key) or [])[:6]]
     targets = [(account, "avatar_bytes", account.get("avatar_path"))]
     targets += [(post, "thumbnail_bytes", post.get("cover_path")) for post in posts]
     references = list(dict.fromkeys(reference for _, _, reference in targets if media_storage.is_r2_reference(reference)))

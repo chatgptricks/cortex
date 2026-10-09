@@ -38,6 +38,7 @@ def post(code="publicA", published="2026-10-08T18:00:00Z", **overrides):
 def report():
     period = {
         "post_count": 2,
+        "eligible_video_count": 2,
         "metrics": {"likes": stats(), "comments": stats(20, 10),
                     "video_views": stats(1000, 500), "video_plays": stats(1300, 650),
                     "likes_at_1h": stats(888), "analysis.private_score": stats(999),
@@ -60,6 +61,7 @@ def report():
                     "private": False, "created_at": "CANARY_INTERNAL_CREATED_DATE"},
         "summary": {key: copy.deepcopy(period) for key in ("all_time", "last_30_days", "previous_30_days", "last_90_days")},
         "public_summary": {key: copy.deepcopy(period) for key in ("all_time", "last_30_days")},
+        "public_recent_available": True,
         "public_best_posts": {"all_time": [post()], "last_30_days": [post()],
                        "by_metric": {"secret": "CANARY_RANKING_METADATA"}},
         "best_posts": {"all_time": [post("CANARY_DRAFT", public_caption="CANARY_DRAFT_CAPTION")]},
@@ -174,7 +176,7 @@ def test_showcase_caps_filters_duplicates_hidden_deleted_future_and_recent_dates
     assert [post["shortcode"] for post in public["best_posts"]["last_30_days"]] == ["one", "two", "three"]
     source["account"]["private"] = "true"
     private = project_public_media_kit(source)
-    assert private["best_posts"] == {"all_time": [], "last_30_days": []}
+    assert private["best_posts"] == {"all_time": []}
     assert all(period["post_count"] == 0 and period["engagements"]["total"] is None for period in private["summary"].values())
 
 
@@ -209,7 +211,7 @@ def test_approximate_growth_missing_values_and_empty_report_are_safe():
     assert "follower_growth" not in project_public_media_kit(source)
     public = project_public_media_kit({})
     assert public["summary"]["all_time"]["engagements"] == {"total": None, "average": None}
-    assert public["best_posts"] == {"all_time": [], "last_30_days": []}
+    assert public["best_posts"] == {"all_time": []}
     assert public["account"]["verified"] is None
 
 
@@ -219,7 +221,7 @@ def test_internal_totals_are_never_used_without_explicit_public_cohort():
     source.pop("public_best_posts")
     public = project_public_media_kit(source)
     assert public["summary"]["all_time"]["post_count"] is None
-    assert public["best_posts"] == {"all_time": [], "last_30_days": []}
+    assert public["best_posts"] == {"all_time": []}
     assert public["summary"]["all_time"]["metrics"]["likes"] == {"total": None, "average": None}
     assert public["summary"]["all_time"]["engagements"] == {"total": None, "average": None}
 
@@ -287,5 +289,60 @@ def test_actual_builder_public_provenance_excludes_registry_and_title_fallback(m
     assert full["summary"]["all_time"]["post_count"] == 5
     assert public["summary"]["all_time"]["post_count"] == 2
     assert public["summary"]["all_time"]["metrics"]["likes"]["total"] == 150
-    assert public["summary"]["last_30_days"]["metrics"]["comments"]["total"] == 15
+    assert "last_30_days" not in public["summary"]
     assert "CANARY" not in json.dumps(public)
+
+
+@pytest.mark.parametrize("availability", [None, False, 1, "true", {"reason": "CANARY_PRIVATE_REASON"}])
+def test_unverified_recent_sample_cannot_become_a_full_account_period(availability):
+    source = report()
+    source["public_recent_available"] = availability
+    source["public_recent_availability"] = {"reasons": ["CANARY_PRIVATE_REASON"]}
+    source["public_summary"]["last_30_days"]["metrics"]["likes"] = stats(117, 58.5)
+    source["public_best_posts"]["last_30_days"] = [post("recentOnly", public_caption="CANARY_RECENT_SAMPLE")]
+    public = project_public_media_kit(source)
+    assert "last_30_days" not in public["summary"]
+    assert "last_30_days" not in public["best_posts"]
+    assert public["summary"]["all_time"]["metrics"]["likes"]["total"] == 100
+    assert public["account"]["followers"] == 1000
+    assert "CANARY" not in json.dumps(public, default=str)
+    assert source["public_summary"]["last_30_days"]["metrics"]["likes"]["total"] == 117
+
+
+def test_partial_recent_likes_never_become_period_total_or_engagement_rate():
+    source = report()
+    period = source["public_summary"]["last_30_days"]
+    period["post_count"] = 3
+    period["metrics"]["likes"] = stats(117, 58.5, count=2)
+    period["metrics"]["comments"] = stats(15, 5, count=3)
+    period["engagements"]["count"] = 3
+    public_period = project_public_media_kit(source)["summary"]["last_30_days"]
+    assert public_period["metrics"]["likes"] == {"total": None, "average": 58.5}
+    assert public_period["metrics"]["comments"] == {"total": 15, "average": 5}
+    assert public_period["engagements"] == {"total": None, "average": None}
+    assert public_period["engagement_rate_pct"] is None
+    assert "eligible_video_count" not in public_period
+
+
+def test_recent_video_total_requires_every_eligible_video_but_not_image_counts():
+    source = report()
+    period = source["public_summary"]["last_30_days"]
+    period["post_count"] = 7  # Five image posts are not missing video readings.
+    period["eligible_video_count"] = 2
+    period["metrics"]["video_views"] = stats(1000, 500, count=2)
+    period["metrics"]["video_plays"] = stats(650, 650, count=1)
+    public_period = project_public_media_kit(source)["summary"]["last_30_days"]
+    assert public_period["metrics"]["video_views"] == {"total": 1000, "average": 500}
+    assert public_period["metrics"]["video_plays"] == {"total": None, "average": 650}
+
+
+def test_observed_recent_zero_is_retained_but_unverified_zero_is_not_published():
+    source = report()
+    period = source["public_summary"]["last_30_days"]
+    period["metrics"]["likes"] = stats(0, 0, count=2)
+    period["metrics"]["comments"] = stats(0, 0, count=2)
+    public_period = project_public_media_kit(source)["summary"]["last_30_days"]
+    assert public_period["metrics"]["likes"] == {"total": 0, "average": 0}
+    assert public_period["engagements"] == {"total": 0, "average": 0}
+    source["public_recent_available"] = False
+    assert "last_30_days" not in project_public_media_kit(source)["summary"]

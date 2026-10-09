@@ -94,3 +94,18 @@ def test_public_showcase_assets_never_fall_back_to_internal_post_images(monkeypa
     report["public_best_posts"] = {"all_time": [], "last_30_days": []}
     assets.prepare_media_kit_assets(report)
     assert requested == []
+
+
+def test_incomplete_recent_images_are_not_fetched_for_client_report(monkeypatch):
+    import boto3
+    from types import SimpleNamespace
+    requested = []
+    monkeypatch.setattr(assets.media_storage, "r2_enabled", lambda: True)
+    monkeypatch.setattr(boto3, "client", lambda *args, **kwargs: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(assets, "_thumbnail", lambda client, reference: requested.append(reference) or b"public-image")
+    report = {"account": {}, "public_recent_available": False,
+              "public_best_posts": {"all_time": [{"cover_path": "r2://uploads/historical.png"}],
+                                    "last_30_days": [{"cover_path": "r2://uploads/incomplete.png"}]}}
+    assets.prepare_media_kit_assets(report)
+    assert requested == ["r2://uploads/historical.png"]
+    assert "thumbnail_bytes" not in report["public_best_posts"]["last_30_days"][0]

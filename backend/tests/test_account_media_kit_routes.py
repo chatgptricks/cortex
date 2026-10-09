@@ -154,6 +154,25 @@ def test_download_only_passes_public_highlights_to_renderer_after_asset_preparat
     assert internal["account"]["name"] == secret
 
 
+def test_download_omits_incomplete_recent_sample_but_internal_json_keeps_it(report_client):
+    client, state = report_client
+    recent = {"post_count": 2, "metrics": {"likes": {"total": 117, "average": 58.5, "count": 2}}}
+    state["extra"] = {
+        "public_recent_available": False,
+        "public_recent_availability": {"reasons": ["PRIVATE_COLLECTION_SCOPE"]},
+        "public_summary": {"all_time": {"post_count": 200}, "last_30_days": recent},
+        "public_best_posts": {"all_time": [], "last_30_days": [{"shortcode": "recentOnly"}]},
+    }
+    response = client.get("/api/admin/accounts/ivanelgrande/media-kit.pdf", headers={"Authorization": "Bearer test"})
+    assert response.status_code == 200
+    public = state["renders"][0]
+    assert "last_30_days" not in public["summary"]
+    assert "last_30_days" not in public["best_posts"]
+    assert "PRIVATE_COLLECTION_SCOPE" not in repr(public)
+    internal = client.get("/api/admin/accounts/ivanelgrande/media-kit", headers={"Authorization": "Bearer test"}).json()
+    assert internal["public_summary"]["last_30_days"]["metrics"]["likes"]["total"] == 117
+
+
 @pytest.mark.parametrize("extension", ["", ".pdf"])
 def test_report_requires_auth_and_admin_access(report_client, extension):
     client, state = report_client

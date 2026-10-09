@@ -68,13 +68,24 @@ def _public_name(account: dict[str, Any], handle: str) -> str:
     return f"@{handle}" if handle else "Account"
 
 
-def _period(value: Any, followers: int | None) -> dict[str, Any]:
+def _period(value: Any, followers: int | None, *, recent: bool = False) -> dict[str, Any]:
     source = _mapping(value)
     metrics = _mapping(source.get("metrics"))
     selected = {key: _stats(metrics.get(key)) for key in _PUBLIC_METRICS}
+    population = _count(source.get("post_count"))
+    if recent:
+        # A partial sum is not an account's period total. Keep observed
+        # averages, but never promote hidden/missing readings to zero.
+        video_population = _count(source.get("eligible_video_count"))
+        for key, values in selected.items():
+            eligible = video_population if key in {"video_views", "video_plays"} else population
+            measured = _count(_mapping(metrics.get(key)).get("count"))
+            if eligible is None or not eligible or measured != eligible:
+                values["total"] = None
     totals = [selected[key]["total"] for key in ("likes", "comments") if selected[key]["total"] is not None]
     engagement_total = _number(sum(totals)) if totals else None
-    population = _count(source.get("post_count"))
+    if recent and any(selected[key]["total"] is None for key in ("likes", "comments")):
+        engagement_total = None
     measured = _count(_mapping(source.get("engagements")).get("count"))
     # The engagement population is the union of posts with known likes or
     # comments, so summing the two separate averages would be misleading.
@@ -180,9 +191,15 @@ def project_public_media_kit(report: dict[str, Any]) -> dict[str, Any]:
         "generated_at": generated.isoformat(timespec="seconds") if generated else None,
         "timezone": "America/Costa_Rica",
         "account": account,
-        "summary": {key: _period({"post_count": 0} if private else summary.get(key), followers) for key in ("all_time", "last_30_days")},
-        "best_posts": {key: [] if private else _posts(best.get(key), followers=followers, generated=generated, recent=key == "last_30_days") for key in ("all_time", "last_30_days")},
+        "summary": {"all_time": _period({"post_count": 0} if private else summary.get("all_time"), followers)},
+        "best_posts": {"all_time": [] if private else _posts(best.get("all_time"), followers=followers, generated=generated, recent=False)},
     }
+    # Only an explicitly checked, sufficiently current full-post source may
+    # support a recent overview. The internal JSON retains the stored sample
+    # and diagnostic reasons; none of that inventory enters a sales PDF.
+    if not private and source.get("public_recent_available") is True and isinstance(summary.get("last_30_days"), dict):
+        result["summary"]["last_30_days"] = _period(summary.get("last_30_days"), followers, recent=True)
+        result["best_posts"]["last_30_days"] = _posts(best.get("last_30_days"), followers=followers, generated=generated, recent=True)
     growth = _mapping(_mapping(source.get("follower_growth")).get("30d"))
     pct = _number(growth.get("pct"), signed=True)
     if pct is not None and growth.get("observed_days") == 30:

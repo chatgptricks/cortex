@@ -53,6 +53,11 @@ repo root.
   and sample sizes. Both read existing data on every call, use private no-store
   responses, and never initiate a scrape. Historical totals describe the
   saved sample, and missing/hidden measurements remain unavailable.
+  Recent highlights require a current full-post source and sufficient
+  30-day history without contradictory profile-count changes. Narrow Reels
+  sources or incomplete periods omit the recent section instead of presenting
+  a partial sample as account activity. Recent metric totals also require
+  every applicable post to have a public reading; partial sums are omitted.
 - `/api/auth/custom-token` — mints a short-lived Firebase custom token so
   the several Sentient Dash subdomains/pages can share one signed-in
   session.
