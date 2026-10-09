@@ -244,6 +244,24 @@ def test_carousel_slide_performance_is_separate_and_reports_known_subsets(report
     assert any("Carousel slide measurements remain separate" in note for note in report["coverage"]["notes"])
 
 
+def test_reel_preview_count_never_implies_carousel_slides_or_child_performance(report_db):
+    connect, _ = report_db
+    with connect() as conn:
+        insert(conn, "dashboard_posts", account="sample", shortcode="reel", likes=50,
+               post_type_label="Video", product_type="clips", slide_count=2,
+               raw_json=json.dumps({"type": "Video", "productType": "clips",
+                   "childPosts": [], "images": ["https://cdn.test/preview1.jpg", "https://cdn.test/preview2.jpg"]}),
+               published_at="2026-10-08T12:00:00Z")
+    report = kit.build_account_media_kit("sample", now=NOW)
+    assert report["best_posts"]["all_time"][0]["format"] == "Reel"
+    assert report["summary"]["all_time"]["metrics"]["slide_count"]["total"] == 2
+    assert report["summary"]["all_time"]["metrics"]["carousel_video_slides"]["count"] == 0
+    assert report["summary"]["all_time"]["metrics"]["carousel_slide_video_views"]["count"] == 0
+    definition = next(entry for entry in report["metric_catalog"] if entry["key"] == "slide_count")
+    assert definition["label"] == "Stored media items (slides / previews)"
+    assert any("For Reels, images may be preview assets" in note for note in report["coverage"]["notes"])
+
+
 def test_newer_duplicate_metrics_win_even_when_publication_date_is_missing(report_db):
     connect, _ = report_db
     with connect() as conn:
