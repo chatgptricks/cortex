@@ -43,6 +43,17 @@ _METRICS = {
     "brain_global_mean_abs": ("Model attention mean", "model_score"),
     "brain_global_peak_abs": ("Model attention peak", "model_score"),
     "virality_potential": ("Model virality score", "model_score"),
+    "carousel_video_slides": ("Carousel video slides", "count"),
+    "carousel_slide_likes": ("Carousel slide likes (separate from parent)", "count"),
+    "carousel_slide_comments": ("Carousel slide comments (separate from parent)", "count"),
+    "carousel_slide_video_views": ("Carousel slide video views (separate from parent)", "count"),
+    "carousel_slide_video_plays": ("Carousel slide video plays (separate from parent)", "count"),
+    "carousel_slide_video_duration": ("Carousel slide video duration", "seconds"),
+    "carousel_slide_likes_measured_slides": ("Carousel slides with measured likes", "count"),
+    "carousel_slide_comments_measured_slides": ("Carousel slides with measured comments", "count"),
+    "carousel_slide_video_views_measured_slides": ("Carousel slides with measured video views", "count"),
+    "carousel_slide_video_plays_measured_slides": ("Carousel slides with measured video plays", "count"),
+    "carousel_slide_video_duration_measured_slides": ("Carousel slides with measured video duration", "count"),
 }
 _ALIASES = {
     "likesCount": "likes", "likeCount": "likes", "like_count": "likes",
@@ -125,9 +136,9 @@ def _bool(value: Any) -> bool | None:
 
 def _performance_field(name: str) -> bool:
     normalized = _snake(name)
-    if normalized in {"first_comment", "comments_disabled", "comments_disabled_at"} or normalized.endswith(("_updated_at", "_captured_at", "_checked_at", "_refresh_at")):
+    if normalized in {"first_comment", "comments_disabled", "comments_disabled_at"} or normalized.endswith(("_id", "_ids", "_url", "_urls", "_at", "_date", "_timestamp")):
         return False
-    return bool(re.search(r"(?:likes?|comments?|views?|plays?|shares?|saves?|reach|impressions?|clicks?|engagement|duration|watch_time|retention|completion|replays?|profile_visits|follows)(?:_|$)", normalized))
+    return bool(re.search(r"(?:^|_)(?:likes?|comments?|views?|plays?|shares?|saves?|reach|impressions?|clicks?|engagement|duration|watch_time|retention|completion|replays?|profile_visits|follows)(?:_|$)", normalized))
 
 
 def _raw_metrics(raw: dict[str, Any]) -> dict[str, int | float | None]:
@@ -147,6 +158,8 @@ def _raw_metrics(raw: dict[str, Any]) -> dict[str, int | float | None]:
                     normalized = _snake(name)
                     key = normalized if normalized in _METRICS else "provider." + prefix + normalized
                 number = _number(value)
+                if number is None and key not in _METRICS:
+                    continue
                 if key not in result or result[key] is None:
                     result[key] = number
 
@@ -154,7 +167,37 @@ def _raw_metrics(raw: dict[str, Any]) -> dict[str, int | float | None]:
     children = raw.get("childPosts")
     if isinstance(children, list) and children:
         result["slide_count"] = len(children)
+        child_records = [child for child in children if isinstance(child, dict)]
+        result["carousel_video_slides"] = sum(str(child.get("type") or "").lower().startswith("video") for child in child_records)
+        child_metrics = [_raw_metrics(child) for child in child_records]
+        names = {"likes", "comments", "video_views", "video_plays", "video_duration"} | {name for metrics in child_metrics for name in metrics if not name.startswith("carousel_") and name != "slide_count"}
+        for name in names:
+            values = [value for metrics in child_metrics if (value := metrics.get(name)) is not None]
+            prefixed = "carousel_slide_" + name
+            # Counts and duration are sums of separately observed slide
+            # counters. A rate/ratio is averaged across measured slides.
+            unit = _metric_unit(name)
+            result[prefixed] = (sum(values) / len(values) if unit in {"ratio", "percent", "model_score"} else sum(values)) if values else None
+            result[prefixed + "_measured_slides"] = len(values)
     return result
+
+
+def _metric_unit(name: str) -> str:
+    if name in _METRICS:
+        return _METRICS[name][1]
+    if name.endswith("_measured_slides"):
+        return "count"
+    if name.startswith("analysis."):
+        return "model_score"
+    if any(word in name for word in ("rate", "percent", "pct", "retention", "completion")):
+        return "percent" if "percent" in name or "pct" in name else "ratio"
+    if name.endswith(("_seconds", "_sec")):
+        return "seconds"
+    if name.endswith(("_milliseconds", "_ms")):
+        return "milliseconds"
+    if name.endswith(("_count", "_number")):
+        return "count"
+    return "provider_value"
 
 
 def _columns(conn: Any, table: str) -> set[str]:
@@ -305,18 +348,9 @@ def _catalog(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     for name in names:
         label, unit = _METRICS.get(name, (name.replace("provider.", "").replace("analysis.", "Model ").replace("_", " ").replace(".", " / ").title(), "provider_value"))
-        if name.startswith("analysis."):
-            unit = "model_score"
-        elif name not in _METRICS:
-            if any(word in name for word in ("rate", "percent", "pct", "retention", "completion")):
-                unit = "percent" if "percent" in name or "pct" in name else "ratio"
-            elif name.endswith(("_seconds", "_sec")):
-                unit = "seconds"
-            elif name.endswith(("_milliseconds", "_ms")):
-                unit = "milliseconds"
-            elif name.endswith(("_count", "_number")):
-                unit = "count"
-        result.append({"key": name, "label": label, "unit": unit, "source": "model" if name.startswith("analysis.") or name in {"brain_global_mean_abs", "brain_global_peak_abs", "virality_potential"} else "stored Instagram measurements"})
+        unit = _metric_unit(name)
+        source = "stored carousel slide measurements" if name.startswith("carousel_") else "model" if name.startswith("analysis.") or name in {"brain_global_mean_abs", "brain_global_peak_abs", "virality_potential"} else "stored Instagram measurements"
+        result.append({"key": name, "label": label, "unit": unit, "source": source})
     return result
 
 
@@ -534,6 +568,7 @@ def build_account_media_kit(handle: str, *, now: datetime | None = None) -> dict
             "Engagements are measured likes plus comments. Partial readings use only the known components; complete sample counts are reported separately.",
             "Engagement rate is average measured likes plus comments divided by the current stored follower count, not reach or a historical follower count.",
             "Views and plays are separate measurements and are never added together. Post reach totals, when present, are non-deduplicated and not unique account reach.",
+            "Carousel slide measurements remain separate from parent-post counters. Slide counts and durations are summed per parent post; slide rates are averaged. Measured-slide counts show the known subset and missing slide counters remain unavailable.",
             "Follower growth compares final Costa Rica calendar-day snapshots against the latest usable snapshot; its actual baseline dates and duration are shown.",
             "Top posts rank by measured likes plus comments; hidden and deleted posts remain in historical totals but are excluded from showcase rankings.",
             "Posting-day and posting-hour patterns use Costa Rica time and indicate observed associations, not a guarantee of future performance.",

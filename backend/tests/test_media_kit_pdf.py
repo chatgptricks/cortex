@@ -96,3 +96,27 @@ def test_empty_account_and_every_dynamic_metric_paginate_without_losing_values()
     assert "Provider metric 49" in text
     assert "123,456,838" in text
     assert any("Complete metric inventory continued" in page.extract_text() for page in reader.pages)
+
+
+def test_rich_creative_signals_keep_source_note_with_content_instead_of_an_orphan_page():
+    report = sample_report()
+    period = report["summary"]["all_time"]
+    report["breakdowns"]["formats"] = [{"label": label, "share_pct": 25, **deepcopy(period)}
+                                      for label in ("Carousel", "Image", "Reel", "Video")]
+    report["content"].update({
+        "hashtags": [{"label": value, "post_count": 40} for value in
+                     ("ai", "chatgpt", "artificialintelligence", "openai", "AI", "aitools", "tech", "samaltman", "gpt4")],
+        "mentions": [{"label": value, "post_count": 40} for value in
+                     ("chatgptricks", "higgsfield.ai", "openai", "lovable.dev", "zuck", "Higgsfield.ai", "chatgpt", "chatgptips", "1x.technologies")],
+        "coauthors": [{"label": value, "post_count": 40} for value in
+                     ("chatgptips", "chatgptricks", "trends", "openai", "aigleeson", "chatgpt", "saysirio", "viclaranja", "speakersdotca")],
+        "music": [{"label": value, "post_count": 40} for value in
+                  ("Original audio", "Follow @chatgptricks for more!", "Sora 2",
+                   "Follow @chatgptricks for more", "Follow @chatgptricks for more!",
+                   "i was only temporary (Slowed + Reverb)", "Solitude", "Movies", "Time")],
+    })
+    reader = PdfReader(io.BytesIO(render_media_kit_pdf(report)))
+    content_pages = [page.extract_text() for page in reader.pages if "The content profile" in page.extract_text()]
+    assert len(content_pages) == 1
+    assert "Publishing times reflect" in content_pages[0]
+    assert "Music / audio" in content_pages[0]

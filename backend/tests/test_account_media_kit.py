@@ -167,6 +167,83 @@ def test_complete_observation_metrics_and_dynamic_provider_fields(report_db):
     assert report["best_posts"]["all_time"][0]["metrics_updated_at"] == "2026-10-09T12:00:00+00:00"
 
 
+def test_provider_discovery_ignores_urls_ids_and_substrings(report_db):
+    connect, _ = report_db
+    with connect() as conn:
+        insert(conn, "dashboard_posts", account="sample", shortcode="a", likes=10,
+               raw_json=json.dumps({"displayUrl": "https://cdn.test/display.jpg", "displayCount": 12,
+                   "ownerId": 998, "igPlayCount": 50, "videoViewCount": 60,
+                   "commentId": 179000000001, "commentIds": 179000000002,
+                   "videoViewsUrl": 123456, "videoViewsUrls": 123456,
+                   "likesUpdatedAt": 1790000000, "commentsDate": 1790000000,
+                   "playsTimestamp": 1790000000,
+                   "replaySourceUrl": "https://cdn.test/video.mp4",
+                   "insights": {"watchTime": 100, "replayCount": 3}}),
+               published_at="2026-10-08T12:00:00Z")
+    report = kit.build_account_media_kit("sample", now=NOW)
+    keys = {entry["key"] for entry in report["metric_catalog"]}
+    assert "provider.display_url" not in keys
+    assert "provider.display_count" not in keys
+    assert "provider.owner_id" not in keys
+    assert "provider.replay_source_url" not in keys
+    for key in ("comment_id", "comment_ids", "video_views_url", "video_views_urls",
+                "likes_updated_at", "comments_date", "plays_timestamp"):
+        assert "provider." + key not in keys
+    assert report["summary"]["all_time"]["metrics"]["video_plays"]["total"] == 50
+    assert report["summary"]["all_time"]["metrics"]["provider.insights.replay_count"]["total"] == 3
+
+
+def test_carousel_slide_performance_is_separate_and_reports_known_subsets(report_db):
+    connect, _ = report_db
+    video_views = [658, 221, 143, 131, 80, 59, 65]
+    durations = [13.675102, 10.215329, 5.014059, 12.815964, 22.707664, 5.014059, 9.913469]
+    children = [{"type": "Image", "likesCount": None, "commentsCount": 0},
+                {"type": "Image", "likesCount": None, "commentsCount": 0}]
+    children += [{"type": "Video", "commentsCount": 0, "likesCount": None,
+                  "videoViewCount": views, "videoDuration": duration}
+                 for views, duration in zip(video_views, durations)]
+    children[2]["videoPlayCount"] = 0
+    children[3]["videoPlayCount"] = 300
+    children[4]["likesCount"] = 5
+    children[4]["insights"] = {"retentionPct": 60, "replayCount": 2}
+    children[5]["insights"] = {"retentionPct": 80, "replayCount": 3}
+    with connect() as conn:
+        insert(conn, "dashboard_posts", account="sample", shortcode="carousel", likes=350, comments=19,
+               post_type_label="Carousel", product_type="carousel_container",
+               raw_json=json.dumps({"type": "Sidecar", "likesCount": 38, "commentsCount": 5,
+                   "videoViewCount": None, "childPosts": children}),
+               published_at="2026-10-08T12:00:00Z")
+    report = kit.build_account_media_kit("sample", now=NOW)
+    metrics = report["summary"]["all_time"]["metrics"]
+    assert metrics["likes"]["total"] == 350
+    assert metrics["comments"]["total"] == 19
+    assert metrics["video_views"]["total"] is None
+    assert metrics["video_plays"]["total"] is None
+    assert metrics["video_duration"]["total"] is None
+    assert metrics["slide_count"]["total"] == 9
+    assert metrics["carousel_video_slides"]["total"] == 7
+    assert metrics["carousel_slide_video_views"]["total"] == 1357
+    assert metrics["carousel_slide_video_views_measured_slides"]["total"] == 7
+    assert metrics["carousel_slide_video_duration"]["total"] == pytest.approx(sum(durations))
+    assert metrics["carousel_slide_video_duration_measured_slides"]["total"] == 7
+    assert metrics["carousel_slide_video_plays"]["total"] == 300
+    assert metrics["carousel_slide_video_plays_measured_slides"]["total"] == 2
+    assert metrics["carousel_slide_likes"]["total"] == 5
+    assert metrics["carousel_slide_likes_measured_slides"]["total"] == 1
+    assert metrics["carousel_slide_comments"]["total"] == 0
+    assert metrics["carousel_slide_comments_measured_slides"]["total"] == 9
+    assert metrics["carousel_slide_provider.insights.retention_pct"]["average"] == 70
+    assert metrics["carousel_slide_provider.insights.retention_pct"]["total"] is None
+    assert metrics["carousel_slide_provider.insights.retention_pct_measured_slides"]["total"] == 2
+    assert metrics["carousel_slide_provider.insights.replay_count"]["total"] == 5
+    assert report["summary"]["all_time"]["engagements"]["total"] == 369
+    assert not report["best_posts"]["by_metric"]["video_views"]["all_time"]
+    definition = next(entry for entry in report["metric_catalog"] if entry["key"] == "carousel_slide_video_views")
+    assert definition["source"] == "stored carousel slide measurements"
+    assert "separate from parent" in definition["label"]
+    assert any("Carousel slide measurements remain separate" in note for note in report["coverage"]["notes"])
+
+
 def test_newer_duplicate_metrics_win_even_when_publication_date_is_missing(report_db):
     connect, _ = report_db
     with connect() as conn:

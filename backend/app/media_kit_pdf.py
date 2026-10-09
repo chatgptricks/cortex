@@ -447,7 +447,6 @@ class _Report:
                        [163, 66, 75, 106, CW - 410], y, row_height=27,
                        page_title="The content profile", subtitle="Format performance continued.")
         content = self.report.get("content") or {}
-        y = self.section("Creative signals", y - 27)
 
         def tokens(entries: Any) -> str:
             if isinstance(entries, dict):
@@ -462,16 +461,20 @@ class _Report:
                     output.append(str(entry))
             return ", ".join(output) or "Not available"
 
-        for label, entries in (("Top hashtags", content.get("hashtags") or []), ("Tagged accounts", content.get("mentions") or []),
-                               ("Collaborators", content.get("coauthors") or []), ("Music / audio", content.get("music") or [])):
-            if y < 134:
-                self.page("The content profile", "Creative signals continued.")
-                y = self.y
+        signals = [(label, tokens(entries)) for label, entries in
+                   (("Top hashtags", content.get("hashtags") or []), ("Tagged accounts", content.get("mentions") or []),
+                    ("Collaborators", content.get("coauthors") or []), ("Music / audio", content.get("music") or []))]
+        signal_height = sum(min(3, len(self.lines(value, CW - 121, 8))) * 12 + 8 for _, value in signals)
+        # Reserve the note and footer before placing the whole creative block.
+        # This prevents a rich account from getting a page with only the note.
+        if y - 47 - signal_height < 132:
+            self.page("The content profile", "Creative signals and their source coverage.")
+            y = self.section("Creative signals", self.y)
+        else:
+            y = self.section("Creative signals", y - 27)
+        for label, value in signals:
             self.text(MARGIN, y, label, 8.5, NAVY, bold=True)
-            y = self.paragraph(MARGIN + 121, y, tokens(entries), CW - 121, 8, MUTED, max_lines=3) - 14
-        if y < 141:
-            self.page("The content profile", "Creative signal notes.")
-            y = self.y
+            y = self.paragraph(MARGIN + 121, y, value, CW - 121, 8, MUTED, max_lines=3) - 8
         self.note("Publishing times reflect recorded publication timestamps in the report timezone. Format comparisons use only posts with the relevant metric recorded; complete samples and metric definitions follow.", y - 3, 57)
 
     def post_card(self, post: dict[str, Any] | None, x: float, y: float, width: float, rank: int) -> None:
