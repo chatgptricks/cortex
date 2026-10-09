@@ -8392,9 +8392,10 @@ def admin_account_media_kit_pdf(
     theme: Literal["light", "dark"] = "light",
     accent: Annotated[str, Query(pattern="^#[0-9A-Fa-f]{6}$")] = "#00A991",
 ) -> Response:
-    """Generate a fresh sales report from stored metrics on every click."""
+    """Generate a client-shareable media kit from public account highlights."""
     from .account_media_kit import build_account_media_kit
     from .media_kit_pdf import render_media_kit_pdf
+    from .public_media_kit import project_public_media_kit
 
     report = build_account_media_kit(handle)
     try:
@@ -8404,7 +8405,10 @@ def admin_account_media_kit_pdf(
             prepare_media_kit_assets(report)
         except Exception:
             logging.getLogger(__name__).warning("Media kit images unavailable; generating the metrics report", exc_info=True)
-        pdf = render_media_kit_pdf(report, theme=theme, accent=accent)
+        # Only an explicit public-data allowlist may cross the PDF boundary.
+        # Asset preparation needs internal paths, but the renderer never does.
+        public_report = project_public_media_kit(report)
+        pdf = render_media_kit_pdf(public_report, theme=theme, accent=accent)
     except Exception as exc:
         logging.getLogger(__name__).exception("Media kit rendering failed for %s", report["account"]["handle"])
         raise HTTPException(status_code=500, detail="Could not generate the PDF media kit. Please try again.") from exc

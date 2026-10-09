@@ -108,6 +108,52 @@ def test_on_click_reads_changes_and_has_no_scrape_or_db_writes(report_db, monkey
     assert kit.build_account_media_kit("sample", now=NOW)["summary"]["all_time"]["metrics"]["likes"]["total"] == 25
 
 
+def test_public_profile_and_caption_never_use_internal_registry_or_title_fallbacks(report_db):
+    connect, _ = report_db
+    with connect() as conn:
+        conn.execute("UPDATE accounts SET is_canonical = 1, label = 'PRIVATE_LABEL', biography = 'PRIVATE_BIO'")
+        insert(conn, "posts", id=1, section="historical", shortcode="publicA", title="PRIVATE_TITLE",
+               caption=None, likes=10, comments=1, published_at="2026-10-08T12:00:00Z")
+    report = kit.build_account_media_kit("sample", now=NOW)
+    assert report["account"]["name"] == "PRIVATE_LABEL"
+    assert report["account"]["public_name"] == "sample"
+    assert report["account"]["public_bio"] is None
+    assert report["best_posts"]["all_time"][0]["caption"] == "PRIVATE_TITLE"
+    assert report["best_posts"]["all_time"][0]["public_caption"] == ""
+    with connect() as conn:
+        conn.execute("ALTER TABLE account_snapshots ADD COLUMN biography TEXT")
+        insert(conn, "account_snapshots", handle="sample", full_name="Public Brand", biography="Public profile bio",
+               followers_count=1000, captured_at="2026-10-09T12:00:00Z")
+        conn.execute("UPDATE posts SET caption = 'Public caption'")
+    report = kit.build_account_media_kit("sample", now=NOW)
+    assert report["account"]["public_name"] == "Public Brand"
+    assert report["account"]["public_bio"] == "Public profile bio"
+    assert report["best_posts"]["all_time"][0]["public_caption"] == "Public caption"
+
+
+def test_public_performance_excludes_nonpublic_rows_and_private_account_posts(report_db):
+    connect, _ = report_db
+    with connect() as conn:
+        for code, extra in (("visible", {}), ("hidden", {"hidden": 1}), ("deleted", {"is_deleted": 1}),
+                            (None, {}), ("future", {"published_at": "2026-10-10T12:00:00Z"})):
+            insert(conn, "dashboard_posts", account="sample", shortcode=code, likes=100, comments=10,
+                   **{"published_at": "2026-10-08T12:00:00Z", **extra})
+        insert(conn, "account_snapshots", handle="sample", followers_count=1000,
+               private=0, captured_at="2026-10-09T12:00:00Z")
+    report = kit.build_account_media_kit("sample", now=NOW)
+    assert report["summary"]["all_time"]["metrics"]["likes"]["total"] == 400
+    assert report["public_summary"]["all_time"]["post_count"] == 1
+    assert report["public_summary"]["last_30_days"]["metrics"]["likes"]["total"] == 100
+    assert [post["shortcode"] for post in report["public_best_posts"]["all_time"]] == ["visible"]
+    assert set(report["public_summary"]["all_time"]["metrics"]) == {"likes", "comments", "video_views", "video_plays"}
+    with connect() as conn:
+        conn.execute("UPDATE account_snapshots SET private = 1")
+    private = kit.build_account_media_kit("sample", now=NOW)
+    assert private["public_summary"]["all_time"]["post_count"] == 0
+    assert private["public_summary"]["all_time"]["metrics"]["likes"]["total"] is None
+    assert private["public_best_posts"] == {"all_time": [], "last_30_days": []}
+
+
 def test_canonical_deduplicates_merges_enrichment_and_keeps_canonical_cover(report_db):
     connect, _ = report_db
     with connect() as conn:

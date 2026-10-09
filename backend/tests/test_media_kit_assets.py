@@ -75,3 +75,22 @@ def test_prepare_deduplicates_existing_assets_and_attaches_only_main_images(monk
     assert report["account"]["avatar_bytes"].startswith(b"\xff\xd8")
     assert report["best_posts"]["all_time"][0]["thumbnail_bytes"] == report["best_posts"]["last_30_days"][0]["thumbnail_bytes"]
     assert "thumbnail_bytes" not in report["best_posts"]["last_30_days"][1]
+
+
+def test_public_showcase_assets_never_fall_back_to_internal_post_images(monkeypatch):
+    import boto3
+    from types import SimpleNamespace
+    requested = []
+    monkeypatch.setattr(assets.media_storage, "r2_enabled", lambda: True)
+    monkeypatch.setattr(boto3, "client", lambda *args, **kwargs: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(assets, "_thumbnail", lambda client, reference: requested.append(reference) or b"public-image")
+    report = {"account": {},
+              "best_posts": {"all_time": [{"cover_path": "r2://uploads/private.png"}]},
+              "public_best_posts": {"all_time": [{"cover_path": "r2://uploads/public.png"}], "last_30_days": []}}
+    assets.prepare_media_kit_assets(report)
+    assert requested == ["r2://uploads/public.png"]
+    assert "thumbnail_bytes" not in report["best_posts"]["all_time"][0]
+    requested.clear()
+    report["public_best_posts"] = {"all_time": [], "last_30_days": []}
+    assets.prepare_media_kit_assets(report)
+    assert requested == []

@@ -1,4 +1,5 @@
 import sys
+from copy import deepcopy
 from types import ModuleType
 
 import pytest
@@ -10,13 +11,14 @@ from app import account_media_kit, main
 
 @pytest.fixture
 def report_client(monkeypatch):
-    state = {"calls": [], "renders": [], "styles": [], "role": "admin", "failure": None}
+    state = {"calls": [], "renders": [], "styles": [], "role": "admin", "failure": None, "extra": {}}
 
     def build(handle):
         state["calls"].append(handle)
         if handle == "missing":
             raise HTTPException(status_code=404, detail="Unknown account.")
-        return {"generated_at": "2026-10-09T04:30:00+00:00", "account": {"handle": handle}, "revision": len(state["calls"])}
+        return {"generated_at": f"2026-10-09T04:30:{len(state['calls']):02d}+00:00",
+                "account": {"handle": handle}, "revision": len(state["calls"]), **deepcopy(state["extra"])}
 
     renderer = ModuleType("app.media_kit_pdf")
 
@@ -25,7 +27,7 @@ def report_client(monkeypatch):
         state["styles"].append({"theme": theme, "accent": accent})
         if state["failure"]:
             raise RuntimeError("Internal render details must stay private")
-        return b"%PDF-1.4\n" + str(report["revision"]).encode() + b"\n%%EOF"
+        return b"%PDF-1.4\n" + report["generated_at"].encode() + b"\n%%EOF"
 
     renderer.render_media_kit_pdf = render
     monkeypatch.setitem(sys.modules, "app.media_kit_pdf", renderer)
@@ -110,6 +112,46 @@ def test_styled_pdf_preserves_auth_before_query_validation(report_client):
                           headers={"Authorization": "Bearer test"})
     assert response.status_code == 403
     assert not state["calls"] and not state["renders"]
+
+
+def test_download_only_passes_public_highlights_to_renderer_after_asset_preparation(report_client, monkeypatch):
+    from app import media_kit_assets
+    client, state = report_client
+    secret = "INTERNAL_PRIVATE_CANARY"
+    post = {"shortcode": "Abc123", "published_at": "2026-10-08T12:00:00+00:00",
+            "public_caption": "Public post caption", "caption": secret, "hook_text": secret,
+            "permalink": f"https://internal.example/{secret}", "local_media_path": secret,
+            "metrics": {"likes": 10, "comments": 2, "likes_at_1h": 8, "analysis.secret": 0.75}}
+    state["extra"] = {
+        "account": {"handle": "chatgptricks", "public_name": "Public profile", "name": secret,
+                    "group": secret, "subcategory": secret, "business_email": secret, "avatar_path": secret},
+        "public_summary": {"all_time": {"post_count": 1, "metrics": {
+            "likes": {"total": 10, "average": 10, "source": secret, "coverage_pct": 100},
+            "likes_at_1h": {"total": 8}, "analysis.secret": {"average": 0.75}}}},
+        "public_best_posts": {"all_time": [post], "last_30_days": [post]},
+        "coverage": {"private": secret}, "metrics_appendix": [{"private": secret}],
+    }
+    def prepare(report):
+        assert report["account"]["avatar_path"] == secret
+        report["account"]["avatar_bytes"] = b"public-avatar"
+        for group in report["public_best_posts"].values():
+            for item in group:
+                item["thumbnail_bytes"] = b"public-thumbnail"
+    monkeypatch.setattr(media_kit_assets, "prepare_media_kit_assets", prepare)
+    response = client.get("/api/admin/accounts/chatgptricks/media-kit.pdf",
+                          params={"theme": "dark", "accent": "#00ac80"},
+                          headers={"Authorization": "Bearer test"})
+    assert response.status_code == 200
+    public = state["renders"][0]
+    assert secret not in repr(public)
+    assert "analysis.secret" not in repr(public) and "likes_at_1h" not in repr(public)
+    assert "coverage" not in public and "metrics_appendix" not in public and "revision" not in public
+    assert public["account"]["avatar_bytes"] == b"public-avatar"
+    assert public["best_posts"]["all_time"][0]["thumbnail_bytes"] == b"public-thumbnail"
+    assert public["best_posts"]["all_time"][0]["permalink"] == "https://www.instagram.com/p/Abc123/"
+    # The authenticated internal data route still has its full source data.
+    internal = client.get("/api/admin/accounts/chatgptricks/media-kit", headers={"Authorization": "Bearer test"}).json()
+    assert internal["account"]["name"] == secret
 
 
 @pytest.mark.parametrize("extension", ["", ".pdf"])

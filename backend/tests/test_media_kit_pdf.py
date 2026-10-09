@@ -20,13 +20,13 @@ def sample_report():
     period = {"post_count": 2, "posts_per_week": 0.5, "metrics": {"likes": stats, "comments": zero},
               "engagements": stats, "complete_engagement_posts": 1,
               "engagement_rate_pct": 5.05, "like_rate_pct": 5.05, "view_rate_pct": None}
-    post = {"published_at": "2026-10-08T18:00:00Z", "caption": "A useful creative example",
+    post = {"published_at": "2026-10-08T18:00:00Z", "caption": "INTERNAL_TITLE_SECRET", "public_caption": "A useful creative example",
             "format": "Reel", "metrics": {"likes": 100, "comments": None},
             "engagements": 100, "engagement_complete": False,
             "permalink": "https://www.instagram.com/p/example/"}
     return {
         "generated_at": "2026-10-09T18:00:00Z", "timezone": "America/Costa_Rica",
-        "account": {"handle": "sample", "name": "Sample Studio", "followers": 1_000,
+        "account": {"handle": "sample", "name": "INTERNAL_NAME_SECRET", "public_name": "Sample Studio", "followers": 1_000,
                     "following": 0, "profile_posts": 2, "private": False, "verified": None,
                     "email": "sales@example.test", "bio": "Useful studio profile",
                     "demographics": {"countries": {"Costa Rica": 75}}},
@@ -45,29 +45,33 @@ def sample_report():
     }
 
 
-def test_report_handles_missing_growth_and_preserves_samples_contacts_and_local_time():
-    report = sample_report()
-    output = render_media_kit_pdf(report)
-    assert output.startswith(b"%PDF-")
+def pdf_text(output):
     reader = PdfReader(io.BytesIO(output))
-    text = "\n".join(page.extract_text() for page in reader.pages)
-    normalized = " ".join(text.split())
-    assert "09 Oct 2026, 12:00" in text
-    assert "sales@example.test" in text
-    assert "Audience highlights" in normalized
-    assert "countries: Costa Rica: 75" in normalized
-    assert "Measured engagements" in text
-    assert "partial engagements" in text
-    assert "Follower delta" not in text
-    assert "creative (2)" in text
-    assert "N/A" in text and "0" in text
-    assert 5 <= len(reader.pages) <= 7
+    return reader, "\n".join(page.extract_text() for page in reader.pages)
+
+
+def test_public_report_is_two_pages_with_links_known_zero_and_no_private_facts():
+    report = sample_report()
+    reader, text = pdf_text(render_media_kit_pdf(report))
+    assert len(reader.pages) == 2
+    assert "Sample Studio" in text
+    assert "A useful creative example" in text
+    assert "The last 30 days" in text
+    assert "Average comments".upper() in text
+    assert "0" in text
+    assert "N/A" not in text
+    assert "sales@example.test" not in text
+    assert "Costa Rica" not in text
+    assert "INTERNAL_NAME_SECRET" not in text
+    assert "INTERNAL_TITLE_SECRET" not in text
+    assert "Prepared 09 Oct 2026" in text
     links = [annotation.get_object().get("/A", {}).get("/URI")
              for page in reader.pages for annotation in page.get("/Annots", [])]
     assert report["best_posts"]["all_time"][0]["permalink"] in links
+    assert "https://www.instagram.com/sample/" in links
 
 
-def test_optional_owned_image_bytes_embed_and_bad_images_fall_back():
+def test_owned_images_embed_in_public_profile_and_post_cards_and_bad_images_fall_back():
     report = sample_report()
     image = io.BytesIO()
     Image.new("RGB", (90, 90), (0, 165, 145)).save(image, "JPEG")
@@ -75,96 +79,79 @@ def test_optional_owned_image_bytes_embed_and_bad_images_fall_back():
     report["best_posts"]["all_time"][0]["thumbnail_bytes"] = image.getvalue()
     reader = PdfReader(io.BytesIO(render_media_kit_pdf(report)))
     assert len(reader.pages[0].images) == 1
-    assert len(reader.pages[3].images) == 1
+    assert len(reader.pages[1].images) == 1
     report["account"]["avatar_bytes"] = b"not an image"
     assert render_media_kit_pdf(report).startswith(b"%PDF-")
 
 
-def test_empty_account_and_every_dynamic_metric_paginate_without_losing_values():
-    report = sample_report()
-    report["best_posts"] = {}
-    report["follower_history"] = []
-    report["summary"] = {}
-    report["metrics_appendix"] = []
-    report["content"] = {}
-    report["account"] = {"handle": "empty"}
-    assert render_media_kit_pdf(report).startswith(b"%PDF-")
-    report = sample_report()
-    for index in range(50):
-        stats = {"total": 123_456_789 + index, "average": 1, "median": 1, "min": 0,
-                 "max": 123_456_789 + index, "count": 2, "coverage_pct": 100}
-        report["metrics_appendix"].append({"key": f"provider.metric_{index}",
-            "label": f"Provider metric {index}", "unit": "count", "all_time": stats,
-            "last_30_days": stats})
-    reader = PdfReader(io.BytesIO(render_media_kit_pdf(report)))
-    text = "\n".join(page.extract_text() for page in reader.pages)
-    assert "Provider metric 49" in text
-    assert "123.5M" in text
-    assert any("Observed metric types continued" in page.extract_text() for page in reader.pages)
-    assert "Median" not in text
-    assert "Publishing performance ledger" not in text
-    assert "audience history ledger" not in text
+def test_empty_account_remains_two_pages_without_unavailable_metric_cards():
+    reader, text = pdf_text(render_media_kit_pdf({"account": {"handle": "empty"}}))
+    assert len(reader.pages) == 2
+    assert "Public performance highlights are not available yet." in text
+    assert "N/A" not in text
+    assert "Not available" not in text
+    assert "Total likes".upper() not in text
 
 
-def test_rich_creative_signals_keep_source_note_with_content_instead_of_an_orphan_page():
+def test_private_metadata_never_enters_pdf_and_public_highlights_are_capped_at_three():
     report = sample_report()
-    period = report["summary"]["all_time"]
-    report["breakdowns"]["formats"] = [{"label": label, "share_pct": 25, **deepcopy(period)}
-                                      for label in ("Carousel", "Image", "Reel", "Video")]
-    report["content"].update({
-        "hashtags": [{"label": value, "post_count": 40} for value in
-                     ("ai", "chatgpt", "artificialintelligence", "openai", "AI", "aitools", "tech", "samaltman", "gpt4")],
-        "mentions": [{"label": value, "post_count": 40} for value in
-                     ("chatgptricks", "higgsfield.ai", "openai", "lovable.dev", "zuck", "Higgsfield.ai", "chatgpt", "chatgptips", "1x.technologies")],
-        "coauthors": [{"label": value, "post_count": 40} for value in
-                     ("chatgptips", "chatgptricks", "trends", "openai", "aigleeson", "chatgpt", "saysirio", "viclaranja", "speakersdotca")],
-        "music": [{"label": value, "post_count": 40} for value in
-                  ("Original audio", "Follow @chatgptricks for more!", "Sora 2",
-                   "Follow @chatgptricks for more", "Follow @chatgptricks for more!",
-                   "i was only temporary (Slowed + Reverb)", "Solitude", "Movies", "Time")],
-    })
-    reader = PdfReader(io.BytesIO(render_media_kit_pdf(report)))
-    content_pages = [page.extract_text() for page in reader.pages if "The content profile" in page.extract_text()]
-    assert len(content_pages) == 1
-    assert "Publishing times reflect" in content_pages[0]
-    assert "Music / audio" in content_pages[0]
+    report["account"].update({"label": "SECRET_ACCOUNT_LABEL", "group": "SECRET_ACCOUNT_GROUP",
+        "subcategory": "SECRET_ROUTE", "name": "SECRET_REGISTRY_NAME", "email": "private-email@secret.test",
+        "phone": "PRIVATE_PHONE_VALUE", "bio": "SECRET_BIO_PRIVATE", "id": "SECRET_ACCOUNT_ID",
+        "demographics": {"audience": "SECRET_DEMOGRAPHICS"},
+        "profile_url": "https://www.instagram.com/sample/?tracking=SECRET_PROFILE_QUERY"})
+    report["coverage"] = {"notes": ["SECRET_STORAGE_NOTE"], "snapshot_count": 777777}
+    report["content"] = {"hashtags": [{"label": "SECRET_HASHTAG"}]}
+    report["breakdowns"] = {"hours": [{"label": "SECRET_HOUR"}]}
+    report["metric_catalog"] = [{"key": "model_attention", "label": "SECRET_MODEL_LABEL", "unit": "model_score"}]
+    report["metrics_appendix"] = [{"key": "likes_1h", "label": "SECRET_FIRST_HOUR_METRIC", "all_time": {"total": 777777}}]
+    for period in report["summary"].values():
+        period["metrics"].update({"model_attention": {"total": 777777}, "likes_1h": {"total": 777777},
+                                  "routing_score": {"average": 777777}, "HOT": {"total": 777777}})
+    posts = []
+    for index in range(8):
+        post = deepcopy(report["best_posts"]["all_time"][0])
+        post.update({"caption": "SECRET_INTERNAL_TITLE", "hook_text": "SECRET_OCR_HOOK",
+                     "id": "SECRET_POST_ID", "rank_metric": "SECRET_RANK_METRIC",
+                     "shortcode": f"public_{index}",
+                     "permalink": f"https://www.instagram.com/p/public_{index}/?tracking=SECRET_POST_QUERY",
+                     "public_caption": f"Public creative example {index}"})
+        posts.append(post)
+    report["best_posts"] = {"all_time": posts, "last_30_days": posts,
+                            "by_metric": {"model_score": {"all_time": posts}}}
+    reader, text = pdf_text(render_media_kit_pdf(report))
+    assert len(reader.pages) == 2
+    for index in range(3):
+        assert f"Public creative example {index}" in text
+    assert "Public creative example 3" not in text
+    links = [annotation.get_object().get("/A", {}).get("/URI", "")
+             for page in reader.pages for annotation in page.get("/Annots", [])]
+    searchable = text + str(reader.metadata) + str(links)
+    assert "SECRET" not in searchable
+    assert "private-email@secret.test" not in searchable
+    assert "PRIVATE_PHONE_VALUE" not in searchable
+    assert "777777" not in searchable
+    for forbidden in ("complete metric overview", "model", "first-hour", "8-hour", "pace", "routing", "coverage",
+                      "stored", "source", "demographics", "publishing by weekday", "follower history"):
+        assert forbidden not in text.lower()
+    assert all(link.startswith("https://www.instagram.com/") and "?" not in link for link in links)
 
 
-def test_compact_overview_keeps_metric_types_filters_helper_rows_and_limits_decimals():
+def test_public_numbers_limit_decimals_preserve_small_averages_and_select_available_video_counts():
     report = sample_report()
-    for key, label, unit, average in (
-        ("provider.retention_pct", "Retention", "percent", 37.123456),
-        ("provider.completion_rate", "Completion rate", "ratio", 0.812345),
-        ("analysis.signal", "Model signal example", "model_score", 0.000012345),
-        ("video_duration", "Video duration", "seconds", 23.123456),
-        ("carousel_slide_video_views", "Carousel slide video views (separate from parent)", "count", 543.123456),
-        ("provider.small_metric", "Small measured metric", "count", 0.023809),
-    ):
-        stats = {"total": 123.123456, "average": average, "median": 1, "min": 0, "max": 3,
-                 "count": 2, "coverage_pct": 100}
-        report["metrics_appendix"].append({"key": key, "label": label, "unit": unit,
-                                           "all_time": stats, "last_30_days": stats})
-    report["metrics_appendix"].extend([
-        {"key": "carousel_slide_video_views_measured_slides", "label": "Carousel slides with measured video views",
-         "unit": "count", "all_time": {"total": 7, "count": 2}},
-        {"key": "unobserved", "label": "Unobserved extra metric", "unit": "count",
-         "all_time": {"total": None, "average": None, "count": 0}},
-    ])
-    report["follower_growth"]["30d"] = {"delta": 17, "pct": 1.712345, "observed_days": 32,
-                                      "from": "2026-09-07T18:00:00Z", "to": "2026-10-09T18:00:00Z"}
-    text = "\n".join(page.extract_text() for page in PdfReader(io.BytesIO(render_media_kit_pdf(report))).pages)
-    normalized = " ".join(text.split())
-    for label in ("Retention", "Completion rate", "Model signal example", "Video duration", "Carousel slide video views"):
-        assert label in normalized
-    assert "Carousel slides with measured video views" not in normalized
-    assert "views: 7 slides" in normalized
-    assert "Unobserved extra metric" not in normalized
-    assert "37.12%" in text
-    assert "0.81" in text
-    assert "<0.01" in text
-    assert "23.12" in text
+    report["account"]["followers"] = 1000.123456
+    report["follower_growth"]["30d"] = {"pct": 1.712345}
+    for period in report["summary"].values():
+        period["metrics"]["likes"] = {"total": 1234.123456, "average": 0.023809}
+        period["metrics"]["comments"] = {"total": 123.123456, "average": 23.123456}
+        period["metrics"]["video_plays"] = {"total": 9876.123456, "average": 37.123456}
+    reader, text = pdf_text(render_media_kit_pdf(report))
+    assert len(reader.pages) == 2
     assert "0.02" in text
-    assert "1.71%" in text
+    assert "+1.71%" in text
+    assert "AVERAGE VIDEO PLAYS" in text
+    assert "AVERAGE VIDEO VIEWS" not in text
+    assert "N/A" not in text
     assert not re.findall(r"(?<![\w.])[-+]?\d+\.\d{3,}(?![\w.])", text)
 
 
@@ -184,7 +171,7 @@ def test_report_palette_keeps_exact_accent_and_contrasting_semantic_text(theme, 
     expected = [int(accent[index:index + 2], 16) / 255 for index in (1, 3, 5)]
     assert any(tuple(values) == pytest.approx(expected, abs=1e-6) for values in fill_colors)
     if _contrast(palette.values["accent"], palette.values["card"]) < 3:
-        stroke_colors = [operands for operands, operator in reader.pages[1].get_contents().operations if operator == b"RG"]
+        stroke_colors = [operands for operands, operator in reader.pages[0].get_contents().operations if operator == b"RG"]
         stroke = palette.values["accent_text"]
         expected_stroke = [int(stroke[index:index + 2], 16) / 255 for index in (1, 3, 5)]
         assert any(tuple(values) == pytest.approx(expected_stroke, abs=1e-6) for values in stroke_colors)

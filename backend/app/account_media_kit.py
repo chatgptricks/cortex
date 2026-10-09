@@ -315,6 +315,9 @@ def _normalize_posts(rows: list[dict[str, Any]], observations: dict[str, dict[st
             "cover_path": merged.get("image_path") or merged.get("cover_image_path"),
             "local_media_path": merged.get("image_path") or merged.get("cover_image_path"),
             "caption": merged.get("caption") or merged.get("title") or "",
+            # The client-facing kit must never inherit an internal title or
+            # generated hook when the public caption is unavailable.
+            "public_caption": merged.get("caption") if isinstance(merged.get("caption"), str) else "",
             "hook_text": merged.get("hook_text") or "", "format": kind,
             "metrics": metrics, "engagements": sum(known) if known else None,
             "engagement_complete": likes is not None and comments is not None,
@@ -501,6 +504,9 @@ def build_account_media_kit(handle: str, *, now: datetime | None = None) -> dict
     account = {
         "handle": clean, "label": registry.get("label") or clean,
         "name": newest.get("full_name") or (latest or {}).get("full_name") or registry.get("label") or clean,
+        "public_name": newest.get("full_name") or (latest or {}).get("full_name") or clean,
+        "public_bio": next((snap[field] for snap in reversed(snapshots) for field in ("biography", "bio")
+                            if isinstance(snap.get(field), str) and snap[field].strip()), None),
         "platform": "Instagram", "profile_url": f"https://www.instagram.com/{clean}/",
         "avatar_url": f"/api/dashboard/avatar/{clean}" if registry.get("avatar_path") else None,
         "avatar_path": registry.get("avatar_path"),
@@ -529,6 +535,17 @@ def build_account_media_kit(handle: str, *, now: datetime | None = None) -> dict
         "last_30_days": _period(recent, catalog, followers, 30),
         "previous_30_days": _period(prior, catalog, followers, 30),
         "last_90_days": _period(ninety, catalog, followers, 90),
+    }
+    # Client-shareable aggregates must not include unpublished analyses,
+    # hidden/deleted content, future posts, or a private account's posts.
+    public_posts = [] if account["private"] else [post for post, date in dated
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", post.get("shortcode") or "")
+        and not post["hidden"] and not post["is_deleted"]]
+    public_catalog = [metric for metric in catalog if metric["key"] in ("likes", "comments", "video_views", "video_plays")]
+    public_recent = [post for post in public_posts if _date(post["published_at"]) >= current - timedelta(days=30)]
+    public_summary = {
+        "all_time": _period(public_posts, public_catalog, followers, None),
+        "last_30_days": _period(public_recent, public_catalog, followers, 30),
     }
     trend = {}
     for name in ("likes", "comments", "video_views", "video_plays"):
@@ -580,7 +597,8 @@ def build_account_media_kit(handle: str, *, now: datetime | None = None) -> dict
     }
     return {
         "schema_version": 1, "generated_at": current.isoformat(timespec="seconds"), "timezone": "America/Costa_Rica",
-        "account": account, "summary": summary,
+        "account": account, "summary": summary, "public_summary": public_summary,
+        "public_best_posts": {"all_time": _top(public_posts, limit=3), "last_30_days": _top(public_recent, limit=3)},
         "periods": {key: {"from": (current - timedelta(days=days)).isoformat(timespec="seconds") if days else coverage["oldest_post_at"], "to": (current - timedelta(days=30)).isoformat(timespec="seconds") if key == "previous_30_days" else current.isoformat(timespec="seconds")} for key, days in (("all_time", None), ("last_30_days", 30), ("previous_30_days", 60), ("last_90_days", 90))},
         "trends_pct": trend, "follower_history": history, "follower_growth": growth,
         "breakdowns": breakdowns, "content": content,
