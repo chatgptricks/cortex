@@ -14,6 +14,7 @@ import zipfile
 root = Path(__file__).resolve().parents[1]
 paths = subprocess.check_output(["git", "ls-files", "-z"], cwd=root).decode().split("\0")
 email = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+slack_user = re.compile(r"\bU0[A-Z0-9]{8,19}\b")
 secret = re.compile(
     r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
     r"|github_pat_[A-Za-z0-9_]{30,}|gh[pousr]_[A-Za-z0-9]{30,}"
@@ -44,6 +45,10 @@ def inspect(name, payload):
     for number, line in enumerate(text.splitlines(), 1):
         if secret.search(line):
             violations.append(f"{name}:{number}: credential-shaped value")
+        if any(not value.startswith(("U0TEST", "U0MOCK", "U012345")) for value in slack_user.findall(line)):
+            violations.append(f"{name}:{number}: use a synthetic Slack user ID in public code")
+        if re.search(r"https://(?:avatars|ca)\.slack-edge\.com/[A-Za-z0-9/_.-]{20,}", line):
+            violations.append(f"{name}:{number}: private staff avatar URL")
         for match in email.finditer(line):
             # URL userinfo fixtures are not staff email addresses.
             prefix = line[:match.start()]

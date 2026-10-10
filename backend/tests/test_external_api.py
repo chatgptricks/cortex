@@ -107,7 +107,7 @@ def setup(tmp_path, monkeypatch):
 
 def create(client, owner="ana@example.com", **overrides):
     response = client.post(api.MANAGEMENT_URL, headers={"Authorization": f"Bearer {owner}"},
-                           json={"name": "User 10 media kit", "account_handles": ["alpha"], **overrides})
+                           json={"name": "Public media kit", "account_handles": ["alpha"], **overrides})
     assert response.status_code == 201, response.text
     return response.json()
 

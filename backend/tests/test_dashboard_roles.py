@@ -49,14 +49,14 @@ def test_unrelated_user_edit_preserves_multi_role_access(monkeypatch, tmp_path):
         connection.execute(
             "INSERT INTO dashboard_users VALUES (?, ?, 'admin', 'vc', ?, 1, ?, '', '')",
             (
-                "coordinator@example.com", "User 05", json.dumps(["vc", "pd", "sales", "trainee"]),
+                "coordinator@example.com", "Example Member", json.dumps(["vc", "pd", "sales", "trainee"]),
                 "U10000002",
             ),
         )
 
     db.upsert_dashboard_user(
         "coordinator@example.com", role="admin", operating_role="vc", is_admin=True,
-        display_name="User 05 Updated", slack_user_id="U10000002",
+        display_name="Example Member Updated", slack_user_id="U10000002",
     )
 
     with connect() as connection:
@@ -64,7 +64,7 @@ def test_unrelated_user_edit_preserves_multi_role_access(monkeypatch, tmp_path):
             "SELECT display_name, operating_roles FROM dashboard_users WHERE email = ?",
             ("coordinator@example.com",),
         ).fetchone()
-    assert row["display_name"] == "User 05 Updated"
+    assert row["display_name"] == "Example Member Updated"
     assert json.loads(row["operating_roles"]) == ["vc", "pd", "sales", "trainee"]
 
 
