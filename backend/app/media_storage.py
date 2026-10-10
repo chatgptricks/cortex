@@ -10,8 +10,11 @@ from __future__ import annotations
 import logging
 import mimetypes
 import tempfile
+import time
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from .config import (
@@ -26,6 +29,13 @@ logger = logging.getLogger("uvicorn.error")
 _REF_PREFIX = "r2://"
 _UPLOAD_PREFIX = "uploads/"
 _PRESIGN_SECONDS = 60 * 60 * 24
+_PUBLIC_CACHE_CONTROL = "public, max-age=31536000, immutable"
+_PRIVATE_CACHE_CONTROL = "private, no-store"
+_PRIVATE_OBJECT_PREFIXES = ("uploads/queue-", "uploads/alert-")
+_PRIVATE_METADATA_CACHE_SECONDS = 60
+_PRIVATE_METADATA_CACHE_LIMIT = 1024
+_private_metadata_cache: OrderedDict[tuple[str, str], float] = OrderedDict()
+_private_metadata_lock = RLock()
 
 
 def r2_enabled() -> bool:
@@ -65,7 +75,7 @@ def _client() -> Any:
                         aws_secret_access_key=R2_SECRET_ACCESS_KEY, region_name="auto")
 
 
-def store_uploaded_media(filename: str, payload: bytes, *, content_type: str | None = None) -> str:
+def store_uploaded_media(filename: str, payload: bytes, *, content_type: str | None = None, private: bool = False) -> str:
     """Store media in R2 and return its durable object reference.
 
     There is intentionally no disk fallback. A successful API response must
@@ -74,14 +84,63 @@ def store_uploaded_media(filename: str, payload: bytes, *, content_type: str | N
     reference = _reference_for_filename(filename)
     if not r2_enabled():
         raise RuntimeError("R2 media storage is not configured; local media fallback is disabled.")
+    key = _object_key(reference)
     try:
-        _client().put_object(Bucket=R2_BUCKET, Key=_object_key(reference), Body=payload,
+        _client().put_object(Bucket=R2_BUCKET, Key=key, Body=payload,
                              ContentType=content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
-                             CacheControl="public, max-age=31536000, immutable")
+                             CacheControl=_PRIVATE_CACHE_CONTROL if private else _PUBLIC_CACHE_CONTROL)
+        with _private_metadata_lock:
+            _private_metadata_cache.pop((R2_BUCKET, key), None)
     except Exception as exc:
         logger.exception("R2 upload failed for %s", filename)
         raise RuntimeError(f"R2 upload failed for {filename}.") from exc
     return reference
+
+
+def _has_private_cache_control(metadata: dict[str, Any]) -> bool:
+    directives = {part.strip().lower() for part in str(metadata.get("CacheControl", "")).split(",")}
+    return {"private", "no-store"}.issubset(directives) and "public" not in directives
+
+
+def _ensure_private_cache_control(client: Any, key: str) -> None:
+    """Repair only private upload metadata before issuing a bearer URL.
+
+    Queue/alert filenames are immutable random keys. A bounded, short cache
+    avoids repeating metadata reads; uploads through this module invalidate it.
+    """
+    if not key.startswith(_PRIVATE_OBJECT_PREFIXES):
+        raise ValueError("Private downloads require a Queue or alert object.")
+    cache_key = (R2_BUCKET, key)
+    with _private_metadata_lock:
+        if _private_metadata_cache.get(cache_key, 0) > time.monotonic():
+            _private_metadata_cache.move_to_end(cache_key)
+            return
+        _private_metadata_cache.pop(cache_key, None)
+        metadata = client.head_object(Bucket=R2_BUCKET, Key=key)
+        if not _has_private_cache_control(metadata):
+            etag = metadata.get("ETag")
+            if not etag:
+                raise RuntimeError("Cannot safely repair private media metadata without an ETag.")
+            copy_args = {
+                "Bucket": R2_BUCKET,
+                "Key": key,
+                "CopySource": {"Bucket": R2_BUCKET, "Key": key},
+                "CopySourceIfMatch": etag,
+                "MetadataDirective": "REPLACE",
+                "CacheControl": _PRIVATE_CACHE_CONTROL,
+            }
+            for field in ("ContentType", "ContentDisposition", "ContentEncoding", "ContentLanguage", "Expires", "Metadata", "StorageClass"):
+                if metadata.get(field) is not None:
+                    copy_args[field] = metadata[field]
+            client.copy_object(**copy_args)
+            # Do not trust a successful copy response to establish the header
+            # seen by the final download, or cache an unsuccessful repair.
+            metadata = client.head_object(Bucket=R2_BUCKET, Key=key)
+            if not _has_private_cache_control(metadata):
+                raise RuntimeError("Private media cache metadata could not be verified.")
+        _private_metadata_cache[cache_key] = time.monotonic() + _PRIVATE_METADATA_CACHE_SECONDS
+        while len(_private_metadata_cache) > _PRIVATE_METADATA_CACHE_LIMIT:
+            _private_metadata_cache.popitem(last=False)
 
 
 def redirect_url(reference: str | Path | None, *, private: bool = False, lifetime_seconds: int = 300) -> str | None:
@@ -90,9 +149,11 @@ def redirect_url(reference: str | Path | None, *, private: bool = False, lifetim
         return None
     try:
         params = {"Bucket": R2_BUCKET, "Key": _object_key(reference)}
+        client = _client()
         if private:
-            params["ResponseCacheControl"] = "private, no-store"
-        return _client().generate_presigned_url("get_object", Params=params,
+            _ensure_private_cache_control(client, params["Key"])
+            params["ResponseCacheControl"] = _PRIVATE_CACHE_CONTROL
+        return client.generate_presigned_url("get_object", Params=params,
                                                 ExpiresIn=max(1, min(lifetime_seconds, _PRESIGN_SECONDS)) if private else _PRESIGN_SECONDS)
     except Exception:
         logger.exception("Could not create R2 read URL for %s", reference)
@@ -146,7 +207,7 @@ def upload_local_media_for_migration(path: str | Path) -> str | None:
     try:
         _client().upload_file(str(local_path), R2_BUCKET, _object_key(reference), ExtraArgs={
             "ContentType": mimetypes.guess_type(local_path.name)[0] or "application/octet-stream",
-            "CacheControl": "public, max-age=31536000, immutable",
+            "CacheControl": _PUBLIC_CACHE_CONTROL,
         })
     except Exception:
         logger.exception("Could not backfill local media %s to R2", local_path)

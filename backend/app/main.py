@@ -7591,6 +7591,7 @@ def dashboard_queue_v2_add_attachment(request_id: int, request: Request, file: A
     media_ref = store_uploaded_media(
         f"queue-{request_id}-{attachment_id}{suffix}", payload,
         content_type=file.content_type or "application/octet-stream",
+        private=True,
     )
     attachments = _queue_v2_json(row["attachments"], [])
     attachments.append({
@@ -8354,7 +8355,7 @@ def admin_slack_custom(
         if len(data) > _ALERT_IMAGE_MAX_BYTES:
             raise HTTPException(status_code=400, detail="Image is too large (8 MB max).")
         filename = f"alert-{secrets.token_hex(16)}{suffix}"
-        store_uploaded_media(filename, data, content_type=image.content_type)
+        store_uploaded_media(filename, data, content_type=image.content_type, private=True)
         image_url = alert_image_url_for(filename)
 
     sent = notify_custom(clean_message, title=(title or "").strip() or None, image_url=image_url)
