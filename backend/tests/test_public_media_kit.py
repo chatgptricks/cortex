@@ -163,6 +163,36 @@ def test_public_caption_is_not_a_keyword_blacklist_and_structured_text_is_reject
     assert public_post["format"] is None
 
 
+@pytest.mark.parametrize(("manual", "caption", "expected"), [
+    (True, "Ordinary public caption", True), (False, "#AITOOLSENTIENT!", True),
+    (False, "#aitoolsentientlabs", False), (False, "#aitoolsentient_", False),
+    (False, "#aİtoolsentient", False), (False, "#aitoolsentienté", True),
+    (False, None, False), (False, {"caption": "#aitoolsentient"}, False),
+])
+def test_promo_classification_in_all_showcases_preserves_summaries_and_input(manual, caption, expected):
+    source = report()
+    source["public_best_posts"] = {period: [post(is_promo=manual, public_caption=caption, title="#aitoolsentient", hook_text="#aitoolsentient")]
+                                   for period in ("all_time", "last_30_days")}
+    original = copy.deepcopy(source)
+    baseline_summary = project_public_media_kit(report())["summary"]
+    public = project_public_media_kit(source)
+    assert source == original
+    assert public["summary"] == baseline_summary
+    for entries in public["best_posts"].values():
+        assert entries[0]["is_promo"] is expected
+        assert "_public_manual_promo" not in entries[0]
+
+
+def test_promo_uses_full_published_caption_before_showcase_truncation():
+    source = report()
+    for period in ("all_time", "last_30_days"):
+        source["public_best_posts"][period][0]["public_caption"] = "x" * 501 + " #aitoolsentient"
+    public = project_public_media_kit(source)
+    for entries in public["best_posts"].values():
+        assert entries[0]["is_promo"] is True
+        assert entries[0]["public_caption"] == "x" * 500
+
+
 def test_showcase_caps_filters_duplicates_hidden_deleted_future_and_recent_dates():
     source = report()
     entries = [post("hidden", hidden="true"), post("deleted", is_deleted=1),

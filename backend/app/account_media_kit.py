@@ -324,6 +324,11 @@ def _normalize_posts(rows: list[dict[str, Any]], observations: dict[str, dict[st
             "engagement_complete": likes is not None and comments is not None,
             "metrics_updated_at": metric_at.isoformat(timespec="seconds") if metric_at else None,
             "is_hot": bool(_bool(merged.get("is_hot"))), "is_promo": bool(_bool(merged.get("is_promo"))),
+            # Research writes curation to the canonical table. A refreshed
+            # metrics copy must neither erase a mark nor resurrect a removal.
+            # Keep internal historical summaries unchanged; only the public
+            # projection uses this source annotation, never emitting it.
+            "_public_manual_promo": bool(_bool(preferred.get("is_promo") if "is_promo" in preferred else merged.get("is_promo"))),
             "hidden": bool(_bool(merged.get("hidden"))), "is_deleted": bool(_bool(merged.get("is_deleted"))),
             "hashtags": merged.get("hashtags") or raw.get("hashtags"),
             "mentions": merged.get("mentions") or raw.get("mentions"),

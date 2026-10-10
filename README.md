@@ -178,7 +178,14 @@ null; insufficient recent coverage omits last_30_days. Public projections
 exclude hidden/deleted/private posts, internal labels, contacts and model data.
 Reads never start a scrape or refresh.
 
-The [Spanish integration guide](https://sentientdash.app/api-guide.html)
-includes a downloadable Node website proxy example, private environment
+Posts and media kit standout posts expose `is_promo`: the manual Research
+flag or a case-insensitive `#aitoolsentient` caption hashtag, using Research's
+word boundary (so `#aitoolsentientlabs` does not match). Posts accept the
+optional `is_promo=true|false` filter before pagination; omitting it returns
+all public posts. Media kit summaries keep their existing mixed population.
+
+The [Spanish integration guide](https://sentientdash.app/api-guide.html?lang=es)
+and [English integration guide](https://sentientdash.app/api-guide.en.html?lang=en)
+include a downloadable Node website proxy example, private environment
 variables, five-minute website caching, field mapping, and error handling.
 Regression coverage lives in `backend/tests/test_external_api.py`.

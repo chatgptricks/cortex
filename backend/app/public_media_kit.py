@@ -11,6 +11,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
+from .promo_classification import is_public_promo
+
 _PUBLIC_METRICS = ("likes", "comments", "video_views", "video_plays")
 _HANDLE = re.compile(r"[A-Za-z0-9_.]{1,30}\Z")
 _SHORTCODE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
@@ -138,6 +140,7 @@ def _posts(value: Any, *, followers: int | None, generated: datetime | None, rec
             "shortcode": code,
             "permalink": f"https://www.instagram.com/p/{code}/",
             "public_caption": _text(source.get("public_caption"), 500),
+            "is_promo": is_public_promo(source),
             "format": source.get("format") if isinstance(source.get("format"), str) and source["format"] in _POST_FORMATS else None,
             "published_at": published.isoformat(timespec="seconds") if published else None,
             "metrics": selected,

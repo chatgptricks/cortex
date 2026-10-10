@@ -17,6 +17,7 @@ from fastapi.security import HTTPBearer
 from pydantic import BaseModel, Field
 
 from . import account_media_kit, db
+from .promo_classification import is_public_promo
 from .public_media_kit import project_public_media_kit
 
 PREFIX = "sad_api_"
@@ -304,6 +305,7 @@ def _pagination(data: list[Any], limit: int, offset: int) -> dict[str, Any]:
 @router.get("/accounts/{handle}/posts")
 def posts(request: Request, handle: str, limit: Annotated[int, Query(ge=1, le=100)] = 20,
           offset: Annotated[int, Query(ge=0)] = 0,
+          is_promo: Annotated[bool | None, Query(description="Filter Research Promo classification: manual mark or #aitoolsentient in the published caption")] = None,
           start: Annotated[date | None, Query(alias="from", description="Inclusive Costa Rica calendar date")] = None,
           end: Annotated[date | None, Query(alias="to", description="Inclusive Costa Rica calendar date")] = None) -> dict[str, Any]:
     clean = _handle(request, handle)
@@ -338,7 +340,11 @@ def posts(request: Request, handle: str, limit: Annotated[int, Query(ge=1, le=10
             if start and day < start or end and day > end:
                 continue
             caption = post["public_caption"]
+            promo = is_public_promo(post)
+            if is_promo is not None and promo != is_promo:
+                continue
             data.append({"shortcode": code, "caption": caption if isinstance(caption, str) and caption else None,
+                         "is_promo": promo,
                          "published_at": published.isoformat(timespec="seconds"),
                          "permalink": f"https://www.instagram.com/p/{code}/", "format": post["format"],
                          **{metric: post["metrics"].get(metric) for metric in ("likes", "comments", "video_views", "video_plays")},

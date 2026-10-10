@@ -78,6 +78,8 @@ def setup(tmp_path, monkeypatch):
                 'Published caption','CANARY_CANONICAL_TITLE',50,5,0,0,'CANARY_PRIVATE_PATH');
             INSERT INTO posts VALUES (11,'ab','InternalDraft','2026-10-01T23:00:00+00:00','2026-10-07T12:00:00+00:00',
                 'CANARY_INTERNAL_DRAFT',NULL,50000,5,0,0,'CANARY_PRIVATE_PATH');
+            ALTER TABLE dashboard_posts ADD COLUMN is_promo INTEGER DEFAULT 0;
+            ALTER TABLE posts ADD COLUMN is_promo INTEGER DEFAULT 0;
         """)
         api.ensure_schema(conn)
     monkeypatch.setattr(db, "connect", connect)
@@ -212,6 +214,115 @@ def test_posts_deduplicate_sources_filter_public_rows_and_paginate_local_dates(s
         assert client.get(path, params=params, headers=headers(key)).status_code == 422
 
 
+def test_promo_manual_hashtag_and_negative_filter_before_pagination(setup):
+    client, connect = setup
+    key = create(client)["key"]
+    path = "/api/v1/accounts/alpha/posts"
+    with connect() as conn:
+        conn.execute("UPDATE posts SET is_promo = 1 WHERE shortcode = 'PublicA'")
+        conn.execute("UPDATE dashboard_posts SET caption = 'Published #AITOOLSENTIENT! text' WHERE shortcode = 'PublicB'")
+        conn.execute("UPDATE dashboard_posts SET caption = '#aitoolsentientlabs' WHERE shortcode = 'PublicC'")
+        # A mark on another account or an excluded post must never enter totals.
+        conn.execute("UPDATE dashboard_posts SET is_promo = 1 WHERE shortcode IN ('Hidden','Deleted','Future','Other')")
+        conn.execute("UPDATE posts SET is_promo = 1 WHERE shortcode = 'InternalDraft'")
+    all_posts = client.get(path, headers=headers(key)).json()
+    assert all_posts["schema_version"] == "1.0"
+    assert {post["shortcode"]: post["is_promo"] for post in all_posts["data"]} == {"PublicA": True, "PublicB": True, "PublicC": False}
+    first = client.get(path, params={"is_promo": "true", "limit": 1}, headers=headers(key)).json()
+    assert [post["shortcode"] for post in first["data"]] == ["PublicB"]
+    assert first["pagination"] == {"limit": 1, "offset": 0, "total": 2, "has_more": True, "next_offset": 1}
+    second = client.get(path, params={"is_promo": "true", "limit": 1, "offset": 1}, headers=headers(key)).json()
+    assert [post["shortcode"] for post in second["data"]] == ["PublicA"]
+    assert second["pagination"] == {"limit": 1, "offset": 1, "total": 2, "has_more": False, "next_offset": None}
+    negative = client.get(path, params={"is_promo": "false"}, headers=headers(key)).json()
+    assert [post["shortcode"] for post in negative["data"]] == ["PublicC"]
+    assert negative["pagination"]["total"] == 1
+    empty = client.get(path, params={"is_promo": "true", "offset": 10}, headers=headers(key)).json()
+    assert empty["data"] == [] and empty["pagination"]["total"] == 2
+    dated = client.get(path, params={"is_promo": "true", "from": "2026-10-02", "to": "2026-10-02"}, headers=headers(key)).json()
+    assert dated["data"] == [] and dated["pagination"]["total"] == 0
+    assert client.get(path, params={"is_promo": "invalid"}, headers=headers(key)).status_code == 422
+    kit = client.get("/api/v1/accounts/alpha/media-kit", headers=headers(key)).json()["data"]
+    assert {post["shortcode"]: post["is_promo"] for post in kit["best_posts"]["all_time"]} == {"PublicA": True, "PublicB": True, "PublicC": False}
+    assert kit["summary"]["all_time"]["post_count"] == 3
+    assert kit["summary"]["all_time"]["metrics"]["likes"]["total"] == 150
+    assert "_public_manual_promo" not in json.dumps(kit)
+
+
+@pytest.mark.parametrize(("caption", "expected"), [
+    ("#aitoolsentient", True), ("#AITOOLSENTIENT", True),
+    ("Try #AiToolSentient, today.", True), ("(#aitoolsentient)", True),
+    ("#aitoolsentientlabs", False), ("#aitoolsentient_", False),
+    ("#aitoolsentient2", False), ("aitoolsentient", False),
+    ("#aİtoolsentient", False), ("#aitoolsentienté", True),
+    (None, False), ("Ordinary published caption", False),
+])
+def test_promo_hashtag_uses_research_case_and_word_boundaries(setup, caption, expected):
+    client, connect = setup
+    key = create(client)["key"]
+    with connect() as conn:
+        conn.execute("UPDATE dashboard_posts SET caption = ?, title = '#aitoolsentient', hook_text = '#aitoolsentient' WHERE shortcode = 'PublicC'", (caption,))
+    posts = client.get("/api/v1/accounts/alpha/posts", headers=headers(key)).json()["data"]
+    assert next(post for post in posts if post["shortcode"] == "PublicC")["is_promo"] is expected
+    kit = client.get("/api/v1/accounts/alpha/media-kit", headers=headers(key)).json()["data"]
+    assert next(post for post in kit["best_posts"]["all_time"] if post["shortcode"] == "PublicC")["is_promo"] is expected
+
+
+@pytest.mark.parametrize(("canonical_flag", "dashboard_flag"), [(1, 0), (0, 1)])
+def test_promo_manual_canonical_changes_survive_newer_duplicate_metrics(setup, canonical_flag, dashboard_flag):
+    client, connect = setup
+    key = create(client)["key"]
+    with connect() as conn:
+        conn.execute("UPDATE posts SET is_promo = ? WHERE shortcode = 'PublicA'", (canonical_flag,))
+        conn.execute("UPDATE dashboard_posts SET is_promo = ? WHERE shortcode = 'PublicA'", (dashboard_flag,))
+    result = client.get("/api/v1/accounts/alpha/posts", headers=headers(key)).json()
+    exported = next(post for post in result["data"] if post["shortcode"] == "PublicA")
+    assert exported["is_promo"] is bool(canonical_flag)
+    assert exported["likes"] == 100  # Metrics still use the freshest duplicate.
+    filtered = client.get("/api/v1/accounts/alpha/posts", params={"is_promo": str(bool(canonical_flag)).lower()}, headers=headers(key)).json()
+    assert "PublicA" in {post["shortcode"] for post in filtered["data"]}
+    kit = client.get("/api/v1/accounts/alpha/media-kit", headers=headers(key)).json()["data"]
+    assert next(post for post in kit["best_posts"]["all_time"] if post["shortcode"] == "PublicA")["is_promo"] is bool(canonical_flag)
+    # Public classification must not change historical internal promo counts.
+    internal = account_media_kit.build_account_media_kit("alpha")
+    assert internal["summary"]["all_time"]["promo_posts"] == dashboard_flag
+
+
+def test_noncanonical_manual_promo_and_legacy_missing_canonical_column(setup):
+    client, connect = setup
+    key = create(client, account_handles=["alpha", "beta"])["key"]
+    with connect() as conn:
+        conn.execute("UPDATE dashboard_posts SET is_promo = 1 WHERE shortcode IN ('PublicA','Other')")
+        conn.execute("ALTER TABLE posts DROP COLUMN is_promo")
+    for handle, code in (("alpha", "PublicA"), ("beta", "Other")):
+        result = client.get(f"/api/v1/accounts/{handle}/posts", params={"is_promo": "true"}, headers=headers(key)).json()
+        assert [post["shortcode"] for post in result["data"]] == [code]
+        assert result["data"][0]["is_promo"] is True
+        kit = client.get(f"/api/v1/accounts/{handle}/media-kit", headers=headers(key)).json()["data"]
+        assert next(post for post in kit["best_posts"]["all_time"] if post["shortcode"] == code)["is_promo"] is True
+
+
+def test_promo_api_recent_showcase_classifies_before_caption_truncation(setup):
+    client, connect = setup
+    key = create(client, account_handles=["beta"])["key"]
+    caption = "x" * 501 + " #AITOOLSENTIENT."
+    with connect() as conn:
+        conn.execute("UPDATE dashboard_posts SET caption = ? WHERE shortcode = 'Other'", (caption,))
+        conn.execute("INSERT INTO dashboard_posts (account, shortcode, published_at, caption, likes, comments, hidden, is_deleted, is_promo) VALUES ('beta','History','2026-09-08T18:00:00Z','Historical public caption',1,0,0,0,1)")
+        conn.execute("INSERT INTO account_snapshots (handle,captured_at,followers_count,posts_count,private) VALUES ('beta','2026-09-09T17:00:00Z',990,1,0)")
+        conn.execute("INSERT INTO account_snapshots (handle,captured_at,followers_count,posts_count,private) VALUES ('beta','2026-10-09T17:00:00Z',1000,2,0)")
+    posts = client.get("/api/v1/accounts/beta/posts", params={"is_promo": "true"}, headers=headers(key)).json()
+    assert posts["pagination"]["total"] == 2
+    assert next(post for post in posts["data"] if post["shortcode"] == "Other")["caption"] == caption
+    kit = client.get("/api/v1/accounts/beta/media-kit", headers=headers(key)).json()["data"]
+    assert kit["summary"]["all_time"]["post_count"] == 2
+    assert kit["summary"]["last_30_days"]["post_count"] == 1
+    assert {post["shortcode"]: post["is_promo"] for post in kit["best_posts"]["all_time"]} == {"Other": True, "History": True}
+    recent = kit["best_posts"]["last_30_days"]
+    assert len(recent) == 1 and recent[0]["shortcode"] == "Other"
+    assert recent[0]["is_promo"] is True and recent[0]["public_caption"] == "x" * 500
+
+
 def test_followers_history_final_costa_rica_daily_snapshots_and_filters(setup):
     client, _ = setup
     key = create(client)["key"]
@@ -231,7 +342,11 @@ def test_private_account_posts_and_showcases_are_not_exported(setup):
     key = create(client)["key"]
     with connect() as conn:
         conn.execute("UPDATE account_snapshots SET private = 1 WHERE handle = 'alpha'")
+        conn.execute("UPDATE dashboard_posts SET is_promo = 1, caption = '#aitoolsentient' WHERE account = 'alpha'")
     assert client.get("/api/v1/accounts/alpha/posts", headers=headers(key)).json()["data"] == []
+    for value in ("true", "false"):
+        result = client.get("/api/v1/accounts/alpha/posts", params={"is_promo": value}, headers=headers(key)).json()
+        assert result["data"] == [] and result["pagination"]["total"] == 0
     kit = client.get("/api/v1/accounts/alpha/media-kit", headers=headers(key)).json()["data"]
     assert kit["best_posts"] == {"all_time": []}
     assert kit["summary"]["all_time"]["post_count"] == 0
@@ -243,9 +358,12 @@ def test_older_canonical_privacy_flags_override_newer_unflagged_metrics_copies(s
     key = create(client)["key"]
     with connect() as conn:
         conn.execute(f"UPDATE posts SET {flag} = 1 WHERE shortcode = 'PublicA'")
+        conn.execute("UPDATE posts SET is_promo = 1 WHERE shortcode = 'PublicA'")
     exported = client.get("/api/v1/accounts/alpha/posts", headers=headers(key)).json()
     assert [post["shortcode"] for post in exported["data"]] == ["PublicC", "PublicB"]
     assert exported["pagination"]["total"] == 2
+    promos = client.get("/api/v1/accounts/alpha/posts", params={"is_promo": "true"}, headers=headers(key)).json()
+    assert promos["data"] == [] and promos["pagination"]["total"] == 0
     kit = client.get("/api/v1/accounts/alpha/media-kit", headers=headers(key)).json()["data"]
     assert kit["summary"]["all_time"]["post_count"] == 2
     assert kit["summary"]["all_time"]["metrics"]["likes"]["total"] == 50
