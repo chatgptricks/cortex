@@ -193,6 +193,25 @@ def test_promo_uses_full_published_caption_before_showcase_truncation():
         assert entries[0]["public_caption"] == "x" * 500
 
 
+@pytest.mark.parametrize(("coauthors", "expected"), [
+    ([{"username": "@PEER", "id": "CANARY", "profileUrl": "CANARY"}, "peer", "other"],
+     {"is_collab": True, "collaborators": ["peer", "other"]}),
+    ([], {"is_collab": False, "collaborators": []}),
+    (None, {"is_collab": None, "collaborators": []}),
+    ([{"id": "CANARY"}], {"is_collab": None, "collaborators": []}),
+])
+def test_collaboration_in_showcases_only_exposes_handles_and_preserves_input(coauthors, expected):
+    source = report()
+    source["public_best_posts"] = {period: [post(coauthors=coauthors)] for period in ("all_time", "last_30_days")}
+    original = copy.deepcopy(source)
+    public = project_public_media_kit(source)
+    assert source == original
+    assert public["summary"] == project_public_media_kit(report())["summary"]
+    for entries in public["best_posts"].values():
+        assert {key: entries[0][key] for key in expected} == expected
+    assert "CANARY" not in json.dumps(public, default=str)
+
+
 def test_showcase_caps_filters_duplicates_hidden_deleted_future_and_recent_dates():
     source = report()
     entries = [post("hidden", hidden="true"), post("deleted", is_deleted=1),

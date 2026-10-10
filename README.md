@@ -184,6 +184,20 @@ word boundary (so `#aitoolsentientlabs` does not match). Posts accept the
 optional `is_promo=true|false` filter before pagination; omitting it returns
 all public posts. Media kit summaries keep their existing mixed population.
 
+Posts and media kit standout posts also expose `is_collab: true|false|null`
+and `collaborators`, a deduplicated list of lowercase Instagram handles that
+excludes the requested account. Classification uses only stored explicit
+coauthor metadata, never mentions, tagged users or Promo status. A valid
+empty list confirms false; a self-only list confirms false only when the
+known primary owner is also the requested account. Missing or unusable
+metadata without sufficient valid evidence remains null. Valid other handles
+still confirm a collaboration when some entries are malformed; the returned
+list contains available participants rather than a guaranteed full inventory.
+When explicit coauthors include the requested account,
+a known different primary owner joins the collaborator list. Newer usable
+explicit metadata supersedes older evidence; updates without usable coauthor
+metadata preserve existing evidence. No collaboration query filter is added.
+
 The [Spanish integration guide](https://sentientdash.app/api-guide.html?lang=es)
 and [English integration guide](https://sentientdash.app/api-guide.en.html?lang=en)
 include a downloadable Node website proxy example, private environment

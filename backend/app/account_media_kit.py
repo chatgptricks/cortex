@@ -17,6 +17,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from . import db
+from .public_collaboration import stored_collaboration
 
 _TZ = timezone(timedelta(hours=-6))
 _METRICS = {
@@ -329,6 +330,7 @@ def _normalize_posts(rows: list[dict[str, Any]], observations: dict[str, dict[st
             # Keep internal historical summaries unchanged; only the public
             # projection uses this source annotation, never emitting it.
             "_public_manual_promo": bool(_bool(preferred.get("is_promo") if "is_promo" in preferred else merged.get("is_promo"))),
+            "_public_collaboration": stored_collaboration(records, handle, observation),
             "hidden": bool(_bool(merged.get("hidden"))), "is_deleted": bool(_bool(merged.get("is_deleted"))),
             "hashtags": merged.get("hashtags") or raw.get("hashtags"),
             "mentions": merged.get("mentions") or raw.get("mentions"),

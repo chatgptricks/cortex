@@ -214,6 +214,109 @@ def test_posts_deduplicate_sources_filter_public_rows_and_paginate_local_dates(s
         assert client.get(path, params=params, headers=headers(key)).status_code == 422
 
 
+@pytest.mark.parametrize(("promoted", "raw", "status", "participants"), [
+    (None, {}, None, []),
+    (None, {"coauthorProducers": []}, False, []),
+    (None, {"coauthorProducers": None}, None, []),
+    (None, {"coauthorProducers": [{"id": "CANARY"}]}, None, []),
+    (None, {"coauthorProducers": [{"username": "@PEER", "id": "CANARY"}, "peer"]}, True, ["peer"]),
+    (None, {"coauthorProducers": [{"username": "peer"}, {"id": "CANARY"}, "https://instagram.com/other"]}, True, ["peer"]),
+    (None, {"coauthorProducers": ["alpha"]}, None, []),
+    (None, {"coauthorProducers": ["alpha"], "ownerUsername": "ALPHA"}, False, []),
+    (None, {"coauthorProducers": ["alpha"], "owner": {"username": "PRIMARY"}}, True, ["primary"]),
+    (None, {"ownerUsername": "primary", "mentions": ["peer"], "taggedUsers": [{"username": "peer"}]}, None, []),
+    ("@ALPHA, @PEER, peer, other", {}, True, ["peer", "other"]),
+    ('[{"username":"peer","profileUrl":"CANARY"}]', {}, True, ["peer"]),
+    ("peer", {"coauthorProducers": []}, False, []),
+])
+def test_collaboration_fields_in_posts_and_media_kit_are_public_and_additive(setup, promoted, raw, status, participants):
+    client, connect = setup
+    key = create(client)["key"]
+    with connect() as conn:
+        conn.execute("ALTER TABLE dashboard_posts ADD COLUMN coauthors TEXT")
+        conn.execute("UPDATE dashboard_posts SET coauthors = ?, raw_json = ? WHERE shortcode = 'PublicA'",
+                     (promoted, json.dumps(raw)))
+    response = client.get("/api/v1/accounts/alpha/posts", params={"limit": 1, "offset": 2}, headers=headers(key))
+    assert response.status_code == 200
+    exported = response.json()
+    assert exported["schema_version"] == "1.0"
+    assert exported["pagination"]["total"] == 3
+    assert exported["data"][0]["shortcode"] == "PublicA"
+    expected = {"is_collab": status, "collaborators": participants}
+    assert {name: exported["data"][0][name] for name in expected} == expected
+    media = client.get("/api/v1/accounts/alpha/media-kit", headers=headers(key))
+    showcase = next(post for post in media.json()["data"]["best_posts"]["all_time"] if post["shortcode"] == "PublicA")
+    assert {name: showcase[name] for name in expected} == expected
+    for public in (response.text, media.text):
+        assert "CANARY" not in public
+        assert "coauthorProducers" not in public and "_public_collaboration" not in public
+
+
+@pytest.mark.parametrize("handle", ["alpha", "beta"])
+@pytest.mark.parametrize(("new_raw", "status", "participants"), [
+    ({"likesCount": 100}, True, ["peer"]),
+    ({"coauthorProducers": None}, True, ["peer"]),
+    ({"coauthorProducers": []}, False, []),
+])
+def test_collaboration_duplicate_evidence_uses_latest_explicit_metadata(setup, handle, new_raw, status, participants):
+    client, connect = setup
+    key = create(client, account_handles=[handle])["key"]
+    code = "PublicA" if handle == "alpha" else "Other"
+    with connect() as conn:
+        conn.execute("ALTER TABLE posts ADD COLUMN raw_json TEXT")
+        conn.execute("UPDATE dashboard_posts SET updated_at = '2026-10-01T12:00:00Z', raw_json = ? WHERE shortcode = ?",
+                     (json.dumps({"coauthorProducers": [{"username": "peer"}]}), code))
+        if handle == "alpha":
+            conn.execute("UPDATE posts SET updated_at = '2026-10-09T12:00:00Z', raw_json = ? WHERE shortcode = ?", (json.dumps(new_raw), code))
+        else:
+            conn.execute("INSERT INTO dashboard_posts (account,shortcode,published_at,updated_at,likes,comments,hidden,is_deleted,raw_json) VALUES ('beta','Other','2026-10-02T09:00:00Z','2026-10-09T12:00:00Z',100,1,0,0,?)", (json.dumps(new_raw),))
+    data = client.get(f"/api/v1/accounts/{handle}/posts", headers=headers(key)).json()["data"]
+    exported = next(post for post in data if post["shortcode"] == code)
+    assert exported["is_collab"] is status and exported["collaborators"] == participants
+    assert sum(post["shortcode"] == code for post in data) == 1
+    best = client.get(f"/api/v1/accounts/{handle}/media-kit", headers=headers(key)).json()["data"]["best_posts"]["all_time"]
+    showcased = next(post for post in best if post["shortcode"] == code)
+    assert showcased["is_collab"] is status and showcased["collaborators"] == participants
+
+
+@pytest.mark.parametrize(("raw", "status", "participants"), [
+    ({"shortCode": "PublicA", "likesCount": 110}, True, ["peer"]),
+    ({"shortCode": "PublicA", "coauthorProducers": None}, True, ["peer"]),
+    ({"shortCode": "Foreign", "coauthorProducers": []}, True, ["peer"]),
+    ({"shortcode": "Foreign", "coauthorProducers": []}, True, ["peer"]),
+    ({"shortCode": "PublicA", "coauthorProducers": []}, False, []),
+    ({"shortCode": "PublicA", "coauthorProducers": ["alpha"], "ownerUsername": "primary"}, True, ["primary"]),
+])
+def test_collaboration_uses_matching_newer_observations_without_erasing_evidence(setup, raw, status, participants):
+    client, connect = setup
+    key = create(client)["key"]
+    with connect() as conn:
+        conn.execute("UPDATE dashboard_posts SET raw_json = ? WHERE shortcode = 'PublicA'", (json.dumps({"coauthorProducers": ["peer"]}),))
+        conn.execute("CREATE TABLE engagement_observations (shortcode TEXT PRIMARY KEY, observed_at TEXT, raw_json TEXT)")
+        conn.execute("INSERT INTO engagement_observations VALUES ('PublicA','2026-10-09T17:00:00Z',?)", (json.dumps(raw),))
+    for suffix in ("/posts", "/media-kit"):
+        response = client.get("/api/v1/accounts/alpha" + suffix, headers=headers(key))
+        posts = response.json()["data"] if suffix == "/posts" else response.json()["data"]["best_posts"]["all_time"]
+        exported = next(post for post in posts if post["shortcode"] == "PublicA")
+        assert exported["is_collab"] is status and exported["collaborators"] == participants
+
+
+def test_collaboration_respects_private_hidden_deleted_future_and_account_scope(setup):
+    client, connect = setup
+    key = create(client)["key"]
+    with connect() as conn:
+        conn.execute("UPDATE dashboard_posts SET raw_json = ?", (json.dumps({"coauthorProducers": ["CANARY_EXCLUDED_PARTNER"]}),))
+        conn.execute("UPDATE dashboard_posts SET raw_json = NULL WHERE shortcode IN ('PublicA','PublicB','PublicC')")
+    for suffix in ("/posts", "/media-kit"):
+        public = client.get("/api/v1/accounts/alpha" + suffix, headers=headers(key))
+        assert "CANARY_EXCLUDED_PARTNER" not in public.text
+    assert client.get("/api/v1/accounts/beta/posts", headers=headers(key)).status_code == 404
+    with connect() as conn:
+        conn.execute("UPDATE account_snapshots SET private = 1 WHERE handle = 'alpha'")
+    assert client.get("/api/v1/accounts/alpha/posts", headers=headers(key)).json()["data"] == []
+    assert client.get("/api/v1/accounts/alpha/media-kit", headers=headers(key)).json()["data"]["best_posts"] == {"all_time": []}
+
+
 def test_promo_manual_hashtag_and_negative_filter_before_pagination(setup):
     client, connect = setup
     key = create(client)["key"]

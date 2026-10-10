@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .promo_classification import is_public_promo
+from .public_collaboration import public_collaboration
 
 _PUBLIC_METRICS = ("likes", "comments", "video_views", "video_plays")
 _HANDLE = re.compile(r"[A-Za-z0-9_.]{1,30}\Z")
@@ -117,7 +118,7 @@ def _post_code(post: dict[str, Any]) -> str | None:
     return None
 
 
-def _posts(value: Any, *, followers: int | None, generated: datetime | None, recent: bool) -> list[dict[str, Any]]:
+def _posts(value: Any, *, account: str, followers: int | None, generated: datetime | None, recent: bool) -> list[dict[str, Any]]:
     if not isinstance(value, list) or generated is None:
         return []
     result = []
@@ -141,6 +142,7 @@ def _posts(value: Any, *, followers: int | None, generated: datetime | None, rec
             "permalink": f"https://www.instagram.com/p/{code}/",
             "public_caption": _text(source.get("public_caption"), 500),
             "is_promo": is_public_promo(source),
+            **public_collaboration(source, account),
             "format": source.get("format") if isinstance(source.get("format"), str) and source["format"] in _POST_FORMATS else None,
             "published_at": published.isoformat(timespec="seconds") if published else None,
             "metrics": selected,
@@ -195,14 +197,14 @@ def project_public_media_kit(report: dict[str, Any]) -> dict[str, Any]:
         "timezone": "America/Costa_Rica",
         "account": account,
         "summary": {"all_time": _period({"post_count": 0} if private else summary.get("all_time"), followers)},
-        "best_posts": {"all_time": [] if private else _posts(best.get("all_time"), followers=followers, generated=generated, recent=False)},
+        "best_posts": {"all_time": [] if private else _posts(best.get("all_time"), account=handle, followers=followers, generated=generated, recent=False)},
     }
     # Only an explicitly checked, sufficiently current full-post source may
     # support a recent overview. The internal JSON retains the stored sample
     # and diagnostic reasons; none of that inventory enters a sales PDF.
     if not private and source.get("public_recent_available") is True and isinstance(summary.get("last_30_days"), dict):
         result["summary"]["last_30_days"] = _period(summary.get("last_30_days"), followers, recent=True)
-        result["best_posts"]["last_30_days"] = _posts(best.get("last_30_days"), followers=followers, generated=generated, recent=True)
+        result["best_posts"]["last_30_days"] = _posts(best.get("last_30_days"), account=handle, followers=followers, generated=generated, recent=True)
     growth = _mapping(_mapping(source.get("follower_growth")).get("30d"))
     pct = _number(growth.get("pct"), signed=True)
     if pct is not None and growth.get("observed_days") == 30:

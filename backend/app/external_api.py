@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from . import account_media_kit, db
 from .promo_classification import is_public_promo
+from .public_collaboration import public_collaboration
 from .public_media_kit import project_public_media_kit
 
 PREFIX = "sad_api_"
@@ -345,6 +346,7 @@ def posts(request: Request, handle: str, limit: Annotated[int, Query(ge=1, le=10
                 continue
             data.append({"shortcode": code, "caption": caption if isinstance(caption, str) and caption else None,
                          "is_promo": promo,
+                         **public_collaboration(post, clean),
                          "published_at": published.isoformat(timespec="seconds"),
                          "permalink": f"https://www.instagram.com/p/{code}/", "format": post["format"],
                          **{metric: post["metrics"].get(metric) for metric in ("likes", "comments", "video_views", "video_plays")},
