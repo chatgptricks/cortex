@@ -205,6 +205,8 @@ def metric_updates(after_at='', after_code='', limit=500):
         rows = conn.execute("""SELECT shortcode, observed_at, raw_json FROM engagement_observations
             WHERE observed_at > ? OR (observed_at = ? AND shortcode > ?)
             ORDER BY observed_at, shortcode LIMIT ?""", (after_at, after_at, after_code, limit + 1)).fetchall()
+        from .research_collaboration import collaboration_updates
+        collabs = collaboration_updates(conn, [row['shortcode'] for row in rows[:limit]])
     has_more = len(rows) > limit
     rows = rows[:limit]
     updates = []
@@ -215,4 +217,4 @@ def metric_updates(after_at='', after_code='', limit=500):
             'comments': comments if isinstance(comments, int) and comments >= 0 else None,
             'likesUpdatedAt': row['observed_at']})
     cursor = {'at': rows[-1]['observed_at'], 'code': rows[-1]['shortcode']} if rows else {'at': after_at, 'code': after_code}
-    return {'updates': updates, 'cursor': cursor, 'hasMore': has_more}
+    return {'updates': updates, 'collaborationUpdates': collabs, 'cursor': cursor, 'hasMore': has_more}

@@ -1360,6 +1360,7 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
         "sources": sources,
         "queue": int(queue["max_id"] or 0),
         "catalogue_generation": _DASHBOARD_CATALOGUE_GENERATION,
+        "projection_version": 2,
     }
     revision = hashlib.sha256(
         json.dumps(fingerprint, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -1368,6 +1369,8 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
         "revision": revision,
         "sources": sources,
         "metricsAvailable": True,
+        "projectionVersion": 2,
+        "projectionGeneration": _DASHBOARD_CATALOGUE_GENERATION,
     }
 
 
@@ -1615,6 +1618,9 @@ def _dashboard_catalogue_page(
                 "transcriptAvailable": bool(str(post.get("transcript") or "").strip()),
             })
 
+    from .research_collaboration import attach_collaboration
+    with connect() as conn:
+        attach_collaboration(conn, posts, canonical_handle=canonical["handle"])
     from .engagement_refresh import attach_freshness
     attach_freshness(posts)
     _annotate_dashboard_queue(posts, decoration["queue_by_source"], decoration["queue_by_final"])
@@ -1863,6 +1869,9 @@ def _dashboard_posts_payload() -> dict[str, Any]:
             }
         )
 
+    from .research_collaboration import attach_collaboration
+    with connect() as conn:
+        attach_collaboration(conn, posts, canonical_handle=canonical["handle"])
     posts = _dedupe_projected_posts(posts)
     posts.sort(key=lambda p: p.get("postDate") or "", reverse=True)
     # Source-post workflow state is useful while a coordinator researches;
@@ -9067,8 +9076,13 @@ def _enrich_worker(max_runs: int, per_run_limit: int) -> None:
 
     try:
         _ENRICH_RUN["result"] = enrich_from_existing_runs(max_runs=max_runs, per_run_limit=per_run_limit)
+        if _ENRICH_RUN["result"].get("updated", 0):
+            _invalidate_dashboard_posts_cache()
     except Exception as exc:
         _ENRICH_RUN["error"] = str(exc)
+        # Earlier dataset batches may already be committed. A retry skips
+        # those filled rows, so expose their metadata despite a later error.
+        _invalidate_dashboard_posts_cache()
     finally:
         _ENRICH_RUN["running"] = False
 
@@ -9092,7 +9106,10 @@ def admin_enrich_from_run(run_id: str, password: Annotated[str, Form()]) -> dict
     from .apify_sync import enrich_from_run
 
     try:
-        return enrich_from_run(run_id)
+        result = enrich_from_run(run_id)
+        if result.get("updated", 0):
+            _invalidate_dashboard_posts_cache()
+        return result
     except ApifySyncError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -9156,8 +9173,12 @@ def _profile_enrich_worker(account: str, results_limit: int) -> None:
 
     try:
         _PROFILE_ENRICH["result"] = enrich_account_via_profile(account, results_limit=results_limit)
+        if _PROFILE_ENRICH["result"].get("updated_existing", 0):
+            _invalidate_dashboard_posts_cache()
     except Exception as exc:
         _PROFILE_ENRICH["error"] = str(exc)
+        # Existing-row metadata commits before new-post insertion/cover work.
+        _invalidate_dashboard_posts_cache()
     finally:
         _PROFILE_ENRICH["running"] = False
 
@@ -9201,8 +9222,13 @@ def _scrape_missing_worker(limit: int, account: str | None) -> None:
 
     try:
         _SCRAPE_RUN["result"] = scrape_missing_enrichment(limit=limit, account=account)
+        if _SCRAPE_RUN["result"].get("updated", 0):
+            _invalidate_dashboard_posts_cache()
     except Exception as exc:
         _SCRAPE_RUN["error"] = str(exc)
+        # Each scrape batch commits independently; preserve visibility of
+        # completed batches when a later provider call fails.
+        _invalidate_dashboard_posts_cache()
     finally:
         _SCRAPE_RUN["running"] = False
 
