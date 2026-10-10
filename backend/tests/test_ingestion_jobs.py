@@ -266,8 +266,8 @@ def test_dev_alerts_only_reach_dev_accounts(monkeypatch):
         return httpx.Response(200, json={'ok': True})
     real_client = httpx.Client
     monkeypatch.setattr(httpx, 'Client', lambda **kw: real_client(transport=httpx.MockTransport(handler)))
-    assert slack_alerts.notify_devs('t', 'b') == len(slack_alerts.DEV_EMAILS)
-    assert opened == [slack_alerts.slack_user_id_for_email(e) for e in slack_alerts.DEV_EMAILS]
+    assert slack_alerts.notify_devs('t', 'b') == len(slack_alerts.dev_emails())
+    assert opened == [slack_alerts.slack_user_id_for_email(e) for e in slack_alerts.dev_emails()]
 
 
 def test_ingestion_status_is_dev_only_and_summarizes_journal(database, monkeypatch):

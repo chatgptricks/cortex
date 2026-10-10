@@ -8,7 +8,13 @@ from app import main
 
 def test_form_can_explicitly_clear_optional_fields(monkeypatch):
     calls = []
-    monkeypatch.setattr(main, "FIREBASE_APP", None)
+    monkeypatch.setattr(main, "FIREBASE_APP", object())
+    monkeypatch.setattr(main.firebase_auth, "verify_id_token", lambda token: {"email": "admin@example.com", "uid": "test"})
+    monkeypatch.setattr(main, "get_dashboard_user_access", lambda email: {
+        "is_admin": True, "operating_role": "admin", "operating_roles": '["admin"]',
+        "time_zone": "America/Costa_Rica",
+    })
+    monkeypatch.setattr(main, "log_usage_event", lambda *args: None)
     monkeypatch.setattr(main, "upsert_dashboard_user", lambda *args, **kwargs: calls.append((args, kwargs)))
     monkeypatch.setattr(main, "admin_list_users", lambda: {"users": [{"email": "pd@example.com", "avatar_url": "avatar"}]})
     monkeypatch.setattr(main, "_queue_v2_publish", lambda *args: None)
@@ -20,7 +26,8 @@ def test_form_can_explicitly_clear_optional_fields(monkeypatch):
     monkeypatch.setattr(main, "connect", connect)
 
     async def scenario():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test",
+                                    headers={"Authorization": "Bearer test-admin"}) as client:
             response = await client.post("/api/admin/users", data={
                 "email": "pd@example.com", "role": "viewer", "operating_role": "pd",
                 "display_name": "Designer", "clear_fields": "slack_user_id,time_zone,minutes_per_pp",

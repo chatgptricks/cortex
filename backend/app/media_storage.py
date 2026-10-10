@@ -84,13 +84,16 @@ def store_uploaded_media(filename: str, payload: bytes, *, content_type: str | N
     return reference
 
 
-def redirect_url(reference: str | Path | None) -> str | None:
+def redirect_url(reference: str | Path | None, *, private: bool = False, lifetime_seconds: int = 300) -> str | None:
     """Create a direct, short-lived URL so Render never proxies an R2 object."""
     if not isinstance(reference, str) or not is_r2_reference(reference) or not r2_enabled():
         return None
     try:
-        return _client().generate_presigned_url("get_object", Params={"Bucket": R2_BUCKET, "Key": _object_key(reference)},
-                                                ExpiresIn=_PRESIGN_SECONDS)
+        params = {"Bucket": R2_BUCKET, "Key": _object_key(reference)}
+        if private:
+            params["ResponseCacheControl"] = "private, no-store"
+        return _client().generate_presigned_url("get_object", Params=params,
+                                                ExpiresIn=max(1, min(lifetime_seconds, _PRESIGN_SECONDS)) if private else _PRESIGN_SECONDS)
     except Exception:
         logger.exception("Could not create R2 read URL for %s", reference)
         return None

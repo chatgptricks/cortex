@@ -1,7 +1,16 @@
 .DS_Store
-.env
-.env.*
+.env*
 !.env.example
+
+# Private service credentials must stay outside the public repository.
+*firebase-adminsdk*.json
+*service-account*.json
+*service_account*.json
+*.pem
+*.key
+sentient-roster.json
+backend/sentient-roster.json
+/work/
 .venv/
 .modal-venv/
 .import-venv/
@@ -22,5 +31,5 @@ Post DB/
 workers/__pycache__/
 
 # Local agent-handover notes -- session-to-session scratch, not project docs.
-AGENTS.md
-FOR_CODEX.md
+AGENTS*.md
+FOR_CODEX*.md

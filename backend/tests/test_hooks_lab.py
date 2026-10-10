@@ -93,7 +93,7 @@ def test_only_full_dev_access(client, headers):
 
 def test_ivan_cannot_use_hooks_without_dev_permissions(client):
     test_client, _ = client
-    headers = {"x-role": "admin", "x-user": "user05@example.com"}
+    headers = {"x-role": "admin", "x-user": "coordinator@example.com"}
     assert test_client.get("/api/dashboard/hooks", headers=headers).status_code == 403
     assert test_client.get("/api/dashboard/hooks", headers={**headers, "x-preview": "1"}).status_code == 403
     assert test_client.get("/api/dashboard/hooks", headers={**headers, "x-user": "other@example.com"}).status_code == 403
@@ -228,7 +228,7 @@ def test_local_bridge_verifies_dev_and_indexes_live_catalogue(client, monkeypatc
     def remote_get(url, headers=None, timeout=None):
         calls.append((url, dict(headers or {})))
         if url.endswith("/api/dashboard/me"):
-            return RemoteResponse(200, {"email": "user03@example.com", "is_dev": True})
+            return RemoteResponse(200, {"email": "developer@example.com", "is_dev": True})
         if (headers or {}).get("If-None-Match") == '"live-v1"':
             return RemoteResponse(304)
         return RemoteResponse(

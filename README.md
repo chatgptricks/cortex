@@ -32,6 +32,33 @@ Requires a `.env` — copy `.env.example` and fill in what you need locally
 etc.). Without `SENTIENT_DATA_DIR` set it defaults to `./data` relative to the
 repo root.
 
+Google sign-in requires a Firebase Admin service-account credential mounted at
+`/etc/secrets/firebase-adminsdk.json` on Render or saved as
+`backend/firebase-adminsdk.json` locally. Keep this private JSON out of Git.
+If the credential is missing, private dashboard reads and writes return
+`503` with `Cache-Control: no-store`; local development has no authentication
+bypass. Health checks, API documentation, OAuth discovery and explicitly public
+media remain available. Existing agent codes, MCP OAuth tokens and website API
+keys keep their own credential and current-owner permission checks.
+
+The reviewed employee roster, Slack mappings, avatar fallback URLs, role
+exceptions and historical roster migrations are private configuration. Mount
+`/etc/secrets/sentient-roster.json` on the API and ingestion worker, or set
+`SENTIENT_ROSTER_FILE` to its private file path. Local development reads
+`backend/sentient-roster.json` when no explicit path is set. Use mode `0600`
+for local files; these files are ignored by Git. The JSON uses `version: 1`;
+Cortex validates the schema, role overrides and boolean capability flags
+before use. An invalid private configuration grants no additional capability.
+`backend/tests/fixtures/roster.example.json` shows the schema with fictitious
+identities. Keep the production migration markers unchanged so existing
+databases retain their completed migrations and subsequent Settings edits.
+Without this file, Cortex uses existing database roles, grants no roster
+exceptions, seeds no roster identities and has no private Slack recipient mappings.
+Configure both services before releasing a change that moves roster metadata.
+
+`GET /api/health` remains public. Its optional `verify=true` database readiness
+checks require an authenticated Admin or Dev and use private, noncached responses.
+
 ## What it actually serves today
 
 - `/api/dashboard/*` — posts, accounts, queue (tasks/assign/reorder), saved

@@ -5,7 +5,7 @@ from app import main
 
 def _request(*, role: str, preview_active: bool) -> SimpleNamespace:
     return SimpleNamespace(state=SimpleNamespace(
-        user_email="user03@example.com",
+        user_email="developer@example.com",
         is_admin=False,
         is_dev=True,
         operating_role=role,

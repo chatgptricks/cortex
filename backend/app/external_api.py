@@ -58,8 +58,14 @@ def ensure_schema(conn: Any) -> None:
 
 
 def _admin(email: str, access: dict[str, Any] | None) -> bool:
-    from .slack_alerts import DEV_EMAILS
-    return access is not None and (bool(access.get("is_admin")) or email in DEV_EMAILS)
+    from .private_roster import user_flags
+    if access is None:
+        return False
+    try:
+        roles = json.loads(access.get("operating_roles") or "[]")
+    except (TypeError, ValueError):
+        roles = []
+    return bool(access.get("is_admin")) or bool(user_flags(email, roles).get("is_dev"))
 
 
 def _browser_owner(request: Request) -> str:

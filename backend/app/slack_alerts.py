@@ -26,66 +26,10 @@ _PUBLIC_API = os.getenv("PUBLIC_API_BASE", "https://cortex-api-db2e.onrender.com
 _DASHBOARD = os.getenv("DASHBOARD_BASE", "https://sentientdash.app").rstrip("/")
 
 # Queue change logs intentionally go to a fixed, shared channel so VCs have a
-# durable audit trail independent of the assignment DMs. Keep the channel ID
-# here (rather than trusting a request parameter) so a Queue action can never
-# be redirected to an arbitrary Slack destination.
-SPOC_DASHBOARD_CHANNEL_ID = "C0BTMHMCYUS"
+# Reviewed Slack destinations and roster metadata belong to private deployment
+# configuration. Request parameters cannot select arbitrary recipients/channels.
+from .private_roster import dev_emails, roster
 
-# Queue users are authenticated by their dashboard email. Slack's Incoming
-# Webhook cannot deliver a message to an arbitrary person's DM, so assignment
-# alerts deliberately use a bot token and this explicit, reviewed mapping.
-# Keeping it local also avoids a users.lookupByEmail dependency and its extra
-# Slack OAuth scope every time someone assigns a post.
-_SLACK_USERS_BY_EMAIL = {
-    "user03@example.com": "U0000000012",
-    "user06@example.com": "U0000000006",
-    "user05@example.com": "U0000000005",
-    "user10@example.com": "U0000000010",
-    "user13@example.com": "U0000000013",
-    "user02@example.com": "U0000000002",
-    "user07@example.com": "U0000000007",
-    "user01@example.com": "U0000000001",
-    "user08@example.com": "U0000000008",
-    "user09@example.com": "U0000000009",
-    # Production was originally allowlisted with this spelling. Keep it as
-    # an alias so the existing account receives User 09's reviewed Slack ID.
-    "user09-legacy@example.com": "U0000000009",
-    "user11@example.com": "U0000000011",
-    "user04@example.com": "U0000000004",
-}
-
-# Verified public Slack avatar URLs used when the bot token cannot read a
-# user's profile (for example, when it lacks the users:read scope). Queue still
-# serves these through the same-origin avatar proxy below, so clients never
-# depend directly on Slack's CDN behavior.
-_SLACK_PROFILE_IMAGES_BY_USER_ID = {
-    "U0000000012": "https://ca.slack-edge.com/T051C9S8WF6-U0000000012-48854702e466-512",
-    "U0000000006": "",
-    "U0000000005": "",
-    "U0000000010": "",
-    "U0000000013": "",
-    "U0000000002": "",
-    "U0000000007": "",
-    "U0000000001": "",
-    "U0000000008": "",
-    "U0000000009": (
-        "https://secure.gravatar.com/avatar/e043ee897db72e2d751469166b4bd9cf.jpg"
-        "?s=512&d=https%3A%2F%2Fa.slack-edge.com%2Fdf10d%2Fimg%2Favatars%2Fava_0024-512.png"
-    ),
-    "U0000000011": "",
-    "U0000000004": "",
-}
-
-# Dashboard DEVs. The auth middleware grants `is_dev` from this same tuple, so
-# operational alerts meant "only for DEVs" can never reach anyone else.
-DEV_EMAILS = ("user03@example.com",)
-
-# The placeholder Trainee has no Slack account yet. Assignment DMs are
-# deliberately routed to User 03 for testing, while profile/avatar lookups
-# remain empty so Queue does not present User 03 as the trainee.
-_QUEUE_NOTIFICATION_SLACK_OVERRIDES = {
-    "user12@example.com": "U0000000012",
-}
 
 
 def slack_user_id_for_email(email: str | None) -> str:
@@ -96,12 +40,12 @@ def slack_user_id_for_email(email: str | None) -> str:
     truth for Queue delivery and profile lookups in those cases.
     """
     clean = str(email or "").strip().lower()
-    return _SLACK_USERS_BY_EMAIL.get(clean, "")
+    return roster().get("slack_users_by_email", {}).get(clean, "")
 
 
 def queue_notification_slack_user_id(email: str | None) -> str:
     clean = str(email or "").strip().lower()
-    return _QUEUE_NOTIFICATION_SLACK_OVERRIDES.get(clean) or slack_user_id_for_email(clean)
+    return roster().get("queue_notification_slack_overrides", {}).get(clean) or slack_user_id_for_email(clean)
 
 _SLACK_PROFILE_CACHE: tuple[float, dict[str, str]] | None = None
 _SLACK_PROFILE_LOCK = threading.Lock()
@@ -186,7 +130,7 @@ def slack_user_avatar(slack_user_id: str) -> tuple[bytes, str] | None:
         cached = _SLACK_AVATAR_CACHE.get(clean)
         if cached and now - cached[0] < _SLACK_AVATAR_TTL:
             return cached[1], cached[2]
-    image_url = slack_user_profile_images([clean]).get(clean) or _SLACK_PROFILE_IMAGES_BY_USER_ID.get(clean)
+    image_url = slack_user_profile_images([clean]).get(clean) or roster().get("slack_profile_images_by_user_id", {}).get(clean)
     if not image_url:
         return None
     try:
@@ -377,7 +321,7 @@ def build_queue_assignment_message(
     assigned the work, which account it is for, show the thumbnail, and offer
     one deep link back to Queue.
     """
-    assigner_id = (assigned_by_slack_id or "").strip() or _SLACK_USERS_BY_EMAIL.get(assigned_by_email.strip().lower())
+    assigner_id = (assigned_by_slack_id or "").strip() or roster().get("slack_users_by_email", {}).get(assigned_by_email.strip().lower())
     assigner = f"<@{assigner_id}>" if assigner_id else assigned_by_email.split("@", 1)[0]
     account_values = recommended_accounts if recommended_accounts is not None else ([recommended_account] if recommended_account else [])
     destinations = [str(value).strip().lstrip("@") for value in account_values if str(value).strip()]
@@ -485,7 +429,7 @@ def notify_queue_assignment_result(**assignment: Any) -> dict[str, Any]:
 def notify_new_account_request(*, ticket_id: int, handle: str, requester: str, reason: str) -> bool:
     """Notify only Dev; Queue retains the request even if Slack is unavailable."""
     token = os.getenv("SLACK_BOT_TOKEN", "").strip()
-    recipient = slack_user_id_for_email("user03@example.com")
+    recipient = slack_user_id_for_email(roster().get("new_account_request_recipient_email"))
     if not token or not recipient:
         return False
     try:
@@ -538,7 +482,7 @@ def notify_devs(title: str, body: str) -> int:
         import httpx
         with httpx.Client(timeout=15.0) as client:
             headers = {"Authorization": f"Bearer {token}"}
-            for email in DEV_EMAILS:
+            for email in dev_emails():
                 recipient = slack_user_id_for_email(email)
                 if not recipient:
                     continue
@@ -755,11 +699,15 @@ def notify_queue_change(**change: Any) -> bool:
     if not token:
         logger.warning("Queue change log skipped: SLACK_BOT_TOKEN is not configured")
         return False
+    channel = str(roster().get("spoc_dashboard_channel_id") or "").strip()
+    if not channel:
+        logger.warning("Queue change log skipped: private roster channel is not configured")
+        return False
     try:
         import httpx
 
         payload = build_queue_change_message(**change)
-        payload["channel"] = SPOC_DASHBOARD_CHANNEL_ID
+        payload["channel"] = channel
         response = httpx.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {token}"},
@@ -777,12 +725,15 @@ def notify_queue_change(**change: Any) -> bool:
         return False
 
 
-def alert_image_url_for(filename: str) -> str:
-    """Public URL for an image attached to a custom alert (see
-    /api/admin/alert-image/{filename} in main.py) -- Slack fetches this
-    itself to render the image inline, so it has to be a URL its servers
-    can reach, not a data: URI or anything auth-gated."""
-    return f"{_PUBLIC_API}/api/admin/alert-image/{filename}"
+def alert_image_url_for(filename: str) -> str | None:
+    """Let Slack fetch one internal image through an expiring capability.
+
+    The ingestion worker already has R2 credentials; no public API exception
+    or Firebase service-account credential is required there.
+    """
+    from .media_storage import redirect_url
+
+    return redirect_url(f"r2://uploads/{filename}", private=True, lifetime_seconds=86400)
 
 
 def notify_custom(message: str, title: str | None = None, image_url: str | None = None) -> bool:

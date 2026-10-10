@@ -49,20 +49,20 @@ def test_unrelated_user_edit_preserves_multi_role_access(monkeypatch, tmp_path):
         connection.execute(
             "INSERT INTO dashboard_users VALUES (?, ?, 'admin', 'vc', ?, 1, ?, '', '')",
             (
-                "user05@example.com", "User 05", json.dumps(["vc", "pd", "sales", "trainee"]),
-                "U0000000005",
+                "coordinator@example.com", "User 05", json.dumps(["vc", "pd", "sales", "trainee"]),
+                "U10000002",
             ),
         )
 
     db.upsert_dashboard_user(
-        "user05@example.com", role="admin", operating_role="vc", is_admin=True,
-        display_name="User 05 Updated", slack_user_id="U0000000005",
+        "coordinator@example.com", role="admin", operating_role="vc", is_admin=True,
+        display_name="User 05 Updated", slack_user_id="U10000002",
     )
 
     with connect() as connection:
         row = connection.execute(
             "SELECT display_name, operating_roles FROM dashboard_users WHERE email = ?",
-            ("user05@example.com",),
+            ("coordinator@example.com",),
         ).fetchone()
     assert row["display_name"] == "User 05 Updated"
     assert json.loads(row["operating_roles"]) == ["vc", "pd", "sales", "trainee"]

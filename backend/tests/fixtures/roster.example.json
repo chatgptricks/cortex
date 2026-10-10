@@ -1,0 +1,498 @@
+{
+  "version": 1,
+  "slack_users_by_email": {
+    "developer@example.com": "U10000000",
+    "member1@example.com": "U10000001",
+    "coordinator@example.com": "U10000002",
+    "member3@example.com": "U10000003",
+    "member4@example.com": "U10000004",
+    "member5@example.com": "U10000005",
+    "member6@example.com": "U10000006",
+    "member7@example.com": "U10000007",
+    "member8@example.com": "U10000008",
+    "member9@example.com": "U10000009",
+    "member10@example.com": "U10000009",
+    "member11@example.com": "U10000010",
+    "member12@example.com": "U10000011"
+  },
+  "slack_profile_images_by_user_id": {
+    "U10000000": "https://avatars.example.com/U10000000.png",
+    "U10000001": "https://avatars.example.com/U10000001.png",
+    "U10000002": "https://avatars.example.com/U10000002.png",
+    "U10000003": "https://avatars.example.com/U10000003.png",
+    "U10000004": "https://avatars.example.com/U10000004.png",
+    "U10000005": "https://avatars.example.com/U10000005.png",
+    "U10000006": "https://avatars.example.com/U10000006.png",
+    "U10000007": "https://avatars.example.com/U10000007.png",
+    "U10000008": "https://avatars.example.com/U10000008.png",
+    "U10000009": "https://avatars.example.com/U10000009.png",
+    "U10000010": "https://avatars.example.com/U10000010.png",
+    "U10000011": "https://avatars.example.com/U10000011.png"
+  },
+  "queue_notification_slack_overrides": {
+    "trainee@example.com": "U10000000"
+  },
+  "spoc_dashboard_channel_id": "C10000000",
+  "dev_emails": [
+    "developer@example.com"
+  ],
+  "new_account_request_recipient_email": "developer@example.com",
+  "user_flags": {
+    "developer@example.com": {
+      "is_dev": true,
+      "self_assignment_notifications": true
+    },
+    "coordinator@example.com": {
+      "can_access_news": true,
+      "can_role_switch": true
+    }
+  },
+  "upsert_roles": {
+    "coordinator@example.com": {
+      "roles": [
+        "vc",
+        "pd",
+        "sales",
+        "trainee"
+      ],
+      "include_primary": false
+    },
+    "developer@example.com": {
+      "roles": [
+        "pd",
+        "vc",
+        "dev"
+      ],
+      "include_primary": true
+    }
+  },
+  "dashboard_email_aliases": {
+    "member10@example.com": "member9@example.com"
+  },
+  "display_names": {
+    "developer@example.com": "Member 0",
+    "member1@example.com": "Member 1",
+    "coordinator@example.com": "Member 2",
+    "member3@example.com": "Member 3",
+    "member4@example.com": "Member 4",
+    "member5@example.com": "Member 5",
+    "member6@example.com": "Member 6",
+    "member7@example.com": "Member 7",
+    "member8@example.com": "Member 8",
+    "member9@example.com": "Member 9",
+    "member10@example.com": "Member 10",
+    "member11@example.com": "Member 11",
+    "member12@example.com": "Member 12",
+    "trainee@example.com": "Member 13"
+  },
+  "slack_user_ids": {
+    "developer@example.com": "U10000000",
+    "member1@example.com": "U10000001",
+    "coordinator@example.com": "U10000002",
+    "member3@example.com": "U10000003",
+    "member4@example.com": "U10000004",
+    "member5@example.com": "U10000005",
+    "member6@example.com": "U10000006",
+    "member7@example.com": "U10000007",
+    "member8@example.com": "U10000008",
+    "member9@example.com": "U10000009",
+    "member10@example.com": "U10000009",
+    "member11@example.com": "U10000010",
+    "member12@example.com": "U10000011"
+  },
+  "seed_migrations": [
+    {
+      "marker": "test_roster_migration_0",
+      "users": [
+        {
+          "email": "developer@example.com",
+          "fields": {
+            "role": "admin",
+            "operating_role": "pd",
+            "operating_roles": [
+              "pd",
+              "vc",
+              "dev"
+            ],
+            "is_admin": 1
+          }
+        },
+        {
+          "email": "member1@example.com",
+          "fields": {
+            "role": "admin",
+            "operating_role": "vc",
+            "operating_roles": [
+              "vc"
+            ],
+            "is_admin": 1
+          }
+        },
+        {
+          "email": "coordinator@example.com",
+          "fields": {
+            "role": "admin",
+            "operating_role": "vc",
+            "operating_roles": [
+              "vc",
+              "pd"
+            ],
+            "is_admin": 1
+          }
+        },
+        {
+          "email": "member3@example.com",
+          "fields": {
+            "role": "admin",
+            "operating_role": "vc",
+            "operating_roles": [
+              "vc"
+            ],
+            "is_admin": 1
+          }
+        },
+        {
+          "email": "member4@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "sales",
+            "operating_roles": [
+              "sales"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member5@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "sales",
+            "operating_roles": [
+              "sales"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member6@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "pd",
+            "operating_roles": [
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member7@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "pd",
+            "operating_roles": [
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member8@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "pd",
+            "operating_roles": [
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member9@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "pd",
+            "operating_roles": [
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member11@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "vc",
+            "operating_roles": [
+              "vc"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member12@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "pd",
+            "operating_roles": [
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        }
+      ],
+      "account_assignments": [
+        {
+          "email": "developer@example.com",
+          "handles": [
+            "chatgptricks",
+            "costarica"
+          ]
+        }
+      ]
+    },
+    {
+      "marker": "test_roster_migration_1",
+      "merge_roles": [
+        {
+          "email": "coordinator@example.com",
+          "roles": [
+            "vc",
+            "pd"
+          ]
+        }
+      ]
+    },
+    {
+      "marker": "test_roster_migration_2",
+      "users": [
+        {
+          "email": "coordinator@example.com",
+          "fields": {
+            "role": "admin",
+            "operating_role": "vc",
+            "operating_roles": [
+              "vc",
+              "pd",
+              "sales",
+              "trainee"
+            ],
+            "is_admin": 1
+          }
+        }
+      ]
+    },
+    {
+      "marker": "test_roster_migration_3",
+      "users": [
+        {
+          "email": "developer@example.com",
+          "fields": {
+            "role": "admin",
+            "operating_role": "vc",
+            "operating_roles": [
+              "vc",
+              "pd",
+              "dev"
+            ],
+            "is_admin": 1
+          }
+        },
+        {
+          "email": "member1@example.com",
+          "fields": {
+            "role": "admin",
+            "operating_role": "vc",
+            "operating_roles": [
+              "vc",
+              "pd"
+            ],
+            "is_admin": 1
+          }
+        },
+        {
+          "email": "coordinator@example.com",
+          "fields": {
+            "role": "admin",
+            "operating_role": "vc",
+            "operating_roles": [
+              "vc",
+              "pd",
+              "sales",
+              "trainee"
+            ],
+            "is_admin": 1
+          }
+        },
+        {
+          "email": "member3@example.com",
+          "fields": {
+            "role": "admin",
+            "operating_role": "vc",
+            "operating_roles": [
+              "vc",
+              "pd"
+            ],
+            "is_admin": 1
+          }
+        },
+        {
+          "email": "member4@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "sales",
+            "operating_roles": [
+              "sales",
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member5@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "sales",
+            "operating_roles": [
+              "sales",
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member6@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "pd",
+            "operating_roles": [
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member7@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "pd",
+            "operating_roles": [
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member8@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "pd",
+            "operating_roles": [
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member9@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "pd",
+            "operating_roles": [
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member11@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "vc",
+            "operating_roles": [
+              "vc",
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "member12@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "pd",
+            "operating_roles": [
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        },
+        {
+          "email": "trainee@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "trainee",
+            "operating_roles": [
+              "trainee",
+              "pd"
+            ],
+            "is_admin": 0
+          }
+        }
+      ]
+    },
+    {
+      "marker": "test_roster_migration_4",
+      "users": [
+        {
+          "email": "member6@example.com",
+          "fields": {
+            "display_name": "Member 6"
+          }
+        },
+        {
+          "email": "member7@example.com",
+          "fields": {
+            "display_name": "Member 7"
+          }
+        }
+      ]
+    },
+    {
+      "marker": "test_roster_migration_5",
+      "users": [
+        {
+          "email": "member12@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "vc",
+            "operating_roles": [
+              "vc",
+              "pd"
+            ],
+            "is_admin": 0,
+            "can_self_assign": 0
+          }
+        }
+      ]
+    },
+    {
+      "marker": "test_roster_migration_6",
+      "users": [
+        {
+          "email": "trainee@example.com",
+          "fields": {
+            "role": "viewer",
+            "operating_role": "trainee",
+            "operating_roles": [
+              "trainee",
+              "pd"
+            ],
+            "is_admin": 0
+          },
+          "create_if_missing": true,
+          "initial_slack_user_id": ""
+        }
+      ]
+    }
+  ]
+}

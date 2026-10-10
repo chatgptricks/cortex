@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .private_roster import user_flags
+
 import asyncio
 import hashlib
 import hmac
@@ -55,6 +57,7 @@ from .config import (
     ensure_directories,
 )
 from .media_storage import redirect_url, store_uploaded_media
+from .private_media import staff_avatar_url
 from .db import (
     delete_account_list,
     all_account_snapshots,
@@ -184,12 +187,10 @@ _SEED_ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").s
 # an Authorization header -- excluded here for that technical reason only,
 # not because they're meant to stay public by design. Everything else (post
 # data, search, every admin action) requires a signed-in, allowlisted
-# Google account once FIREBASE_APP is configured.
+# Google account. A missing Firebase credential never opens private routes.
 _FIREBASE_OPEN_PREFIXES = (
     "/api/dashboard/covers/",
     "/api/dashboard/avatar/",
-    "/api/dashboard/user-avatar/",
-    "/api/admin/alert-image/",
 )
 _FIREBASE_OPEN_PATHS = {"/api/health", "/", "/docs", "/openapi.json", "/redoc", "/api/slack/interactions"}
 _OAUTH_OPEN_PATHS = {"/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp",
@@ -253,12 +254,19 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
             return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
                                 headers={"Cache-Control": "private, no-store", "Vary": "Authorization", **(exc.headers or {})})
         return await call_next(request)
+    verify_health = path == "/api/health" and request.query_params.get("verify", "").strip().lower() in {"true", "1", "yes", "on"}
+    public_path = path in _FIREBASE_OPEN_PATHS and not verify_health
+    if (request.method == "OPTIONS" or public_path or path.startswith(_FIREBASE_OPEN_PREFIXES)) and oauth_identity is None:
+        return await call_next(request)
+    if request.method in {"GET", "HEAD"} and oauth_identity is None:
+        from .private_media import valid_private_media_request
+        if valid_private_media_request(request):
+            return await call_next(request)
     if FIREBASE_APP is None and not token.startswith("sad_agent_") and not key_management and not oauth_browser and oauth_identity is None:
-        # No credentials configured (e.g. local dev without the secret
-        # file) -- stay open rather than lock everyone out.
-        return await call_next(request)
-    if (request.method == "OPTIONS" or path in _FIREBASE_OPEN_PATHS or path.startswith(_FIREBASE_OPEN_PREFIXES)) and oauth_identity is None:
-        return await call_next(request)
+        # Local previews and hosted deployments share the same boundary.
+        # Missing credentials must stop private reads and writes; independently
+        # validated agent, OAuth and website credentials remain available.
+        return auth_error("Firebase authentication is not configured.", 503)
     if key_management and token.startswith("sad_agent_"):
         return JSONResponse({"detail": "Use your signed-in browser to manage website API keys."}, status_code=403,
                             headers={"Cache-Control": "no-store"})
@@ -311,18 +319,13 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         request.state.operating_roles = []
     if not request.state.operating_roles:
         request.state.operating_roles = [access["operating_role"]]
-    # Keep the user's actual capabilities separately from the currently active
-    # UI role. Esteban can preview every restricted role; Ivan can switch only
-    # between roles he already has, never into Dev or an unassigned privilege.
+    # Role previews use the private roster flags and current stored roles.
     request.state.available_operating_roles = list(dict.fromkeys(request.state.operating_roles))
-    from .slack_alerts import DEV_EMAILS
-    request.state.is_dev = email in DEV_EMAILS
-    # News is a DEV tool by default. Ivan has a deliberately narrow exception
-    # so he can use News and its Jev review without receiving the broader Dev
-    # capabilities checked by request.state.is_dev elsewhere.
+    flags = user_flags(email, request.state.operating_roles)
+    request.state.is_dev = bool(flags.get("is_dev"))
     request.state.can_access_hooks = request.state.is_dev
-    request.state.can_access_news = request.state.is_dev or email == "user05@example.com"
-    request.state.can_role_switch = request.state.is_dev or email == "user05@example.com"
+    request.state.can_access_news = request.state.is_dev or bool(flags.get("can_access_news"))
+    request.state.can_role_switch = request.state.is_dev or bool(flags.get("can_role_switch"))
     preview_role = request.headers.get("x-queue-role-preview", "").strip().lower()
     request.state.queue_role_preview_active = False
     allowed_preview_roles = set(request.state.available_operating_roles)
@@ -353,6 +356,8 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     except Exception:
         logging.getLogger(__name__).warning("usage log insert failed", exc_info=True)
     response = await call_next(request)
+    if verify_health:
+        response.headers.update({"Cache-Control": "private, no-store", "Vary": "Authorization"})
     if oauth_browser or path in {"/mcp", "/mcp/"}:
         response.headers.update({"Cache-Control": "no-store", "Pragma": "no-cache"})
     return response
@@ -543,7 +548,11 @@ def _runtime_catalogue_page_check() -> None:
 
 
 @app.get("/api/health")
-async def health(verify: bool = False, check: str = "all") -> dict[str, Any]:
+async def health(verify: bool = False, check: str = "all", request: Request = None) -> dict[str, Any]:
+    if verify and not (request is not None and (
+        getattr(request.state, "is_admin", False) or getattr(request.state, "is_dev", False)
+    )):
+        raise HTTPException(status_code=403, detail="Admin or Dev access required.")
     result: dict[str, Any] = {
         "ok": True,
         "ready": _startup_ready.is_set(),
@@ -3372,9 +3381,9 @@ def dashboard_queue_assign(
             )
             # An assignment to someone else always notifies that person. A
             # self-assignment is normally quiet, with the one requested
-            # exception for Esteban's own personal Queue reminder.
+            # exception for the reviewed account's own personal Queue reminder.
             is_self_assignment = email == caller
-            if not is_self_assignment or caller == "user03@example.com":
+            if not is_self_assignment or user_flags(caller).get("self_assignment_notifications", False):
                 dm_notifications.append({
                     "task_id": assignment_id,
                     "assignee_email": email,
@@ -3739,7 +3748,7 @@ def _queue_v2_access(request: Request, *, coordinator: bool = False) -> tuple[st
     email = _caller_email(request)
     is_admin = bool(getattr(request.state, "is_admin", False))
     roles = list(getattr(request.state, "operating_roles", [getattr(request.state, "operating_role", "sales")]))
-    # Esteban's Queue role selector is a *restricted-view* switch, not a way
+    # the reviewed account's Queue role selector is a *restricted-view* switch, not a way
     # for a Settings edit or an old database row to lock the Dev account out
     # of its own production board.  Keep full Queue coordination in the
     # normal Dev view and the Admin/VC previews; the Sales, PD and Trainee
@@ -5041,7 +5050,7 @@ def _queue_v2_scheduler_users() -> list[dict[str, Any]]:
             # current image lazily, so a transient users.list failure during
             # the data request does not permanently turn the roster into
             # initials-only until the next full Queue reload.
-            "avatarUrl": f"/api/dashboard/user-avatar/{slack_id}" if slack_id else "",
+            "avatarUrl": staff_avatar_url(slack_id) if slack_id else "",
             "accounts": managed_accounts,
             "accountAvatars": account_avatars,
         })
@@ -7608,9 +7617,9 @@ def dashboard_queue_v2_attachment(request_id: int, attachment_id: str, request: 
     if not attachment:
         raise HTTPException(status_code=404, detail="Queue attachment not found.")
     media_ref = attachment.get("mediaRef") if isinstance(attachment, dict) else None
-    direct_url = redirect_url(media_ref)
+    direct_url = redirect_url(media_ref, private=True)
     if direct_url:
-        return RedirectResponse(direct_url, status_code=307)
+        return RedirectResponse(direct_url, status_code=307, headers={"Cache-Control": "private, no-store"})
     raise HTTPException(status_code=404, detail="Queue attachment is not available in R2.")
 
 
@@ -8354,17 +8363,17 @@ def admin_slack_custom(
 
 @app.get("/api/admin/alert-image/{filename}")
 def admin_alert_image(filename: str) -> Response:
-    """Serves an image attached to a custom alert. Unauthenticated on
-    purpose -- Slack's own servers fetch this URL to render the image
-    inline in the message, and can't send a Bearer token when they do.
-    Filenames are a random 32-hex-char token generated server-side (see
-    admin_slack_custom above), not user input, so the regex here is just a
-    path-traversal guard, not a real access check."""
+    """Read an internal alert image with the normal Admin/Dev session.
+
+    Slack receives an expiring R2 capability directly, never this API route.
+    The filename check is only a path-traversal guard; middleware authorizes
+    the request before reaching this handler.
+    """
     if not _ALERT_IMAGE_NAME_RE.match(filename):
         raise HTTPException(status_code=404, detail="Not found.")
-    direct_url = redirect_url(f"r2://uploads/{filename}")
+    direct_url = redirect_url(f"r2://uploads/{filename}", private=True)
     if direct_url:
-        return RedirectResponse(direct_url, status_code=307)
+        return RedirectResponse(direct_url, status_code=307, headers={"Cache-Control": "private, no-store"})
     raise HTTPException(status_code=404, detail="Not found.")
 
 
@@ -8626,7 +8635,7 @@ def admin_list_users() -> dict[str, Any]:
         # Users response so Settings can populate the field immediately.
         if slack_id and not str(user.get("slack_user_id") or "").strip():
             user["slack_user_id"] = slack_id
-        user["avatar_url"] = f"/api/dashboard/user-avatar/{slack_id}" if slack_id else ""
+        user["avatar_url"] = staff_avatar_url(slack_id) if slack_id else ""
     return {"users": users}
 
 
@@ -9904,11 +9913,9 @@ def dashboard_avatar(handle: str) -> Response:
 def dashboard_user_avatar(slack_user_id: str) -> Response:
     """Serve a Slack user's profile picture from the same origin as Queue.
 
-    Plain ``<img>`` tags cannot attach the Firebase bearer token, so this
-    asset route is intentionally public like the existing account-avatar
-    route. Only a Slack user ID is accepted and the server fetches the image
-    with the configured bot token; the browser never needs direct access to
-    Slack's CDN.
+    Requires an authorized session or a resource-bound, one-hour capability
+    issued in an authenticated API response. A Slack user ID by itself does
+    not grant access to the team's profile images.
     """
     clean_id = str(slack_user_id or "").strip().upper()
     if not re.fullmatch(r"U[A-Z0-9]{8,20}", clean_id):
@@ -9922,7 +9929,7 @@ def dashboard_user_avatar(slack_user_id: str) -> Response:
     return Response(
         content=content,
         media_type=media_type,
-        headers={"Cache-Control": "public, max-age=3600, stale-while-revalidate=86400"},
+        headers={"Cache-Control": "private, no-store"},
     )
 
 

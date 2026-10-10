@@ -70,7 +70,7 @@ def test_runtime_schema_extensions_add_post_cutover_fields_idempotently() -> Non
 
     connection.execute(
         "INSERT INTO queue_scheduler_preferences (viewer_email, updated_at) VALUES (?, ?)",
-        ("user03@example.com", "2026-09-01T09:00:00+00:00"),
+        ("developer@example.com", "2026-09-01T09:00:00+00:00"),
     )
     row = connection.execute(
         "SELECT hidden_users, row_order FROM queue_scheduler_preferences"
@@ -115,7 +115,7 @@ def test_account_scope_migration_classifies_existing_roster_once() -> None:
     assert lead["research_enabled"] == 0
     assert lead["promos_enabled"] == 1
 def test_gabo_is_not_an_internal_self_assignment_exception() -> None:
-    assert not _has_internal_self_assign("user04@example.com")
+    assert not _has_internal_self_assign("member12@example.com")
 
 
 def test_legacy_profile_schema_cannot_break_authentication_access(monkeypatch, tmp_path) -> None:
@@ -124,7 +124,7 @@ def test_legacy_profile_schema_cannot_break_authentication_access(monkeypatch, t
         connection.execute("CREATE TABLE dashboard_users (email TEXT PRIMARY KEY, role TEXT NOT NULL)")
         connection.execute(
             "INSERT INTO dashboard_users (email, role) VALUES (?, ?)",
-            ("user03@example.com", "admin"),
+            ("developer@example.com", "admin"),
         )
 
     @contextmanager
@@ -138,7 +138,7 @@ def test_legacy_profile_schema_cannot_break_authentication_access(monkeypatch, t
             connection.close()
 
     monkeypatch.setattr(db, "connect", connect)
-    access = db.get_dashboard_user_access("user03@example.com")
+    access = db.get_dashboard_user_access("developer@example.com")
     assert access is not None
     assert access["is_admin"] is True
     assert access["operating_role"] == "sales"
@@ -148,7 +148,7 @@ def test_legacy_profile_schema_cannot_break_authentication_access(monkeypatch, t
 
     # The incoming browser clock is an optional preference, not a reason to
     # make every authenticated request fail while the old schema is upgraded.
-    db.set_dashboard_user_time_zone("user03@example.com", "America/Bogota")
+    db.set_dashboard_user_time_zone("developer@example.com", "America/Bogota")
 
 
 def test_victor_receives_promos_without_admin_access(monkeypatch, tmp_path) -> None:
@@ -177,7 +177,7 @@ def test_victor_receives_promos_without_admin_access(monkeypatch, tmp_path) -> N
                 PRIMARY KEY (designer_email, account_handle)
             );
             INSERT INTO dashboard_users (email, created_at, updated_at)
-            VALUES ('user13@example.com', 'now', 'now');
+            VALUES ('member4@example.com', 'now', 'now');
             """
         )
 
@@ -193,7 +193,7 @@ def test_victor_receives_promos_without_admin_access(monkeypatch, tmp_path) -> N
 
     monkeypatch.setattr(db, "connect", connect)
     seed_queue_role_roster()
-    access = db.get_dashboard_user_access("user13@example.com")
+    access = db.get_dashboard_user_access("member4@example.com")
     assert access is not None
     assert access["can_access_promos"] is True
     assert access["is_admin"] is False

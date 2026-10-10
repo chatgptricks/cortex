@@ -64,7 +64,7 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
         """
     )
     conn.execute("INSERT INTO dashboard_users VALUES ('pd@example.com', 'pd', ?, '')", (json.dumps(["pd"]),))
-    conn.execute("INSERT INTO dashboard_users VALUES ('user12@example.com', 'trainee', ?, '')", (json.dumps(["trainee"]),))
+    conn.execute("INSERT INTO dashboard_users VALUES ('trainee@example.com', 'trainee', ?, '')", (json.dumps(["trainee"]),))
     conn.execute("INSERT INTO queue_requests VALUES (1, 3, 10, 'pool', NULL, NULL, NULL, 'chatgptricks', 'ONE', 'vc@example.com', '')")
     conn.execute("INSERT INTO queue_requests VALUES (2, 3, 10, 'pool', NULL, NULL, NULL, 'chatgptricks', 'TWO', 'vc@example.com', '')")
     conn.execute("INSERT INTO queue_requests VALUES (3, 3, 10, 'pool', NULL, NULL, NULL, 'chatgptricks', 'THREE', 'vc@example.com', '')")
@@ -90,7 +90,7 @@ def test_shared_draft_planning_uses_existing_drafts(monkeypatch, tmp_path):
             "scheduledStartMinutes": 540, "recommendedAccounts": [],
         }])
         trainee = main._queue_v2_prepare_schedule_changes(value, [{
-            "id": 3, "designerEmail": "user12@example.com", "scheduledDate": future_date,
+            "id": 3, "designerEmail": "trainee@example.com", "scheduledDate": future_date,
             "scheduledStartMinutes": 600, "recommendedAccounts": [],
         }])
     assert prepared[0]["date"] == future_date

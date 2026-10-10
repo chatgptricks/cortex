@@ -56,6 +56,26 @@ def test_media_filename_cannot_escape_uploads(monkeypatch):
         raise AssertionError("Expected an invalid filename to be rejected")
 
 
+def test_private_downloads_cannot_be_cached_and_expire_quickly(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def generate_presigned_url(self, operation, **kwargs):
+            calls.append((operation, kwargs))
+            return "https://example.com/signed-test-image"
+
+    monkeypatch.setattr(media_storage, "R2_BUCKET", "test-media")
+    monkeypatch.setattr(media_storage, "r2_enabled", lambda: True)
+    monkeypatch.setattr(media_storage, "_client", lambda: FakeClient())
+    media_storage.redirect_url("r2://uploads/attachment.jpg", private=True)
+    assert calls[-1][1]["ExpiresIn"] == 300
+    assert calls[-1][1]["Params"]["ResponseCacheControl"] == "private, no-store"
+    media_storage.redirect_url("r2://uploads/alert.jpg", private=True, lifetime_seconds=86400)
+    assert calls[-1][1]["ExpiresIn"] == 86400
+    media_storage.redirect_url("r2://uploads/public-cover.jpg")
+    assert "ResponseCacheControl" not in calls[-1][1]["Params"]
+
+
 def test_backfill_binds_the_r2_prefix_for_postgres_compatibility(monkeypatch):
     class FakeCursor:
         rowcount = 1

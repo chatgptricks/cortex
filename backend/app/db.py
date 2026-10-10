@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .private_roster import roster
+
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -1228,7 +1230,7 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
 
 # Self-assignment is an internal Queue exception, not a role that Settings
 # admins should grant accidentally. There are currently no approved
-# exceptions: User 04 is a normal VC, so his capabilities come from his
+# exceptions: the reviewed account is a normal VC, so his capabilities come from his
 # persisted operating role rather than this bypass.
 INTERNAL_SELF_ASSIGN_EMAILS = frozenset()
 
@@ -1389,14 +1391,12 @@ def upsert_dashboard_user(
             except (TypeError, json.JSONDecodeError):
                 existing_roles = []
 
-        # Post Designer is the baseline capability for every allowlisted user.
-        # Editing an unrelated field (display name, Slack ID, or Admin flag)
-        # must not collapse special multi-role accounts such as User 05 or
-        # User 03 back to a single role.
-        if email == "user05@example.com":
-            operating_roles = ["vc", "pd", "sales", "trainee"]
-        elif email == "user03@example.com":
-            operating_roles = list(dict.fromkeys([operating_role, "pd", "vc", "dev"]))
+        # Private roster exceptions preserve reviewed capabilities during
+        # unrelated Settings edits; all other users retain the PD baseline.
+        role_override = roster().get("upsert_roles", {}).get(email)
+        if role_override:
+            prefix = [operating_role] if role_override.get("include_primary") else []
+            operating_roles = list(dict.fromkeys([*prefix, *role_override.get("roles", [])]))
         elif existing and existing["operating_role"] == operating_role:
             operating_roles = list(dict.fromkeys([*existing_roles, operating_role, "pd"]))
         else:
@@ -1430,9 +1430,8 @@ def remove_dashboard_user(email: str) -> None:
         conn.execute("DELETE FROM dashboard_users WHERE email = ?", (email.strip().lower(),))
 
 
-_DASHBOARD_EMAIL_ALIASES = {
-    "user09-legacy@example.com": "user09@example.com",
-}
+def _dashboard_email_aliases() -> dict[str, str]:
+    return roster().get("dashboard_email_aliases", {})
 
 
 def _migrate_dashboard_user_email_aliases(conn: sqlite3.Connection) -> None:
@@ -1458,7 +1457,7 @@ def _migrate_dashboard_user_email_aliases(conn: sqlite3.Connection) -> None:
         ("queue_presence", "email"),
         ("usage_log", "email"),
     )
-    for legacy_email, canonical_email in _DASHBOARD_EMAIL_ALIASES.items():
+    for legacy_email, canonical_email in _dashboard_email_aliases().items():
         legacy = conn.execute("SELECT email FROM dashboard_users WHERE email = ?", (legacy_email,)).fetchone()
         canonical = conn.execute("SELECT email FROM dashboard_users WHERE email = ?", (canonical_email,)).fetchone()
         if not legacy or canonical:
@@ -1476,8 +1475,8 @@ def seed_dashboard_users_from_env(allowed_emails: set[str], admin_emails: set[st
     Emails already in the table (added/edited via the Users tab) are left
     alone -- this only fills in gaps, never overwrites.
     """
-    allowed_emails = {_DASHBOARD_EMAIL_ALIASES.get(email, email) for email in allowed_emails}
-    admin_emails = {_DASHBOARD_EMAIL_ALIASES.get(email, email) for email in admin_emails}
+    allowed_emails = {_dashboard_email_aliases().get(email, email) for email in allowed_emails}
+    admin_emails = {_dashboard_email_aliases().get(email, email) for email in admin_emails}
     now = utc_now()
     with connect() as conn:
         _migrate_dashboard_user_email_aliases(conn)
@@ -1496,234 +1495,69 @@ def seed_dashboard_users_from_env(allowed_emails: set[str], admin_emails: set[st
 
 
 def seed_queue_role_roster() -> None:
-    """Apply the agreed initial Queue operating roles once, after env users
-    have been seeded.  Admin is independent of VC/PD/Sales."""
-    roster = {
-        "user03@example.com": ("pd", True),
-        "user06@example.com": ("vc", True),
-        "user05@example.com": ("vc", True),
-        "user10@example.com": ("vc", True),
-        "user13@example.com": ("sales", False),
-        "user02@example.com": ("sales", False),
-        "user07@example.com": ("pd", False),
-        "user01@example.com": ("pd", False),
-        "user08@example.com": ("pd", False),
-        "user09@example.com": ("pd", False),
-        "user11@example.com": ("vc", False),
-        "user04@example.com": ("pd", False),
-    }
-    display_names = {
-        "user03@example.com": "User 03",
-        "user06@example.com": "User 06",
-        "user05@example.com": "User 05",
-        "user10@example.com": "User 10",
-        "user13@example.com": "User 13",
-        "user02@example.com": "User 02",
-        "user07@example.com": "User 07",
-        "user01@example.com": "User 01",
-        "user08@example.com": "User 08",
-        "user09@example.com": "User 09",
-        "user09-legacy@example.com": "User 09",
-        "user11@example.com": "User 11",
-        "user04@example.com": "User 04",
-        "user12@example.com": "Trainee",
-    }
-    slack_user_ids = {
-        "user03@example.com": "U0000000012",
-        "user06@example.com": "U0000000006",
-        "user05@example.com": "U0000000005",
-        "user10@example.com": "U0000000010",
-        "user13@example.com": "U0000000013",
-        "user02@example.com": "U0000000002",
-        "user07@example.com": "U0000000007",
-        "user01@example.com": "U0000000001",
-        "user08@example.com": "U0000000008",
-        "user09@example.com": "U0000000009",
-        "user09-legacy@example.com": "U0000000009",
-        "user11@example.com": "U0000000011",
-        "user04@example.com": "U0000000004",
-    }
+    """Apply private, reviewed roster migrations once; Settings owns later edits."""
+    config = roster()
+    if not config:
+        return
     now = utc_now()
+    allowed_fields = {"role", "operating_role", "operating_roles", "is_admin",
+                      "can_self_assign", "display_name"}
     with connect() as conn:
-        for email, display_name in display_names.items():
-            slack_user_id = slack_user_ids.get(email, "")
+        for email, display_name in config.get("display_names", {}).items():
+            slack_user_id = config.get("slack_user_ids", {}).get(email, "")
             conn.execute(
                 """UPDATE dashboard_users
                    SET display_name = CASE WHEN TRIM(display_name) = '' THEN ? ELSE display_name END,
                        slack_user_id = CASE WHEN TRIM(slack_user_id) = '' THEN ? ELSE slack_user_id END
-                   WHERE email = ?""",
-                (display_name, slack_user_id, email),
+                   WHERE email = ?""", (display_name, slack_user_id, email),
             )
-        marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v4_seeded'").fetchone()
-        if not marker:
-            for email, (operating_role, is_admin) in roster.items():
-                exists = conn.execute("SELECT email FROM dashboard_users WHERE email = ?", (email,)).fetchone()
-                if not exists:
-                    # Do not silently grant dashboard access to emails not in the
-                    # Firebase allowlist. Settings can add them later if needed.
-                    continue
-                operating_roles = (
-                    ["pd", "vc", "dev"] if email == "user03@example.com"
-                    else ["vc", "pd"] if email == "user05@example.com"
-                    else [operating_role]
-                )
+        for migration in config.get("seed_migrations", []):
+            marker = str(migration.get("marker") or "").strip()
+            if not marker:
+                raise ValueError("Private roster migration requires an identity.")
+            if conn.execute("SELECT value FROM scheduler_state WHERE key = ?", (marker,)).fetchone():
+                continue
+            for entry in migration.get("merge_roles", []):
+                email = entry["email"]
+                existing = conn.execute(
+                    "SELECT operating_role, operating_roles FROM dashboard_users WHERE email = ?", (email,),
+                ).fetchone()
+                if existing:
+                    roles = json.loads(existing["operating_roles"] or "[]") or [existing["operating_role"]]
+                    roles = list(dict.fromkeys([*roles, *entry["roles"]]))
+                    conn.execute("UPDATE dashboard_users SET operating_roles = ?, updated_at = ? WHERE email = ?",
+                                 (json.dumps(roles), now, email))
+            for entry in migration.get("users", []):
+                email = entry["email"]
+                fields = dict(entry.get("fields", {}))
+                if not fields or not set(fields).issubset(allowed_fields):
+                    raise ValueError("Private roster migration contains unsupported user fields.")
+                if "operating_roles" in fields:
+                    fields["operating_roles"] = json.dumps(fields["operating_roles"])
+                existing = conn.execute("SELECT email FROM dashboard_users WHERE email = ?", (email,)).fetchone()
+                if not existing:
+                    if not entry.get("create_if_missing"):
+                        continue
+                    conn.execute(
+                        """INSERT INTO dashboard_users
+                           (email, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (email, fields.get("role", "viewer"), fields.get("operating_role", "sales"),
+                         fields.get("operating_roles", "[]"), fields.get("is_admin", 0),
+                         entry.get("initial_slack_user_id", ""), now, now),
+                    )
+                fields["updated_at"] = now
                 conn.execute(
-                    """UPDATE dashboard_users SET role = ?, operating_role = ?, operating_roles = ?, is_admin = ?, updated_at = ?
-                       WHERE email = ?""",
-                    ("admin" if is_admin else "viewer", operating_role, json.dumps(operating_roles), int(is_admin), now, email),
+                    f"UPDATE dashboard_users SET {', '.join(name + ' = ?' for name in fields)} WHERE email = ?",
+                    (*fields.values(), email),
                 )
-            # Initial agreed account mapping. The Settings API owns all later
-            # additions, so this is intentionally a one-time seed too.
-            for handle in ("chatgptricks", "costarica"):
-                conn.execute(
-                    "INSERT OR IGNORE INTO queue_designer_accounts (designer_email, account_handle, created_at) VALUES (?, ?, ?)",
-                    ("user03@example.com", handle, now),
-                )
-            conn.execute(
-                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v4_seeded', '1', ?)",
-                (now,),
-            )
-
-        # Role additions after the initial seed need their own idempotent
-        # marker because most production databases already have v4 applied.
-        ivan_marker = conn.execute("SELECT value FROM scheduler_state WHERE key = 'queue_roles_v5_ivan_pd'").fetchone()
-        if not ivan_marker:
-            ivan = conn.execute(
-                "SELECT operating_role, operating_roles FROM dashboard_users WHERE email = ?",
-                ("user05@example.com",),
-            ).fetchone()
-            if ivan:
-                roles = json.loads(ivan["operating_roles"] or "[]")
-                if not roles:
-                    roles = [ivan["operating_role"]]
-                roles = list(dict.fromkeys([*roles, "vc", "pd"]))
-                conn.execute(
-                    "UPDATE dashboard_users SET operating_roles = ?, updated_at = ? WHERE email = ?",
-                    (json.dumps(roles), now, "user05@example.com"),
-                )
-            conn.execute(
-                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v5_ivan_pd', '1', ?)",
-                (now,),
-            )
-
-        # User 05 is the non-Dev role-preview account: he needs every operating
-        # perspective available in Queue (VC, PD, Sales, and Trainee), while
-        # Admin remains granted through is_admin and Dev stays User 03-only.
-        # This is a separate migration because v5 has already run in
-        # production and must not prevent the expanded capability set.
-        ivan_all_roles_marker = conn.execute(
-            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v7_ivan_all_non_dev'"
-        ).fetchone()
-        if not ivan_all_roles_marker:
-            conn.execute(
-                """UPDATE dashboard_users
-                   SET role = 'admin', operating_role = 'vc', operating_roles = ?, is_admin = 1, updated_at = ?
-                   WHERE email = ?""",
-                (json.dumps(["vc", "pd", "sales", "trainee"]), now, "user05@example.com"),
-            )
-            conn.execute(
-                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v7_ivan_all_non_dev', '1', ?)",
-                (now,),
-            )
-
-        # Normalize the reviewed production roster after Settings edits from
-        # older releases could silently collapse a user's capabilities. PD is
-        # implicit for everyone; the explicit role is their additional
-        # operating perspective. This migration is one-time so later, valid
-        # changes made in Settings remain authoritative.
-        reviewed_roles_marker = conn.execute(
-            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v8_reviewed_roster'"
-        ).fetchone()
-        if not reviewed_roles_marker:
-            reviewed_roles = {
-                "user03@example.com": ("vc", ["vc", "pd", "dev"], True),
-                "user06@example.com": ("vc", ["vc", "pd"], True),
-                "user05@example.com": ("vc", ["vc", "pd", "sales", "trainee"], True),
-                "user10@example.com": ("vc", ["vc", "pd"], True),
-                "user13@example.com": ("sales", ["sales", "pd"], False),
-                "user02@example.com": ("sales", ["sales", "pd"], False),
-                "user07@example.com": ("pd", ["pd"], False),
-                "user01@example.com": ("pd", ["pd"], False),
-                "user08@example.com": ("pd", ["pd"], False),
-                "user09@example.com": ("pd", ["pd"], False),
-                "user11@example.com": ("vc", ["vc", "pd"], False),
-                "user04@example.com": ("pd", ["pd"], False),
-                "user12@example.com": ("trainee", ["trainee", "pd"], False),
-            }
-            for email, (operating_role, operating_roles, is_admin) in reviewed_roles.items():
-                conn.execute(
-                    """UPDATE dashboard_users
-                       SET role = ?, operating_role = ?, operating_roles = ?, is_admin = ?, updated_at = ?
-                       WHERE email = ?""",
-                    (
-                        "admin" if is_admin else "viewer", operating_role, json.dumps(operating_roles),
-                        int(is_admin), now, email,
-                    ),
-                )
-            conn.execute(
-                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v8_reviewed_roster', '1', ?)",
-                (now,),
-            )
-
-        # The initial repair shipped with these two display labels reversed.
-        # Keep emails/Slack IDs untouched and explicitly supersede it once.
-        display_name_fix_marker = conn.execute(
-            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v10_fix_santiago_florez_names'"
-        ).fetchone()
-        if not display_name_fix_marker:
-            for email, display_name in (
-                ("user07@example.com", "User 07"),
-                ("user01@example.com", "User 01"),
-            ):
-                conn.execute(
-                    "UPDATE dashboard_users SET display_name = ?, updated_at = ? WHERE email = ?",
-                    (display_name, now, email),
-                )
-            conn.execute(
-                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v10_fix_santiago_florez_names', '1', ?)",
-                (now,),
-            )
-
-        # User 04's former self-assignment bypass never granted coordinator
-        # permissions reliably. Replace it with the durable, ordinary VC
-        # operating role once; later Settings edits still remain authoritative.
-        gabo_vc_marker = conn.execute(
-            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v10_gabo_vc'"
-        ).fetchone()
-        if not gabo_vc_marker:
-            conn.execute(
-                """UPDATE dashboard_users
-                   SET role = 'viewer', operating_role = 'vc', operating_roles = ?,
-                       is_admin = 0, can_self_assign = 0, updated_at = ?
-                   WHERE email = 'user04@example.com'""",
-                (json.dumps(["vc", "pd"]), now),
-            )
-            conn.execute(
-                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v10_gabo_vc', '1', ?)",
-                (now,),
-            )
-
-        # A real Trainee role uses longer production-point units. This seeded
-        # placeholder keeps the scheduler and assignment flow testable before
-        # the first trainee receives a company account. Notifications are
-        # routed separately so the row can keep its own neutral identity.
-        trainee_marker = conn.execute(
-            "SELECT value FROM scheduler_state WHERE key = 'queue_roles_v6_trainee_test'"
-        ).fetchone()
-        if not trainee_marker:
-            conn.execute(
-                """INSERT INTO dashboard_users
-                   (email, role, operating_role, operating_roles, is_admin, slack_user_id, created_at, updated_at)
-                   VALUES (?, 'viewer', 'trainee', ?, 0, '', ?, ?)
-                   ON CONFLICT(email) DO UPDATE SET
-                     role = 'viewer', operating_role = 'trainee', operating_roles = excluded.operating_roles,
-                     is_admin = 0, updated_at = excluded.updated_at""",
-                ("user12@example.com", json.dumps(["trainee", "pd"]), now, now),
-            )
-            conn.execute(
-                "INSERT INTO scheduler_state (key, value, updated_at) VALUES ('queue_roles_v6_trainee_test', '1', ?)",
-                (now,),
-            )
+            for assignment in migration.get("account_assignments", []):
+                for handle in assignment.get("handles", []):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO queue_designer_accounts (designer_email, account_handle, created_at) VALUES (?, ?, ?)",
+                        (assignment["email"], handle, now),
+                    )
+            conn.execute("INSERT INTO scheduler_state (key, value, updated_at) VALUES (?, '1', ?)", (marker, now))
 
 
 def log_usage_event(email: str, path: str, method: str) -> None:

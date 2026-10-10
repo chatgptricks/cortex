@@ -85,7 +85,7 @@ def test_pending_request_survives_retention(storage):
 def test_slack_notification_is_private_to_dev(monkeypatch, correct_recipient):
     import httpx
     calls = []
-    recipient = slack_alerts.slack_user_id_for_email("user03@example.com")
+    recipient = slack_alerts.slack_user_id_for_email("developer@example.com")
     assert recipient
     monkeypatch.setenv("SLACK_BOT_TOKEN", "test-token")
 
