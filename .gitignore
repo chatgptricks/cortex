@@ -8,6 +8,9 @@
 *service_account*.json
 *.pem
 *.key
+*.db
+*.sqlite
+*.sqlite3
 sentient-roster.json
 backend/sentient-roster.json
 /work/
