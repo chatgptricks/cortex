@@ -189,6 +189,7 @@ Website requests require `Authorization: Bearer sad_api_…` and can read only:
 - `GET /api/v1/accounts/{handle}/posts`
 - `GET /api/v1/accounts/{handle}/posts/{shortcode}`
 - `GET /api/v1/accounts/{handle}/posts/{shortcode}/cover`
+- `GET /api/v1/posts/{shortcode}`
 - `GET /api/v1/accounts/{handle}/followers/history`
 
 The owner's current allowlist/Admin/Dev access, selected account scope, and
@@ -212,6 +213,9 @@ item plus `cover_url`, and returns 404 for anything the list would exclude
 (hidden, deleted, future, private-account or out-of-scope posts). The cover
 route redirects to the post's stored cover (R2) and returns 404 when no cover
 has been stored; it never fetches from Instagram.
+`GET /api/v1/posts/{shortcode}` finds the same post without knowing its
+account, searching only the key's accounts, and adds `account` to the result.
+Single-post reads query only that shortcode's rows.
 
 Posts and media kit standout posts expose `is_promo`: the manual Research
 flag or a case-insensitive `#aitoolsentient` caption hashtag, using Research's

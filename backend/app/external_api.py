@@ -29,7 +29,7 @@ VERSION = "1.0"
 RATE_LIMIT = 60
 LOCAL_ZONE = timezone(timedelta(hours=-6))
 _HANDLE = re.compile(r"[a-z0-9_.]{1,30}\Z")
-_READ_PATH = re.compile(r"/api/v1/accounts(?:/[a-z0-9_.]{1,30}(?:/(?:media-kit|posts(?:/[A-Za-z0-9_-]{1,64}(?:/cover)?)?|followers/history))?)?/?\Z")
+_READ_PATH = re.compile(r"/api/v1/(?:accounts(?:/[a-z0-9_.]{1,30}(?:/(?:media-kit|posts(?:/[A-Za-z0-9_-]{1,64}(?:/cover)?)?|followers/history))?)?|posts/[A-Za-z0-9_-]{1,64})/?\Z")
 _SHORTCODE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _PUBLIC_FIELDS = "id, name, key_prefix, account_handles, created_at, expires_at, revoked_at, last_used_at"
 
@@ -204,7 +204,7 @@ def authenticate(key: str, path: str, method: str) -> dict[str, Any]:
         active = _active_accounts(conn)
         handles = [handle for handle in json.loads(row["account_handles"]) if handle in active]
         parts = path.strip("/").split("/")
-        if len(parts) > 3 and parts[3] not in handles:
+        if len(parts) > 3 and parts[2] == "accounts" and parts[3] not in handles:
             raise HTTPException(404, "Account not available for this API key.")
         minute = int(now.timestamp()) // 60
         # Both SQLite and PostgreSQL serialize conflicting upserts. The
@@ -313,15 +313,15 @@ def _pagination(data: list[Any], limit: int, offset: int) -> dict[str, Any]:
 
 
 def _public_posts(clean: str, start: date | None = None, end: date | None = None,
-                  is_promo: bool | None = None) -> tuple[datetime, list[dict[str, Any]]]:
-    """Every exported post for one account, newest first, after public exclusions."""
+                  is_promo: bool | None = None, shortcode: str | None = None) -> tuple[datetime, list[dict[str, Any]]]:
+    """Exported posts for one account (or one shortcode), newest first, after public exclusions."""
     now = datetime.now(UTC)
     with db.connect() as conn:
         row = conn.execute("SELECT is_canonical FROM accounts WHERE handle = ?", (clean,)).fetchone()
         canonical = bool(row["is_canonical"])
-        rows = account_media_kit._post_rows(conn, "dashboard_posts", clean, canonical)
+        rows = account_media_kit._post_rows(conn, "dashboard_posts", clean, canonical, shortcode)
         if canonical:
-            rows += account_media_kit._post_rows(conn, "posts", clean, True)
+            rows += account_media_kit._post_rows(conn, "posts", clean, True, shortcode)
         snapshots = conn.execute("SELECT * FROM account_snapshots WHERE LOWER(handle) = ? ORDER BY captured_at DESC", (clean,)).fetchall()
         latest = next((dict(snap) for snap in snapshots if (captured := account_media_kit._date(snap["captured_at"])) and captured <= now), {})
         observations = {}
@@ -376,7 +376,7 @@ def _public_post(request: Request, handle: str, shortcode: str) -> tuple[str, da
     clean = _handle(request, handle)
     if not _SHORTCODE.fullmatch(shortcode):
         raise HTTPException(404, "Post not available for this API key.")
-    now, data = _public_posts(clean)
+    now, data = _public_posts(clean, shortcode=shortcode)
     post = next((post for post in data if post["shortcode"] == shortcode), None)
     if post is None:
         raise HTTPException(404, "Post not available for this API key.")
@@ -389,6 +389,29 @@ def post(request: Request, handle: str, shortcode: str) -> dict[str, Any]:
     clean, now, value = _public_post(request, handle, shortcode)
     return {"schema_version": VERSION, "generated_at": now.isoformat(timespec="seconds"),
             "data": {**value, "cover_url": f"/api/v1/accounts/{clean}/posts/{shortcode}/cover"}}
+
+
+@router.get("/posts/{shortcode}")
+def post_by_shortcode(request: Request, shortcode: str) -> dict[str, Any]:
+    """Find one exported post by shortcode across the key's accounts."""
+    identity = _identity(request)
+    if not _SHORTCODE.fullmatch(shortcode):
+        raise HTTPException(404, "Post not available for this API key.")
+    handles = identity["account_handles"]
+    with db.connect() as conn:
+        candidates: list[str] = []
+        if "shortcode" in account_media_kit._columns(conn, "dashboard_posts"):
+            candidates += [str(row["account"]).lower() for row in conn.execute(
+                "SELECT DISTINCT LOWER(account) AS account FROM dashboard_posts WHERE shortcode = ?", (shortcode,)).fetchall()]
+        if "shortcode" in account_media_kit._columns(conn, "posts") and conn.execute(
+                "SELECT 1 FROM posts WHERE shortcode = ? LIMIT 1", (shortcode,)).fetchone():
+            candidates += [str(row["handle"]) for row in conn.execute("SELECT handle FROM accounts WHERE is_canonical = 1").fetchall()]
+    for handle in dict.fromkeys(candidate for candidate in candidates if candidate in handles):
+        now, data = _public_posts(handle, shortcode=shortcode)
+        if data:
+            return {"schema_version": VERSION, "generated_at": now.isoformat(timespec="seconds"),
+                    "data": {"account": handle, **data[0], "cover_url": f"/api/v1/accounts/{handle}/posts/{shortcode}/cover"}}
+    raise HTTPException(404, "Post not available for this API key.")
 
 
 @router.get("/accounts/{handle}/posts/{shortcode}/cover")

@@ -208,14 +208,24 @@ def _columns(conn: Any, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
-def _post_rows(conn: Any, table: str, handle: str, canonical: bool) -> list[dict[str, Any]]:
+def _post_rows(conn: Any, table: str, handle: str, canonical: bool, shortcode: str | None = None) -> list[dict[str, Any]]:
+    """Every stored row for an account, or only one shortcode's rows when given."""
     columns = _columns(conn, table)
     selected = sorted(columns & _METADATA | {key for key in columns if key in _METRICS or _performance_field(key)})
     if not selected:
         return []
-    scope = "" if table == "posts" and canonical else " WHERE LOWER(account) = ?"
+    conditions, parameters = [], []
+    if not (table == "posts" and canonical):
+        conditions.append("LOWER(account) = ?")
+        parameters.append(handle)
+    if shortcode is not None:
+        if "shortcode" not in columns:
+            return []
+        conditions.append("shortcode = ?")
+        parameters.append(shortcode)
+    scope = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     query = f"SELECT {', '.join(selected)} FROM {table}{scope}"
-    return [dict(row) | {"_table": table} for row in conn.execute(query, () if not scope else (handle,)).fetchall()]
+    return [dict(row) | {"_table": table} for row in conn.execute(query, tuple(parameters)).fetchall()]
 
 
 def _row_quality(row: dict[str, Any]) -> tuple[Any, ...]:

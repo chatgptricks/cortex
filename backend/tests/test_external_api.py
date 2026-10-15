@@ -605,3 +605,16 @@ def test_post_cover_redirects_to_stored_media_only(setup, monkeypatch):
     assert client.get("/api/v1/accounts/alpha/posts/PublicB/cover", headers=headers(key), follow_redirects=False).status_code == 404
     for method in (client.post, client.delete):
         assert method("/api/v1/accounts/alpha/posts/PublicA/cover", headers=headers(key)).status_code == 403
+
+
+def test_post_by_shortcode_finds_the_account_within_the_key_scope(setup):
+    client, _ = setup
+    key = create(client)["key"]
+    response = client.get("/api/v1/posts/PublicA", headers=headers(key))
+    assert response.status_code == 200
+    body = response.json()["data"]
+    single = client.get("/api/v1/accounts/alpha/posts/PublicA", headers=headers(key)).json()["data"]
+    assert body == {"account": "alpha", **single}
+    for shortcode in ("Other", "Hidden", "Future", "Missing", "bad!code"):
+        assert client.get(f"/api/v1/posts/{shortcode}", headers=headers(key)).status_code in (403, 404)
+    assert client.post("/api/v1/posts/PublicA", headers=headers(key)).status_code == 403
