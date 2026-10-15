@@ -130,6 +130,10 @@ from .external_api import router as website_api_router, management_router as web
 from .external_api import authenticate as authenticate_website_api_key, MANAGEMENT_URL as WEBSITE_API_MANAGEMENT_URL
 app.include_router(website_api_router)
 app.include_router(website_api_management_router)
+from .external_research import router as website_research_router
+from .external_workspace import router as website_workspace_router
+app.include_router(website_research_router)
+app.include_router(website_workspace_router)
 
 DEFAULT_PERSON_OPTIONS = [
     "Elon Musk",
@@ -250,10 +254,21 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
             if not token.startswith("sad_api_"):
                 raise HTTPException(401, "A website API key is required.")
             request.state.website_api_key = await run_in_threadpool(authenticate_website_api_key, token, path, request.method)
+            response = await call_next(request)
+            identity = request.state.website_api_key
+            if "rate_limit_remaining" in identity:
+                response.headers.update({"X-RateLimit-Limit": "60", "X-RateLimit-Remaining": str(identity["rate_limit_remaining"]),
+                                         "X-RateLimit-Reset": str(identity["rate_limit_reset"])})
+            return response
         except HTTPException as exc:
             return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
                                 headers={"Cache-Control": "private, no-store", "Vary": "Authorization", **(exc.headers or {})})
-        return await call_next(request)
+        except Exception as exc:
+            from .external_api import transient_storage_error
+            if transient_storage_error(exc):
+                return JSONResponse({"detail": "Stored data is temporarily busy. Retry this read shortly."}, status_code=503,
+                                    headers={"Cache-Control": "private, no-store", "Vary": "Authorization", "Retry-After": "2"})
+            raise
     verify_health = path == "/api/health" and request.query_params.get("verify", "").strip().lower() in {"true", "1", "yes", "on"}
     public_path = path in _FIREBASE_OPEN_PATHS and not verify_health
     if (request.method == "OPTIONS" or public_path or path.startswith(_FIREBASE_OPEN_PREFIXES)) and oauth_identity is None:

@@ -208,7 +208,120 @@ def _columns(conn: Any, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
-def _post_rows(conn: Any, table: str, handle: str, canonical: bool, shortcode: str | None = None) -> list[dict[str, Any]]:
+_UNUSED_PUBLIC_MEDIA_FIELDS = (
+    "displayUrl", "videoUrl", "images", "displayResources", "thumbnailSrc", "thumbnailUrl",
+    "previewUrl", "previewImageUrl", "image_versions2", "video_versions", "videoResource",
+    "video_url", "display_url", "thumbnail_src",
+)
+
+
+def _compact_public_json(conn: Any) -> str:
+    """Remove only media fields ignored by normalization, retaining metrics.
+
+    This deliberately does not whitelist metric names. All custom scalar
+    measurements, nested performance containers, coauthors, owner facts, nulls
+    and child counts survive, including future provider measurement names.
+    Nested childPosts beyond the first level remain intact as well.
+    """
+    if getattr(conn, "is_postgres", False):
+        keys = ",".join(f"'{key}'" for key in _UNUSED_PUBLIC_MEDIA_FIELDS)
+
+        def strip(value: str) -> str:
+            result = f"({value} - ARRAY[{keys}]::text[])"
+            for key in ("comments", "latestComments"):
+                result = f"({result} - CASE WHEN jsonb_typeof({value}->'{key}') IN ('array','object') THEN ARRAY['{key}']::text[] ELSE ARRAY[]::text[] END)"
+            return result
+
+        source = "CASE WHEN jsonb_typeof(public_payload) = 'object' THEN public_payload ELSE '{}'::jsonb END"
+        base = strip(source)
+        child = "CASE WHEN jsonb_typeof(child) = 'object' THEN " + strip("child") + " ELSE child END"
+        return f"""(CASE WHEN jsonb_typeof(public_payload->'childPosts') = 'array'
+            THEN jsonb_set({base}, '{{childPosts}}', COALESCE((SELECT jsonb_agg({child} ORDER BY ordinal)
+                FROM jsonb_array_elements(public_payload->'childPosts') WITH ORDINALITY AS media_children(child, ordinal)), '[]'::jsonb))
+            ELSE {base} END)::text"""
+
+    paths = ",".join(f"'$.{key}'" for key in _UNUSED_PUBLIC_MEDIA_FIELDS)
+
+    def strip(value: str) -> str:
+        # json_remove(NULL) is not a no-op, so every optional path is supplied
+        # by a conditional json_remove call instead of a nullable path value.
+        result = f"json_remove({value}, {paths})"
+        for key in ("comments", "latestComments"):
+            result = f"CASE WHEN json_type({value}, '$.{key}') IN ('array','object') THEN json_remove({result}, '$.{key}') ELSE {result} END"
+        return result
+
+    base = strip("raw_json")
+    child = strip("value")
+    children = f"""COALESCE((SELECT json_group_array(json(CASE
+        WHEN type = 'object' THEN {child}
+        WHEN type = 'array' THEN value WHEN type = 'true' THEN 'true'
+        WHEN type = 'false' THEN 'false' ELSE json_quote(value) END))
+        FROM json_each(raw_json, '$.childPosts')), '[]')"""
+    return f"""CASE WHEN json_valid(raw_json) THEN CASE WHEN json_type(raw_json) = 'object'
+        THEN CASE WHEN json_type(raw_json, '$.childPosts') = 'array'
+            THEN json_set({base}, '$.childPosts', json({children})) ELSE {base} END
+        ELSE '{{}}' END ELSE '{{}}' END"""
+
+
+def _compact_public_rows(conn: Any, table: str, selected: list[str], where: str,
+                         parameters: list[Any], *, order: str) -> list[dict[str, Any]]:
+    """Read compact JSON in fixed batches, isolating malformed legacy rows.
+
+    PostgreSQL cannot safely cast malformed serialized JSON. A failing batch
+    is divided until that one row can project an empty payload, matching
+    _json's existing behavior without transferring the full history as a
+    fallback. Savepoints keep a bad legacy row from aborting the report.
+    """
+    batch_size = 200
+    postgres = bool(getattr(conn, "is_postgres", False))
+    projection = ", ".join(f"{_compact_public_json(conn)} AS raw_json" if field == "raw_json" else field for field in selected)
+    fields = ", ".join(selected)
+    source = f"(SELECT {fields} FROM {table}{where} ORDER BY {order} LIMIT ? OFFSET ?) public_rows"
+    join = " CROSS JOIN LATERAL (SELECT NULLIF(TRIM(raw_json), '')::jsonb AS public_payload OFFSET 0) public_json" if postgres else ""
+
+    def read_window(offset: int, take: int) -> list[dict[str, Any]]:
+        split = False
+        if postgres:
+            conn.execute("SAVEPOINT public_payload_json")
+        try:
+            rows = conn.execute(f"SELECT {projection} FROM {source}{join}", [*parameters, take, offset]).fetchall()
+        except Exception as error:
+            if not postgres:
+                raise
+            conn.execute("ROLLBACK TO SAVEPOINT public_payload_json")
+            if getattr(error, "sqlstate", None) != "22P02":
+                raise
+            if take > 1:
+                split = True
+                rows = []
+            else:
+                safe = ", ".join("NULL AS raw_json" if field == "raw_json" else field for field in selected)
+                rows = conn.execute(f"SELECT {safe} FROM {source}", [*parameters, take, offset]).fetchall()
+        finally:
+            if postgres:
+                conn.execute("RELEASE SAVEPOINT public_payload_json")
+        if split:
+            first = take // 2
+            return read_window(offset, first) + read_window(offset + first, take - first)
+        return [dict(row) for row in rows]
+
+    result = []
+    while True:
+        rows = read_window(len(result), batch_size)
+        result.extend(rows)
+        if len(rows) < batch_size:
+            return result
+
+
+def _public_observation_rows(conn: Any, codes: list[str]) -> list[dict[str, Any]]:
+    if not codes:
+        return []
+    where = f" WHERE shortcode IN ({','.join('?' for _ in codes)})"
+    return _compact_public_rows(conn, "engagement_observations", ["shortcode", "observed_at", "raw_json"], where, codes, order="shortcode")
+
+
+def _post_rows(conn: Any, table: str, handle: str, canonical: bool, shortcode: str | None = None,
+               *, compact_public: bool = False) -> list[dict[str, Any]]:
     """Every stored row for an account, or only one shortcode's rows when given."""
     columns = _columns(conn, table)
     selected = sorted(columns & _METADATA | {key for key in columns if key in _METRICS or _performance_field(key)})
@@ -224,6 +337,9 @@ def _post_rows(conn: Any, table: str, handle: str, canonical: bool, shortcode: s
         conditions.append("shortcode = ?")
         parameters.append(shortcode)
     scope = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    if compact_public and "raw_json" in selected:
+        rows = _compact_public_rows(conn, table, selected, scope, parameters, order="id" if "id" in columns else "shortcode")
+        return [row | {"_table": table} for row in rows]
     query = f"SELECT {', '.join(selected)} FROM {table}{scope}"
     return [dict(row) | {"_table": table} for row in conn.execute(query, tuple(parameters)).fetchall()]
 
@@ -553,16 +669,16 @@ def build_account_media_kit(handle: str, *, now: datetime | None = None, strict_
             raise HTTPException(status_code=404, detail="Unknown account.")
         registry = dict(row)
         canonical = bool(registry.get("is_canonical"))
-        rows = _post_rows(conn, "dashboard_posts", clean, canonical)
+        rows = _post_rows(conn, "dashboard_posts", clean, canonical, compact_public=strict_public_exclusions)
         if canonical:
-            rows += _post_rows(conn, "posts", clean, True)
+            rows += _post_rows(conn, "posts", clean, True, compact_public=strict_public_exclusions)
         snapshots = [dict(row) for row in conn.execute("SELECT * FROM account_snapshots WHERE LOWER(handle) = ? ORDER BY captured_at", (clean,)).fetchall()] if _columns(conn, "account_snapshots") else []
         observations: dict[str, dict[str, Any]] = {}
         if _columns(conn, "engagement_observations"):
             codes = sorted({str(row.get("shortcode")) for row in rows if row.get("shortcode")})
             for start in range(0, len(codes), 200):
                 batch = codes[start:start + 200]
-                data = conn.execute(f"SELECT shortcode, observed_at, raw_json FROM engagement_observations WHERE shortcode IN ({','.join('?' for _ in batch)})", batch).fetchall()
+                data = _public_observation_rows(conn, batch) if strict_public_exclusions else conn.execute(f"SELECT shortcode, observed_at, raw_json FROM engagement_observations WHERE shortcode IN ({','.join('?' for _ in batch)})", batch).fetchall()
                 observations.update({row["shortcode"]: dict(row) for row in data})
     # Website exports conservatively honor a privacy/deletion flag on any
     # stored copy. A newer unflagged metrics copy must not republish a post

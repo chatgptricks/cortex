@@ -90,10 +90,14 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "log_usage_event", lambda *args: None)
     monkeypatch.setattr(api, "datetime", FixedNow)
     monkeypatch.setattr(account_media_kit, "datetime", FixedNow)
+    from app import external_research, external_workspace
+    monkeypatch.setattr(external_research, "datetime", FixedNow)
     app = FastAPI()
     app.middleware("http")(main._require_firebase_user)
     app.include_router(api.management_router)
     app.include_router(api.router)
+    app.include_router(external_research.router)
+    app.include_router(external_workspace.router)
 
     @app.get("/api/admin/users")
     @app.get("/api/health")
@@ -126,7 +130,10 @@ def test_secret_returned_once_hashed_at_rest_and_owner_only_management(setup):
     assert listed.json()["keys"] == [created["connection"]]
     assert listed.json()["can_create"] is True
     assert key not in listed.text and "key_hash" not in listed.text
-    assert listed.json()["available_accounts"] == [{"handle": "alpha", "public_name": "Public Alpha"}, {"handle": "beta", "public_name": "Public Beta"}]
+    assert listed.json()["available_accounts"] == [
+        {"handle": "alpha", "public_name": "Public Alpha", "group": "sentient", "group_name": "sentient", "subcategory": "other"},
+        {"handle": "beta", "public_name": "Public Beta", "group": "sentient", "group_name": "sentient", "subcategory": "other"},
+    ]
     with connect() as conn:
         row = dict(conn.execute("SELECT * FROM website_api_keys").fetchone())
     assert key not in row.values() and len(row["key_hash"]) == 64

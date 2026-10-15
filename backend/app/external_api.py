@@ -29,9 +29,11 @@ VERSION = "1.0"
 RATE_LIMIT = 60
 LOCAL_ZONE = timezone(timedelta(hours=-6))
 _HANDLE = re.compile(r"[a-z0-9_.]{1,30}\Z")
-_READ_PATH = re.compile(r"/api/v1/(?:accounts(?:/[a-z0-9_.]{1,30}(?:/(?:media-kit|posts(?:/[A-Za-z0-9_-]{1,64}(?:/cover)?)?|followers/history))?)?|posts/[A-Za-z0-9_-]{1,64})/?\Z")
 _SHORTCODE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _PUBLIC_FIELDS = "id, name, key_prefix, account_handles, created_at, expires_at, revoked_at, last_used_at"
+DATA_SCOPES = ("accounts", "research", "tracker", "insights", "queue", "promos", "news", "hooks", "vault", "settings")
+GLOBAL_SCOPES = frozenset({"queue", "news", "vault", "hooks", "settings"})
+_PUBLIC_FIELDS += ", data_scopes, owner_email"
 
 
 def _no_store(response: Response) -> None:
@@ -54,6 +56,7 @@ def ensure_schema(conn: Any) -> None:
         expires_at TEXT NOT NULL, revoked_at TEXT, last_used_at TEXT
     )""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_website_api_keys_owner ON website_api_keys(owner_email)")
+    db._ensure_column(conn, "website_api_keys", "data_scopes", "data_scopes TEXT NOT NULL DEFAULT '[\"accounts\"]'")
     conn.execute("""CREATE TABLE IF NOT EXISTS website_api_rate_windows (
         key_id TEXT PRIMARY KEY, minute_window BIGINT NOT NULL,
         request_count INTEGER NOT NULL
@@ -71,6 +74,17 @@ def _admin(email: str, access: dict[str, Any] | None) -> bool:
     return bool(access.get("is_admin")) or bool(user_flags(email, roles).get("is_dev"))
 
 
+def _dev(email: str, access: dict[str, Any] | None) -> bool:
+    from .private_roster import user_flags
+    if access is None:
+        return False
+    try:
+        roles = json.loads(access.get("operating_roles") or "[]")
+    except (TypeError, ValueError):
+        roles = []
+    return bool(user_flags(email, roles).get("is_dev"))
+
+
 def _browser_owner(request: Request) -> str:
     if getattr(request.state, "auth_method", None) != "firebase":
         raise HTTPException(403, "Use your signed-in browser to manage website API keys.")
@@ -81,8 +95,10 @@ def _browser_owner(request: Request) -> str:
 
 
 def _active_accounts(conn: Any) -> dict[str, dict[str, Any]]:
+    columns = account_media_kit._columns(conn, "accounts")
+    selected = ["handle", "is_active"] + sorted(columns & {"group_name", "subcategory"})
     return {str(row["handle"]).lower(): dict(row) for row in conn.execute(
-        "SELECT handle, is_active FROM accounts WHERE is_active = 1 ORDER BY handle"
+        f"SELECT {', '.join(selected)} FROM accounts WHERE is_active = 1 ORDER BY handle"
     ).fetchall()}
 
 
@@ -107,34 +123,95 @@ def _public_accounts(conn: Any, handles: list[str]) -> list[dict[str, Any]]:
 def _connection(row: Any) -> dict[str, Any]:
     value = dict(row)
     value["account_handles"] = json.loads(value["account_handles"])
+    value["data_scopes"] = _stored_scopes(value.get("data_scopes"))
     return value
+
+
+def _stored_scopes(value: Any) -> list[str]:
+    if value is None:
+        return ["accounts"]
+    try:
+        scopes = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError):
+        return []
+    return [scope for scope in DATA_SCOPES if isinstance(scopes, list) and scope in scopes]
+
+
+def _available_scopes(owner: str, access: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not _admin(owner, access):
+        return []
+    from .private_roster import user_flags
+    try:
+        roles = json.loads(access.get("operating_roles") or "[]")
+    except (TypeError, ValueError):
+        roles = []
+    flags = user_flags(owner, roles)
+    dev = bool(flags.get("is_dev"))
+    allowed = set(DATA_SCOPES) - {"news", "hooks", "vault"}
+    if dev:
+        allowed.update({"news", "hooks", "vault"})
+    elif flags.get("can_access_news"):
+        allowed.add("news")
+    return [{"id": scope, "global": scope in GLOBAL_SCOPES} for scope in DATA_SCOPES if scope in allowed]
+
+
+def _validate_scopes(scopes: list[str], owner: str, access: dict[str, Any] | None) -> list[str]:
+    selected = [scope for scope in DATA_SCOPES if scope in scopes]
+    if not selected or any(scope not in DATA_SCOPES for scope in scopes):
+        raise HTTPException(422, "Choose one or more supported read-only data areas.")
+    allowed = {item["id"] for item in _available_scopes(owner, access)}
+    if not set(selected).issubset(allowed):
+        raise HTTPException(403, "Your current product permissions do not include every selected data area.")
+    return selected
 
 
 class CreateAPIKey(BaseModel):
     name: str = Field(min_length=1, max_length=80)
-    account_handles: list[str] = Field(min_length=1, max_length=100)
+    account_handles: list[str] = Field(min_length=1, max_length=1000)
     expires_in_days: Literal[30, 90, 365] = 90
+    data_scopes: list[str] = Field(default_factory=lambda: ["accounts"], min_length=1, max_length=len(DATA_SCOPES))
+
+
+class UpdateAPIKeyScopes(BaseModel):
+    data_scopes: list[str] = Field(min_length=1, max_length=len(DATA_SCOPES))
 
 
 @management_router.get("")
 def list_keys(request: Request) -> dict[str, Any]:
     owner = _browser_owner(request)
-    allowed = _admin(owner, db.get_dashboard_user_access(owner))
+    access = db.get_dashboard_user_access(owner)
+    allowed = _admin(owner, access)
+    can_manage_all = _dev(owner, access)
     with db.connect() as conn:
         ensure_schema(conn)
+        where = "owner_email = ?"
+        params: tuple[Any, ...] = (owner,)
+        if can_manage_all:
+            where = "owner_email = ? OR (revoked_at IS NULL AND expires_at > ?)"
+            params = (owner, datetime.now(UTC).isoformat(timespec="seconds"))
         keys = [_connection(row) for row in conn.execute(
-            f"SELECT {_PUBLIC_FIELDS} FROM website_api_keys WHERE owner_email = ? ORDER BY created_at DESC", (owner,)
+            f"SELECT {_PUBLIC_FIELDS} FROM website_api_keys WHERE {where} ORDER BY created_at DESC, id DESC", params
         ).fetchall()]
-        accounts = _public_accounts(conn, sorted(_active_accounts(conn))) if allowed else []
-    return {"keys": keys, "available_accounts": [{"handle": value["handle"], "public_name": value["public_name"]} for value in accounts], "can_create": allowed,
-            "rate_limit_per_minute": RATE_LIMIT}
+        for key in keys:
+            key["can_edit"] = allowed and key["owner_email"] == owner
+            key["can_revoke"] = can_manage_all or key["owner_email"] == owner
+        active = _active_accounts(conn) if allowed else {}
+        accounts = _public_accounts(conn, sorted(active)) if allowed else []
+    return {"keys": keys, "available_accounts": [{"handle": value["handle"], "public_name": value["public_name"],
+                "group": "sentient" if active[value["handle"]].get("group_name") == "sentient" else "others",
+                "group_name": active[value["handle"]].get("group_name") or "others",
+                "subcategory": active[value["handle"]].get("subcategory") or "other"} for value in accounts],
+            "available_scopes": _available_scopes(owner, access), "can_create": allowed, "can_manage_all": can_manage_all,
+            "rate_limit_per_minute": RATE_LIMIT, "max_accounts_per_key": 1000}
 
 
 @management_router.post("", status_code=201)
 def create_key(request: Request, payload: CreateAPIKey) -> dict[str, Any]:
     owner = _browser_owner(request)
-    if not _admin(owner, db.get_dashboard_user_access(owner)):
+    access = db.get_dashboard_user_access(owner)
+    if not _admin(owner, access):
         raise HTTPException(403, "Admin or Dev access is required to create website API keys.")
+    scopes = _validate_scopes(payload.data_scopes, owner, access)
     name = payload.name.strip()
     handles = sorted(set(handle.strip().lstrip("@").lower() for handle in payload.account_handles))
     if not name or any(not _HANDLE.fullmatch(handle) for handle in handles):
@@ -152,37 +229,85 @@ def create_key(request: Request, payload: CreateAPIKey) -> dict[str, Any]:
         count = conn.execute("SELECT COUNT(*) AS n FROM website_api_keys WHERE owner_email = ? AND revoked_at IS NULL AND expires_at > ?", (owner, created)).fetchone()["n"]
         if count >= 20:
             raise HTTPException(409, "Revoke an existing API key before creating more (limit 20).")
-        row = {"id": identity, "name": name, "key_prefix": key[:15], "account_handles": handles,
-               "created_at": created, "expires_at": expires, "revoked_at": None, "last_used_at": None}
+        row = {"id": identity, "owner_email": owner, "name": name, "key_prefix": key[:15], "account_handles": handles,
+               "can_edit": True, "can_revoke": True,
+               "created_at": created, "expires_at": expires, "revoked_at": None, "last_used_at": None, "data_scopes": scopes}
         conn.execute("""INSERT INTO website_api_keys
-            (id, owner_email, name, key_hash, key_prefix, account_handles, created_at, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (identity, owner, name, hashlib.sha256(key.encode()).hexdigest(),
-                key[:15], json.dumps(handles), created, expires))
+            (id, owner_email, name, key_hash, key_prefix, account_handles, created_at, expires_at, data_scopes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", (identity, owner, name, hashlib.sha256(key.encode()).hexdigest(),
+                key[:15], json.dumps(handles), created, expires, json.dumps(scopes)))
     return {"key": key, "connection": row}
+
+
+@management_router.patch("/{key_id}")
+def update_key_scopes(request: Request, key_id: str, payload: UpdateAPIKeyScopes) -> dict[str, Any]:
+    owner = _browser_owner(request)
+    access = db.get_dashboard_user_access(owner)
+    scopes = _validate_scopes(payload.data_scopes, owner, access)
+    with db.connect() as conn:
+        ensure_schema(conn)
+        row = conn.execute(f"SELECT {_PUBLIC_FIELDS} FROM website_api_keys WHERE id = ? AND owner_email = ? AND revoked_at IS NULL AND expires_at > ?",
+                           (key_id, owner, datetime.now(UTC).isoformat(timespec="seconds"))).fetchone()
+        if row is None:
+            raise HTTPException(404, "Active API key not found.")
+        conn.execute("UPDATE website_api_keys SET data_scopes = ? WHERE id = ? AND owner_email = ?", (json.dumps(scopes), key_id, owner))
+        updated = _connection(row)
+        updated["data_scopes"] = scopes
+        updated.update(can_edit=True, can_revoke=True)
+    return {"connection": updated}
+
+
+def transient_storage_error(error: Exception) -> bool:
+    """Retryable database pressure must not masquerade as an auth failure."""
+    if type(error).__name__ == "PoolTimeout":
+        return True
+    return getattr(error, "sqlstate", None) in {"08000", "08003", "08006", "53300", "53400", "57014", "57P01", "57P02", "57P03"}
 
 
 @management_router.delete("/{key_id}")
 def revoke_key(request: Request, key_id: str) -> dict[str, Any]:
     owner = _browser_owner(request)
+    can_manage_all = _dev(owner, db.get_dashboard_user_access(owner))
     with db.connect() as conn:
         ensure_schema(conn)
-        row = conn.execute("SELECT id FROM website_api_keys WHERE id = ? AND owner_email = ?", (key_id, owner)).fetchone()
+        where = "id = ?" if can_manage_all else "id = ? AND owner_email = ?"
+        params = (key_id,) if can_manage_all else (key_id, owner)
+        row = conn.execute(f"SELECT id FROM website_api_keys WHERE {where}", params).fetchone()
         if row is None:
             raise HTTPException(404, "API key not found.")
-        conn.execute("UPDATE website_api_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ? AND owner_email = ?", (db.utc_now(), key_id, owner))
+        conn.execute(f"UPDATE website_api_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE {where}", (db.utc_now(), *params))
     return {"revoked": True, "id": key_id}
+
+
+def _versioned_routes():
+    from .external_research import router as research_router
+    from .external_workspace import router as workspace_router
+    return [route for source in (router, research_router, workspace_router) for route in source.routes
+            if "GET" in getattr(route, "methods", set())]
+
+
+def _route_scopes(path: str) -> tuple[str, ...]:
+    part = path.removeprefix("/api/v1").strip("/").split("/")[0]
+    if part in {"capabilities", "openapi.json"}:
+        return ()
+    if part == "hot":
+        return ("accounts", "research")
+    if part == "accounts" or path.startswith("/api/v1/posts/"):
+        return ("accounts",)
+    if part == "posts":
+        return ("research",)
+    return (part,) if part in DATA_SCOPES else ("research",)
 
 
 def authenticate(key: str, path: str, method: str) -> dict[str, Any]:
     if not re.fullmatch(r"sad_api_[A-Za-z0-9_-]{43}", key):
         raise HTTPException(401, "Invalid or expired website API key.")
-    if method != "GET" or not _READ_PATH.fullmatch(path):
+    if method != "GET" or not any(route.path_regex.fullmatch(path.rstrip("/")) for route in _versioned_routes()):
         raise HTTPException(403, "Website API keys can only read the versioned website API.")
     now = datetime.now(UTC)
     timestamp = now.isoformat(timespec="seconds")
     key_hash = hashlib.sha256(key.encode()).hexdigest()
     with db.connect() as conn:
-        ensure_schema(conn)
         row = conn.execute("SELECT owner_email FROM website_api_keys WHERE key_hash = ? AND revoked_at IS NULL AND expires_at > ?", (key_hash, timestamp)).fetchone()
         if row is None:
             raise HTTPException(401, "Invalid or expired website API key.")
@@ -201,6 +326,12 @@ def authenticate(key: str, path: str, method: str) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM website_api_keys WHERE key_hash = ? AND owner_email = ? AND revoked_at IS NULL AND expires_at > ?", (key_hash, owner, timestamp)).fetchone()
         if row is None:
             raise HTTPException(401, "Invalid or expired website API key.")
+        available = _available_scopes(owner, access)
+        allowed_scopes = {item["id"] for item in available}
+        scopes = [scope for scope in _stored_scopes(dict(row).get("data_scopes")) if scope in allowed_scopes]
+        required = _route_scopes(path)
+        if required and not set(required).intersection(scopes):
+            raise HTTPException(403, "This API key cannot read this data area. Update its read-only areas in API connections.")
         active = _active_accounts(conn)
         handles = [handle for handle in json.loads(row["account_handles"]) if handle in active]
         parts = path.strip("/").split("/")
@@ -221,7 +352,9 @@ def authenticate(key: str, path: str, method: str) -> dict[str, Any]:
         if admitted is None:
             raise HTTPException(429, "Website API rate limit exceeded.", headers={"Retry-After": str(60 - int(now.timestamp()) % 60)})
         conn.execute("UPDATE website_api_keys SET last_used_at = ? WHERE id = ?", (timestamp, row["id"]))
-    return {"id": row["id"], "owner_email": owner, "account_handles": handles}
+    return {"id": row["id"], "owner_email": owner, "account_handles": handles,
+            "data_scopes": scopes, "available_scopes": available,
+            "rate_limit_remaining": RATE_LIMIT - int(admitted["request_count"]), "rate_limit_reset": (minute + 1) * 60}
 
 
 def _identity(request: Request) -> dict[str, Any]:
@@ -229,6 +362,95 @@ def _identity(request: Request) -> dict[str, Any]:
     if not value:
         raise HTTPException(401, "A website API key is required.")
     return value
+
+
+def require_scope(request: Request, *scopes: str) -> dict[str, Any]:
+    """Domain adapters only receive the already revalidated key identity."""
+    identity = _identity(request)
+    granted = identity.get("data_scopes", ["accounts"])
+    if not set(scopes).intersection(granted):
+        raise HTTPException(403, "This API key cannot read this data area.")
+    return identity
+
+
+@router.get("/capabilities", summary="Discover this key's readable areas, accounts and operations")
+def capabilities(request: Request) -> dict[str, Any]:
+    identity = _identity(request)
+    scopes = set(identity.get("data_scopes", ["accounts"]))
+    operations = []
+    for route in _versioned_routes():
+        required = _route_scopes(route.path)
+        operations.append({"method": "GET", "path": route.path, "required_scopes": list(required),
+                           "available": not required or bool(scopes.intersection(required)),
+                           "summary": route.summary or route.name.replace("_", " ")})
+    return {"schema_version": VERSION, "base_url": "/api/v1", "read_only": True, "methods": ["GET"],
+            "account_handles": identity["account_handles"], "data_scopes": sorted(scopes),
+            "available_scopes": identity.get("available_scopes", []), "rate_limit_per_minute": RATE_LIMIT,
+            "operations": sorted(operations, key=lambda item: item["path"]),
+            "restrictions": ["Only stored data; no refresh, scraping, generation or product mutations.",
+                             "Account records are limited to the key's selected active accounts.",
+                             "Workspace areas require an explicit grant and the owner's current product permission."]}
+
+
+@router.get("/openapi.json", summary="Machine-readable contract for all supported read-only data routes")
+def api_contract(request: Request) -> dict[str, Any]:
+    from fastapi.openapi.utils import get_openapi
+    identity = _identity(request)
+    scopes = set(identity.get("data_scopes", ["accounts"]))
+    spec = get_openapi(title="Sentient Dash read-only data API", version=VERSION, routes=_versioned_routes())
+    schemas = spec.setdefault("components", {}).setdefault("schemas", {})
+    nullable_number = {"type": ["number", "null"]}
+    nullable_text = {"type": ["string", "null"]}
+    schemas["ReadPagination"] = {"type": "object", "required": ["limit", "offset", "has_more", "next_offset"], "properties": {
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100}, "offset": {"type": "integer", "minimum": 0},
+        "total": {"type": ["integer", "null"]}, "count": {"type": "integer"}, "has_more": {"type": "boolean"},
+        "next_offset": {"type": ["integer", "null"]}, "offset_type": {"type": "string", "enum": ["candidate"]},
+        "scanned_count": {"type": "integer"}, "candidate_total": {"type": "integer"}, "scan_limit": {"type": "integer"}},
+        "description": "Always follow next_offset. Candidate scans can return a short/empty page with has_more=true and total=null."}
+    schemas["HotEvidence"] = {"type": "object", "properties": {
+        "is_hot": {"type": "boolean"}, "score": nullable_number, "multiplier": nullable_number,
+        "criterion": {"type": "string"}, "observed_at": nullable_text,
+        "account_threshold": nullable_number, "likes_at_first_check": nullable_number, "score_unit": {"type": "string"}}}
+    schemas["ReadPost"] = {"type": "object", "required": ["shortcode", "permalink", "likes", "comments"], "properties": {
+        **{name: nullable_text for name in ("account", "caption", "published_at", "metrics_updated_at", "title", "ocr_text")},
+        "shortcode": {"type": "string"}, "permalink": {"type": "string", "format": "uri"},
+        "format": {"type": "string"}, **{name: nullable_number for name in ("likes", "comments", "views", "video_views", "video_plays")},
+        "is_promo": {"type": "boolean"}, "is_hot": {"type": "boolean"}, "is_collab": {"type": ["boolean", "null"]},
+        "collaborators": {"type": "array", "items": {"type": "string"}}, "cover_url": {"type": "string"},
+        "hot": {"$ref": "#/components/schemas/HotEvidence"}},
+        "description": "Known fields of a stored post. Unknown metrics remain null. Research grants may add OCR, curation and enrichment fields."}
+    schemas["QueueReportPagination"] = {"type": "object", "required": ["designers", "assigned_posts"], "properties": {
+        "designers": {"$ref": "#/components/schemas/ReadPagination"},
+        "assigned_posts": {"$ref": "#/components/schemas/ReadPagination"}},
+        "description": "Independent designer and assigned-post pages; follow each page's next_offset with its own offset parameter."}
+    schemas["ReadEnvelope"] = {"type": "object", "required": ["schema_version", "data"], "properties": {
+        "schema_version": {"type": "string"}, "generated_at": {"type": "string", "format": "date-time"},
+        "data": {"oneOf": [{"type": "object"}, {"type": "array", "items": {"type": "object"}}]},
+        "pagination": {"oneOf": [{"$ref": "#/components/schemas/ReadPagination"}, {"$ref": "#/components/schemas/QueueReportPagination"}]}},
+        "description": "Common stored-data envelope. Domain fields are defined in the bilingual guide; optional metadata differs by endpoint."}
+    for name, data_schema in (("PostPage", {"type": "array", "items": {"$ref": "#/components/schemas/ReadPost"}}),
+                              ("PostResult", {"$ref": "#/components/schemas/ReadPost"})):
+        schemas[name] = {"allOf": [{"$ref": "#/components/schemas/ReadEnvelope"}, {"type": "object", "properties": {"data": data_schema}}]}
+    for path, operations in spec.get("paths", {}).items():
+        for operation in operations.values():
+            if isinstance(operation, dict):
+                required = _route_scopes(path)
+                operation["x-required-scopes"] = list(required)
+                operation["x-available"] = not required or bool(scopes.intersection(required))
+                if path.endswith("/cover") or path.endswith("/content") or path.endswith("/media/{index}"):
+                    operation["responses"]["200"] = {"description": "Stored asset bytes", "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}}
+                    if path.endswith("/cover"):
+                        operation["responses"].pop("200", None)
+                        operation["responses"]["307"] = {"description": "Redirect to the stored asset; never forward the API credential to another origin."}
+                elif path not in {"/api/v1/capabilities", "/api/v1/openapi.json"}:
+                    schema = "PostPage" if path.endswith("/posts") or path == "/api/v1/hot" else "ReadEnvelope"
+                    if path in {"/api/v1/posts/{shortcode}", "/api/v1/accounts/{handle}/posts/{shortcode}"}:
+                        schema = "PostResult"
+                    operation["responses"]["200"] = {"description": "Stored data within the key's account and area grants", "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{schema}"}}}}
+    spec.setdefault("components", {}).setdefault("securitySchemes", {})["WebsiteAPIKey"] = {
+        "type": "http", "scheme": "bearer", "description": "Account- and area-scoped sad_api_ key"}
+    spec["security"] = [{"WebsiteAPIKey": []}]
+    return spec
 
 
 def _handle(request: Request, handle: str) -> str:
@@ -319,9 +541,9 @@ def _public_posts(clean: str, start: date | None = None, end: date | None = None
     with db.connect() as conn:
         row = conn.execute("SELECT is_canonical FROM accounts WHERE handle = ?", (clean,)).fetchone()
         canonical = bool(row["is_canonical"])
-        rows = account_media_kit._post_rows(conn, "dashboard_posts", clean, canonical, shortcode)
+        rows = account_media_kit._post_rows(conn, "dashboard_posts", clean, canonical, shortcode, compact_public=True)
         if canonical:
-            rows += account_media_kit._post_rows(conn, "posts", clean, True, shortcode)
+            rows += account_media_kit._post_rows(conn, "posts", clean, True, shortcode, compact_public=True)
         snapshots = conn.execute("SELECT * FROM account_snapshots WHERE LOWER(handle) = ? ORDER BY captured_at DESC", (clean,)).fetchall()
         latest = next((dict(snap) for snap in snapshots if (captured := account_media_kit._date(snap["captured_at"])) and captured <= now), {})
         observations = {}
@@ -329,7 +551,7 @@ def _public_posts(clean: str, start: date | None = None, end: date | None = None
             codes = sorted({str(value["shortcode"]) for value in rows if value.get("shortcode")})
             for index in range(0, len(codes), 200):
                 batch = codes[index:index + 200]
-                readings = conn.execute(f"SELECT shortcode, observed_at, raw_json FROM engagement_observations WHERE shortcode IN ({','.join('?' for _ in batch)})", batch).fetchall()
+                readings = account_media_kit._public_observation_rows(conn, batch)
                 observations.update({reading["shortcode"]: dict(reading) for reading in readings})
     excluded_codes = {str(row.get("shortcode") or "").strip() for row in rows
                       if account_media_kit._bool(row.get("hidden")) or account_media_kit._bool(row.get("is_deleted"))}
@@ -367,6 +589,16 @@ def posts(request: Request, handle: str, limit: Annotated[int, Query(ge=1, le=10
           end: Annotated[date | None, Query(alias="to", description="Inclusive Costa Rica calendar date")] = None) -> dict[str, Any]:
     clean = _handle(request, handle)
     _range(start, end)
+    if is_promo is None:
+        # Ordinary pages must not deserialize every provider payload for the
+        # account. The bounded Research projection preserves the established
+        # metric precedence and public exclusions for just this result page.
+        from .external_research import _posts_page
+        result = _posts_page([clean], limit=limit, offset=offset, start=start, end=end, public_only=True)
+        fields = ("shortcode", "caption", "is_promo", "is_collab", "collaborators", "published_at", "permalink", "format",
+                  "likes", "comments", "video_views", "video_plays", "metrics_updated_at")
+        return {"schema_version": VERSION, "generated_at": result["generated_at"],
+                "data": [{field: post.get(field) for field in fields} for post in result["data"]], "pagination": result["pagination"]}
     now, data = _public_posts(clean, start, end, is_promo)
     return {"schema_version": VERSION, "generated_at": now.isoformat(timespec="seconds"),
             "data": data[offset:offset + limit], "pagination": _pagination(data, limit, offset)}
