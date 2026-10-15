@@ -573,3 +573,35 @@ def test_revocation_during_owner_lookup_is_rechecked_before_admission(setup, mon
     assert error.value.status_code == 401
     with connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS n FROM website_api_rate_windows").fetchone()["n"] == 0
+
+
+def test_single_post_matches_the_list_projection_and_respects_exclusions(setup):
+    client, _ = setup
+    key = create(client)["key"]
+    listed = {post["shortcode"]: post for post in client.get("/api/v1/accounts/alpha/posts", params={"limit": 100}, headers=headers(key)).json()["data"]}
+    response = client.get("/api/v1/accounts/alpha/posts/PublicA", headers=headers(key))
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "private, no-store"
+    body = response.json()
+    assert body["schema_version"] == api.VERSION
+    assert body["data"] == {**listed["PublicA"], "cover_url": "/api/v1/accounts/alpha/posts/PublicA/cover"}
+    assert "CANARY" not in json.dumps(body)
+    for shortcode in ("Hidden", "Deleted", "Future", "InternalDraft", "Missing", "bad!code"):
+        assert client.get(f"/api/v1/accounts/alpha/posts/{shortcode}", headers=headers(key)).status_code in (403, 404)
+    assert client.get("/api/v1/accounts/beta/posts/Other", headers=headers(key)).status_code == 404
+
+
+def test_post_cover_redirects_to_stored_media_only(setup, monkeypatch):
+    client, _ = setup
+    key = create(client)["key"]
+    monkeypatch.setattr(api, "redirect_url", lambda reference: f"https://media.example/{reference}")
+    response = client.get("/api/v1/accounts/alpha/posts/PublicA/cover", headers=headers(key), follow_redirects=False)
+    assert response.status_code == 307
+    assert response.headers["Location"] == "https://media.example/CANARY_PRIVATE_PATH"
+    for shortcode in ("Hidden", "Future", "Missing"):
+        assert client.get(f"/api/v1/accounts/alpha/posts/{shortcode}/cover", headers=headers(key), follow_redirects=False).status_code == 404
+    assert client.get("/api/v1/accounts/beta/posts/Other/cover", headers=headers(key), follow_redirects=False).status_code == 404
+    monkeypatch.setattr(api, "redirect_url", lambda reference: None)
+    assert client.get("/api/v1/accounts/alpha/posts/PublicB/cover", headers=headers(key), follow_redirects=False).status_code == 404
+    for method in (client.post, client.delete):
+        assert method("/api/v1/accounts/alpha/posts/PublicA/cover", headers=headers(key)).status_code == 403

@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -20,6 +21,7 @@ from . import account_media_kit, db
 from .promo_classification import is_public_promo
 from .public_collaboration import public_collaboration
 from .public_media_kit import project_public_media_kit
+from .media_storage import redirect_url
 
 PREFIX = "sad_api_"
 MANAGEMENT_URL = "/api/dashboard/me/api-keys"
@@ -27,7 +29,8 @@ VERSION = "1.0"
 RATE_LIMIT = 60
 LOCAL_ZONE = timezone(timedelta(hours=-6))
 _HANDLE = re.compile(r"[a-z0-9_.]{1,30}\Z")
-_READ_PATH = re.compile(r"/api/v1/accounts(?:/[a-z0-9_.]{1,30}(?:/(?:media-kit|posts|followers/history))?)?/?\Z")
+_READ_PATH = re.compile(r"/api/v1/accounts(?:/[a-z0-9_.]{1,30}(?:/(?:media-kit|posts(?:/[A-Za-z0-9_-]{1,64}(?:/cover)?)?|followers/history))?)?/?\Z")
+_SHORTCODE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _PUBLIC_FIELDS = "id, name, key_prefix, account_handles, created_at, expires_at, revoked_at, last_used_at"
 
 
@@ -309,14 +312,9 @@ def _pagination(data: list[Any], limit: int, offset: int) -> dict[str, Any]:
     return {"limit": limit, "offset": offset, "total": total, "has_more": next_offset is not None, "next_offset": next_offset}
 
 
-@router.get("/accounts/{handle}/posts")
-def posts(request: Request, handle: str, limit: Annotated[int, Query(ge=1, le=100)] = 20,
-          offset: Annotated[int, Query(ge=0)] = 0,
-          is_promo: Annotated[bool | None, Query(description="Filter Research Promo classification: manual mark or #aitoolsentient in the published caption")] = None,
-          start: Annotated[date | None, Query(alias="from", description="Inclusive Costa Rica calendar date")] = None,
-          end: Annotated[date | None, Query(alias="to", description="Inclusive Costa Rica calendar date")] = None) -> dict[str, Any]:
-    clean = _handle(request, handle)
-    _range(start, end)
+def _public_posts(clean: str, start: date | None = None, end: date | None = None,
+                  is_promo: bool | None = None) -> tuple[datetime, list[dict[str, Any]]]:
+    """Every exported post for one account, newest first, after public exclusions."""
     now = datetime.now(UTC)
     with db.connect() as conn:
         row = conn.execute("SELECT is_canonical FROM accounts WHERE handle = ?", (clean,)).fetchone()
@@ -358,8 +356,60 @@ def posts(request: Request, handle: str, limit: Annotated[int, Query(ge=1, le=10
                          **{metric: post["metrics"].get(metric) for metric in ("likes", "comments", "video_views", "video_plays")},
                          "metrics_updated_at": post["metrics_updated_at"]})
     data.sort(key=lambda post: (post["published_at"], post["shortcode"]), reverse=True)
+    return now, data
+
+
+@router.get("/accounts/{handle}/posts")
+def posts(request: Request, handle: str, limit: Annotated[int, Query(ge=1, le=100)] = 20,
+          offset: Annotated[int, Query(ge=0)] = 0,
+          is_promo: Annotated[bool | None, Query(description="Filter Research Promo classification: manual mark or #aitoolsentient in the published caption")] = None,
+          start: Annotated[date | None, Query(alias="from", description="Inclusive Costa Rica calendar date")] = None,
+          end: Annotated[date | None, Query(alias="to", description="Inclusive Costa Rica calendar date")] = None) -> dict[str, Any]:
+    clean = _handle(request, handle)
+    _range(start, end)
+    now, data = _public_posts(clean, start, end, is_promo)
     return {"schema_version": VERSION, "generated_at": now.isoformat(timespec="seconds"),
             "data": data[offset:offset + limit], "pagination": _pagination(data, limit, offset)}
+
+
+def _public_post(request: Request, handle: str, shortcode: str) -> tuple[str, datetime, dict[str, Any]]:
+    clean = _handle(request, handle)
+    if not _SHORTCODE.fullmatch(shortcode):
+        raise HTTPException(404, "Post not available for this API key.")
+    now, data = _public_posts(clean)
+    post = next((post for post in data if post["shortcode"] == shortcode), None)
+    if post is None:
+        raise HTTPException(404, "Post not available for this API key.")
+    return clean, now, post
+
+
+@router.get("/accounts/{handle}/posts/{shortcode}")
+def post(request: Request, handle: str, shortcode: str) -> dict[str, Any]:
+    """One exported post by its Instagram shortcode, with the same fields as the list."""
+    clean, now, value = _public_post(request, handle, shortcode)
+    return {"schema_version": VERSION, "generated_at": now.isoformat(timespec="seconds"),
+            "data": {**value, "cover_url": f"/api/v1/accounts/{clean}/posts/{shortcode}/cover"}}
+
+
+@router.get("/accounts/{handle}/posts/{shortcode}/cover")
+def post_cover(request: Request, handle: str, shortcode: str) -> Response:
+    """Redirect to the stored cover of an exported post. Never fetches from Instagram."""
+    clean, _, _ = _public_post(request, handle, shortcode)
+    with db.connect() as conn:
+        references = []
+        if "cover_image_path" in account_media_kit._columns(conn, "dashboard_posts"):
+            row = conn.execute("""SELECT cover_image_path FROM dashboard_posts WHERE LOWER(account) = ? AND shortcode = ?
+                AND cover_image_path IS NOT NULL AND cover_image_path <> '' ORDER BY id DESC LIMIT 1""", (clean, shortcode)).fetchone()
+            references.append(row["cover_image_path"] if row else None)
+        registry = conn.execute("SELECT is_canonical FROM accounts WHERE handle = ?", (clean,)).fetchone()
+        if registry and registry["is_canonical"] and "image_path" in account_media_kit._columns(conn, "posts"):
+            row = conn.execute("""SELECT image_path FROM posts WHERE shortcode = ? AND image_path IS NOT NULL AND image_path <> ''
+                ORDER BY id DESC LIMIT 1""", (shortcode,)).fetchone()
+            references.append(row["image_path"] if row else None)
+    target = next((url for reference in references if reference and (url := redirect_url(reference))), None)
+    if target is None:
+        raise HTTPException(404, "No stored cover for this post.")
+    return RedirectResponse(target, status_code=307)
 
 
 @router.get("/accounts/{handle}/followers/history")

@@ -187,6 +187,8 @@ Website requests require `Authorization: Bearer sad_api_…` and can read only:
 - `GET /api/v1/accounts/{handle}`
 - `GET /api/v1/accounts/{handle}/media-kit`
 - `GET /api/v1/accounts/{handle}/posts`
+- `GET /api/v1/accounts/{handle}/posts/{shortcode}`
+- `GET /api/v1/accounts/{handle}/posts/{shortcode}/cover`
 - `GET /api/v1/accounts/{handle}/followers/history`
 
 The owner's current allowlist/Admin/Dev access, selected account scope, and
@@ -204,6 +206,12 @@ Pagination includes total, has_more, and next_offset. Missing readings remain
 null; insufficient recent coverage omits last_30_days. Public projections
 exclude hidden/deleted/private posts, internal labels, contacts and model data.
 Reads never start a scrape or refresh.
+
+A single post by Instagram shortcode returns the same projection as a list
+item plus `cover_url`, and returns 404 for anything the list would exclude
+(hidden, deleted, future, private-account or out-of-scope posts). The cover
+route redirects to the post's stored cover (R2) and returns 404 when no cover
+has been stored; it never fetches from Instagram.
 
 Posts and media kit standout posts expose `is_promo`: the manual Research
 flag or a case-insensitive `#aitoolsentient` caption hashtag, using Research's
