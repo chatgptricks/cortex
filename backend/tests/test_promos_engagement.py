@@ -234,6 +234,92 @@ def test_newer_observation_can_decrease_counts_and_newer_enrichment_can_replace_
     assert account["metrics_updated_at"] == "2026-10-16T10:00:00+00:00"
 
 
+def test_recent_cohorts_filter_before_provider_json_and_keep_every_duplicate_copy(engagement_db, monkeypatch):
+    connect, statements = engagement_db
+    monkeypatch.setattr(engagement, "_BLOCK_SIZE", 2)
+    with connect() as conn:
+        conn.execute("UPDATE accounts SET is_canonical = 1")
+        conn.executescript("CREATE INDEX account_date ON dashboard_posts(account,published_at); CREATE INDEX account_code ON dashboard_posts(account,shortcode);")
+        for index in range(20):
+            post(conn, f"old{index}", likes=99999, comments=999,
+                 published_at="2025-01-01T12:00:00Z", raw_json='{"likesCount":99999}')
+        for index in range(5):
+            post(conn, f"recent{index}", likes=100, comments=10)
+        # An undated canonical copy must still contribute its current metrics.
+        insert(conn, "posts", shortcode="recent0", section="historical", likes=300, comments=30,
+               updated_at="2026-10-16T12:00:00Z")
+        # A hidden older copy must remove a recent duplicate, even outside the window.
+        insert(conn, "posts", shortcode="recent1", section="historical", likes=200, comments=20,
+               published_at="2025-01-01T12:00:00Z", hidden=1)
+    seen = []
+    measured = engagement._measured_posts
+
+    def observe(records, *args):
+        seen.append([row.get("shortcode") for row in records])
+        return measured(records, *args)
+
+    monkeypatch.setattr(engagement, "_measured_posts", observe)
+    statements.clear()
+    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    assert account["post_count"] == 4
+    assert account["average_engagements"] == 165
+    assert all(not str(code).startswith("old") for block in seen for code in block)
+    assert max(map(len, seen)) <= 4
+    assert all(" OFFSET " not in statement.upper() for statement in statements)
+    # All-time traverses the same small keyset blocks and includes old samples.
+    assert engagement.build_promos_engagement(days=0, now=NOW)["accounts"][0]["post_count"] == 24
+
+
+def test_parent_projection_keeps_nested_metrics_and_formats_without_summing_children(engagement_db):
+    connect, _ = engagement_db
+    with connect() as conn:
+        post(conn, "carousel", likes=100, comments=10, enriched_at="2026-10-15T12:00:00Z",
+             raw_json=json.dumps({"Likes": 100, "commentsCount": 10,
+                 "Metrics": {"sharesCount": 5, "savedCount": 3, "impressionsCount": 1000},
+                 "childPosts": [{"likesCount": 9000, "sharesCount": 9999}, {"likesCount": 8000}],
+                 "caption": "large ignored text", "images": ["unused preview"]}))
+        post(conn, "reel", likes=200, comments=20, post_type_label="Reel")
+    account = engagement.build_promos_engagement(format="carousel", now=NOW)["accounts"][0]
+    assert account["post_count"] == 1
+    assert account["average_engagements"] == 110
+    assert account["average_complete_engagements"] == 118
+    assert account["metrics"]["shares"]["average"] == 5
+    assert engagement.build_promos_engagement(format="reel", now=NOW)["accounts"][0]["post_count"] == 1
+
+
+def test_shortcode_less_imports_keep_independent_provider_counters(engagement_db, monkeypatch):
+    connect, _ = engagement_db
+    monkeypatch.setattr(engagement, "_BLOCK_SIZE", 2)
+    with connect() as conn:
+        for index, likes in enumerate((100, 200, 300)):
+            post(conn, None, likes=likes, comments=likes // 10,
+                 enriched_at=f"2026-10-{13 + index}T12:00:00Z",
+                 raw_json=json.dumps({"likesCount": likes, "commentsCount": likes // 10}))
+    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    assert account["post_count"] == 3
+    assert account["average_engagements"] == 220
+    assert account["metrics"]["likes"]["average"] == 200
+
+
+def test_malformed_provider_json_keeps_promoted_counters(engagement_db):
+    connect, _ = engagement_db
+    with connect() as conn:
+        post(conn, "malformed", likes=100, comments=10, raw_json="not valid JSON")
+    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    assert account["average_engagements"] == 110
+    assert account["metrics"]["shares"]["average"] is None
+
+
+def test_latest_observed_carousel_structure_overrides_stale_promoted_slide_count(engagement_db):
+    connect, _ = engagement_db
+    with connect() as conn:
+        post(conn, "changed", likes=100, comments=10, slide_count=1,
+             updated_at="2026-10-14T12:00:00Z")
+        insert(conn, "engagement_observations", shortcode="changed", observed_at="2026-10-15T12:00:00Z",
+               raw_json='{"shortCode":"changed","likesCount":100,"commentsCount":10,"childPosts":[{},{}]}')
+    assert engagement.build_promos_engagement(format="carousel", now=NOW)["accounts"][0]["post_count"] == 1
+
+
 @pytest.fixture
 def endpoint_client(monkeypatch):
     from app import main
