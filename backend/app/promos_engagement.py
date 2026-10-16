@@ -382,9 +382,9 @@ def _account_benchmark(conn: Any, account: dict[str, Any], columns: dict[str, se
     }
 
 
-def calculate_promos_engagement(*, days: int = 30, format: str = "all", now: datetime | None = None,
+def calculate_promos_engagement(*, days: int = 0, format: str = "all", now: datetime | None = None,
                                 _roster: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Read selected active dashboard benchmarks without scraping or writes.
+    """Read selected accounts' full stored history by default, without scraping.
 
     Publication dates select the sample; each counter is its latest stored
     cumulative value. Every account remains in the result even if its sample
@@ -456,9 +456,12 @@ def engagement_accounts(*, now: datetime | None = None) -> dict[str, Any]:
     ], "generated_at": current.isoformat(timespec="seconds")}
 
 
-def build_promos_engagement(*, days: int = 30, format: str = "all", now: datetime | None = None,
+def build_promos_engagement(*, days: int = 0, format: str = "all", now: datetime | None = None,
                             accounts: list[str] | None = None) -> dict[str, Any]:
-    """Reuse selected dashboard accounts' calculations for exactly seven days."""
+    """Reuse all-history/all-format account benchmarks for exactly seven days.
+
+    Explicit legacy windows and format filters retain their separate keys.
+    """
     if days not in {0, 30, 90} or format not in {"all", *_FORMATS}:
         raise ValueError("Unsupported engagement window or format")
     current = _date(now) if now is not None else datetime.now(UTC)

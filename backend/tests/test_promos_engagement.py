@@ -134,7 +134,7 @@ def test_publication_window_format_and_active_dashboard_roster_include_leads(eng
         for handle, active, enabled, research in (("lead", 1, 1, 0), ("inactive", 0, 1, 1), ("disabled", 1, 0, 1)):
             insert(conn, "accounts", handle=handle, label=handle, category="leads", is_active=active,
                    promos_enabled=enabled, research_enabled=research)
-    recent = engagement.calculate_promos_engagement(now=NOW)
+    recent = engagement.calculate_promos_engagement(days=30, now=NOW)
     assert {account["handle"] for account in recent["accounts"]} == {"sample", "lead", "disabled"}
     assert recent["methodology"]["account_scope"] == "active_dashboard_accounts"
     sample = next(account for account in recent["accounts"] if account["handle"] == "sample")
@@ -145,10 +145,10 @@ def test_publication_window_format_and_active_dashboard_roster_include_leads(eng
     stored = engagement.calculate_promos_engagement(days=0, now=NOW)["accounts"][0]
     assert stored["post_count"] == 5
     assert stored["undated_post_count"] == 1
-    reel = engagement.calculate_promos_engagement(format="reel", now=NOW)["accounts"][0]
+    reel = engagement.calculate_promos_engagement(days=30, format="reel", now=NOW)["accounts"][0]
     assert reel["post_count"] == 1
-    assert engagement.calculate_promos_engagement(format="carousel", now=NOW)["accounts"][0]["post_count"] == 1
-    assert engagement.calculate_promos_engagement(format="image", now=NOW)["accounts"][0]["post_count"] == 0
+    assert engagement.calculate_promos_engagement(days=30, format="carousel", now=NOW)["accounts"][0]["post_count"] == 1
+    assert engagement.calculate_promos_engagement(days=30, format="image", now=NOW)["accounts"][0]["post_count"] == 0
     empty = next(account for account in recent["accounts"] if account["handle"] == "lead")
     assert empty["average_engagements"] is None
     assert empty["metrics"]["shares"]["total"] is None
@@ -261,7 +261,7 @@ def test_recent_cohorts_filter_before_provider_json_and_keep_every_duplicate_cop
 
     monkeypatch.setattr(engagement, "_measured_posts", observe)
     statements.clear()
-    account = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(days=30, now=NOW)["accounts"][0]
     assert account["post_count"] == 4
     assert account["average_engagements"] == 165
     assert all(not str(code).startswith("old") for block in seen for code in block)
@@ -342,7 +342,7 @@ def test_saved_benchmarks_are_reused_through_exactly_seven_days(engagement_db, m
     assert account["from_cache"] is True
     assert account["calculated_at"] == NOW.isoformat()
     assert account["cache_expires_at"] == (NOW + timedelta(days=7)).isoformat()
-    assert account["calculation_period"] == {"days": 30, "from": (NOW - timedelta(days=30)).isoformat(), "to": NOW.isoformat()}
+    assert account["calculation_period"] == {"days": 0, "from": None, "to": NOW.isoformat()}
     assert not any(table in statement.lower() for statement in statements for table in ("dashboard_posts", "account_snapshots", "engagement_observations"))
 
 
@@ -568,6 +568,45 @@ def test_canonical_and_empty_dashboard_accounts_ignore_tool_flags_but_honor_arch
     assert restored["accounts"][0]["from_cache"] is True
 
 
+def test_default_uses_full_stored_history_all_formats_and_the_all_history_cache_key(engagement_db, monkeypatch):
+    connect, _ = engagement_db
+    with connect() as conn:
+        conn.execute("UPDATE accounts SET is_canonical = 1")
+        for code, likes, published, kind, product in (
+            ("image", 10, "2025-01-01T12:00:00Z", "Image", None),
+            ("carousel", 20, "2026-01-01T12:00:00Z", "Sidecar", None),
+            ("reel", 30, "2026-10-15T12:00:00Z", "Video", "clips"),
+            ("video", 40, "2026-06-01T12:00:00Z", "Video", None),
+            ("undated", 100, None, "Image", None),
+        ):
+            post(conn, code, likes=likes, comments=likes // 10, published_at=published,
+                 post_type_label=kind, product_type=product)
+        insert(conn, "posts", shortcode="image", section="historical", likes=10, comments=1,
+               published_at="2025-01-01T12:00:00Z")
+    direct = engagement.calculate_promos_engagement(now=NOW)
+    assert direct["period"]["days"] == 0 and direct["format"] == "all"
+    assert direct["accounts"][0]["post_count"] == 5
+    assert direct["accounts"][0]["undated_post_count"] == 1
+    assert direct["accounts"][0]["average_engagements"] == 44
+    assert direct["accounts"][0]["first_post_at"] == "2025-01-01T12:00:00+00:00"
+    # An existing filtered cache must never satisfy the default full-history key.
+    filtered = engagement.build_promos_engagement(days=30, format="reel", accounts=["sample"], now=NOW)
+    assert filtered["accounts"][0]["post_count"] == 1
+    assert filtered["accounts"][0]["average_engagements"] == 33
+    stored = engagement.build_promos_engagement(accounts=["sample"], now=NOW)
+    assert stored["accounts"][0]["post_count"] == 5
+    assert stored["accounts"][0]["average_engagements"] == 44
+    assert stored["accounts"][0]["calculation_period"]["days"] == 0
+    with connect() as conn:
+        rows = conn.execute("SELECT days, format FROM promos_engagement_cache").fetchall()
+        assert {(row["days"], row["format"]) for row in rows} == {(0, "all"), (30, "reel")}
+        conn.execute("UPDATE dashboard_posts SET likes = 999")
+    monkeypatch.setattr(engagement, "calculate_promos_engagement", lambda **kwargs: pytest.fail("Recalculated a valid full-history cache"))
+    reused = engagement.build_promos_engagement(accounts=["sample"], now=NOW + timedelta(days=7))
+    assert reused["accounts"][0]["average_engagements"] == 44
+    assert reused["accounts"][0]["from_cache"] is True
+
+
 def test_older_concurrent_calculation_cannot_replace_a_newer_saved_result(engagement_db):
     connect, _ = engagement_db
     with connect() as conn:
@@ -575,9 +614,9 @@ def test_older_concurrent_calculation_cannot_replace_a_newer_saved_result(engage
     payload = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     with connect() as conn:
         engagement.benchmark_cache.ensure_schema(conn)
-        engagement.benchmark_cache.save(conn, "sample", 30, "all", NOW + timedelta(seconds=1), payload)
+        engagement.benchmark_cache.save(conn, "sample", 0, "all", NOW + timedelta(seconds=1), payload)
         older = {**payload, "average_engagements": 1}
-        engagement.benchmark_cache.save(conn, "sample", 30, "all", NOW, older)
+        engagement.benchmark_cache.save(conn, "sample", 0, "all", NOW, older)
     report = engagement.build_promos_engagement(now=NOW + timedelta(seconds=2))
     assert report["accounts"][0]["average_engagements"] == 110
 
@@ -627,13 +666,16 @@ def test_engagement_endpoint_rejects_unauthenticated_and_invalid_queries(endpoin
     assert state["calls"] == []
 
 
-def test_default_and_all_stored_windows_and_real_route_order(endpoint_client):
+def test_default_all_history_and_explicit_legacy_filters_and_real_route_order(endpoint_client):
     from app import main
     client, state = endpoint_client
     headers = {"Authorization": "Bearer test"}
     assert client.get("/api/admin/promos/engagement", headers=headers).status_code == 200
-    assert client.get("/api/admin/promos/engagement?days=0", headers=headers).status_code == 200
-    assert state["calls"] == [{"days": 30, "format": "all", "accounts": None}, {"days": 0, "format": "all", "accounts": None}]
+    assert client.get("/api/admin/promos/engagement?days=30&format=image", headers=headers).status_code == 200
+    assert client.get("/api/admin/promos/engagement?days=90&format=reel", headers=headers).status_code == 200
+    assert state["calls"] == [{"days": 0, "format": "all", "accounts": None},
+                              {"days": 30, "format": "image", "accounts": None},
+                              {"days": 90, "format": "reel", "accounts": None}]
     paths = [route.path for route in main.app.routes if hasattr(route, "path")]
     assert paths.index("/api/admin/promos/engagement") < paths.index("/api/admin/promos/{account}/{shortcode}")
     assert paths.index("/api/admin/promos/engagement/accounts") < paths.index("/api/admin/promos/{account}/{shortcode}")
@@ -655,4 +697,4 @@ def test_account_selection_query_repeats_as_array(endpoint_client):
     client, state = endpoint_client
     response = client.get("/api/admin/promos/engagement?accounts=sample&accounts=lead", headers={"Authorization": "Bearer test"})
     assert response.status_code == 200
-    assert state["calls"] == [{"days": 30, "format": "all", "accounts": ["sample", "lead"]}]
+    assert state["calls"] == [{"days": 0, "format": "all", "accounts": ["sample", "lead"]}]

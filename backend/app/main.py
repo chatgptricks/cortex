@@ -8548,7 +8548,7 @@ def admin_promos_engagement_accounts() -> Response:
 
 @app.get("/api/admin/promos/engagement")
 def admin_promos_engagement(
-    days: int = Query(30, ge=0, le=90),
+    days: int = Query(0, ge=0, le=90),
     format: Literal["all", "reel", "carousel", "image"] = "all",
     accounts: list[str] | None = Query(None),
 ) -> Response:
