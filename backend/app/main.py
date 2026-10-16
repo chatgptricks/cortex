@@ -86,6 +86,7 @@ from .post_recovery_queue import enqueue as enqueue_post_recovery, status as pos
 from .post_refresh_queue import enqueue as enqueue_post_refresh, get as get_post_refresh
 from .promos import create_backfill, create_jev_scan, get_job, get_opportunity, list_opportunities, update_opportunity
 from .promos_detector import detect_promo
+from .promos_engagement import build_promos_engagement
 from .jev_features import (
     JevFeatureUnavailable,
     audit_stack,
@@ -8534,6 +8535,19 @@ def admin_account_media_kit_pdf(
             "Vary": "Authorization, X-Queue-Role-Preview",
             "X-Content-Type-Options": "nosniff",
         },
+    )
+
+
+@app.get("/api/admin/promos/engagement")
+def admin_promos_engagement(
+    days: int = Query(30, ge=0, le=90),
+    format: Literal["all", "reel", "carousel", "image"] = "all",
+) -> Response:
+    if days not in {0, 30, 90}:
+        raise HTTPException(status_code=422, detail="days must be 0, 30, or 90")
+    return JSONResponse(
+        build_promos_engagement(days=days, format=format),
+        headers={"Cache-Control": "private, no-store", "Vary": "Authorization"},
     )
 
 
