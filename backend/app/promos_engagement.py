@@ -1,4 +1,4 @@
-"""Comparable account benchmarks for Promos, from stored measurements only."""
+"""Comparable benchmarks for every active dashboard account, from stored data."""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -33,6 +33,11 @@ _RAW_KEYS = {*_METRICS, *(key for key, metric in _ALIASES.items() if metric in _
              *(key.replace("_", "") for key in _METRICS),
              "shortCode", "type", "productType", "slide_count"}
 _CONTAINERS = {"metrics", "insights", "statistics", "stats", "video", "video_info", "engagement"}
+
+
+def _engagement_roster() -> list[dict[str, Any]]:
+    """Tool-specific Research/Promos flags do not restrict Engagement accounts."""
+    return list_accounts(active_only=True)
 
 
 @lru_cache(maxsize=256)
@@ -379,7 +384,7 @@ def _account_benchmark(conn: Any, account: dict[str, Any], columns: dict[str, se
 
 def calculate_promos_engagement(*, days: int = 30, format: str = "all", now: datetime | None = None,
                                 _roster: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Read a compact, complete roster projection without scraping or writes.
+    """Read selected active dashboard benchmarks without scraping or writes.
 
     Publication dates select the sample; each counter is its latest stored
     cumulative value. Every account remains in the result even if its sample
@@ -391,7 +396,7 @@ def calculate_promos_engagement(*, days: int = 30, format: str = "all", now: dat
     if current is None:
         raise ValueError("Invalid report time")
     cutoff = current - timedelta(days=days) if days else None
-    roster = list_accounts(active_only=True, promos_only=True) if _roster is None else _roster
+    roster = _engagement_roster() if _roster is None else _roster
     handles = [account["handle"].lower() for account in roster]
     snapshots: dict[str, list[dict[str, Any]]] = defaultdict(list)
     accounts = []
@@ -436,34 +441,35 @@ def _report(accounts: list[dict[str, Any]], days: int, format: str, current: dat
             "likes_minimum": 4, "followers_basis": "latest_usable_stored_snapshot",
             "post_date_basis": "publication_date", "metrics_basis": "latest_stored_cumulative_measurements",
             "metric_freshness_basis": "provider_observation_or_enrichment_time_when_known",
-            "account_scope": "active_promos_enabled", "missing_metrics": "unavailable_not_zero",
+            "account_scope": "active_dashboard_accounts", "missing_metrics": "unavailable_not_zero",
             "excluded_posts": ["future", "hidden", "deleted", "unpublished_analyses"],
         },
     }
 
 
 def engagement_accounts(*, now: datetime | None = None) -> dict[str, Any]:
+    """List every active dashboard account, including Leads, without metrics."""
     current = _date(now) if now is not None else datetime.now(UTC)
     return {"accounts": [
         {name: account.get(name) for name in ("handle", "label", "group", "subcategory", "has_avatar")}
-        for account in list_accounts(active_only=True, promos_only=True)
+        for account in _engagement_roster()
     ], "generated_at": current.isoformat(timespec="seconds")}
 
 
 def build_promos_engagement(*, days: int = 30, format: str = "all", now: datetime | None = None,
                             accounts: list[str] | None = None) -> dict[str, Any]:
-    """Reuse each selected account's stored calculation for exactly seven days."""
+    """Reuse selected dashboard accounts' calculations for exactly seven days."""
     if days not in {0, 30, 90} or format not in {"all", *_FORMATS}:
         raise ValueError("Unsupported engagement window or format")
     current = _date(now) if now is not None else datetime.now(UTC)
     if current is None:
         raise ValueError("Invalid report time")
-    roster = list_accounts(active_only=True, promos_only=True)
+    roster = _engagement_roster()
     if accounts is not None:
         requested = {value.strip().lstrip("@").lower() for value in accounts}
         allowed = {account["handle"].lower() for account in roster}
         if requested - allowed:
-            raise HTTPException(status_code=422, detail="One or more selected accounts are unavailable in Promos.")
+            raise HTTPException(status_code=422, detail="One or more selected accounts are unavailable in the dashboard.")
         roster = [account for account in roster if account["handle"].lower() in requested]
     handles = [account["handle"].lower() for account in roster]
     with db.connect() as conn:

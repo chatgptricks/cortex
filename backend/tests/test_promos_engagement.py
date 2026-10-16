@@ -119,7 +119,7 @@ def test_latest_observation_overrides_stale_payload_and_duplicate_canonical_is_o
     assert account["metrics_updated_at"] == "2026-10-16T12:00:00+00:00"
 
 
-def test_publication_window_format_and_active_promos_roster_include_leads(engagement_db):
+def test_publication_window_format_and_active_dashboard_roster_include_leads(engagement_db):
     connect, _ = engagement_db
     with connect() as conn:
         for code, date, kind in (("recent_reel", "2026-10-15T12:00:00Z", "clips"),
@@ -135,7 +135,8 @@ def test_publication_window_format_and_active_promos_roster_include_leads(engage
             insert(conn, "accounts", handle=handle, label=handle, category="leads", is_active=active,
                    promos_enabled=enabled, research_enabled=research)
     recent = engagement.calculate_promos_engagement(now=NOW)
-    assert {account["handle"] for account in recent["accounts"]} == {"sample", "lead"}
+    assert {account["handle"] for account in recent["accounts"]} == {"sample", "lead", "disabled"}
+    assert recent["methodology"]["account_scope"] == "active_dashboard_accounts"
     sample = next(account for account in recent["accounts"] if account["handle"] == "sample")
     assert sample["post_count"] == 2
     assert sample["first_post_at"] == "2026-10-15T12:00:00+00:00"
@@ -444,6 +445,9 @@ def test_roster_changes_are_live_while_only_new_or_expired_accounts_recalculate(
     with connect() as conn:
         conn.execute("UPDATE accounts SET is_active = 0 WHERE handle = 'sample'")
         conn.execute("UPDATE accounts SET promos_enabled = 0 WHERE handle = 'expired'")
+    assert {account["handle"] for account in engagement.build_promos_engagement(now=NOW)["accounts"]} == {"expired", "new"}
+    with connect() as conn:
+        conn.execute("UPDATE accounts SET is_active = 0 WHERE handle = 'expired'")
     assert [account["handle"] for account in engagement.build_promos_engagement(now=NOW)["accounts"]] == ["new"]
 
 
@@ -474,8 +478,8 @@ def test_unknown_or_unavailable_selection_is_rejected_before_any_cache_or_metric
     from fastapi import HTTPException
     connect, statements = engagement_db
     with connect() as conn:
-        insert(conn, "accounts", handle="disabled", label="Disabled", category="leads", promos_enabled=0)
-    for handles in (["unknown"], ["sample", "disabled"], [""]):
+        insert(conn, "accounts", handle="inactive", label="Inactive", category="leads", is_active=0)
+    for handles in (["unknown"], ["sample", "inactive"], [""]):
         statements.clear()
         with pytest.raises(HTTPException) as failure:
             engagement.build_promos_engagement(accounts=handles, now=NOW)
@@ -496,6 +500,72 @@ def test_roster_read_never_opens_metrics_or_cache_and_schema_is_idempotent(engag
     with connect() as conn:
         engagement.benchmark_cache.ensure_schema(conn)
         engagement.benchmark_cache.ensure_schema(conn)
+
+
+@pytest.mark.parametrize("promos,research,group", [(0, 1, "competitors"), (1, 0, "sentient"), (0, 0, "leads")])
+def test_all_active_dashboard_accounts_can_be_listed_calculated_and_cached_regardless_of_tool_flags(
+    engagement_db, monkeypatch, promos, research, group
+):
+    connect, statements = engagement_db
+    with connect() as conn:
+        insert(conn, "accounts", handle="dashboard_only", label="Dashboard only", category=group,
+               promos_enabled=promos, research_enabled=research)
+        insert(conn, "accounts", handle="archived", label="Archived", category=group,
+               promos_enabled=promos, research_enabled=research, is_active=0)
+        insert(conn, "dashboard_posts", account="dashboard_only", shortcode="included", likes=100,
+               comments=10, published_at="2026-10-15T12:00:00Z")
+    statements.clear()
+    roster = engagement.engagement_accounts(now=NOW)
+    assert {account["handle"] for account in roster["accounts"]} == {"sample", "dashboard_only"}
+    assert not any("dashboard_posts" in statement or "promos_engagement_cache" in statement for statement in statements)
+    direct = engagement.calculate_promos_engagement(now=NOW)
+    account = next(account for account in direct["accounts"] if account["handle"] == "dashboard_only")
+    assert account["average_engagements"] == 110
+    assert account["group"] == group
+    selected = engagement.build_promos_engagement(accounts=["@DASHBOARD_ONLY"], now=NOW)
+    assert [account["handle"] for account in selected["accounts"]] == ["dashboard_only"]
+    assert selected["accounts"][0]["average_engagements"] == 110
+    assert selected["cache"]["recalculated_count"] == 1
+    with connect() as conn:
+        rows = conn.execute("SELECT account_handle, payload_json FROM promos_engagement_cache").fetchall()
+        assert [row["account_handle"] for row in rows] == ["dashboard_only"]
+        assert "price" not in rows[0]["payload_json"] and "currency" not in rows[0]["payload_json"]
+        conn.execute("UPDATE dashboard_posts SET likes = 999 WHERE account = 'dashboard_only'")
+        conn.execute("UPDATE accounts SET promos_enabled = 0, research_enabled = 0 WHERE handle = 'dashboard_only'")
+    monkeypatch.setattr(engagement, "calculate_promos_engagement", lambda **kwargs: pytest.fail("Recalculated a valid cached dashboard account"))
+    cached = engagement.build_promos_engagement(accounts=["dashboard_only"], now=NOW + timedelta(days=7))
+    assert cached["accounts"][0]["average_engagements"] == 110
+    assert cached["accounts"][0]["from_cache"] is True
+    assert cached["cache"]["cached_count"] == 1
+
+
+def test_canonical_and_empty_dashboard_accounts_ignore_tool_flags_but_honor_archiving(engagement_db, monkeypatch):
+    from fastapi import HTTPException
+    connect, _ = engagement_db
+    with connect() as conn:
+        conn.execute("UPDATE accounts SET category = 'sentient', is_canonical = 1, promos_enabled = 0, research_enabled = 0 WHERE handle = 'sample'")
+        insert(conn, "posts", shortcode="canonical", section="historical", likes=200, comments=20,
+               published_at="2026-10-15T12:00:00Z")
+        insert(conn, "accounts", handle="empty", label="Empty", category="competitors", promos_enabled=0, research_enabled=0)
+    direct = engagement.calculate_promos_engagement(now=NOW)
+    by_handle = {account["handle"]: account for account in direct["accounts"]}
+    assert by_handle["sample"]["average_engagements"] == 220
+    assert by_handle["empty"]["post_count"] == 0
+    assert by_handle["empty"]["average_engagements"] is None
+    assert by_handle["empty"]["metrics"]["likes"]["average"] is None
+    engagement.build_promos_engagement(accounts=["sample"], now=NOW)
+    with connect() as conn:
+        conn.execute("UPDATE accounts SET is_active = 0 WHERE handle = 'sample'")
+    assert [account["handle"] for account in engagement.engagement_accounts(now=NOW)["accounts"]] == ["empty"]
+    with pytest.raises(HTTPException) as failure:
+        engagement.build_promos_engagement(accounts=["sample"], now=NOW)
+    assert failure.value.status_code == 422
+    with connect() as conn:
+        conn.execute("UPDATE accounts SET is_active = 1 WHERE handle = 'sample'")
+    monkeypatch.setattr(engagement, "calculate_promos_engagement", lambda **kwargs: pytest.fail("Recalculated after reactivation despite valid cache"))
+    restored = engagement.build_promos_engagement(accounts=["sample"], now=NOW + timedelta(days=1))
+    assert restored["accounts"][0]["average_engagements"] == 220
+    assert restored["accounts"][0]["from_cache"] is True
 
 
 def test_older_concurrent_calculation_cannot_replace_a_newer_saved_result(engagement_db):
