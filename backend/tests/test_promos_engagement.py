@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi import FastAPI
@@ -78,7 +78,7 @@ def test_paired_core_sample_and_full_sample_do_not_mix_missing_with_zero(engagem
         insert(conn, "account_snapshots", handle="sample", followers_count=1000, captured_at="2026-10-14T12:00:00Z")
         insert(conn, "account_snapshots", handle="sample", followers_count=None, captured_at="2026-10-15T12:00:00Z")
         insert(conn, "account_snapshots", handle="sample", followers_count=9999, captured_at="2026-10-17T12:00:00Z")
-    report = engagement.build_promos_engagement(now=NOW)
+    report = engagement.calculate_promos_engagement(now=NOW)
     account = report["accounts"][0]
     assert account["post_count"] == 5
     assert account["engagement_post_count"] == 2
@@ -110,7 +110,7 @@ def test_latest_observation_overrides_stale_payload_and_duplicate_canonical_is_o
         insert(conn, "posts", shortcode="experiment", section="ab", likes=10000, comments=100,
                published_at="2026-10-15T12:00:00Z")
         insert(conn, "posts", section="historical", likes=10000, comments=100)
-    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     assert account["post_count"] == 1
     assert account["average_engagements"] == 220
     assert account["average_complete_engagements"] == 235
@@ -134,20 +134,20 @@ def test_publication_window_format_and_active_promos_roster_include_leads(engage
         for handle, active, enabled, research in (("lead", 1, 1, 0), ("inactive", 0, 1, 1), ("disabled", 1, 0, 1)):
             insert(conn, "accounts", handle=handle, label=handle, category="leads", is_active=active,
                    promos_enabled=enabled, research_enabled=research)
-    recent = engagement.build_promos_engagement(now=NOW)
+    recent = engagement.calculate_promos_engagement(now=NOW)
     assert {account["handle"] for account in recent["accounts"]} == {"sample", "lead"}
     sample = next(account for account in recent["accounts"] if account["handle"] == "sample")
     assert sample["post_count"] == 2
     assert sample["first_post_at"] == "2026-10-15T12:00:00+00:00"
     assert sample["engagement_rate_pct"] is None
-    assert engagement.build_promos_engagement(days=90, now=NOW)["accounts"][0]["post_count"] == 3
-    stored = engagement.build_promos_engagement(days=0, now=NOW)["accounts"][0]
+    assert engagement.calculate_promos_engagement(days=90, now=NOW)["accounts"][0]["post_count"] == 3
+    stored = engagement.calculate_promos_engagement(days=0, now=NOW)["accounts"][0]
     assert stored["post_count"] == 5
     assert stored["undated_post_count"] == 1
-    reel = engagement.build_promos_engagement(format="reel", now=NOW)["accounts"][0]
+    reel = engagement.calculate_promos_engagement(format="reel", now=NOW)["accounts"][0]
     assert reel["post_count"] == 1
-    assert engagement.build_promos_engagement(format="carousel", now=NOW)["accounts"][0]["post_count"] == 1
-    assert engagement.build_promos_engagement(format="image", now=NOW)["accounts"][0]["post_count"] == 0
+    assert engagement.calculate_promos_engagement(format="carousel", now=NOW)["accounts"][0]["post_count"] == 1
+    assert engagement.calculate_promos_engagement(format="image", now=NOW)["accounts"][0]["post_count"] == 0
     empty = next(account for account in recent["accounts"] if account["handle"] == "lead")
     assert empty["average_engagements"] is None
     assert empty["metrics"]["shares"]["total"] is None
@@ -165,13 +165,13 @@ def test_hidden_flag_on_either_duplicate_removes_post_and_counts_are_fresh_read_
         post(conn, "hidden_copy", likes=9999, comments=99, updated_at="2026-10-16T12:00:00Z")
         post(conn, "visible", likes=10, comments=0)
     statements.clear()
-    first = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    first = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     assert first["post_count"] == 1
     assert first["average_engagements"] == 10
     assert all(statement.lstrip().startswith(("SELECT", "PRAGMA")) for statement in statements)
     with connect() as conn:
         conn.execute("UPDATE dashboard_posts SET likes = 30 WHERE shortcode = 'visible'")
-    assert engagement.build_promos_engagement(now=NOW)["accounts"][0]["average_engagements"] == 30
+    assert engagement.calculate_promos_engagement(now=NOW)["accounts"][0]["average_engagements"] == 30
 
 
 def test_metadata_edits_cannot_revert_observed_counts_or_claim_metric_freshness(engagement_db):
@@ -184,14 +184,14 @@ def test_metadata_edits_cannot_revert_observed_counts_or_claim_metric_freshness(
         post(conn, "same", likes=100, comments=10, updated_at="2026-10-16T12:00:00Z")
         insert(conn, "engagement_observations", shortcode="same", observed_at="2026-10-15T12:00:00Z",
                raw_json='{"shortCode":"same","likesCount":300,"commentsCount":30}')
-    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     assert account["average_engagements"] == 330
     assert account["metrics_updated_at"] == "2026-10-15T12:00:00+00:00"
     with connect() as conn:
         # Reverse the tables: a canonical cover repair has the same outcome.
         conn.execute("UPDATE posts SET likes = 100, comments = 10, updated_at = '2026-10-16T13:00:00Z'")
         conn.execute("UPDATE dashboard_posts SET likes = 300, comments = 30, updated_at = '2026-10-15T12:00:00Z'")
-    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     assert account["average_engagements"] == 330
     assert account["metrics_updated_at"] == "2026-10-15T12:00:00+00:00"
 
@@ -200,7 +200,7 @@ def test_unstamped_promoted_metrics_remain_available_without_claiming_update_tim
     connect, _ = engagement_db
     with connect() as conn:
         post(conn, "fallback", likes=100, comments=10, updated_at="2026-10-16T12:00:00Z")
-    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     assert account["average_engagements"] == 110
     assert account["metrics_updated_at"] is None
 
@@ -212,7 +212,7 @@ def test_older_visible_observation_does_not_resurrect_newer_unavailable_likes(en
         post(conn, "hidden", likes=hidden_likes, comments=10, updated_at="2026-10-16T12:00:00Z")
         insert(conn, "engagement_observations", shortcode="hidden", observed_at="2026-10-15T12:00:00Z",
                raw_json='{"shortCode":"hidden","likesCount":300,"commentsCount":30}')
-    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     assert account["metrics"]["likes"]["average"] is None
     assert account["engagement_post_count"] == 0
 
@@ -223,12 +223,12 @@ def test_newer_observation_can_decrease_counts_and_newer_enrichment_can_replace_
         post(conn, "changing", likes=300, comments=30, updated_at="2026-10-16T12:00:00Z")
         insert(conn, "engagement_observations", shortcode="changing", observed_at="2026-10-15T12:00:00Z",
                raw_json='{"shortCode":"changing","likesCount":200,"commentsCount":20}')
-    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     assert account["average_engagements"] == 220
     with connect() as conn:
         conn.execute("UPDATE dashboard_posts SET enriched_at = '2026-10-16T10:00:00Z', raw_json = ?",
                      ('{"likesCount":400,"commentsCount":40,"sharesCount":2}',))
-    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     assert account["average_engagements"] == 440
     assert account["metrics"]["shares"]["average"] == 2
     assert account["metrics_updated_at"] == "2026-10-16T10:00:00+00:00"
@@ -260,14 +260,14 @@ def test_recent_cohorts_filter_before_provider_json_and_keep_every_duplicate_cop
 
     monkeypatch.setattr(engagement, "_measured_posts", observe)
     statements.clear()
-    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     assert account["post_count"] == 4
     assert account["average_engagements"] == 165
     assert all(not str(code).startswith("old") for block in seen for code in block)
     assert max(map(len, seen)) <= 4
     assert all(" OFFSET " not in statement.upper() for statement in statements)
     # All-time traverses the same small keyset blocks and includes old samples.
-    assert engagement.build_promos_engagement(days=0, now=NOW)["accounts"][0]["post_count"] == 24
+    assert engagement.calculate_promos_engagement(days=0, now=NOW)["accounts"][0]["post_count"] == 24
 
 
 def test_parent_projection_keeps_nested_metrics_and_formats_without_summing_children(engagement_db):
@@ -279,12 +279,12 @@ def test_parent_projection_keeps_nested_metrics_and_formats_without_summing_chil
                  "childPosts": [{"likesCount": 9000, "sharesCount": 9999}, {"likesCount": 8000}],
                  "caption": "large ignored text", "images": ["unused preview"]}))
         post(conn, "reel", likes=200, comments=20, post_type_label="Reel")
-    account = engagement.build_promos_engagement(format="carousel", now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(format="carousel", now=NOW)["accounts"][0]
     assert account["post_count"] == 1
     assert account["average_engagements"] == 110
     assert account["average_complete_engagements"] == 118
     assert account["metrics"]["shares"]["average"] == 5
-    assert engagement.build_promos_engagement(format="reel", now=NOW)["accounts"][0]["post_count"] == 1
+    assert engagement.calculate_promos_engagement(format="reel", now=NOW)["accounts"][0]["post_count"] == 1
 
 
 def test_shortcode_less_imports_keep_independent_provider_counters(engagement_db, monkeypatch):
@@ -295,7 +295,7 @@ def test_shortcode_less_imports_keep_independent_provider_counters(engagement_db
             post(conn, None, likes=likes, comments=likes // 10,
                  enriched_at=f"2026-10-{13 + index}T12:00:00Z",
                  raw_json=json.dumps({"likesCount": likes, "commentsCount": likes // 10}))
-    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     assert account["post_count"] == 3
     assert account["average_engagements"] == 220
     assert account["metrics"]["likes"]["average"] == 200
@@ -305,7 +305,7 @@ def test_malformed_provider_json_keeps_promoted_counters(engagement_db):
     connect, _ = engagement_db
     with connect() as conn:
         post(conn, "malformed", likes=100, comments=10, raw_json="not valid JSON")
-    account = engagement.build_promos_engagement(now=NOW)["accounts"][0]
+    account = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
     assert account["average_engagements"] == 110
     assert account["metrics"]["shares"]["average"] is None
 
@@ -317,19 +317,215 @@ def test_latest_observed_carousel_structure_overrides_stale_promoted_slide_count
              updated_at="2026-10-14T12:00:00Z")
         insert(conn, "engagement_observations", shortcode="changed", observed_at="2026-10-15T12:00:00Z",
                raw_json='{"shortCode":"changed","likesCount":100,"commentsCount":10,"childPosts":[{},{}]}')
-    assert engagement.build_promos_engagement(format="carousel", now=NOW)["accounts"][0]["post_count"] == 1
+    assert engagement.calculate_promos_engagement(format="carousel", now=NOW)["accounts"][0]["post_count"] == 1
+
+
+@pytest.mark.parametrize("age", [timedelta(days=6, hours=23, minutes=59), timedelta(days=7)])
+def test_saved_benchmarks_are_reused_through_exactly_seven_days(engagement_db, monkeypatch, age):
+    connect, statements = engagement_db
+    with connect() as conn:
+        post(conn, "visible", likes=100, comments=10)
+        insert(conn, "account_snapshots", handle="sample", followers_count=1000, captured_at="2026-10-15T12:00:00Z")
+    first = engagement.build_promos_engagement(now=NOW)
+    assert first["cache"] == {"ttl_days": 7, "cached_count": 0, "recalculated_count": 1}
+    with connect() as conn:
+        conn.execute("UPDATE dashboard_posts SET likes = 999")
+        conn.execute("UPDATE account_snapshots SET followers_count = 9999")
+    statements.clear()
+    monkeypatch.setattr(engagement, "calculate_promos_engagement", lambda **kwargs: pytest.fail("Recalculated a valid saved benchmark"))
+    second = engagement.build_promos_engagement(now=NOW + age)
+    account = second["accounts"][0]
+    assert second["cache"] == {"ttl_days": 7, "cached_count": 1, "recalculated_count": 0}
+    assert account["average_engagements"] == 110
+    assert account["followers"] == 1000
+    assert account["from_cache"] is True
+    assert account["calculated_at"] == NOW.isoformat()
+    assert account["cache_expires_at"] == (NOW + timedelta(days=7)).isoformat()
+    assert account["calculation_period"] == {"days": 30, "from": (NOW - timedelta(days=30)).isoformat(), "to": NOW.isoformat()}
+    assert not any(table in statement.lower() for statement in statements for table in ("dashboard_posts", "account_snapshots", "engagement_observations"))
+
+
+def test_expired_benchmark_recalculates_after_seven_days_and_persists_across_connections(engagement_db):
+    connect, _ = engagement_db
+    with connect() as conn:
+        post(conn, "visible", likes=100, comments=10)
+    engagement.build_promos_engagement(now=NOW)
+    with connect() as conn:
+        conn.execute("UPDATE dashboard_posts SET likes = 200")
+    later = NOW + timedelta(days=7, microseconds=1)
+    report = engagement.build_promos_engagement(now=later)
+    assert report["cache"]["recalculated_count"] == 1
+    assert report["accounts"][0]["average_engagements"] == 210
+    with connect() as conn:
+        row = conn.execute("SELECT calculated_at, payload_json FROM promos_engagement_cache").fetchone()
+        assert row["calculated_at"] == later.isoformat()
+        assert json.loads(row["payload_json"])["average_engagements"] == 210
+    # The application has no process-local cache; a separate connection/run
+    # reads the same durable row, even after source counters change again.
+    with connect() as conn:
+        conn.execute("UPDATE dashboard_posts SET likes = 300")
+    assert engagement.build_promos_engagement(now=later + timedelta(seconds=1))["accounts"][0]["average_engagements"] == 210
+
+
+def test_cache_keys_separate_account_window_and_format_and_never_store_prices(engagement_db, monkeypatch):
+    connect, _ = engagement_db
+    with connect() as conn:
+        post(conn, "visible", likes=100, comments=10, product_type="clips")
+        insert(conn, "accounts", handle="lead", label="Lead", category="leads")
+    calculate = engagement.calculate_promos_engagement
+
+    def priced(**kwargs):
+        report = calculate(**kwargs)
+        for account in report["accounts"]:
+            account.update(price=2500, currency="USD", post_price=99)
+        return report
+
+    monkeypatch.setattr(engagement, "calculate_promos_engagement", priced)
+    for days, format, handles in ((30, "all", ["sample"]), (90, "all", ["sample"]),
+                                  (30, "reel", ["sample"]), (30, "all", ["lead"])):
+        assert engagement.build_promos_engagement(days=days, format=format, accounts=handles, now=NOW)["cache"]["recalculated_count"] == 1
+    with connect() as conn:
+        rows = conn.execute("SELECT account_handle, days, format, payload_json FROM promos_engagement_cache").fetchall()
+    assert len(rows) == 4
+    assert all(not any(word in row["payload_json"] for word in ("price", "currency")) for row in rows)
+
+
+@pytest.mark.parametrize("damage", ["json", "shape", "future", "timestamp", "number", "version"])
+def test_damaged_or_future_saved_benchmarks_recalculate(engagement_db, damage):
+    connect, _ = engagement_db
+    with connect() as conn:
+        post(conn, "visible", likes=100, comments=10)
+    engagement.build_promos_engagement(now=NOW)
+    with connect() as conn:
+        if damage == "json":
+            conn.execute("UPDATE promos_engagement_cache SET payload_json = 'broken JSON'")
+        elif damage == "shape":
+            conn.execute("UPDATE promos_engagement_cache SET payload_json = '{}'")
+        elif damage == "future":
+            conn.execute("UPDATE promos_engagement_cache SET calculated_at = ?", ((NOW + timedelta(days=1)).isoformat(),))
+        elif damage == "timestamp":
+            conn.execute("UPDATE promos_engagement_cache SET calculated_at = 'not a date'")
+        elif damage == "version":
+            conn.execute("UPDATE promos_engagement_cache SET schema_version = 0")
+        else:
+            payload = json.loads(conn.execute("SELECT payload_json FROM promos_engagement_cache").fetchone()["payload_json"])
+            payload["metrics"]["likes"]["coverage_pct"] = "invalid"
+            conn.execute("UPDATE promos_engagement_cache SET payload_json = ?", (json.dumps(payload),))
+        conn.execute("UPDATE dashboard_posts SET likes = 200")
+    report = engagement.build_promos_engagement(now=NOW)
+    assert report["cache"]["recalculated_count"] == 1
+    assert report["accounts"][0]["average_engagements"] == 210
+    assert engagement.build_promos_engagement(now=NOW)["cache"]["cached_count"] == 1
+
+
+def test_roster_changes_are_live_while_only_new_or_expired_accounts_recalculate(engagement_db, monkeypatch):
+    connect, _ = engagement_db
+    with connect() as conn:
+        post(conn, "visible", likes=100, comments=10)
+        insert(conn, "accounts", handle="expired", label="Expired", category="leads")
+    engagement.build_promos_engagement(now=NOW)
+    with connect() as conn:
+        conn.execute("UPDATE accounts SET label = 'New label', category = 'leads', avatar_path = 'new-avatar' WHERE handle = 'sample'")
+        conn.execute("UPDATE promos_engagement_cache SET calculated_at = ? WHERE account_handle = 'expired'", ((NOW - timedelta(days=8)).isoformat(),))
+        insert(conn, "accounts", handle="new", label="New", category="leads")
+    seen = []
+    calculate = engagement.calculate_promos_engagement
+
+    def track(**kwargs):
+        seen.extend(account["handle"] for account in kwargs["_roster"])
+        return calculate(**kwargs)
+
+    monkeypatch.setattr(engagement, "calculate_promos_engagement", track)
+    report = engagement.build_promos_engagement(now=NOW)
+    assert set(seen) == {"expired", "new"}
+    sample = next(account for account in report["accounts"] if account["handle"] == "sample")
+    assert sample["label"] == "New label" and sample["group"] == "leads" and sample["has_avatar"] is True
+    assert sample["from_cache"] is True
+    with connect() as conn:
+        conn.execute("UPDATE accounts SET is_active = 0 WHERE handle = 'sample'")
+        conn.execute("UPDATE accounts SET promos_enabled = 0 WHERE handle = 'expired'")
+    assert [account["handle"] for account in engagement.build_promos_engagement(now=NOW)["accounts"]] == ["new"]
+
+
+def test_selection_limits_calculation_and_cold_cache_to_chosen_accounts(engagement_db, monkeypatch):
+    connect, statements = engagement_db
+    with connect() as conn:
+        post(conn, "visible", likes=100, comments=10)
+        insert(conn, "accounts", handle="other", label="Other", category="leads")
+    seen = []
+    benchmark = engagement._account_benchmark
+
+    def track(conn, account, *args):
+        seen.append(account["handle"])
+        return benchmark(conn, account, *args)
+
+    monkeypatch.setattr(engagement, "_account_benchmark", track)
+    report = engagement.build_promos_engagement(accounts=["@SAMPLE", "sample"], now=NOW)
+    assert seen == ["sample"]
+    assert [account["handle"] for account in report["accounts"]] == ["sample"]
+    with connect() as conn:
+        assert [row["account_handle"] for row in conn.execute("SELECT account_handle FROM promos_engagement_cache").fetchall()] == ["sample"]
+    statements.clear()
+    assert engagement.build_promos_engagement(accounts=[], now=NOW)["accounts"] == []
+    assert not any("dashboard_posts" in statement for statement in statements)
+
+
+def test_unknown_or_unavailable_selection_is_rejected_before_any_cache_or_metric_work(engagement_db):
+    from fastapi import HTTPException
+    connect, statements = engagement_db
+    with connect() as conn:
+        insert(conn, "accounts", handle="disabled", label="Disabled", category="leads", promos_enabled=0)
+    for handles in (["unknown"], ["sample", "disabled"], [""]):
+        statements.clear()
+        with pytest.raises(HTTPException) as failure:
+            engagement.build_promos_engagement(accounts=handles, now=NOW)
+        assert failure.value.status_code == 422
+        assert all("dashboard_posts" not in statement and "promos_engagement_cache" not in statement for statement in statements)
+
+
+def test_roster_read_never_opens_metrics_or_cache_and_schema_is_idempotent(engagement_db, monkeypatch):
+    connect, statements = engagement_db
+    with connect() as conn:
+        insert(conn, "accounts", handle="lead", label="Lead", category="leads", research_enabled=0)
+    monkeypatch.setattr(engagement, "calculate_promos_engagement", lambda **kwargs: pytest.fail("Roster calculated metrics"))
+    statements.clear()
+    roster = engagement.engagement_accounts(now=NOW)
+    assert {account["handle"] for account in roster["accounts"]} == {"sample", "lead"}
+    assert all(set(account) == {"handle", "label", "group", "subcategory", "has_avatar"} for account in roster["accounts"])
+    assert all("promos_engagement_cache" not in statement and "dashboard_posts" not in statement for statement in statements)
+    with connect() as conn:
+        engagement.benchmark_cache.ensure_schema(conn)
+        engagement.benchmark_cache.ensure_schema(conn)
+
+
+def test_older_concurrent_calculation_cannot_replace_a_newer_saved_result(engagement_db):
+    connect, _ = engagement_db
+    with connect() as conn:
+        post(conn, "visible", likes=100, comments=10)
+    payload = engagement.calculate_promos_engagement(now=NOW)["accounts"][0]
+    with connect() as conn:
+        engagement.benchmark_cache.ensure_schema(conn)
+        engagement.benchmark_cache.save(conn, "sample", 30, "all", NOW + timedelta(seconds=1), payload)
+        older = {**payload, "average_engagements": 1}
+        engagement.benchmark_cache.save(conn, "sample", 30, "all", NOW, older)
+    report = engagement.build_promos_engagement(now=NOW + timedelta(seconds=2))
+    assert report["accounts"][0]["average_engagements"] == 110
 
 
 @pytest.fixture
 def endpoint_client(monkeypatch):
     from app import main
-    state = {"calls": [], "role": "sales"}
+    state = {"calls": [], "role": "sales", "roster_calls": 0}
 
     def build(**params):
         state["calls"].append(params)
         return {"accounts": [], "period": {"days": params["days"]}}
 
     monkeypatch.setattr(main, "build_promos_engagement", build)
+    def roster():
+        state["roster_calls"] += 1
+        return {"accounts": [{"handle": "sample", "label": "Sample", "group": "competitors", "subcategory": "other", "has_avatar": False}], "generated_at": NOW.isoformat()}
+    monkeypatch.setattr(main, "engagement_accounts", roster)
     monkeypatch.setattr(main, "FIREBASE_APP", object())
     monkeypatch.setattr(main.firebase_auth, "verify_id_token", lambda token: {"email": "member@example.com", "uid": "test"})
     monkeypatch.setattr(main, "get_dashboard_user_access", lambda email: {
@@ -338,6 +534,7 @@ def endpoint_client(monkeypatch):
     monkeypatch.setattr(main, "log_usage_event", lambda *args: None)
     app = FastAPI()
     app.middleware("http")(main._require_firebase_user)
+    app.add_api_route("/api/admin/promos/engagement/accounts", main.admin_promos_engagement_accounts)
     app.add_api_route("/api/admin/promos/engagement", main.admin_promos_engagement)
     return TestClient(app), state
 
@@ -348,7 +545,7 @@ def test_promos_members_can_read_endpoint_without_settings_or_tracker_permission
     state["role"] = role
     response = client.get("/api/admin/promos/engagement?days=90&format=reel", headers={"Authorization": "Bearer test"})
     assert response.status_code == 200
-    assert state["calls"] == [{"days": 90, "format": "reel"}]
+    assert state["calls"] == [{"days": 90, "format": "reel", "accounts": None}]
     assert "no-store" in response.headers["cache-control"]
 
 
@@ -366,6 +563,26 @@ def test_default_and_all_stored_windows_and_real_route_order(endpoint_client):
     headers = {"Authorization": "Bearer test"}
     assert client.get("/api/admin/promos/engagement", headers=headers).status_code == 200
     assert client.get("/api/admin/promos/engagement?days=0", headers=headers).status_code == 200
-    assert state["calls"] == [{"days": 30, "format": "all"}, {"days": 0, "format": "all"}]
+    assert state["calls"] == [{"days": 30, "format": "all", "accounts": None}, {"days": 0, "format": "all", "accounts": None}]
     paths = [route.path for route in main.app.routes if hasattr(route, "path")]
     assert paths.index("/api/admin/promos/engagement") < paths.index("/api/admin/promos/{account}/{shortcode}")
+    assert paths.index("/api/admin/promos/engagement/accounts") < paths.index("/api/admin/promos/{account}/{shortcode}")
+
+
+@pytest.mark.parametrize("role", ["sales", "pd", "vc", "admin"])
+def test_roster_endpoint_shares_promos_auth_without_running_calculation(endpoint_client, role):
+    client, state = endpoint_client
+    state["role"] = role
+    assert client.get("/api/admin/promos/engagement/accounts").status_code == 401
+    assert state["roster_calls"] == 0
+    response = client.get("/api/admin/promos/engagement/accounts", headers={"Authorization": "Bearer test"})
+    assert response.status_code == 200
+    assert response.json()["accounts"][0]["handle"] == "sample"
+    assert state["calls"] == [] and state["roster_calls"] == 1
+
+
+def test_account_selection_query_repeats_as_array(endpoint_client):
+    client, state = endpoint_client
+    response = client.get("/api/admin/promos/engagement?accounts=sample&accounts=lead", headers={"Authorization": "Bearer test"})
+    assert response.status_code == 200
+    assert state["calls"] == [{"days": 30, "format": "all", "accounts": ["sample", "lead"]}]

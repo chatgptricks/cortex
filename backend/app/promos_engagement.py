@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from typing import Any
 
+from fastapi import HTTPException
+
 from . import db
 from .account_media_kit import (
     _bool,
@@ -17,6 +19,7 @@ from .account_media_kit import (
     _snake,
 )
 from .apify_sync import list_accounts
+from . import promos_engagement_cache as benchmark_cache
 
 _METRICS = ("likes", "comments", "shares", "saves", "impressions", "video_views", "video_plays")
 _POST_FIELDS = {
@@ -374,7 +377,8 @@ def _account_benchmark(conn: Any, account: dict[str, Any], columns: dict[str, se
     }
 
 
-def build_promos_engagement(*, days: int = 30, format: str = "all", now: datetime | None = None) -> dict[str, Any]:
+def calculate_promos_engagement(*, days: int = 30, format: str = "all", now: datetime | None = None,
+                                _roster: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Read a compact, complete roster projection without scraping or writes.
 
     Publication dates select the sample; each counter is its latest stored
@@ -387,7 +391,7 @@ def build_promos_engagement(*, days: int = 30, format: str = "all", now: datetim
     if current is None:
         raise ValueError("Invalid report time")
     cutoff = current - timedelta(days=days) if days else None
-    roster = list_accounts(active_only=True, promos_only=True)
+    roster = list_accounts(active_only=True, promos_only=True) if _roster is None else _roster
     handles = [account["handle"].lower() for account in roster]
     snapshots: dict[str, list[dict[str, Any]]] = defaultdict(list)
     accounts = []
@@ -417,6 +421,11 @@ def build_promos_engagement(*, days: int = 30, format: str = "all", now: datetim
                 "engagement_rate_pct": average / followers * 100 if followers and average is not None else None,
                 **benchmark,
             })
+    return _report(accounts, days, format, current)
+
+
+def _report(accounts: list[dict[str, Any]], days: int, format: str, current: datetime) -> dict[str, Any]:
+    cutoff = current - timedelta(days=days) if days else None
     return {
         "accounts": accounts, "generated_at": current.isoformat(timespec="seconds"), "format": format,
         "period": {"days": days, "from": cutoff.isoformat(timespec="seconds") if cutoff else None, "to": current.isoformat(timespec="seconds")},
@@ -431,3 +440,60 @@ def build_promos_engagement(*, days: int = 30, format: str = "all", now: datetim
             "excluded_posts": ["future", "hidden", "deleted", "unpublished_analyses"],
         },
     }
+
+
+def engagement_accounts(*, now: datetime | None = None) -> dict[str, Any]:
+    current = _date(now) if now is not None else datetime.now(UTC)
+    return {"accounts": [
+        {name: account.get(name) for name in ("handle", "label", "group", "subcategory", "has_avatar")}
+        for account in list_accounts(active_only=True, promos_only=True)
+    ], "generated_at": current.isoformat(timespec="seconds")}
+
+
+def build_promos_engagement(*, days: int = 30, format: str = "all", now: datetime | None = None,
+                            accounts: list[str] | None = None) -> dict[str, Any]:
+    """Reuse each selected account's stored calculation for exactly seven days."""
+    if days not in {0, 30, 90} or format not in {"all", *_FORMATS}:
+        raise ValueError("Unsupported engagement window or format")
+    current = _date(now) if now is not None else datetime.now(UTC)
+    if current is None:
+        raise ValueError("Invalid report time")
+    roster = list_accounts(active_only=True, promos_only=True)
+    if accounts is not None:
+        requested = {value.strip().lstrip("@").lower() for value in accounts}
+        allowed = {account["handle"].lower() for account in roster}
+        if requested - allowed:
+            raise HTTPException(status_code=422, detail="One or more selected accounts are unavailable in Promos.")
+        roster = [account for account in roster if account["handle"].lower() in requested]
+    handles = [account["handle"].lower() for account in roster]
+    with db.connect() as conn:
+        if not _columns(conn, "promos_engagement_cache"):
+            benchmark_cache.ensure_schema(conn)
+        cached = benchmark_cache.load(conn, handles, days, format, current)
+    missing = [account for account in roster if account["handle"].lower() not in cached]
+    recalculated = {}
+    if missing:
+        fresh = calculate_promos_engagement(days=days, format=format, now=current, _roster=missing)
+        recalculated = {account["handle"]: account for account in fresh["accounts"]}
+        with db.connect() as conn:
+            for handle, account in recalculated.items():
+                benchmark_cache.save(conn, handle, days, format, current, account)
+    result = []
+    for account in roster:
+        handle = account["handle"].lower()
+        from_cache = handle in cached
+        measured, calculated = cached[handle] if from_cache else (recalculated[handle], current)
+        result.append({
+            **{name: measured[name] for name in benchmark_cache.FIELDS},
+            "handle": handle, "label": account.get("label") or handle,
+            "group": account.get("group"), "subcategory": account.get("subcategory"),
+            "has_avatar": bool(account.get("has_avatar")),
+            "calculated_at": calculated.isoformat(),
+            "cache_expires_at": (calculated + benchmark_cache.TTL).isoformat(),
+            "calculation_period": {"days": days, "from": (calculated - timedelta(days=days)).isoformat() if days else None,
+                                   "to": calculated.isoformat()},
+            "from_cache": from_cache,
+        })
+    report = _report(result, days, format, current)
+    report["cache"] = {"ttl_days": 7, "cached_count": len(cached), "recalculated_count": len(recalculated)}
+    return report

@@ -1050,6 +1050,8 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     ensure_golden_nugget_schema(conn)
     from .user_preferences import ensure_schema as ensure_user_preferences_schema
     ensure_user_preferences_schema(conn)
+    from .promos_engagement_cache import ensure_schema as ensure_promos_engagement_cache_schema
+    ensure_promos_engagement_cache_schema(conn)
     _ensure_column(conn, "dashboard_users", "time_zone", "time_zone TEXT NOT NULL DEFAULT ''")
     _ensure_column(
         conn,
