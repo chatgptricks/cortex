@@ -189,7 +189,17 @@ def _run(task: dict[str, Any]) -> None:
                 return {"error": _safe_error(exc)}
         # Retain the completed result: a crash after persisting snapshots but
         # before marking this queue row done must not erase success on replay.
-        result = ingestion_jobs.call(f"tracker-refresh:{task['job_key']}", work, slot=task["requested_at"])
+        ingestion_key = f"tracker-refresh:{task['job_key']}"
+        slot = task["requested_at"]
+        with db.connect() as conn:
+            ingestion_jobs.initialize(conn)
+            previous = conn.execute("SELECT slot, status, state FROM ingestion_jobs WHERE job_key = ?", (ingestion_key,)).fetchone()
+        if previous and (previous["status"] != "done" or "result" in json.loads(previous["state"])):
+            # An old worker could claim this queue row during a rolling deploy
+            # using its UTC-day slot. Keep that slot through retry/redelivery;
+            # this queue job has its own unique ingestion key.
+            slot = previous["slot"]
+        result = ingestion_jobs.call(ingestion_key, work, slot=slot)
         if result.get("error"):
             with db.connect() as conn:
                 conn.execute("UPDATE tracker_refresh_jobs SET status = 'error', error = ?, finished_at = ?, updated_at = ? WHERE job_id = ?",

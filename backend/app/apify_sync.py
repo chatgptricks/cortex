@@ -2838,6 +2838,20 @@ def _snapshot_preview(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _store_profile_snapshot(handle: str, item: dict[str, Any], observed_at: str) -> dict[str, Any]:
+    from .db import account_snapshot_day, get_account_snapshot_for_day, insert_account_snapshot
+
+    preview = _profile_preview(item, handle)
+    insert_account_snapshot(
+        handle=handle, followers_count=preview["followers_count"],
+        posts_count=preview.get("posts_count"), full_name=preview.get("full_name"),
+        verified=bool(preview.get("verified")), private=bool(preview.get("private")),
+        following_count=preview.get("following_count"), captured_at=observed_at,
+    )
+    saved = get_account_snapshot_for_day(handle, account_snapshot_day(datetime.fromisoformat(observed_at)))
+    return _snapshot_preview(saved) if saved else {**preview, "captured_at": observed_at}
+
+
 def _collect_account_snapshots(
     handles: list[str], *, force: bool, on_progress: ProgressFn = None,
 ) -> dict[str, Any]:
@@ -2847,18 +2861,55 @@ def _collect_account_snapshots(
     journal. Recovery consumes the original paid runs without shifting their
     positional identities or stamping an old reading with the recovery date.
     """
-    from .db import account_snapshot_day, get_account_snapshot_for_day, insert_account_snapshot, utc_now
+    from .db import get_account_snapshot_for_day, utc_now
     from .ingestion_jobs import current
 
     journal = current()
     freeze = journal.frozen if journal else lambda _key, value: value
+    # During a rolling deploy the old worker can have started this job with
+    # one profile per positional run. Recover those paid inputs before the
+    # new batched inputs; treating legacy run:0 as a full-roster batch would
+    # silently turn all its other profiles into missing data.
+    legacy_steps = freeze("tracker_snapshot_legacy_steps", sorted(
+        [int(key.split(":")[1]) for key in journal.state if re.fullmatch(r"run:\d+", key)]
+        if journal and "tracker_snapshot_handles" not in journal.state else []
+    ))
     handles = freeze("tracker_snapshot_handles", sorted(set(handles)))
+    legacy_readings: dict[str, dict[str, Any]] = {}
+    for index in legacy_steps:
+        saved = journal.state[f"run:{index}"]
+        payload = saved.get("payload", {})
+        if payload.get("resultsType") != "details":
+            continue
+        if saved.get("items") is None and not saved.get("run") and not saved.get("starting_at"):
+            continue  # A failed legacy attempt with no paid result to recover.
+        journal.index = index
+        items = _run_apify_actor_and_fetch(
+            payload, max_wait_seconds=180.0, poll_interval=3.0,
+            actor_id=saved.get("actor", APIFY_ACTOR_ID), accept_partial=True,
+        )
+        old_run = saved.get("run", {})
+        observed_at = saved.get("finished_at") or old_run.get("finishedAt") or old_run.get("startedAt")
+        if not observed_at:
+            # Legacy cached data without any provider timestamp cannot become
+            # a newly dated reading. The fresh batch below covers its handle.
+            continue
+        for item in items:
+            handle = str(item.get("username") or "").strip().lstrip("@").lower()
+            if handle in handles:
+                try:
+                    legacy_readings[handle] = _store_profile_snapshot(handle, item, observed_at)
+                except Exception:
+                    pass  # The fresh batch retries any unusable legacy row.
+    if legacy_steps:
+        journal.index = max(legacy_steps) + 1
     existing = {handle: get_account_snapshot_for_day(handle) for handle in handles}
     pending = freeze("tracker_snapshot_pending", [
         handle for handle in handles
-        if force or not existing[handle] or existing[handle].get("followers_count") is None
+        if handle not in legacy_readings and (force or not existing[handle] or existing[handle].get("followers_count") is None)
     ])
     readings = {handle: _snapshot_preview(row) for handle, row in existing.items() if handle not in pending and row}
+    readings.update(legacy_readings)
     failed: dict[str, str] = {}
 
     def progress(**fields: Any) -> None:
@@ -2900,19 +2951,7 @@ def _collect_account_snapshots(
             try:
                 if handle not in matched:
                     raise ApifySyncError(f"Instagram did not return a matching profile for @{handle}.")
-                preview = _profile_preview(matched[handle], handle)
-                insert_account_snapshot(
-                    handle=handle,
-                    followers_count=preview["followers_count"],
-                    posts_count=preview.get("posts_count"),
-                    full_name=preview.get("full_name"),
-                    verified=bool(preview.get("verified")),
-                    private=bool(preview.get("private")),
-                    following_count=preview.get("following_count"),
-                    captured_at=observed_at,
-                )
-                saved = get_account_snapshot_for_day(handle, account_snapshot_day(datetime.fromisoformat(observed_at)))
-                readings[handle] = _snapshot_preview(saved) if saved else {**preview, "captured_at": observed_at}
+                readings[handle] = _store_profile_snapshot(handle, matched[handle], observed_at)
                 failed.pop(handle, None)
             except Exception as exc:  # one invalid account cannot discard the others
                 failed[handle] = re.sub(r"token=[^&\s]+", "token=REDACTED", str(exc))[:500]

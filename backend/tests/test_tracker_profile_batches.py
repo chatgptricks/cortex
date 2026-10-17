@@ -145,3 +145,53 @@ def test_recovered_previous_day_cannot_complete_todays_scheduler_marker(database
     db.insert_account_snapshot('a', 200, 1, 'A', False, False, captured_at='2026-10-18T15:00:00Z')
     scheduler._tick()
     assert completed == ['2026-10-18']
+
+
+def test_legacy_single_profile_journal_recovers_paid_rows_before_new_batch(database, monkeypatch):
+    import json
+    old_payload = lambda handle: {'directUrls': [f'https://www.instagram.com/{handle}/'], 'resultsType': 'details'}
+    state = {
+        'run:0': {'actor': apify_sync.APIFY_ACTOR_ID, 'payload': old_payload('a')},
+        'run:1': {'actor': apify_sync.APIFY_ACTOR_ID, 'payload': old_payload('a'),
+                  'run': {'id': 'paid-a', 'startedAt': '2026-10-17T12:01:00Z'},
+                  'items': [{'username': 'a', 'followersCount': 101}]},
+        'run:2': {'actor': apify_sync.APIFY_ACTOR_ID, 'payload': old_payload('b'),
+                  'run': {'id': 'paid-b', 'startedAt': '2026-10-17T12:01:10Z'}},
+    }
+    with database() as conn:
+        ingestion_jobs.initialize(conn)
+        conn.execute("INSERT INTO ingestion_jobs VALUES ('legacy', '2026-10-17', 'retry', 'old', 0, ?, NULL, 'old')", (json.dumps(state),))
+    monkeypatch.setattr(apify_sync, 'list_accounts', lambda **kw: [{'handle': h} for h in ['a', 'b', 'c', 'd']])
+    starts = []
+    fail = [True]
+    def actor(payload, **kw):
+        journal = ingestion_jobs.current()
+        saved = journal.next_run(apify_sync.APIFY_ACTOR_ID, payload)
+        if saved.get('items') is not None:
+            return saved['items']
+        if saved.get('run', {}).get('id') == 'paid-b':
+            saved['items'] = [{'username': 'b', 'followersCount': 202}]
+        else:
+            # Legacy run positions must never consume the new roster batch.
+            assert journal.index == 4
+            assert payload['directUrls'] == ['https://www.instagram.com/c/', 'https://www.instagram.com/d/']
+            if 'run' not in saved:
+                starts.append(payload)
+                saved['run'] = {'id': 'paid-new-batch'}
+                journal.save()
+            if fail[0]:
+                fail[0] = False
+                raise RuntimeError('one transient polling failure')
+            saved['items'] = [{'username': 'c', 'followersCount': 303}, {'username': 'd', 'followersCount': 404}]
+        saved['finished_at'] = '2026-10-17T12:02:00Z'
+        journal.save()
+        return saved['items']
+    monkeypatch.setattr(apify_sync, '_run_apify_actor_and_fetch', actor)
+    with pytest.raises(ingestion_jobs.IngestionPending):
+        ingestion_jobs.call('legacy', lambda: apify_sync.snapshot_all_accounts(force=True), slot='2026-10-17')
+    with database() as conn:
+        conn.execute('UPDATE ingestion_jobs SET lease_until=0')
+    result = ingestion_jobs.call('legacy', lambda: apify_sync.snapshot_all_accounts(force=True), slot='2026-10-17')
+    assert result == {'snapshotted': ['a', 'b', 'c', 'd'], 'failed': {}}
+    assert len(starts) == 1
+    assert [db.get_account_snapshot_for_day(handle)['followers_count'] for handle in ['a', 'b', 'c', 'd']] == [101, 202, 303, 404]

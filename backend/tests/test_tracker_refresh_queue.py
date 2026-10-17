@@ -129,3 +129,28 @@ def test_stale_worker_is_recovered(database):
     queue._recover_stale()
     assert queue.get(job['job_id'])['status'] == 'queued'
     assert queue._claim()['job_id'] == job['job_id']
+
+
+def test_legacy_day_slot_is_preserved_for_recovery_and_result_redelivery(database, monkeypatch):
+    job = enqueue()
+    task = queue._claim()
+    key = f"tracker-refresh:{task['job_key']}"
+    with database() as conn:
+        ingestion_jobs.initialize(conn)
+        conn.execute(
+            "INSERT INTO ingestion_jobs VALUES (?, '2026-10-17', 'retry', 'old-worker', 0, ?, NULL, 'old')",
+            (key, json.dumps({'paid_run': 'retained'})),
+        )
+    calls = []
+    def snapshot(*a, **kw):
+        calls.append(ingestion_jobs.current().state['paid_run'])
+        return {'handle': 'openai', 'followers_count': 98765}
+    monkeypatch.setattr(apify_sync, 'snapshot_one_account', snapshot)
+    queue._run(task)
+    with database() as conn:
+        assert conn.execute('SELECT slot FROM ingestion_jobs WHERE job_key=?', (key,)).fetchone()['slot'] == '2026-10-17'
+        conn.execute("UPDATE tracker_refresh_jobs SET status='running' WHERE job_id=?", (job['job_id'],))
+    queue._run(task)  # crash/redelivery after ingestion committed its result
+    assert calls == ['retained']
+    assert queue.get(job['job_id'])['result']['followers_count'] == 98765
+    assert queue.get(job['job_id'])['status'] == 'done'
