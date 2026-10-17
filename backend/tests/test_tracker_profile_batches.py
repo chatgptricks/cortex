@@ -38,7 +38,9 @@ def test_all_accounts_share_one_profile_run_and_retry_only_unusable_rows(databas
         calls.append(payload['directUrls'])
         assert kw['accept_partial'] is True
         assert kw['run_limits']['timeout'] == 180
+        assert kw['max_wait_seconds'] == 210.0
         if len(calls) == 1:
+            assert kw['run_limits']['memory'] == 4096
             return [
                 {'username': 'a', 'followersCount': 1234567},
                 {'username': 'a', 'followersCount': None},
@@ -46,6 +48,7 @@ def test_all_accounts_share_one_profile_run_and_retry_only_unusable_rows(databas
                 {'username': 'c', 'followersCount': '1.2M'},
                 {'username': 'foreign', 'followersCount': 999},
             ]
+        assert 'memory' not in kw['run_limits']
         return [{'username': 'c', 'followersCount': 1200123}]
     monkeypatch.setattr(apify_sync, '_run_apify_actor_and_fetch', actor)
     updates = []

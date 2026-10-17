@@ -2925,9 +2925,13 @@ def _collect_account_snapshots(
         # actors serially was the dominant delay in an overview refresh.
         items = _run_apify_actor_and_fetch(
             {"directUrls": [f"https://www.instagram.com/{handle}/" for handle in pending], "resultsType": "details"},
-            max_wait_seconds=180.0,
+            # Apify's actor timeout includes a shutdown period. Wait through
+            # it so a usable partial dataset does not incur a queue retry.
+            max_wait_seconds=210.0,
             poll_interval=3.0,
-            run_limits={"timeout": 180},
+            # Multi-profile actors need CPU for their autoscaled requests;
+            # 4096 MB allocates one CPU core versus the default quarter-core.
+            run_limits={"timeout": 180, **({"memory": 4096} if len(pending) > 1 else {})},
             accept_partial=True,
             on_progress=lambda fields: progress(phase=fields.get("phase", "waiting_apify"), attempt=attempt + 1),
         )
