@@ -54,6 +54,10 @@ class ApifySyncError(RuntimeError):
     pass
 
 
+class ProfileSnapshotError(ApifySyncError):
+    """All bounded profile-data retries completed without a usable reading."""
+
+
 # ---------------------------------------------------------------------------
 # Account registry (DB-driven, self-serve -- see /api/admin/accounts)
 # ---------------------------------------------------------------------------
@@ -1143,6 +1147,7 @@ def _run_apify_actor_and_fetch(
             saved.pop("items", None)
         saved["dataset_id"] = dataset_id
         saved["dataset_count"] = fetched
+        saved["finished_at"] = run.get("finishedAt") or datetime.now(UTC).isoformat()
         journal.save()
     _emit(on_progress, phase="dataset_ready", fetched=fetched)
     return items
@@ -1436,7 +1441,6 @@ _EIGHT_HOUR_FINALIZATION_LOOKBACK = 11
 _SNAPSHOT_ATTEMPTS = 3
 _SNAPSHOT_RETRY_DELAY_SECONDS = 5.0
 _SHORT_RESULTS_LIMIT = 20
-_SNAPSHOT_LOCK = threading.Lock()
 
 # Short-term cycle: every 45min during posting hours, hourly overnight -- posts <=2h old.
 # ---------------------------------------------------------------------------
@@ -2561,6 +2565,30 @@ def run_backfill(
     return summary
 
 
+def _profile_preview(item: dict[str, Any], expected_handle: str) -> dict[str, Any]:
+    """Only a matching profile with an exact follower count is a reading."""
+    if item.get("error"):
+        raise ApifySyncError(str(item.get("errorDescription") or item.get("error")))
+    actual = str(item.get("username") or "").strip().lstrip("@").lower()
+    if actual != expected_handle:
+        raise ApifySyncError(f"Instagram returned a different account for @{expected_handle}.")
+    followers = item.get("followersCount")
+    if isinstance(followers, str) and re.fullmatch(r"\d+", followers):
+        followers = int(followers)
+    if isinstance(followers, bool) or not isinstance(followers, int) or followers < 0:
+        raise ApifySyncError(f"Instagram did not return an exact follower count for @{expected_handle}.")
+    return {
+        "handle": actual,
+        "full_name": item.get("fullName"),
+        "profile_pic_url": item.get("profilePicUrlHD") or item.get("profilePicUrl"),
+        "followers_count": followers,
+        "following_count": item.get("followsCount"),
+        "posts_count": item.get("postsCount"),
+        "verified": bool(item.get("verified")),
+        "private": bool(item.get("private")),
+    }
+
+
 def fetch_profile_preview(handle: str) -> dict[str, Any]:
     """Lightweight lookup for the add-account wizard: a single Apify
     'details' scrape of the profile URL itself (one result, not paginated
@@ -2568,7 +2596,7 @@ def fetch_profile_preview(handle: str) -> dict[str, Any]:
     and follower count before the account is actually created. Read-only --
     doesn't touch the database at all.
     """
-    clean = handle.strip().lstrip("@")
+    clean = handle.strip().lstrip("@").lower()
     if not clean:
         raise ApifySyncError("Handle is required.")
 
@@ -2580,20 +2608,8 @@ def fetch_profile_preview(handle: str) -> dict[str, Any]:
     if not items:
         raise ApifySyncError("Could not find that Instagram account.")
 
-    item = items[0]
-    if item.get("error"):
-        raise ApifySyncError(item.get("errorDescription") or "Could not find that Instagram account.")
-
-    return {
-        "handle": item.get("username") or clean,
-        "full_name": item.get("fullName"),
-        "profile_pic_url": item.get("profilePicUrlHD") or item.get("profilePicUrl"),
-        "followers_count": item.get("followersCount"),
-        "following_count": item.get("followsCount"),
-        "posts_count": item.get("postsCount"),
-        "verified": bool(item.get("verified")),
-        "private": bool(item.get("private")),
-    }
+    item = next((row for row in items if str(row.get("username") or "").lower() == clean), items[0])
+    return _profile_preview(item, clean)
 
 
 def store_avatar_from_url(handle: str, image_url: str) -> str:
@@ -2822,83 +2838,110 @@ def _snapshot_preview(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def snapshot_one_account(handle: str, *, force: bool = False) -> dict[str, Any]:
-    """Records at most one profile reading per account per Costa Rica day.
+def _collect_account_snapshots(
+    handles: list[str], *, force: bool, on_progress: ProgressFn = None,
+) -> dict[str, Any]:
+    """Collect matching profiles in one actor run, retrying only missing data.
 
-    The daily worker and the Tracker refresh buttons share this function. The
-    daily worker reuses today's reading; an explicit Refresh action passes
-    ``force=True`` to obtain the current Instagram value and upsert that
-    day's single canonical row. A process lock prevents concurrent requests
-    from both passing the check before the first one writes the row.
-
-    Retries transient failures (Apify read timeouts on individual profiles
-    do happen) since a flaky request otherwise costs a full day of follower
-    history that can never be recovered. Retrying one profile costs
-    ~$0.002, always cheaper than losing the data point.
+    Membership, retry batches and observation times are frozen in the durable
+    journal. Recovery consumes the original paid runs without shifting their
+    positional identities or stamping an old reading with the recovery date.
     """
-    from .db import get_account_snapshot_for_day, insert_account_snapshot
+    from .db import account_snapshot_day, get_account_snapshot_for_day, insert_account_snapshot, utc_now
+    from .ingestion_jobs import current
 
-    clean = handle.strip().lstrip("@").lower()
-    if not clean:
-        raise ApifySyncError("Handle is required.")
+    journal = current()
+    freeze = journal.frozen if journal else lambda _key, value: value
+    handles = freeze("tracker_snapshot_handles", sorted(set(handles)))
+    existing = {handle: get_account_snapshot_for_day(handle) for handle in handles}
+    pending = freeze("tracker_snapshot_pending", [
+        handle for handle in handles
+        if force or not existing[handle] or existing[handle].get("followers_count") is None
+    ])
+    readings = {handle: _snapshot_preview(row) for handle, row in existing.items() if handle not in pending and row}
+    failed: dict[str, str] = {}
 
-    with _SNAPSHOT_LOCK:
-        existing = get_account_snapshot_for_day(clean)
-        if existing and not force:
-            return _snapshot_preview(existing)
+    def progress(**fields: Any) -> None:
+        _emit(on_progress, total=len(handles), completed=len(readings), succeeded=len(readings), failed=0, **fields)
 
-        last_error: Exception | None = None
-        for attempt in range(_SNAPSHOT_ATTEMPTS):
+    progress(phase="starting")
+    for attempt in range(_SNAPSHOT_ATTEMPTS):
+        pending = freeze(f"tracker_snapshot_batch:{attempt}", pending)
+        if not pending:
+            break
+        run_index = journal.index if journal else None
+        # A single actor can resolve profiles together; starting 75 separate
+        # actors serially was the dominant delay in an overview refresh.
+        items = _run_apify_actor_and_fetch(
+            {"directUrls": [f"https://www.instagram.com/{handle}/" for handle in pending], "resultsType": "details"},
+            max_wait_seconds=180.0,
+            poll_interval=3.0,
+            run_limits={"timeout": 180},
+            accept_partial=True,
+            on_progress=lambda fields: progress(phase=fields.get("phase", "waiting_apify"), attempt=attempt + 1),
+        )
+        # The provider run's finish time survives recovery. Use it instead of
+        # either a pre-midnight request time or tomorrow's recovery time.
+        finished_at = journal.state.get(f"run:{run_index}", {}).get("finished_at") if journal else None
+        observed_at = freeze(f"tracker_snapshot_observed:{attempt}", finished_at or utc_now())
+        matched: dict[str, dict[str, Any]] = {}
+        for item in items:
+            username = str(item.get("username") or "").strip().lstrip("@").lower()
+            if username in pending:
+                try:
+                    _profile_preview(item, username)
+                except ApifySyncError:
+                    if username not in matched:
+                        matched[username] = item
+                else:
+                    matched[username] = item
+        retry: list[str] = []
+        for handle in pending:
             try:
-                preview = fetch_profile_preview(clean)
+                if handle not in matched:
+                    raise ApifySyncError(f"Instagram did not return a matching profile for @{handle}.")
+                preview = _profile_preview(matched[handle], handle)
                 insert_account_snapshot(
-                    handle=clean,
-                    followers_count=preview.get("followers_count"),
+                    handle=handle,
+                    followers_count=preview["followers_count"],
                     posts_count=preview.get("posts_count"),
                     full_name=preview.get("full_name"),
                     verified=bool(preview.get("verified")),
                     private=bool(preview.get("private")),
                     following_count=preview.get("following_count"),
+                    captured_at=observed_at,
                 )
-                # The provider preview has no database timestamp. Return the
-                # persisted row so the UI can update both the real follower
-                # total and its "Last snapshot" label in one response.
-                saved = get_account_snapshot_for_day(clean)
-                return _snapshot_preview(saved) if saved else preview
-            except Exception as exc:  # noqa: BLE001 -- reported back, not raised
-                last_error = exc
-                # A missing/renamed account fails identically on every attempt,
-                # so don't burn retries (or money) on it.
-                if isinstance(exc, ApifySyncError) and "Could not find" in str(exc):
-                    break
-                if attempt + 1 < _SNAPSHOT_ATTEMPTS:
-                    logger.warning(
-                        "Snapshot for %s failed (attempt %d/%d): %s -- retrying",
-                        clean, attempt + 1, _SNAPSHOT_ATTEMPTS, exc,
-                    )
-                    time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS)
-    if isinstance(last_error, ApifySyncError):
-        raise last_error
-    raise ApifySyncError(str(last_error) if last_error else "Snapshot failed.")
+                saved = get_account_snapshot_for_day(handle, account_snapshot_day(datetime.fromisoformat(observed_at)))
+                readings[handle] = _snapshot_preview(saved) if saved else {**preview, "captured_at": observed_at}
+                failed.pop(handle, None)
+            except Exception as exc:  # one invalid account cannot discard the others
+                failed[handle] = re.sub(r"token=[^&\s]+", "token=REDACTED", str(exc))[:500]
+                retry.append(handle)
+            progress(phase="saving", handle=handle, attempt=attempt + 1)
+        pending = retry
+        if pending and attempt + 1 < _SNAPSHOT_ATTEMPTS:
+            time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS)
+    return {"snapshotted": sorted(readings), "failed": failed, "readings": readings}
 
 
-def snapshot_all_accounts(*, force: bool = False) -> dict[str, Any]:
-    """Takes one Tracker-page snapshot (followers/posts count) per active
-    account and records it. Shared by the scheduler's daily job, the admin
-    "snapshot now" button, and the Tracker page's own overview "refresh all"
-    action, so a fresh install (or someone impatient for day-one data)
-    doesn't have to wait for 7am CST to see the leaderboard populate.
-    """
-    ok: list[str] = []
-    failed: dict[str, str] = {}
-    for account in list_accounts(active_only=True):
-        handle = account["handle"]
-        try:
-            snapshot_one_account(handle, force=force)
-            ok.append(handle)
-        except Exception as exc:  # noqa: BLE001 -- reported back, not raised
-            failed[handle] = str(exc)
-    return {"snapshotted": ok, "failed": failed}
+def snapshot_one_account(handle: str, *, force: bool = False) -> dict[str, Any]:
+    """Refresh one exact profile reading, preserving one row per local day."""
+    clean = handle.strip().lstrip("@").lower()
+    if not clean:
+        raise ApifySyncError("Handle is required.")
+    result = _collect_account_snapshots([clean], force=force)
+    if clean in result["failed"]:
+        raise ProfileSnapshotError(result["failed"][clean])
+    return result["readings"][clean]
+
+
+def snapshot_all_accounts(*, force: bool = False, on_progress: ProgressFn = None) -> dict[str, Any]:
+    """Refresh active profiles together and report every unresolved account."""
+    result = _collect_account_snapshots(
+        [account["handle"] for account in list_accounts(active_only=True)],
+        force=force, on_progress=on_progress,
+    )
+    return {"snapshotted": result["snapshotted"], "failed": result["failed"]}
 
 
 def fetch_and_store_avatar(handle: str) -> str:

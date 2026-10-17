@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -252,16 +252,21 @@ def _run_daily_jobs() -> None:
 def _run_account_snapshot_job() -> dict:
     """One row per active account per day into account_snapshots -- the
     Tracker page's entire follower-growth chart is built from this. A
-    separate lightweight Apify 'details' scrape per account (the same call
-    fetch_profile_preview already makes for the add-account wizard), not
+    batched Apify 'details' scrape for the missing profiles, not
     bundled into run_daily_cycle above since that scrapes individual posts
     and never touches the profile-level follower count.
     """
     from .apify_sync import snapshot_all_accounts
+    from .ingestion_jobs import call
     from .slack_alerts import notify_snapshot_failure, slack_configured
 
     try:
-        result = snapshot_all_accounts()
+        # Keep the paid batch through a worker restart/network failure. A
+        # later five-minute slot can retry still-missing profiles after a
+        # completed partial result; successful daily readings are reused.
+        now = datetime.now(UTC)
+        slot = now.replace(minute=now.minute // 5 * 5, second=0, microsecond=0).isoformat()
+        result = call("scheduled-tracker-snapshot", snapshot_all_accounts, slot=slot)
         if result["failed"]:
             logger.error("Account snapshot job: %d ok, failed: %s", len(result["snapshotted"]), result["failed"])
             # This job runs once a day and is the Tracker's only data source,
@@ -277,6 +282,19 @@ def _run_account_snapshot_job() -> dict:
         if slack_configured():
             notify_snapshot_failure(0, {"*": "snapshot job crashed before it could run -- see Render logs"})
         return {"snapshotted": [], "failed": {"*": "snapshot job crashed before it could run -- see Render logs"}}
+
+
+def _account_snapshot_day_complete(day: str) -> bool:
+    """A recovered older paid run cannot complete today's daily marker."""
+    from .db import connect
+
+    required = set(_active_account_handles())
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT handle FROM account_snapshots WHERE snapshot_date = ? AND followers_count IS NOT NULL",
+            (day,),
+        ).fetchall()
+    return required.issubset({str(row["handle"]).lower() for row in rows})
 
 
 def _run_ocr_job() -> None:
@@ -484,7 +502,7 @@ def _tick() -> None:
             # from today's upserted row, so retries do not spend another call.
             if _state_get(_DAILY_DATE_KEY) != today:
                 result = _run_account_snapshot_job()
-                if not result.get("failed"):
+                if not result.get("failed") and _account_snapshot_day_complete(today):
                     _claim_bucket(_DAILY_DATE_KEY, today)
         _launch("daily", daily_pass)
 

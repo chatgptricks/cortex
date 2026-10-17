@@ -67,7 +67,14 @@ checks require an authenticated Admin or Dev and use private, noncached response
   Apify run history/enrich/scrape-missing controls, OCR status, Slack
   test/custom-alert, disk status.
 - `/api/tracker/*` — daily follower snapshots, calendar-day growth deltas,
-  per-account/batch refresh.
+  per-account/batch refresh. Refresh submissions return a durable job; poll
+  `/api/tracker/refresh-jobs/{job_id}` until it finishes and inspect per-account
+  failures before reporting success. Concurrent requests share active work;
+  a later refresh starts a new Instagram reading without a time-based cooldown.
+  Full refreshes batch profiles and retry missing readings. Only matching
+  profiles with exact integer follower counts replace stored data. Snapshot
+  dates use Costa Rica time, and recovered older observations cannot overwrite
+  a newer reading for the same day.
 - `/api/insights/*` — aggregate stats for `insights.html`.
 - `GET /api/admin/accounts/{handle}/media-kit` and `media-kit.pdf` — fresh
   account media-kit data and a downloadable PDF for Admin/Dev Settings.

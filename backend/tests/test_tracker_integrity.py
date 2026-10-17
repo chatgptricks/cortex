@@ -75,7 +75,9 @@ def test_snapshot_one_account_reuses_today_without_second_apify_read(monkeypatch
             "private": False,
         }
 
-    monkeypatch.setattr(apify_sync, "fetch_profile_preview", preview)
+    monkeypatch.setattr(apify_sync, "_run_apify_actor_and_fetch", lambda payload, **kw: [{
+        "username": "chatgptricks", "followersCount": preview("chatgptricks")["followers_count"],
+    }])
     first = apify_sync.snapshot_one_account("@chatgptricks")
     second = apify_sync.snapshot_one_account("chatgptricks")
 
@@ -90,10 +92,10 @@ def test_forced_snapshot_updates_today_reading(monkeypatch, tmp_path):
     monkeypatch.setattr(db, "connect", connect)
     readings = iter([100, 125])
     monkeypatch.setattr(db, "utc_now", lambda: "2026-09-09T12:00:00+00:00")
-    monkeypatch.setattr(apify_sync, "fetch_profile_preview", lambda handle: {
-        "handle": handle, "followers_count": next(readings), "following_count": 20,
-        "posts_count": 5, "full_name": "ChatGPTricks", "verified": False, "private": False,
-    })
+    monkeypatch.setattr(apify_sync, "_run_apify_actor_and_fetch", lambda payload, **kw: [{
+        "username": "chatgptricks", "followersCount": next(readings), "followsCount": 20,
+        "postsCount": 5, "fullName": "ChatGPTricks", "verified": False, "private": False,
+    }])
 
     apify_sync.snapshot_one_account("chatgptricks")
     refreshed = apify_sync.snapshot_one_account("chatgptricks", force=True)

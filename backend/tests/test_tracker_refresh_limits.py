@@ -18,7 +18,6 @@ def _request(email="sergio@example.com", *, is_admin=False, is_dev=False, previe
 @pytest.fixture
 def last_request(monkeypatch):
     times = {}
-    monkeypatch.setattr(main, "last_tracker_refresh_request", lambda email: times.get(email))
     monkeypatch.setattr(main, "list_accounts", lambda active_only=True: [{"handle": "openai"}])
     queued = []
     monkeypatch.setattr(main, "enqueue_tracker_refresh", lambda **job: queued.append(job) or {"job_id": "j1", **job})
@@ -32,52 +31,25 @@ def test_every_user_can_refresh_once(last_request):
     assert last_request.queued[0]["requested_by"] == "sergio@example.com"
 
 
-def test_members_wait_an_hour_between_manual_refreshes(last_request):
-    last_request.times["sergio@example.com"] = datetime.now(UTC) - timedelta(minutes=20)
-
-    with pytest.raises(HTTPException) as error:
-        main.tracker_snapshot_now(_request())
-
-    assert error.value.status_code == 429
-    assert "40 minutes" in error.value.detail
-    assert 2300 < int(error.value.headers["Retry-After"]) <= 2400
-    assert not last_request.queued
-
-    last_request.times["sergio@example.com"] = datetime.now(UTC) - timedelta(minutes=61)
-    main.tracker_snapshot_now(_request())
-    assert last_request.queued[0]["kind"] == "all"
-
-
-def test_admins_wait_five_minutes(last_request):
-    last_request.times["admin@example.com"] = datetime.now(UTC) - timedelta(minutes=2)
-    with pytest.raises(HTTPException) as error:
-        main.tracker_account_refresh("openai", _request("admin@example.com", is_admin=True))
-    assert error.value.status_code == 429
-
-    last_request.times["admin@example.com"] = datetime.now(UTC) - timedelta(minutes=6)
-    main.tracker_account_refresh("openai", _request("admin@example.com", is_admin=True))
-    assert len(last_request.queued) == 1
-
-
-def test_dev_is_unlimited_unless_previewing_another_role(last_request):
-    last_request.times["dev@example.com"] = datetime.now(UTC)
+@pytest.mark.parametrize("role", [
+    {}, {"is_admin": True}, {"is_dev": True}, {"is_dev": True, "preview": True},
+])
+def test_every_role_can_refresh_after_previous_completion(last_request, role):
+    last_request.times["sergio@example.com"] = datetime.now(UTC)
     for _ in range(3):
-        main.tracker_account_refresh("openai", _request("dev@example.com", is_dev=True))
-    assert len(last_request.queued) == 3
-    assert main.tracker_refresh_allowance(_request("dev@example.com", is_dev=True))["unlimited"] is True
+        main.tracker_snapshot_now(_request(**role))
+        main.tracker_account_refresh("openai", _request(**role))
+    assert len(last_request.queued) == 6
+    assert main.tracker_refresh_allowance(_request(**role)) == {
+        "unlimited": True, "windowSeconds": 0, "retryAfterSeconds": 0,
+    }
 
-    with pytest.raises(HTTPException):
-        main.tracker_account_refresh("openai", _request("dev@example.com", is_dev=True, preview=True))
 
-
-def test_allowance_reports_the_remaining_wait(last_request):
-    last_request.times["sergio@example.com"] = datetime.now(UTC) - timedelta(minutes=50)
-
-    allowance = main.tracker_refresh_allowance(_request())
-
-    assert allowance["unlimited"] is False
-    assert allowance["windowSeconds"] == 3600
-    assert 500 < allowance["retryAfterSeconds"] <= 600
+def test_unknown_account_still_cannot_be_refreshed(last_request):
+    with pytest.raises(HTTPException) as error:
+        main.tracker_account_refresh("unknown", _request())
+    assert error.value.status_code == 404
+    assert last_request.queued == []
 
 
 def test_last_requested_at_reads_the_newest_job_per_person(tmp_path, monkeypatch):

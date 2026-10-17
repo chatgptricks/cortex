@@ -99,7 +99,6 @@ from .jev_features import (
 )
 from .hooks_lab import router as hooks_router
 from .tracker_refresh_queue import enqueue as enqueue_tracker_refresh, get as get_tracker_refresh
-from .tracker_refresh_queue import last_requested_at as last_tracker_refresh_request
 from .account_media_kit import build_account_media_kit
 from .queue_rules import (
     SCHEDULER_BUFFER_MINUTES,
@@ -1118,6 +1117,8 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
             dt = datetime.fromisoformat(row["published_at"])
         except ValueError:
             continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
         # ISO week start (Monday) as a stable bucket key -- the chart plots
         # calendar weeks, not an exact rolling 7-day window.
         week_start = (dt - timedelta(days=dt.weekday())).date().isoformat()
@@ -1129,7 +1130,7 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
         # Per calendar day too -- feeds the historical-stats table's
         # "engagement rate" column (that day's avg likes / that day's
         # follower count), independent of the weekly chart above.
-        daily.setdefault(dt.date().isoformat(), []).append(row["likes"] or 0)
+        daily.setdefault(dt.astimezone(_TRACKER_TZ).date().isoformat(), []).append(row["likes"] or 0)
 
     engagement_weekly = [
         {
@@ -1143,9 +1144,14 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
 
     def _day_likes(captured_at: str) -> list[int]:
         try:
-            day = datetime.fromisoformat(captured_at).date().isoformat()
+            captured = datetime.fromisoformat(captured_at)
         except ValueError:
             return []
+        if captured.tzinfo is None:
+            captured = captured.replace(tzinfo=UTC)
+        # A reload after 18:00 Costa Rica time has tomorrow's UTC date but
+        # still updates today's canonical follower reading and daily posts.
+        day = captured.astimezone(_TRACKER_TZ).date().isoformat()
         return daily.get(day, [])
 
     # Keep the detail response deliberately distinct from the raw database
@@ -1188,31 +1194,10 @@ def tracker_account_detail(handle: str) -> dict[str, Any]:
     }
 
 
-# Manual Tracker refreshes are paid Apify runs. Everyone may refresh, with a
-# per-person limit: DEV is unlimited, admins once every 5 minutes, everyone
-# else once an hour. A DEV role preview follows the previewed role's limit.
-_TRACKER_REFRESH_WINDOW_SECONDS = {"admin": 5 * 60, "member": 60 * 60}
-
-
 def _tracker_refresh_allowance(request: Request) -> dict[str, Any]:
-    if getattr(request.state, "is_dev", False) and not getattr(request.state, "queue_role_preview_active", False):
-        return {"unlimited": True, "windowSeconds": 0, "retryAfterSeconds": 0}
-    window = _TRACKER_REFRESH_WINDOW_SECONDS["admin" if getattr(request.state, "is_admin", False) else "member"]
-    last = last_tracker_refresh_request(str(request.state.user_email))
-    elapsed = (datetime.now(UTC) - last).total_seconds() if last else window
-    return {"unlimited": False, "windowSeconds": window, "retryAfterSeconds": max(0, int(window - elapsed))}
-
-
-def _require_tracker_refresh_allowance(request: Request) -> None:
-    retry_after = _tracker_refresh_allowance(request)["retryAfterSeconds"]
-    if retry_after <= 0:
-        return
-    minutes = max(1, -(-retry_after // 60))
-    raise HTTPException(
-        status_code=429,
-        detail=f"You can refresh the Tracker again in {minutes} minute{'s' if minutes != 1 else ''}.",
-        headers={"Retry-After": str(retry_after)},
-    )
+    # Reload must collect current followers for every role. Concurrent requests
+    # share only active work in the queue; a finished job never blocks a reload.
+    return {"unlimited": True, "windowSeconds": 0, "retryAfterSeconds": 0}
 
 
 @app.get("/api/tracker/refresh-allowance")
@@ -1228,14 +1213,12 @@ def tracker_account_refresh(handle: str, request: Request) -> dict[str, Any]:
     known = {a["handle"] for a in list_accounts(active_only=True)}
     if clean not in known:
         raise HTTPException(status_code=404, detail=f"Unknown or inactive account '{clean}'.")
-    _require_tracker_refresh_allowance(request)
     return enqueue_tracker_refresh(kind="account", handle=clean, requested_by=str(request.state.user_email))
 
 
 @app.post("/api/tracker/snapshot-now", status_code=202)
 def tracker_snapshot_now(request: Request) -> dict[str, Any]:
     """Queue the all-account daily snapshot without blocking the API."""
-    _require_tracker_refresh_allowance(request)
     return enqueue_tracker_refresh(kind="all", handle=None, requested_by=str(request.state.user_email))
 
 

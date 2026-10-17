@@ -1709,8 +1709,14 @@ def insert_account_snapshot(
     verified: bool,
     private: bool,
     following_count: int | None = None,
+    *,
+    captured_at: str | None = None,
 ) -> None:
-    captured_at = utc_now()
+    captured_at = captured_at or utc_now()
+    observed = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=UTC)
+    captured_at = observed.astimezone(UTC).isoformat()
     snapshot_date = account_snapshot_day(datetime.fromisoformat(captured_at))
     with connect() as conn:
         # Small test/legacy databases can reach this function without the
@@ -1730,6 +1736,7 @@ def insert_account_snapshot(
                 private = excluded.private,
                 following_count = excluded.following_count,
                 captured_at = excluded.captured_at
+            WHERE excluded.captured_at >= account_snapshots.captured_at
             """,
             (
                 handle.strip().lower(),

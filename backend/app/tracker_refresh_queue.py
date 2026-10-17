@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -16,10 +17,13 @@ _WAKE = threading.Event()
 _START_LOCK = threading.Lock()
 _STARTED = False
 _STALE_SECONDS = 300
+_ENQUEUE_LOCK_KEY = 7042198374
+_CLAIM_LOCK_KEY = 7042198375
+_MAX_ATTEMPTS = 4
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
 def initialize(conn: Any) -> None:
@@ -34,6 +38,15 @@ def initialize(conn: Any) -> None:
            )"""
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tracker_refresh_jobs_status ON tracker_refresh_jobs(status, requested_at)")
+    if getattr(conn, "is_postgres", False):
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tracker_refresh_jobs)").fetchall()}
+        if "attempts" not in columns:
+            conn.execute("ALTER TABLE tracker_refresh_jobs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0")
+        if "available_at" not in columns:
+            conn.execute("ALTER TABLE tracker_refresh_jobs ADD COLUMN IF NOT EXISTS available_at TEXT")
+    else:
+        db._ensure_column(conn, "tracker_refresh_jobs", "attempts", "attempts INTEGER NOT NULL DEFAULT 0")
+        db._ensure_column(conn, "tracker_refresh_jobs", "available_at", "available_at TEXT")
 
 
 def _item(row: Any) -> dict[str, Any]:
@@ -42,6 +55,7 @@ def _item(row: Any) -> dict[str, Any]:
         item["result"] = json.loads(item.pop("result_json") or "{}")
     except (TypeError, ValueError):
         item["result"] = {}
+    item["progress"] = item["result"].get("progress", {})
     return item
 
 
@@ -51,22 +65,32 @@ def enqueue(*, kind: str, handle: str | None, requested_by: str) -> dict[str, An
     clean_handle = (handle or "").strip().lstrip("@").lower() or None
     if kind == "account" and not clean_handle:
         raise ValueError("Account refresh requires a handle")
-    # Deduplicate repeated clicks for 15 minutes, but do not turn an explicit
-    # refresh into a no-op for the rest of the day. The worker force-refreshes
-    # the profile and updates that day's one canonical snapshot row.
-    now_utc = datetime.now(UTC)
-    refresh_bucket = now_utc.strftime("%Y-%m-%dT%H:") + f"{now_utc.minute // 15 * 15:02d}"
-    job_key = f"tracker:{kind}:{clean_handle or 'all'}:{refresh_bucket}"
+    # Share in-flight work only. Returning a completed 15-minute bucket made
+    # an explicit reload appear successful without ever reading Instagram.
+    job_id = uuid.uuid4().hex
+    job_key = f"tracker:{kind}:{clean_handle or 'all'}:{job_id}"
     now = _now()
     with db.connect() as conn:
         initialize(conn)
-        conn.execute(
-            """INSERT INTO tracker_refresh_jobs(job_id, job_key, kind, handle, requested_by, status, requested_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
-               ON CONFLICT(job_key) DO NOTHING""",
-            (uuid.uuid4().hex, job_key, kind, clean_handle, requested_by, now, now),
-        )
-        row = conn.execute("SELECT * FROM tracker_refresh_jobs WHERE job_key = ?", (job_key,)).fetchone()
+        if getattr(conn, "is_postgres", False):
+            conn.execute("SELECT pg_advisory_xact_lock(?)", (_ENQUEUE_LOCK_KEY,))
+        else:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT * FROM tracker_refresh_jobs
+               WHERE status IN ('queued', 'running')
+                 AND kind = ? AND COALESCE(handle, '') = ?
+               ORDER BY requested_at LIMIT 1""",
+            (kind, clean_handle or ""),
+        ).fetchone()
+        if not row:
+            conn.execute(
+                """INSERT INTO tracker_refresh_jobs(job_id, job_key, kind, handle, requested_by, status, requested_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                (job_id, job_key, kind, clean_handle, requested_by, now, now),
+            )
+            row = conn.execute("SELECT * FROM tracker_refresh_jobs WHERE job_id = ?", (job_id,)).fetchone()
     _WAKE.set()
     return _item(row)
 
@@ -93,12 +117,12 @@ def get(job_id: str) -> dict[str, Any] | None:
 
 
 def _recover_stale() -> None:
-    threshold = (datetime.now(UTC) - timedelta(seconds=_STALE_SECONDS)).isoformat(timespec="seconds")
+    threshold = (datetime.now(UTC) - timedelta(seconds=_STALE_SECONDS)).isoformat(timespec="microseconds")
     with db.connect() as conn:
         initialize(conn)
         conn.execute(
             """UPDATE tracker_refresh_jobs SET status = 'queued', started_at = NULL,
-                   heartbeat_at = NULL, updated_at = ?
+                   heartbeat_at = NULL, available_at = NULL, updated_at = ?
                WHERE status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < ?)""",
             (_now(), threshold),
         )
@@ -107,12 +131,22 @@ def _recover_stale() -> None:
 def _claim() -> dict[str, Any] | None:
     with db.connect() as conn:
         initialize(conn)
-        row = conn.execute("SELECT * FROM tracker_refresh_jobs WHERE status = 'queued' ORDER BY requested_at LIMIT 1").fetchone()
+        if getattr(conn, "is_postgres", False):
+            lock = conn.execute("SELECT pg_try_advisory_xact_lock(?) AS locked", (_CLAIM_LOCK_KEY,)).fetchone()
+            if not lock or not lock["locked"]:
+                return None
+        else:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM tracker_refresh_jobs WHERE status = 'queued' "
+            "AND (available_at IS NULL OR available_at <= ?) ORDER BY requested_at LIMIT 1", (_now(),)
+        ).fetchone()
         if not row:
             return None
         now = _now()
         changed = conn.execute(
-            """UPDATE tracker_refresh_jobs SET status = 'running', started_at = ?, heartbeat_at = ?, updated_at = ?
+            """UPDATE tracker_refresh_jobs SET status = 'running', started_at = ?, heartbeat_at = ?, updated_at = ?, attempts = attempts + 1
                WHERE job_id = ? AND status = 'queued'""",
             (now, now, now, row["job_id"]),
         ).rowcount
@@ -122,31 +156,66 @@ def _claim() -> dict[str, Any] | None:
     return _item(row)
 
 
+def _safe_error(exc: Exception) -> str:
+    return re.sub(r"(?i)(token|api_key|authorization)=[^&\s]+", r"\1=REDACTED", str(exc))[:1000]
+
+
 def _run(task: dict[str, Any]) -> None:
     job_id = task["job_id"]
     stop = threading.Event()
     def heartbeat() -> None:
         while not stop.wait(15):
-            with db.connect() as conn:
-                conn.execute("UPDATE tracker_refresh_jobs SET heartbeat_at = ?, updated_at = ? WHERE job_id = ? AND status = 'running'", (_now(), _now(), job_id))
+            try:
+                with db.connect() as conn:
+                    conn.execute("UPDATE tracker_refresh_jobs SET heartbeat_at = ?, updated_at = ? WHERE job_id = ? AND status = 'running'", (_now(), _now(), job_id))
+            except Exception:
+                logger.exception("Could not update Tracker refresh heartbeat")
     thread = threading.Thread(target=heartbeat, daemon=True, name=f"tracker-refresh-{job_id[:8]}")
     thread.start()
     try:
-        result_box: dict[str, Any] = {}
-        def work() -> None:
-            from .apify_sync import snapshot_all_accounts, snapshot_one_account
-            result_box["value"] = snapshot_all_accounts(force=True) if task["kind"] == "all" else snapshot_one_account(task["handle"], force=True)
-        complete = ingestion_jobs.run(f"tracker-refresh:{task['job_key']}", datetime.now(UTC).date().isoformat(), work)
+        def progress(fields: dict[str, Any]) -> None:
+            with db.connect() as conn:
+                conn.execute("UPDATE tracker_refresh_jobs SET result_json = ?, updated_at = ? WHERE job_id = ? AND status = 'running'",
+                             (json.dumps({"progress": fields}), _now(), job_id))
+
+        def work() -> dict[str, Any]:
+            from .apify_sync import ProfileSnapshotError, snapshot_all_accounts, snapshot_one_account
+            if task["kind"] == "all":
+                return snapshot_all_accounts(force=True, on_progress=progress)
+            progress({"total": 1, "completed": 0, "succeeded": 0, "failed": 0, "handle": task["handle"]})
+            try:
+                return snapshot_one_account(task["handle"], force=True)
+            except ProfileSnapshotError as exc:
+                return {"error": _safe_error(exc)}
+        # Retain the completed result: a crash after persisting snapshots but
+        # before marking this queue row done must not erase success on replay.
+        result = ingestion_jobs.call(f"tracker-refresh:{task['job_key']}", work, slot=task["requested_at"])
+        if result.get("error"):
+            with db.connect() as conn:
+                conn.execute("UPDATE tracker_refresh_jobs SET status = 'error', error = ?, finished_at = ?, updated_at = ? WHERE job_id = ?",
+                             (result["error"], _now(), _now(), job_id))
+            return
+        if task["kind"] == "all":
+            succeeded, failed = len(result.get("snapshotted", [])), len(result.get("failed", {}))
+        else:
+            succeeded, failed = 1, 0
+        result["progress"] = {"total": succeeded + failed, "completed": succeeded + failed, "succeeded": succeeded, "failed": failed}
         now = _now()
         with db.connect() as conn:
-            if complete:
-                conn.execute("UPDATE tracker_refresh_jobs SET status = 'done', result_json = ?, error = NULL, finished_at = ?, updated_at = ? WHERE job_id = ?", (json.dumps(result_box.get("value") or {}, default=str), now, now, job_id))
-            else:
-                conn.execute("UPDATE tracker_refresh_jobs SET status = 'error', error = 'Refresh interrupted; retry tomorrow or inspect ingestion job.', finished_at = ?, updated_at = ? WHERE job_id = ?", (now, now, job_id))
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Tracker refresh %s failed", job_id)
+            conn.execute("UPDATE tracker_refresh_jobs SET status = 'done', result_json = ?, error = NULL, finished_at = ?, updated_at = ? WHERE job_id = ?", (json.dumps(result, default=str), now, now, job_id))
+    except ingestion_jobs.IngestionPending as exc:
+        # Resume the journal's paid run automatically after its retry lease.
+        # A transient provider/DB error must not require another user click.
+        retry = int(task.get("attempts") or 1) < _MAX_ATTEMPTS
+        now = _now()
+        available = (datetime.now(UTC) + timedelta(seconds=ingestion_jobs.RETRY_SECONDS + 1)).isoformat(timespec="microseconds")
         with db.connect() as conn:
-            conn.execute("UPDATE tracker_refresh_jobs SET status = 'error', error = ?, finished_at = ?, updated_at = ? WHERE job_id = ?", (str(exc)[:1000], _now(), _now(), job_id))
+            conn.execute("UPDATE tracker_refresh_jobs SET status = ?, error = ?, available_at = ?, finished_at = ?, updated_at = ? WHERE job_id = ?",
+                         ("queued" if retry else "error", _safe_error(exc), available if retry else None, None if retry else now, now, job_id))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Tracker refresh %s failed: %s", job_id, _safe_error(exc))
+        with db.connect() as conn:
+            conn.execute("UPDATE tracker_refresh_jobs SET status = 'error', error = ?, finished_at = ?, updated_at = ? WHERE job_id = ?", (_safe_error(exc), _now(), _now(), job_id))
     finally:
         stop.set()
         thread.join(timeout=1)
