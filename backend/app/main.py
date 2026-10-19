@@ -2307,6 +2307,27 @@ async def dashboard_news_review(request: Request) -> dict[str, Any]:
         raise _jev_error(exc) from exc
 
 
+@app.post("/api/dashboard/news/status")
+async def dashboard_news_status(request: Request) -> dict[str, Any]:
+    if not getattr(request.state, "can_access_news", False):
+        raise HTTPException(status_code=403, detail="News is not available to this account.")
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeError) as exc:
+        raise HTTPException(status_code=400, detail="A JSON News status payload is required.") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="A JSON News status payload is required.")
+    story_id, status = payload.get("id"), payload.get("status")
+    if not isinstance(story_id, str) or not story_id.strip() or len(story_id) > 4096:
+        raise HTTPException(status_code=400, detail="A story id is required.")
+    if status not in ("pending", "done", "rejected"):
+        raise HTTPException(status_code=400, detail="Status must be pending, done, or rejected.")
+    from .news_store import set_status
+    if not await run_in_threadpool(set_status, story_id, status, _caller_email(request)):
+        raise HTTPException(status_code=404, detail="Story not found.")
+    return {"ok": True, "id": story_id, "status": status}
+
+
 @app.post("/api/dashboard/jev/news-review")
 async def dashboard_jev_news_review(request: Request) -> dict[str, Any]:
     """Restricted Jev review for authorized News, Reddit, and X users."""

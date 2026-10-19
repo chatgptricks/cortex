@@ -32,6 +32,10 @@ def ensure(conn):
         saved INTEGER NOT NULL DEFAULT 0, brief TEXT NOT NULL DEFAULT '',
         reviewed_at TEXT, error TEXT, updated_at TEXT NOT NULL)''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_news_stories_updated ON news_stories(updated_at DESC)')
+    conn.execute('''CREATE TABLE IF NOT EXISTS news_story_statuses (
+        story_id TEXT PRIMARY KEY REFERENCES news_stories(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'done', 'rejected')),
+        updated_at TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '')''')
 
 
 def canonical(url):
@@ -86,14 +90,24 @@ def list_stories():
     with connect() as conn:
         ensure(conn)
         rows = conn.execute('SELECT id,item_json,review_json,saved,brief,error FROM news_stories ORDER BY updated_at DESC LIMIT 1500').fetchall()
-    items, reviews, saved = [], {}, {}
-    for row in rows:
-        item = json.loads(row['item_json']); items.append(item)
+        # Decisions and reopened stories remain available even after they leave
+        # the bounded current feed. A feed refresh never resets them.
+        status_rows = conn.execute('''SELECT n.id,n.item_json,n.review_json,n.saved,n.brief,
+            s.status,s.updated_at,s.updated_by
+            FROM news_story_statuses s JOIN news_stories n ON n.id=s.story_id''').fetchall()
+    items = [json.loads(row['item_json']) for row in rows]
+    reviews, saved = {}, {}
+    # Retained cards need the same review and saved-brief state as feed cards.
+    for row in [*rows, *status_rows]:
+        item = json.loads(row['item_json'])
         if row['review_json']:
             review = json.loads(row['review_json'])
             if review.get('reviewVersion') == VERSION: reviews[row['id']] = review
         if row['saved']: saved[row['id']] = {'item': item, 'brief': row['brief']}
-    return {'items': items, 'reviews': reviews, 'saved': saved,
+    statuses = {row['id']: {'status': row['status'], 'item': json.loads(row['item_json']),
+                                'updatedAt': row['updated_at'], 'updatedBy': row['updated_by']}
+                for row in status_rows}
+    return {'items': items, 'reviews': reviews, 'saved': saved, 'statuses': statuses,
             'pending': sum(1 for item in items if item['id'] not in reviews)}
 
 
@@ -106,6 +120,23 @@ def save(story_id, saved, brief=None):
             conn.execute('UPDATE news_stories SET saved=? WHERE id=?', (int(saved), story_id))
         else:
             conn.execute('UPDATE news_stories SET saved=?,brief=? WHERE id=?', (int(saved), brief[:30000], story_id))
+    return True
+
+
+def set_status(story_id, status, actor_email=''):
+    """Set a shared editorial decision independently of saving or Jev review."""
+    if status not in ('pending', 'done', 'rejected'):
+        raise ValueError('Invalid News status.')
+    with connect() as conn:
+        ensure(conn)
+        if not conn.execute('SELECT id FROM news_stories WHERE id=?', (story_id,)).fetchone():
+            return False
+        # Retain an explicit pending row when reopening, so an archived story
+        # remains actionable after it falls outside the current feed window.
+        conn.execute('''INSERT INTO news_story_statuses (story_id,status,updated_at,updated_by)
+            VALUES (?,?,?,?) ON CONFLICT(story_id) DO UPDATE SET status=excluded.status,
+            updated_at=excluded.updated_at,updated_by=excluded.updated_by''',
+            (story_id, status, utc_now(), actor_email))
     return True
 
 
