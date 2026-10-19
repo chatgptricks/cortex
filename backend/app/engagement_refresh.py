@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import sqlite3
 import uuid
 
 from . import db
@@ -49,15 +50,34 @@ def cached(shortcode, max_age_minutes=15):
     return None
 
 
-def attach_freshness(posts):
+def attach_freshness(posts, *, conn=None):
     codes = list({p.get('shortcode') for p in posts if p.get('shortcode')})
     stamps = {}
-    with db.connect() as conn:
-        initialize(conn)
-        for start in range(0, len(codes), 200):
-            batch = codes[start:start + 200]
+    if not codes:
+        for post in posts:
+            post['likesUpdatedAt'] = None
+        return
+    if conn is None:
+        with db.connect() as connection:
+            attach_freshness(posts, conn=connection)
+        return
+    # init_db owns the observation schema. Catalogue reads must not run DDL
+    # or spend one remote round trip for every 200 posts.
+    if getattr(conn, 'is_postgres', False):
+        rows = conn.execute('SELECT shortcode, observed_at FROM engagement_observations WHERE shortcode = ANY(?)', [codes]).fetchall()
+        stamps.update({r['shortcode']: r['observed_at'] for r in rows})
+    else:
+        for start in range(0, len(codes), 400):
+            batch = codes[start:start + 400]
             placeholders = ','.join('?' for _ in batch)
-            rows = conn.execute(f'SELECT shortcode, observed_at FROM engagement_observations WHERE shortcode IN ({placeholders})', batch).fetchall()
+            try:
+                rows = conn.execute(f'SELECT shortcode, observed_at FROM engagement_observations WHERE shortcode IN ({placeholders})', batch).fetchall()
+            except sqlite3.OperationalError as error:
+                # A pre-migration local catalogue still opens with unknown
+                # freshness; its read path need not create budget tables.
+                if str(error) != 'no such table: engagement_observations':
+                    raise
+                break
             stamps.update({r['shortcode']: r['observed_at'] for r in rows})
     for post in posts:
         post['likesUpdatedAt'] = stamps.get(post.get('shortcode'))

@@ -1627,10 +1627,10 @@ def _dashboard_catalogue_page(
             })
 
     from .research_collaboration import attach_collaboration
+    from .engagement_refresh import attach_freshness
     with connect() as conn:
         attach_collaboration(conn, posts, canonical_handle=canonical["handle"])
-    from .engagement_refresh import attach_freshness
-    attach_freshness(posts)
+        attach_freshness(posts, conn=conn)
     _annotate_dashboard_queue(posts, decoration["queue_by_source"], decoration["queue_by_final"])
     stack_by_post = decoration["stack_by_post"]
     stack_sizes = decoration["stack_sizes"]
@@ -1878,8 +1878,10 @@ def _dashboard_posts_payload() -> dict[str, Any]:
         )
 
     from .research_collaboration import attach_collaboration
+    from .engagement_refresh import attach_freshness
     with connect() as conn:
         attach_collaboration(conn, posts, canonical_handle=canonical["handle"])
+        attach_freshness(posts, conn=conn)
     posts = _dedupe_projected_posts(posts)
     posts.sort(key=lambda p: p.get("postDate") or "", reverse=True)
     # Source-post workflow state is useful while a coordinator researches;
@@ -1914,8 +1916,6 @@ def _dashboard_posts_payload() -> dict[str, Any]:
     # Posts with an unknown like count are null now, so they're excluded from
     # both the total and the average -- averaging them in as 0 would drag the
     # figure down with data we simply don't have.
-    from .engagement_refresh import attach_freshness
-    attach_freshness(posts)
     known_likes = [post["likes"] for post in posts if post["likes"] is not None]
     total_likes = sum(known_likes)
     return {

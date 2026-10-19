@@ -8,6 +8,14 @@ from .public_collaboration import public_collaboration, stored_collaboration
 
 
 _BATCH_SIZE = 400
+_POSTGRES_BATCH_SIZE = 12_000
+
+
+def _selection(conn: Any, column: str, values: list[str]) -> tuple[str, list[Any]]:
+    """Use one bounded array parameter on Postgres, SQLite's small IN list locally."""
+    if getattr(conn, "is_postgres", False):
+        return f"{column} = ANY(?)", [values]
+    return f"{column} IN ({','.join('?' for _ in values)})", list(values)
 
 
 def _columns(conn: Any, table: str) -> set[str]:
@@ -51,6 +59,7 @@ def _metadata_rows(conn: Any, table: str, columns: set[str], where: str,
     query = f"SELECT {', '.join(selected)}, {raw} AS raw_json FROM {table}{payload_join} WHERE {where}"
     # Stored payloads are serialized JSON. A malformed legacy value must
     # remain unknown, not break the entire page or leave Postgres aborted.
+    split_bad_json = False
     if guarded:
         conn.execute("SAVEPOINT research_collaboration_json")
     try:
@@ -61,12 +70,20 @@ def _metadata_rows(conn: Any, table: str, columns: set[str], where: str,
         conn.execute("ROLLBACK TO SAVEPOINT research_collaboration_json")
         if getattr(error, "sqlstate", None) != "22P02":
             raise
-        # Only this at-most-400-shortcode batch uses full payloads in the
-        # exceptional malformed-JSON path; normal pages transfer tiny facts.
-        rows = conn.execute(f"SELECT {', '.join(selected)}, raw_json FROM {table} WHERE {where}", params).fetchall()
+        # Keep the legacy malformed-JSON fallback at 400 codes: one bad row
+        # must not make an entire 12k page transfer full media payloads.
+        split_bad_json = bool(params and isinstance(params[0], list) and len(params[0]) > _BATCH_SIZE)
+        if not split_bad_json:
+            rows = conn.execute(f"SELECT {', '.join(selected)}, raw_json FROM {table} WHERE {where}", params).fetchall()
     finally:
         if guarded:
             conn.execute("RELEASE SAVEPOINT research_collaboration_json")
+    if split_bad_json:
+        rows = []
+        for start in range(0, len(params[0]), _BATCH_SIZE):
+            rows.extend(_metadata_rows(conn, table, columns, where,
+                                       [params[0][start:start + _BATCH_SIZE], *params[1:]]))
+        return rows
     return [dict(row) | {"_table": table} for row in rows]
 
 
@@ -91,29 +108,34 @@ def collaboration_by_post(conn: Any, posts: list[dict[str, Any]], *, canonical_h
     observations: dict[str, dict[str, Any]] = {}
     columns = {table: _columns(conn, table) for table in ("posts", "dashboard_posts", "engagement_observations")}
     codes = sorted({code for _, code in keys})
-    for start in range(0, len(codes), _BATCH_SIZE):
-        batch = codes[start:start + _BATCH_SIZE]
-        placeholders = ",".join("?" for _ in batch)
+    # The production database is remote. A 12k catalogue page used to run
+    # hundreds of sequential queries/savepoints with SQLite-sized batches.
+    # Arrays keep each source to one lookup per page without expanding SQL
+    # parameters, while SQLite retains its portable parameter bound.
+    batch_size = _POSTGRES_BATCH_SIZE if getattr(conn, "is_postgres", False) else _BATCH_SIZE
+    for start in range(0, len(codes), batch_size):
+        batch = codes[start:start + batch_size]
+        code_where, code_params = _selection(conn, "shortcode", batch)
         canonical_codes = [code for code in batch if (canonical, code) in keys]
         if canonical_codes and "shortcode" in columns["posts"]:
-            canonical_marks = ",".join("?" for _ in canonical_codes)
-            for row in _metadata_rows(conn, "posts", columns["posts"], f"shortcode IN ({canonical_marks})", canonical_codes):
+            canonical_where, canonical_params = _selection(conn, "shortcode", canonical_codes)
+            for row in _metadata_rows(conn, "posts", columns["posts"], canonical_where, canonical_params):
                 grouped[(canonical, str(row["shortcode"]).strip())].append(row)
         batch_codes = set(batch)
         accounts = sorted({variant for account, code in keys if code in batch_codes
                            for variant in account_variants.get(account, {account})})
         if {"account", "shortcode"} <= columns["dashboard_posts"]:
-            for account_start in range(0, len(accounts), _BATCH_SIZE):
-                account_batch = accounts[account_start:account_start + _BATCH_SIZE]
-                account_marks = ",".join("?" for _ in account_batch)
+            for account_start in range(0, len(accounts), batch_size):
+                account_batch = accounts[account_start:account_start + batch_size]
+                account_where, account_params = _selection(conn, "account", account_batch)
                 for row in _metadata_rows(conn, "dashboard_posts", columns["dashboard_posts"],
-                                          f"shortcode IN ({placeholders}) AND account IN ({account_marks})", [*batch, *account_batch]):
+                                          f"{code_where} AND {account_where}", [*code_params, *account_params]):
                     key = (str(row["account"]).strip().lower(), str(row["shortcode"]).strip())
                     if key in grouped:
                         grouped[key].append(row)
         if {"shortcode", "observed_at", "raw_json"} <= columns["engagement_observations"]:
             for row in _metadata_rows(conn, "engagement_observations", columns["engagement_observations"],
-                                      f"shortcode IN ({placeholders})", batch):
+                                      code_where, code_params):
                 observations[str(row["shortcode"]).strip()] = row
     result = {}
     for key, records in grouped.items():

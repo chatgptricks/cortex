@@ -176,6 +176,80 @@ def test_metadata_projection_never_mutates_rows_or_schema_and_batches_large_page
         assert all(" WHERE " in statement for statement in statements if statement.lstrip().upper().startswith("SELECT"))
 
 
+def test_postgres_large_page_uses_one_array_lookup_per_source(monkeypatch):
+    class Connection:
+        is_postgres = True
+
+    conn = Connection()
+    monkeypatch.setattr(collab, "_columns", lambda conn, table: {
+        "shortcode", "account", "coauthors", "observed_at", "raw_json"
+    })
+    lookups = []
+
+    def metadata(connection, table, columns, where, params):
+        lookups.append((table, where, params))
+        assert _sql(where).count("%s") == len(params)
+        if table == "posts":
+            return [{"shortcode": "Code0", "coauthors": "openai"}]
+        if table == "dashboard_posts":
+            return [{"account": "OpenAI", "shortcode": "Code1", "coauthors": "chatgptricks"},
+                    {"account": "foreign", "shortcode": "Code1", "coauthors": "CANARY"}]
+        return []
+
+    monkeypatch.setattr(collab, "_metadata_rows", metadata)
+    posts = [{"account": "OpenAI", "shortcode": f"Code{index}"} for index in range(12_000)]
+    posts.append({"account": "chatgptricks", "shortcode": "Code0"})
+    collab.attach_collaboration(conn, posts)
+    assert len(lookups) == 3
+    assert lookups[0] == ("posts", "shortcode = ANY(?)", [["Code0"]])
+    assert lookups[1][1] == "shortcode = ANY(?) AND account = ANY(?)"
+    assert len(lookups[1][2][0]) == 12_000
+    assert lookups[1][2][1] == ["OpenAI", "chatgptricks", "openai"]
+    assert posts[1]["collaborators"] == ["chatgptricks"]
+    assert posts[-1]["collaborators"] == ["openai"]
+    assert posts[2]["isCollab"] is None
+    assert "CANARY" not in json.dumps(posts)
+
+
+def test_freshness_uses_existing_connection_without_schema_writes(catalogue, monkeypatch):
+    with catalogue() as conn:
+        conn.execute("INSERT INTO engagement_observations VALUES ('Code0', '2026-10-19T00:00:00Z', '{}')")
+        statements = []
+        conn.set_trace_callback(statements.append)
+        monkeypatch.setattr(engagement_refresh, "initialize", lambda _: pytest.fail("read attempted schema initialization"))
+        posts = [{"shortcode": f"Code{index}"} for index in range(805)] + [{}]
+        engagement_refresh.attach_freshness(posts, conn=conn)
+        assert posts[0]["likesUpdatedAt"] == "2026-10-19T00:00:00Z"
+        assert all(post["likesUpdatedAt"] is None for post in posts[1:])
+        assert len(statements) == 3
+        assert all(statement.startswith("SELECT ") for statement in statements)
+
+
+def test_postgres_freshness_uses_one_array_for_large_page():
+    class Connection:
+        is_postgres = True
+
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, query, params):
+            self.statements.append((query, params))
+            assert _sql(query).count("%s") == len(params)
+            return self
+
+        def fetchall(self):
+            return [{"shortcode": "Code0", "observed_at": "2026-10-19T00:00:00Z"}]
+
+    conn = Connection()
+    posts = [{"shortcode": f"Code{index}"} for index in range(12_000)]
+    engagement_refresh.attach_freshness(posts, conn=conn)
+    assert len(conn.statements) == 1
+    assert "shortcode = ANY(?)" in conn.statements[0][0]
+    assert len(conn.statements[0][1][0]) == 12_000
+    assert posts[0]["likesUpdatedAt"] == "2026-10-19T00:00:00Z"
+    assert all(post["likesUpdatedAt"] is None for post in posts[1:])
+
+
 def test_metrics_metadata_only_updates_are_account_relative_and_keep_cursor_shape(catalogue):
     add(catalogue)
     add(catalogue, table="dashboard_posts", account="openai")
@@ -220,6 +294,40 @@ def test_postgres_projection_preserves_parameter_count_and_recovers_bad_json():
     assert rows[0]["raw_json"] == "malformed"
     assert conn.statements[-1] == "RELEASE SAVEPOINT research_collaboration_json"
     assert any(query.startswith("ROLLBACK TO") for query in conn.statements)
+
+
+def test_postgres_large_page_limits_malformed_payload_fallback_to_small_batch():
+    class BadJson(ValueError):
+        sqlstate = "22P02"
+
+    class Connection:
+        is_postgres = True
+
+        def __init__(self):
+            self.statements = []
+            self.rows = []
+
+        def execute(self, query, params=None):
+            self.statements.append((query, params))
+            if params:
+                codes = params[0]
+                if "jsonb_build_object" in query and "Code450" in codes:
+                    raise BadJson("malformed legacy payload")
+                self.rows = [{"shortcode": code, "raw_json": "malformed" if code == "Code450" else "{}"} for code in codes]
+            return self
+
+        def fetchall(self):
+            return self.rows
+
+    conn = Connection()
+    codes = [f"Code{index}" for index in range(805)]
+    rows = collab._metadata_rows(conn, "posts", {"shortcode", "raw_json"}, "shortcode = ANY(?)", [codes])
+    assert len(rows) == len(codes)
+    fallbacks = [(query, params) for query, params in conn.statements
+                 if query.startswith("SELECT ") and "jsonb_build_object" not in query]
+    assert len(fallbacks) == 1
+    assert len(fallbacks[0][1][0]) == 400
+    assert any(row["shortcode"] == "Code450" and row["raw_json"] == "malformed" for row in rows)
 
 
 def test_metrics_use_registered_canonical_handle(catalogue):
