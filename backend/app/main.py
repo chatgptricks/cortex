@@ -8981,12 +8981,12 @@ def temp_runs(request: Request, limit: int = 15) -> dict[str, Any]:
     _require_paid_refresh_access(request)
     import httpx
 
-    from .apify_sync import APIFY_ACTOR_ID, APIFY_REEL_ACTOR_ID
+    from .apify_sync import APIFY_ACTOR_ID, APIFY_PROFILE_ACTOR_ID, APIFY_REEL_ACTOR_ID
 
     token = os.getenv("APIFY_TOKEN", "").strip()
     with httpx.Client(timeout=30.0) as client:
         items: list[dict[str, Any]] = []
-        for actor_id in (APIFY_ACTOR_ID, APIFY_REEL_ACTOR_ID):
+        for actor_id in (APIFY_ACTOR_ID, APIFY_PROFILE_ACTOR_ID, APIFY_REEL_ACTOR_ID):
             r = client.get(
                 f"https://api.apify.com/v2/acts/{actor_id}/runs",
                 params={"token": token, "limit": limit, "desc": "true"},
