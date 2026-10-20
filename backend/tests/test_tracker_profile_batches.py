@@ -35,7 +35,7 @@ def test_all_accounts_share_one_profile_run_and_retry_only_unusable_rows(databas
     monkeypatch.setattr(apify_sync, 'list_accounts', lambda **kw: [{'handle': h} for h in ['b', 'a', 'c']])
     calls = []
     def actor(payload, **kw):
-        calls.append(payload['directUrls'])
+        calls.append((kw['actor_id'], payload))
         assert kw['accept_partial'] is True
         assert kw['run_limits']['timeout'] == 180
         assert kw['max_wait_seconds'] == 210.0
@@ -55,12 +55,39 @@ def test_all_accounts_share_one_profile_run_and_retry_only_unusable_rows(databas
     result = apify_sync.snapshot_all_accounts(force=True, on_progress=updates.append)
     assert result == {'snapshotted': ['a', 'b', 'c'], 'failed': {}}
     assert calls == [
-        ['https://www.instagram.com/a/', 'https://www.instagram.com/b/', 'https://www.instagram.com/c/'],
-        ['https://www.instagram.com/c/'],
+        (apify_sync.APIFY_PROFILE_ACTOR_ID, {'usernames': ['a', 'b', 'c']}),
+        (apify_sync.APIFY_ACTOR_ID, {'directUrls': ['https://www.instagram.com/c/'], 'resultsType': 'details'}),
     ]
     assert db.get_account_snapshot_for_day('a')['followers_count'] == 1234567
     assert db.get_account_snapshot_for_day('c')['followers_count'] == 1200123
     assert any(update['completed'] == 2 for update in updates)
+
+
+def test_unresolved_profile_returns_to_dedicated_actor_on_last_attempt(database, monkeypatch):
+    calls = []
+    def actor(payload, **kw):
+        calls.append(kw['actor_id'])
+        if len(calls) < 3:
+            return [{'inputUrl': 'https://www.instagram.com/openai/', 'error': 'no_items',
+                     'errorDescription': 'Empty or private data'}]
+        assert payload == {'usernames': ['openai']}
+        return [{'username': 'openai', 'followersCount': 123456}]
+    monkeypatch.setattr(apify_sync, '_run_apify_actor_and_fetch', actor)
+    assert apify_sync.snapshot_one_account('openai', force=True)['followers_count'] == 123456
+    assert calls == [apify_sync.APIFY_PROFILE_ACTOR_ID, apify_sync.APIFY_ACTOR_ID, apify_sync.APIFY_PROFILE_ACTOR_ID]
+
+
+def test_error_input_url_preserves_provider_reason_without_trusting_identity(database, monkeypatch):
+    db.insert_account_snapshot('openai', 123456, 1, 'OpenAI', False, False)
+    monkeypatch.setattr(apify_sync, '_run_apify_actor_and_fetch', lambda *a, **kw: [
+        {'inputUrl': 'https://www.instagram.com/openai/?token=secret', 'followersCount': 888888,
+         'error': 'no_items', 'errorDescription': 'Empty or private data token=secret'},
+        {'inputUrl': 'https://www.instagram.com/openai/', 'username': 'wrong', 'followersCount': 999999},
+    ])
+    with pytest.raises(apify_sync.ProfileSnapshotError, match='Empty or private data token=REDACTED') as caught:
+        apify_sync.snapshot_one_account('openai', force=True)
+    assert 'secret' not in str(caught.value)
+    assert db.get_account_snapshot_for_day('openai')['followers_count'] == 123456
 
 
 @pytest.mark.parametrize('count', [None, -1, True, 100.0, '1.2M', '1,200', ''])
@@ -80,7 +107,7 @@ def test_recovery_reuses_frozen_paid_batch_and_provider_observation_day(database
     fail = [True]
     def actor(payload, **kw):
         journal = ingestion_jobs.current()
-        saved = journal.next_run(apify_sync.APIFY_ACTOR_ID, payload)
+        saved = journal.next_run(kw['actor_id'], payload)
         if 'run' not in saved:
             saved['run'] = {'id': 'paid-run'}
             starts.append(payload)
@@ -114,6 +141,39 @@ def test_older_recovered_reading_cannot_replace_newer_same_day_even_within_secon
     row = db.get_account_snapshot_for_day('a')
     assert row['followers_count'] == 200
     assert row['captured_at'] == '2026-10-17T12:00:00.900000+00:00'
+
+
+def test_new_profile_actor_resumes_already_paid_generic_batch_without_starting_another(database, monkeypatch):
+    import json
+    import httpx
+    old_payload = {'directUrls': ['https://www.instagram.com/a/'], 'resultsType': 'details'}
+    state = {
+        'tracker_snapshot_legacy_steps': [], 'tracker_snapshot_handles': ['a'],
+        'tracker_snapshot_pending': ['a'], 'tracker_snapshot_batch:0': ['a'],
+        'run:0': {'actor': apify_sync.APIFY_ACTOR_ID, 'payload': old_payload,
+                  'run': {'id': 'paid-generic', 'status': 'RUNNING', 'defaultDatasetId': 'paid-data'}},
+    }
+    with database() as conn:
+        ingestion_jobs.initialize(conn)
+        conn.execute("INSERT INTO ingestion_jobs VALUES ('generic-recovery', 'request', 'retry', 'old', 0, ?, NULL, 'old')", (json.dumps(state),))
+    requests = []
+    def respond(request):
+        requests.append(request)
+        if request.url.path == '/v2/actor-runs/paid-generic':
+            return httpx.Response(200, json={'data': {
+                'id': 'paid-generic', 'status': 'SUCCEEDED', 'defaultDatasetId': 'paid-data',
+                'finishedAt': '2026-10-17T12:02:00Z',
+            }})
+        assert request.url.path == '/v2/datasets/paid-data/items'
+        return httpx.Response(200, json=[{'username': 'a', 'followersCount': 101}])
+    original_client = httpx.Client
+    monkeypatch.setattr(httpx, 'Client', lambda **kw: original_client(transport=httpx.MockTransport(respond)))
+    monkeypatch.setenv('APIFY_TOKEN', 'fake-token')
+    monkeypatch.setattr(apify_sync, 'list_accounts', lambda **kw: [{'handle': 'a'}])
+    result = ingestion_jobs.call('generic-recovery', lambda: apify_sync.snapshot_all_accounts(force=True), slot='request')
+    assert result == {'snapshotted': ['a'], 'failed': {}}
+    assert len(requests) == 2 and all(request.method == 'GET' for request in requests)
+    assert db.get_account_snapshot_for_day('a')['followers_count'] == 101
 
 
 def test_scheduler_snapshot_uses_a_durable_job(database, monkeypatch):
@@ -169,7 +229,7 @@ def test_legacy_single_profile_journal_recovers_paid_rows_before_new_batch(datab
     fail = [True]
     def actor(payload, **kw):
         journal = ingestion_jobs.current()
-        saved = journal.next_run(apify_sync.APIFY_ACTOR_ID, payload)
+        saved = journal.next_run(kw['actor_id'], payload)
         if saved.get('items') is not None:
             return saved['items']
         if saved.get('run', {}).get('id') == 'paid-b':
@@ -177,7 +237,8 @@ def test_legacy_single_profile_journal_recovers_paid_rows_before_new_batch(datab
         else:
             # Legacy run positions must never consume the new roster batch.
             assert journal.index == 4
-            assert payload['directUrls'] == ['https://www.instagram.com/c/', 'https://www.instagram.com/d/']
+            assert kw['actor_id'] == apify_sync.APIFY_PROFILE_ACTOR_ID
+            assert payload == {'usernames': ['c', 'd']}
             if 'run' not in saved:
                 starts.append(payload)
                 saved['run'] = {'id': 'paid-new-batch'}

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 APIFY_ACTOR_ID = "apify~instagram-scraper"
+APIFY_PROFILE_ACTOR_ID = "apify~instagram-profile-scraper"
 APIFY_REEL_ACTOR_ID = "apify~instagram-reel-scraper"
 VALID_SCRAPE_MODES = ("posts", "reels", "both")
 
@@ -2921,10 +2922,17 @@ def _collect_account_snapshots(
         if not pending:
             break
         run_index = journal.index if journal else None
-        # A single actor can resolve profiles together; starting 75 separate
-        # actors serially was the dominant delay in an overview refresh.
+        # The dedicated profile actor resolves public accounts that the general
+        # scraper can return as no_items. Retry unresolved profiles through the
+        # alternate actor, then the dedicated actor once more. Existing paid
+        # steps retain their original actor and input in the durable journal.
+        actor_id = APIFY_PROFILE_ACTOR_ID if attempt != 1 else APIFY_ACTOR_ID
+        payload = ({"usernames": pending} if actor_id == APIFY_PROFILE_ACTOR_ID else {
+            "directUrls": [f"https://www.instagram.com/{handle}/" for handle in pending],
+            "resultsType": "details",
+        })
         items = _run_apify_actor_and_fetch(
-            {"directUrls": [f"https://www.instagram.com/{handle}/" for handle in pending], "resultsType": "details"},
+            payload,
             # Apify's actor timeout includes a shutdown period. Wait through
             # it so a usable partial dataset does not incur a queue retry.
             max_wait_seconds=210.0,
@@ -2932,6 +2940,7 @@ def _collect_account_snapshots(
             # Multi-profile actors need CPU for their autoscaled requests;
             # 4096 MB allocates one CPU core versus the default quarter-core.
             run_limits={"timeout": 180, **({"memory": 4096} if len(pending) > 1 else {})},
+            actor_id=actor_id,
             accept_partial=True,
             on_progress=lambda fields: progress(phase=fields.get("phase", "waiting_apify"), attempt=attempt + 1),
         )
@@ -2940,8 +2949,20 @@ def _collect_account_snapshots(
         finished_at = journal.state.get(f"run:{run_index}", {}).get("finished_at") if journal else None
         observed_at = freeze(f"tracker_snapshot_observed:{attempt}", finished_at or utc_now())
         matched: dict[str, dict[str, Any]] = {}
+        profile_errors: dict[str, str] = {}
         for item in items:
             username = str(item.get("username") or "").strip().lstrip("@").lower()
+            if item.get("error"):
+                # Error rows often have only inputUrl. Use that URL solely to
+                # attribute the provider error, never to accept a follower count
+                # without the profile's matching username.
+                match = re.fullmatch(
+                    r"https?://(?:www\.)?instagram\.com/([\w.]+)/?(?:[?#].*)?",
+                    str(item.get("inputUrl") or item.get("url") or ""), re.IGNORECASE,
+                )
+                error_handle = username if username in pending else match.group(1).lower() if match else None
+                if error_handle in pending:
+                    profile_errors[error_handle] = str(item.get("errorDescription") or item["error"])
             if username in pending:
                 try:
                     _profile_preview(item, username)
@@ -2954,11 +2975,11 @@ def _collect_account_snapshots(
         for handle in pending:
             try:
                 if handle not in matched:
-                    raise ApifySyncError(f"Instagram did not return a matching profile for @{handle}.")
+                    raise ApifySyncError(profile_errors.get(handle) or f"Instagram did not return a matching profile for @{handle}.")
                 readings[handle] = _store_profile_snapshot(handle, matched[handle], observed_at)
                 failed.pop(handle, None)
             except Exception as exc:  # one invalid account cannot discard the others
-                failed[handle] = re.sub(r"token=[^&\s]+", "token=REDACTED", str(exc))[:500]
+                failed[handle] = re.sub(r"(?i)(token|api_key|authorization)=[^&\s]+", r"\1=REDACTED", str(exc))[:500]
                 retry.append(handle)
             progress(phase="saving", handle=handle, attempt=attempt + 1)
         pending = retry

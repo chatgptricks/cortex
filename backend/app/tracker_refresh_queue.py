@@ -128,7 +128,9 @@ def _recover_stale() -> None:
         )
 
 
-def _claim() -> dict[str, Any] | None:
+def _claim(kind: str | None = None) -> dict[str, Any] | None:
+    if kind not in {None, "account", "all"}:
+        raise ValueError("Unknown Tracker refresh kind")
     with db.connect() as conn:
         initialize(conn)
         if getattr(conn, "is_postgres", False):
@@ -138,9 +140,17 @@ def _claim() -> dict[str, Any] | None:
         else:
             conn.commit()
             conn.execute("BEGIN IMMEDIATE")
+        # Each lane has one running job across worker processes. An overview
+        # batch can take minutes; it must not hold up an explicit account reload.
+        # Check and claim under the same DB lock, including during rolling deploys.
+        kind_filter = "AND job.kind = ? " if kind else ""
         row = conn.execute(
-            "SELECT * FROM tracker_refresh_jobs WHERE status = 'queued' "
-            "AND (available_at IS NULL OR available_at <= ?) ORDER BY requested_at LIMIT 1", (_now(),)
+            "SELECT job.* FROM tracker_refresh_jobs AS job WHERE job.status = 'queued' "
+            "AND (job.available_at IS NULL OR job.available_at <= ?) "
+            + kind_filter +
+            "AND NOT EXISTS (SELECT 1 FROM tracker_refresh_jobs AS active "
+            "WHERE active.status = 'running' AND active.kind = job.kind) "
+            "ORDER BY job.requested_at LIMIT 1", (_now(), kind) if kind else (_now(),)
         ).fetchone()
         if not row:
             return None
@@ -231,11 +241,11 @@ def _run(task: dict[str, Any]) -> None:
         thread.join(timeout=1)
 
 
-def _loop() -> None:
+def _loop(kind: str) -> None:
     while True:
         try:
             _recover_stale()
-            task = _claim()
+            task = _claim(kind)
             if task:
                 _run(task)
                 continue
@@ -251,4 +261,5 @@ def start_worker() -> None:
         if _STARTED:
             return
         _STARTED = True
-        threading.Thread(target=_loop, daemon=True, name="tracker-refresh-worker").start()
+        for kind in ("account", "all"):
+            threading.Thread(target=_loop, args=(kind,), daemon=True, name=f"tracker-refresh-{kind}-worker").start()

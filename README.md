@@ -71,7 +71,10 @@ checks require an authenticated Admin or Dev and use private, noncached response
   `/api/tracker/refresh-jobs/{job_id}` until it finishes and inspect per-account
   failures before reporting success. Concurrent requests share active work;
   a later refresh starts a new Instagram reading without a time-based cooldown.
-  Full refreshes batch profiles and retry missing readings. Only matching
+  Individual refreshes have their own worker lane, so a full refresh cannot
+  hold up a selected account. Profiles use Apify's dedicated profile scraper,
+  with the general scraper as a fallback for missing readings. Full refreshes
+  batch profiles and retry only missing readings. Only matching
   profiles with exact integer follower counts replace stored data. Snapshot
   dates use Costa Rica time, and recovered older observations cannot overwrite
   a newer reading for the same day.

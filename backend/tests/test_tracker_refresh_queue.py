@@ -60,6 +60,30 @@ def test_claim_is_atomic_across_workers(database):
     assert len([task for task in claimed if task]) == 1
 
 
+def test_running_batch_and_account_have_independent_serial_lanes(database):
+    batch = enqueue(None)
+    first, second = enqueue('openai'), enqueue('chatgptricks')
+    assert queue._claim('all')['job_id'] == batch['job_id']
+    assert queue._claim('account')['job_id'] == first['job_id']
+    assert queue._claim('account') is None
+    assert queue._claim('all') is None
+    # Even an unscoped claimant in another process must respect each lane.
+    assert queue._claim() is None
+    with database() as conn:
+        conn.execute("UPDATE tracker_refresh_jobs SET status='done' WHERE job_id=?", (first['job_id'],))
+    assert queue._claim('account')['job_id'] == second['job_id']
+    assert queue.get(batch['job_id'])['status'] == 'running'
+
+
+def test_concurrent_workers_cannot_run_two_jobs_in_one_lane(database):
+    enqueue('openai')
+    enqueue('chatgptricks')
+    enqueue('anthropic')
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        claimed = list(pool.map(lambda _: queue._claim('account'), range(4)))
+    assert len([task for task in claimed if task]) == 1
+
+
 def test_completed_ingestion_result_survives_queue_redelivery(database, monkeypatch):
     queued = enqueue()
     task = queue._claim()
