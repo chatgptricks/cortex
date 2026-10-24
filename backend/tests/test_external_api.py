@@ -96,6 +96,7 @@ def setup(tmp_path, monkeypatch):
     app.middleware("http")(main._require_firebase_user)
     app.include_router(api.management_router)
     app.include_router(api.router)
+    app.include_router(api.profile_router)
     app.include_router(external_research.router)
     app.include_router(external_workspace.router)
 
@@ -625,3 +626,27 @@ def test_post_by_shortcode_finds_the_account_within_the_key_scope(setup):
     for shortcode in ("Other", "Hidden", "Future", "Missing", "bad!code"):
         assert client.get(f"/api/v1/posts/{shortcode}", headers=headers(key)).status_code in (403, 404)
     assert client.post("/api/v1/posts/PublicA", headers=headers(key)).status_code == 403
+
+
+def test_deck_profile_action_looks_up_external_accounts_without_registration(setup, monkeypatch):
+    client, connect = setup
+    key = create(client)["key"]
+    looked_up = []
+
+    def preview(handle):
+        looked_up.append(handle)
+        return {"handle": handle, "followers_count": 12345, "profile_pic_url": "https://scontent.cdninstagram.com/profile.jpg"}
+
+    monkeypatch.setattr(main, "admin_preview_account", preview)
+    path = api.PROFILE_PREVIEW_PATH
+    assert client.post(path, json={"handle": "outside_account"}).status_code == 401
+    result = client.post(path, headers=headers(key), json={"handle": "outside_account"})
+    assert result.status_code == 200
+    assert result.json()["followers_count"] == 12345
+    assert looked_up == ["outside_account"]
+    with connect() as conn:
+        assert conn.execute("SELECT handle FROM accounts WHERE handle = ?", ("outside_account",)).fetchone() is None
+    assert client.get("/api/v1/accounts/outside_account", headers=headers(key)).status_code == 404
+    assert client.get("/api/admin/accounts/preview?handle=outside_account", headers=headers(key)).status_code == 403
+    research_key = create(client, data_scopes=["research"])["key"]
+    assert client.post(path, headers=headers(research_key), json={"handle": "outside_account"}).status_code == 403

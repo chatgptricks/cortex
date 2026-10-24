@@ -46,6 +46,9 @@ management_router = APIRouter(prefix=MANAGEMENT_URL, tags=["website-api-keys"], 
     Depends(_no_store), Depends(HTTPBearer(auto_error=False, scheme_name="FirebaseSession", description="Signed-in Dashboard Firebase ID token"))])
 router = APIRouter(prefix="/api/v1", tags=["website-api-v1"], dependencies=[
     Depends(_no_store), Depends(HTTPBearer(auto_error=False, scheme_name="WebsiteAPIKey", description="Account-scoped website API key, beginning sad_api_"))])
+PROFILE_PREVIEW_PATH = "/api/decks/profile-preview"
+profile_router = APIRouter(tags=["deck-profiles"], dependencies=[
+    Depends(_no_store), Depends(HTTPBearer(auto_error=False, scheme_name="WebsiteAPIKey"))])
 
 
 def ensure_schema(conn: Any) -> None:
@@ -287,6 +290,8 @@ def _versioned_routes():
 
 
 def _route_scopes(path: str) -> tuple[str, ...]:
+    if path == PROFILE_PREVIEW_PATH:
+        return ("accounts",)
     part = path.removeprefix("/api/v1").strip("/").split("/")[0]
     if part in {"capabilities", "openapi.json"}:
         return ()
@@ -302,7 +307,10 @@ def _route_scopes(path: str) -> tuple[str, ...]:
 def authenticate(key: str, path: str, method: str) -> dict[str, Any]:
     if not re.fullmatch(r"sad_api_[A-Za-z0-9_-]{43}", key):
         raise HTTPException(401, "Invalid or expired website API key.")
-    if method != "GET" or not any(route.path_regex.fullmatch(path.rstrip("/")) for route in _versioned_routes()):
+    # Public profile lookup is an explicit, bounded action for the deck editor.
+    # Ordinary versioned reads remain GET-only and never contact a provider.
+    profile_action = path == PROFILE_PREVIEW_PATH and method == "POST"
+    if not profile_action and (method != "GET" or not any(route.path_regex.fullmatch(path.rstrip("/")) for route in _versioned_routes())):
         raise HTTPException(403, "Website API keys can only read the versioned website API.")
     now = datetime.now(UTC)
     timestamp = now.isoformat(timespec="seconds")
@@ -508,6 +516,24 @@ def accounts(request: Request) -> dict[str, Any]:
     with db.connect() as conn:
         data = _public_accounts(conn, identity["account_handles"])
     return {"schema_version": VERSION, "data": data}
+
+
+class ProfilePreviewRequest(BaseModel):
+    handle: str = Field(min_length=1, max_length=30)
+
+
+@profile_router.post(PROFILE_PREVIEW_PATH, summary="Look up one public Instagram profile for a deck")
+def deck_profile_preview(request: Request, payload: ProfilePreviewRequest) -> dict[str, Any]:
+    """No account registration or internal data access. The existing preview
+    reader caches profiles for ten minutes and limits provider calls globally.
+    Stored-account reads keep their original account and area restrictions.
+    """
+    _identity(request)
+    handle = payload.handle.strip().lstrip("@").lower()
+    if not _HANDLE.fullmatch(handle):
+        raise HTTPException(400, "Use an Instagram handle.")
+    from .main import admin_preview_account
+    return admin_preview_account(handle)
 
 
 @router.get("/accounts/{handle}")

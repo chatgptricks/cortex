@@ -126,10 +126,11 @@ app.include_router(agent_connections_router)
 from .mcp_oauth import router as mcp_oauth_router
 from .mcp_oauth import authenticate_access_token, enforce_delegated_route
 app.include_router(mcp_oauth_router)
-from .external_api import router as website_api_router, management_router as website_api_management_router
+from .external_api import router as website_api_router, management_router as website_api_management_router, profile_router as deck_profile_router
 from .external_api import authenticate as authenticate_website_api_key, MANAGEMENT_URL as WEBSITE_API_MANAGEMENT_URL
 app.include_router(website_api_router)
 app.include_router(website_api_management_router)
+app.include_router(deck_profile_router)
 from .external_research import router as website_research_router
 from .external_workspace import router as website_workspace_router
 app.include_router(website_research_router)
