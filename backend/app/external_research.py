@@ -418,6 +418,52 @@ def top_posts(request: Request, account: str | None = None, sort: _SORT = "likes
                        start=start, end=end, sort=sort)
 
 
+def music_page(handles: list[str], *, limit: int = 20, offset: int = 0, sort: _SORT = "likes",
+               start: date | None = None, end: date | None = None) -> dict[str, Any]:
+    """Page the scalar catalogue first, then hydrate only selected music facts."""
+    from .insights_music import music_metadata_for_posts
+
+    result = _posts_page(handles, limit=limit, offset=offset, start=start, end=end, sort=sort, public_only=True)
+    with db.connect() as conn:
+        registry = _registry(conn, handles)
+        music = music_metadata_for_posts(conn, result["data"], registry)
+    values = []
+    allowed = set(handles)
+    for post in result["data"]:
+        metadata = music.get((post["account"], post["shortcode"]), {})
+        audio_id = metadata.get("ai")
+        values.append({
+            "account": post["account"],
+            "accounts": sorted({post["account"]} | (set(post.get("collaborators", [])) & allowed)),
+            **{field: post.get(field) for field in ("shortcode", "published_at", "permalink", "format", "likes", "comments", "views", "metrics_updated_at")},
+            "song": metadata.get("ms"), "artist": metadata.get("ma"), "audio_id": audio_id,
+            "is_original_audio": metadata.get("oa"),
+            "audio_url": f"https://www.instagram.com/reels/audio/{audio_id}/" if audio_id else None,
+        })
+    result["data"] = values
+    known = sum(bool(p["song"] or p["artist"] or p["audio_id"] or p["is_original_audio"] is True) for p in values)
+    result["coverage"] = {"scope": "returned_page", "posts": len(values), "with_music_metadata": known,
+                          "unknown_music": len(values) - known, "with_audio_id": sum(bool(p["audio_id"]) for p in values)}
+    result["ordering"] = {"sort": sort, "basis": "stored_post_index", "direction": "descending",
+                          "note": "Pagination uses stored post fields. Returned metrics may include newer retained observations; collect pages and re-sort returned values for exact current ranking."}
+    return result
+
+
+@router.get("/insights/music", summary="Read a bounded page of post music and engagement from stored data")
+def music(request: Request, account: str | None = None, sort: _SORT = "likes", limit: _LIMIT = 20,
+          offset: _OFFSET = 0, start: _START = None, end: _END = None) -> dict[str, Any]:
+    """Insights scope. Account restrictions precede pagination; no scraping.
+
+    Song, artist, exact audio ID and original-audio status remain null when
+    unknown. Follow pagination.next_offset; collaborative posts are account
+    rows, so deduplicate shortcode when aggregating across accounts.
+    Sort uses the stored post index before hydration; returned metrics can be
+    newer, so re-sort collected rows for an exact current engagement ranking.
+    """
+    return music_page(_handles(_scope(request, "insights"), account), limit=limit, offset=offset,
+                      start=start, end=end, sort=sort)
+
+
 @router.get("/research/posts/{account}/{shortcode}")
 def detail(request: Request, account: str, shortcode: str) -> dict[str, Any]:
     identity = _scope(request, "research")

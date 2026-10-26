@@ -431,14 +431,30 @@ def api_contract(request: Request) -> dict[str, Any]:
         "designers": {"$ref": "#/components/schemas/ReadPagination"},
         "assigned_posts": {"$ref": "#/components/schemas/ReadPagination"}},
         "description": "Independent designer and assigned-post pages; follow each page's next_offset with its own offset parameter."}
+    schemas["ReadMusicPost"] = {"type": "object", "required": ["account", "shortcode", "song", "artist", "audio_id", "is_original_audio", "likes"], "properties": {
+        **{name: nullable_text for name in ("account", "shortcode", "published_at", "permalink", "format", "metrics_updated_at", "song", "artist", "audio_id", "audio_url")},
+        "accounts": {"type": "array", "items": {"type": "string"}, "description": "Represented accounts restricted to the request's authorized account selection."},
+        "is_original_audio": {"type": ["boolean", "null"]},
+        **{name: nullable_number for name in ("likes", "comments", "views")}},
+        "description": "Retained music and engagement for one account/post row. Exact audio IDs are strings; missing and placeholder IDs are null. Original-audio names remain unchanged. Deduplicate shortcode for cross-account totals."}
     schemas["ReadEnvelope"] = {"type": "object", "required": ["schema_version", "data"], "properties": {
         "schema_version": {"type": "string"}, "generated_at": {"type": "string", "format": "date-time"},
         "data": {"oneOf": [{"type": "object"}, {"type": "array", "items": {"type": "object"}}]},
         "pagination": {"oneOf": [{"$ref": "#/components/schemas/ReadPagination"}, {"$ref": "#/components/schemas/QueueReportPagination"}]}},
         "description": "Common stored-data envelope. Domain fields are defined in the bilingual guide; optional metadata differs by endpoint."}
     for name, data_schema in (("PostPage", {"type": "array", "items": {"$ref": "#/components/schemas/ReadPost"}}),
+                              ("MusicPostPage", {"type": "array", "items": {"$ref": "#/components/schemas/ReadMusicPost"}}),
                               ("PostResult", {"$ref": "#/components/schemas/ReadPost"})):
         schemas[name] = {"allOf": [{"$ref": "#/components/schemas/ReadEnvelope"}, {"type": "object", "properties": {"data": data_schema}}]}
+    schemas["MusicPostPage"]["allOf"][1]["properties"].update({
+        "coverage": {"type": "object", "properties": {
+            "scope": {"type": "string", "const": "returned_page"},
+            **{field: {"type": "integer", "minimum": 0} for field in ("posts", "with_music_metadata", "unknown_music", "with_audio_id")}}},
+        "ordering": {"type": "object", "properties": {
+            "sort": {"type": "string"}, "basis": {"type": "string", "const": "stored_post_index"},
+            "direction": {"type": "string", "const": "descending"}, "note": {"type": "string"}},
+            "description": "Pagination ranks stored post fields before bounded hydration. Returned metrics may be newer; collect pages and re-sort for an exact current ranking."},
+    })
     for path, operations in spec.get("paths", {}).items():
         for operation in operations.values():
             if isinstance(operation, dict):
@@ -452,6 +468,8 @@ def api_contract(request: Request) -> dict[str, Any]:
                         operation["responses"]["307"] = {"description": "Redirect to the stored asset; never forward the API credential to another origin."}
                 elif path not in {"/api/v1/capabilities", "/api/v1/openapi.json"}:
                     schema = "PostPage" if path.endswith("/posts") or path == "/api/v1/hot" else "ReadEnvelope"
+                    if path == "/api/v1/insights/music":
+                        schema = "MusicPostPage"
                     if path in {"/api/v1/posts/{shortcode}", "/api/v1/accounts/{handle}/posts/{shortcode}"}:
                         schema = "PostResult"
                     operation["responses"]["200"] = {"description": "Stored data within the key's account and area grants", "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{schema}"}}}}

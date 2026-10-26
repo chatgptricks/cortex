@@ -229,6 +229,65 @@ def _music(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _resolve_music(facts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Resolve newest coherent audio facts without merging different sounds."""
+    music: dict[str, Any] = {"ms": None, "ma": None, "ai": None, "oa": None}
+    anchored = False
+    for fact in facts:
+        candidate = _music(fact)
+        if not any(candidate[key] for key in ("ms", "ma", "ai")) and candidate["oa"] is not True:
+            continue
+        if not anchored:
+            music, anchored = candidate, True
+            continue
+        if not music["ai"] or music["ai"] != candidate["ai"]:
+            continue
+        for key, value in candidate.items():
+            if music[key] is None and value is not None:
+                music[key] = value
+    if not anchored:
+        music["oa"] = next((_music(r)["oa"] for r in facts if _music(r)["oa"] is not None), None)
+    return music
+
+
+def music_metadata_for_posts(conn: Any, posts: list[dict[str, Any]], registry: dict[str, dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Hydrate music for an already authorized page, never the full catalogue."""
+    keys = {(str(p["account"]).lower(), str(p["shortcode"])) for p in posts}
+    if not keys:
+        return {}
+    codes, handles = sorted({code for _, code in keys}), sorted({handle for handle, _ in keys})
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {key: [] for key in keys}
+    def selection(column: str, values: list[str]) -> tuple[str, list[Any]]:
+        return (f"{column} = ANY(?)", [values]) if getattr(conn, "is_postgres", False) else (f"{column} IN ({','.join('?' for _ in values)})", values)
+    code_where, code_params = selection("shortcode", codes)
+    account_where, account_params = selection("LOWER(account)", handles)
+    for row in _read_source(conn, "dashboard_posts", _columns(conn, "dashboard_posts"), f"{code_where} AND {account_where}", [*code_params, *account_params]):
+        key = (str(row["account"]).lower(), str(row["shortcode"]))
+        if key in grouped:
+            grouped[key].append(row)
+    canonical = next((handle for handle in handles if registry.get(handle, {}).get("is_canonical")), None)
+    if canonical:
+        canonical_codes = sorted(code for handle, code in keys if handle == canonical)
+        where, params = selection("shortcode", canonical_codes)
+        columns = _columns(conn, "posts")
+        if "section" in columns:
+            where += " AND COALESCE(section, '') <> 'ab'"
+        for row in _read_source(conn, "posts", columns, where, params):
+            grouped[(canonical, str(row["shortcode"]))].append(row)
+    observations = {}
+    for row in _read_source(conn, "engagement_observations", _columns(conn, "engagement_observations"), code_where, code_params):
+        if row.get("r_code") and str(row["r_code"]) != str(row["shortcode"]):
+            continue
+        observations[str(row["shortcode"])] = row
+    result = {}
+    for key, rows in grouped.items():
+        rows.sort(key=lambda row: (_date(row.get("updated_at")) or datetime.min.replace(tzinfo=UTC), row["_table"] == "posts", row.get("id") or 0), reverse=True)
+        observation = observations.get(key[1])
+        facts = sorted(rows + ([observation] if observation else []), key=lambda r: _date(r.get("observed_at") or r.get("enriched_at") or r.get("updated_at")) or datetime.min.replace(tzinfo=UTC), reverse=True)
+        result[key] = _resolve_music(facts)
+    return result
+
+
 def build_music_catalogue(conn: Any, accounts: list[dict[str, Any]], *, now: datetime | None = None) -> dict[str, Any]:
     """One physical post per shortcode, preserving every represented account."""
     current = now or datetime.now(UTC)
@@ -291,25 +350,7 @@ def build_music_catalogue(conn: Any, accounts: list[dict[str, Any]], *, now: dat
         base = records[0]
         observation = observations.get(code)
         facts = sorted(records + ([observation] if observation else []), key=timestamp, reverse=True)
-        music: dict[str, Any] = {"ms": None, "ma": None, "ai": None, "oa": None}
-        anchored = False
-        for fact in facts:
-            candidate = _music(fact)
-            if not any(candidate[key] for key in ("ms", "ma", "ai")) and candidate["oa"] is not True:
-                continue  # A false flag alone does not establish an audio.
-            if not anchored:
-                music = candidate
-                anchored = True
-                continue
-            if not music["ai"] or music["ai"] != candidate["ai"]:
-                # A newer title without an ID may describe a replacement
-                # track. Only the same exact ID permits cross-snapshot fills.
-                continue
-            for key, value in candidate.items():
-                if music[key] is None and value is not None:
-                    music[key] = value
-        if not anchored:
-            music["oa"] = next((_music(r)["oa"] for r in facts if _music(r)["oa"] is not None), None)
+        music = _resolve_music(facts)
         raw_type = next((r.get("product_type") or r.get("r_product") for r in facts if r.get("product_type") or r.get("r_product")), None)
         label = str(base.get("post_type_label") or next((r.get("r_type") for r in facts if r.get("r_type")), "Image")).split(" (")[0].strip()
         label = "Carousel" if label.lower() in {"sidecar", "carousel"} else "Video" if label.lower() in {"video", "reel"} or base.get("is_animated") else label

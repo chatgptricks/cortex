@@ -17,7 +17,7 @@ import threading
 import time
 from collections import Counter
 from contextlib import nullcontext
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from statistics import median
@@ -776,6 +776,29 @@ def insights_music() -> dict[str, Any]:
         with connect() as conn:
             return build_music_catalogue(conn, accounts)
     return cached_music_catalogue(accounts, load, database_identity=DATABASE_URL or str(DB_PATH))
+
+
+@app.get("/api/insights/music/page", summary="Read a bounded page of music, exact audio IDs and post engagement")
+def insights_music_page(response: Response, account: str | None = None, sort: Literal["date", "likes", "comments", "views", "hot"] = "likes",
+                        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+                        offset: Annotated[int, Query(ge=0)] = 0,
+                        start: Annotated[date | None, Query(alias="from", description="Inclusive America/Costa_Rica calendar date")] = None,
+                        end: Annotated[date | None, Query(alias="to", description="Inclusive America/Costa_Rica calendar date")] = None) -> dict[str, Any]:
+    """Stored-only Music API for authenticated clients and read-only agents.
+
+    Use account (one handle or comma-separated handles), from/to calendar
+    dates and pagination.next_offset. Returns data with song, artist,
+    audio_id, is_original_audio, likes and public post/audio links. Unknown
+    music remains null; coverage describes only the returned page. Account
+    rows may share a shortcode, so deduplicate it for cross-account totals.
+    Sort uses stored post fields; returned metrics may be newer, so collect
+    pages and re-sort returned values for an exact current ranking.
+    """
+    from .external_research import _handles, music_page
+
+    response.headers["Cache-Control"] = "private, no-store"
+    identity = {"account_handles": [a["handle"] for a in list_accounts(active_only=True, research_only=True)]}
+    return music_page(_handles(identity, account), limit=limit, offset=offset, start=start, end=end, sort=sort)
 
 
 def _insights_timestamp(value: Any) -> datetime | None:
