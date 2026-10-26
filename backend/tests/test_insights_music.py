@@ -1,7 +1,10 @@
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -15,6 +18,12 @@ ACCOUNTS = [
     {"handle": "beta", "group": "competitors", "is_canonical": False, "label": "Beta", "hot_threshold": 900},
 ]
 NOW = datetime(2026, 10, 25, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def isolated_music_cache(monkeypatch):
+    monkeypatch.setattr(music, "_CACHE_ENTRY", None)
+    monkeypatch.setattr(music, "_INFLIGHT", {})
 
 
 @pytest.fixture
@@ -288,3 +297,79 @@ def test_malformed_postgres_json_isolated_without_fetching_full_payloads():
     assert result[0]["r_song"] is None and result[1]["r_song"] == "Song"
     assert "ROLLBACK TO SAVEPOINT insights_music_json" in conn.queries
     assert all("raw_json" not in q.split(" FROM ")[0] for q in conn.queries if q.startswith("SELECT"))
+
+
+def test_cache_ttl_preserves_source_timestamp_and_recomputes_after_expiry(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(music, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    calls = []
+    def load():
+        calls.append(1)
+        return {"posts": [], "coverage": {"generated_at": f"read-{len(calls)}"}}
+    first = music.cached_music_catalogue(ACCOUNTS, load, database_identity="example-db")
+    clock[0] += 299
+    assert music.cached_music_catalogue(ACCOUNTS, load, database_identity="example-db") is first
+    assert first["coverage"]["generated_at"] == "read-1" and len(calls) == 1
+    clock[0] += 1
+    second = music.cached_music_catalogue(ACCOUNTS, load, database_identity="example-db")
+    assert second["coverage"]["generated_at"] == "read-2" and len(calls) == 2
+
+
+def test_cache_invalidates_for_roster_and_database_identity():
+    calls = []
+    def load():
+        calls.append(1)
+        return {"revision": len(calls)}
+    assert music.cached_music_catalogue(ACCOUNTS, load, database_identity="first-db")["revision"] == 1
+    changed = [{**a, "label": "Changed"} for a in ACCOUNTS]
+    assert music.cached_music_catalogue(changed, load, database_identity="first-db")["revision"] == 2
+    assert music.cached_music_catalogue(changed, load, database_identity="second-db")["revision"] == 3
+    assert len(calls) == 3
+    assert "second-db" not in repr(music._CACHE_ENTRY[0])
+
+
+def test_concurrent_cache_reads_share_one_calculation():
+    ready = threading.Barrier(9)
+    started, release = threading.Event(), threading.Event()
+    calls = []
+    def load():
+        calls.append(1)
+        started.set()
+        assert release.wait(3)
+        return {"posts": [], "coverage": {"generated_at": "same-read"}}
+    def read():
+        ready.wait(timeout=3)
+        return music.cached_music_catalogue(ACCOUNTS, load, database_identity="shared-db")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        pending = [pool.submit(read) for _ in range(8)]
+        ready.wait(timeout=3)
+        assert started.wait(3)
+        release.set()
+        results = [future.result(timeout=3) for future in pending]
+    assert len(calls) == 1
+    assert all(result is results[0] for result in results)
+    assert music._INFLIGHT == {}
+
+
+def test_failed_cache_calculation_does_not_poison_next_read():
+    def fail():
+        raise RuntimeError("temporary storage failure")
+    with pytest.raises(RuntimeError, match="temporary storage failure"):
+        music.cached_music_catalogue(ACCOUNTS, fail, database_identity="shared-db")
+    assert music._INFLIGHT == {} and music._CACHE_ENTRY is None
+    result = music.cached_music_catalogue(ACCOUNTS, lambda: {"posts": []}, database_identity="shared-db")
+    assert result == {"posts": []}
+
+
+def test_music_route_cache_rechecks_roster_and_avoids_reopening_catalogue_connection(stored, monkeypatch):
+    connect, _ = stored
+    with connect() as conn:
+        add(conn, "first", music_song="Song")
+    first = main.insights_music()
+    def forbidden_connection():
+        raise AssertionError("A warm music catalogue should not reopen its data connection")
+    monkeypatch.setattr(main, "connect", forbidden_connection)
+    assert main.insights_music() is first
+    monkeypatch.setattr(main, "list_accounts", lambda **kwargs: ACCOUNTS[:1])
+    with pytest.raises(AssertionError, match="warm music catalogue"):
+        main.insights_music()

@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from concurrent.futures import Future
+import hashlib
 import math
-from typing import Any
+import threading
+import time
+from typing import Any, Callable
 
 
 _FIELDS = (
@@ -21,6 +25,50 @@ _RAW = {
     "r_plays": "videoPlayCount", "r_igplays": "igPlayCount", "r_duration": "videoDuration",
 }
 _WINDOW = 12_000
+_CACHE_TTL_SECONDS = 300
+_CACHE_LOCK = threading.Lock()
+_CACHE_ENTRY: tuple[tuple[Any, ...], float, dict[str, Any]] | None = None
+_INFLIGHT: dict[tuple[Any, ...], Future[dict[str, Any]]] = {}
+
+
+def cached_music_catalogue(accounts: list[dict[str, Any]], loader: Callable[[], dict[str, Any]],
+                           *, database_identity: str) -> dict[str, Any]:
+    """Share one retained-data calculation per roster/database for five minutes.
+
+    Authentication and current roster resolution happen before this function.
+    Only the last successful catalogue is retained; failed calculations are
+    shared with current waiters but never cached. Callers must not mutate the
+    returned report. Its generated_at continues to describe the source read.
+    """
+    global _CACHE_ENTRY
+    identity = hashlib.sha256(database_identity.encode()).digest()
+    roster = tuple((a["handle"], a.get("group"), a.get("label"), a.get("hot_threshold"),
+                    bool(a.get("is_canonical"))) for a in accounts)
+    key = (identity, roster)
+    with _CACHE_LOCK:
+        if _CACHE_ENTRY is not None:
+            cached_key, completed_at, payload = _CACHE_ENTRY
+            if cached_key == key and time.monotonic() - completed_at < _CACHE_TTL_SECONDS:
+                return payload
+        future = _INFLIGHT.get(key)
+        owner = future is None
+        if owner:
+            future = Future()
+            _INFLIGHT[key] = future
+    if not owner:
+        return future.result()
+    try:
+        payload = loader()
+    except BaseException as error:
+        with _CACHE_LOCK:
+            _INFLIGHT.pop(key, None)
+            future.set_exception(error)
+        raise
+    with _CACHE_LOCK:
+        _CACHE_ENTRY = (key, time.monotonic(), payload)
+        _INFLIGHT.pop(key, None)
+        future.set_result(payload)
+    return payload
 
 
 def _columns(conn: Any, table: str) -> set[str]:

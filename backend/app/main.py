@@ -768,11 +768,14 @@ def insights_posts() -> dict[str, Any]:
 @app.get("/api/insights/music")
 def insights_music() -> dict[str, Any]:
     """Music analysis over retained metadata, with no scrape or enrichment writes."""
-    from .insights_music import build_music_catalogue
+    from .insights_music import build_music_catalogue, cached_music_catalogue
+    from .config import DATABASE_URL, DB_PATH
 
     accounts = list_accounts(active_only=True, research_only=True)
-    with connect() as conn:
-        return build_music_catalogue(conn, accounts)
+    def load() -> dict[str, Any]:
+        with connect() as conn:
+            return build_music_catalogue(conn, accounts)
+    return cached_music_catalogue(accounts, load, database_identity=DATABASE_URL or str(DB_PATH))
 
 
 def _insights_timestamp(value: Any) -> datetime | None:
