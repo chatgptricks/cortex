@@ -765,6 +765,16 @@ def insights_posts() -> dict[str, Any]:
     ]}
 
 
+@app.get("/api/insights/music")
+def insights_music() -> dict[str, Any]:
+    """Music analysis over retained metadata, with no scrape or enrichment writes."""
+    from .insights_music import build_music_catalogue
+
+    accounts = list_accounts(active_only=True, research_only=True)
+    with connect() as conn:
+        return build_music_catalogue(conn, accounts)
+
+
 def _insights_timestamp(value: Any) -> datetime | None:
     """Return a timezone-aware timestamp without making malformed history fatal."""
     if not value:
