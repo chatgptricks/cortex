@@ -1293,20 +1293,17 @@ def get_dashboard_user_access(email: str) -> dict[str, Any] | None:
         "minutes_per_pp": None,
     }
     with connect() as conn:
-        columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(dashboard_users)").fetchall()
-        }
-        if "email" not in columns:
-            return None
-        selected = [column for column in defaults if column in columns]
+        # Reading the row also tells us which optional fields exist. Avoid a
+        # separate information_schema query on every authenticated request;
+        # permissions themselves are still read fresh, including revocations.
         row = conn.execute(
-            f"SELECT {', '.join(selected)} FROM dashboard_users WHERE email = ?",
+            "SELECT * FROM dashboard_users WHERE email = ?",
             (email.strip().lower(),),
         ).fetchone()
         if not row:
             return None
-        value = {**defaults, **dict(row)}
+        stored = dict(row)
+        value = {key: stored.get(key, default) for key, default in defaults.items()}
         # Existing databases only have the legacy role until init_db's
         # migration has run; honour it during that tiny transition window.
         value["is_admin"] = bool(value["is_admin"] or value["role"] == "admin")
@@ -1569,9 +1566,11 @@ def log_usage_event(email: str, path: str, method: str) -> None:
     it's piggybacking on.
     """
     with connect() as conn:
-        conn.execute(
+        # No inserted ID is needed. The bulk API avoids PostgreSQL's
+        # compatibility LASTVAL/savepoint round trips for this common write.
+        conn.executemany(
             "INSERT INTO usage_log (email, path, method, ts) VALUES (?, ?, ?, ?)",
-            (email.strip().lower(), path, method, utc_now()),
+            [(email.strip().lower(), path, method, utc_now())],
         )
 
 

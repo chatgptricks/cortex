@@ -687,6 +687,21 @@ def _clean_ocr_text(raw: Any) -> str:
     return "" if text in {"-", "~"} else text
 
 
+# Match Python's str.strip() in both SQLite and Postgres. Preview reads must
+# trim before taking a prefix, including legacy OCR with long leading
+# whitespace; otherwise a bounded SQL preview would lose its visible text.
+_SQL_WHITESPACE = "".join(chr(code) for code in range(0x3100) if chr(code).isspace())
+
+
+def _sql_text_prefix(column: str, length: int, *, strip: bool = False) -> str:
+    """Bound transferred text; callers supply fixed internal column names."""
+    value = f"TRIM({column}, '{_SQL_WHITESPACE}')" if strip else column
+    return f"SUBSTR({value}, 1, {length}) AS {column}"
+
+
+_SQL_TRANSCRIPT_PRESENT = f"LENGTH(TRIM(COALESCE(transcript, ''), '{_SQL_WHITESPACE}')) > 0 AS transcript_available"
+
+
 @app.get("/api/insights/posts")
 def insights_posts() -> dict[str, Any]:
     """Compact projection built for analysis rather than browsing.
@@ -703,12 +718,12 @@ def insights_posts() -> dict[str, Any]:
 
     with connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT account, shortcode, published_at, likes, comments,
                    post_type_label, product_type, video_views, video_plays,
                    video_duration, slide_count, hashtags, music_song,
                    music_artist, uses_original_audio, paid_partnership,
-                   is_hot, hot_rate_multiplier, hook_text, permalink
+                   is_hot, hot_rate_multiplier, {_sql_text_prefix('hook_text', 220, strip=True)}, permalink
             FROM dashboard_posts
             WHERE published_at IS NOT NULL AND published_at != ''
             """
@@ -971,9 +986,9 @@ def insights_follower_growth() -> dict[str, Any]:
     accounts = list_accounts(active_only=True)
     with connect() as conn:
         post_rows = conn.execute(
-            """
+            f"""
             SELECT account, shortcode, published_at, likes, video_views,
-                   post_type_label, permalink, hook_text
+                   post_type_label, permalink, {_sql_text_prefix('hook_text', 120, strip=True)}
             FROM dashboard_posts
             WHERE published_at IS NOT NULL AND published_at != ''
             """
@@ -1527,8 +1542,9 @@ def _dashboard_catalogue_page(
     with connect() as conn:
         if source == "canonical" and after_id is None:
             rows = conn.execute(
-                """
-                SELECT id, title, caption, hook_text, published_at, likes, comments,
+                f"""
+                SELECT id, {_sql_text_prefix('title', 481)}, {_sql_text_prefix('caption', 481)},
+                       {_sql_text_prefix('hook_text', 361, strip=True)}, published_at, likes, comments,
                        post_type_label, shortcode, image_path, is_animated,
                        source_row_number, created_at, section, is_hot, hot_rate_multiplier,
                        is_promo, hidden, is_deleted, updated_at
@@ -1541,11 +1557,11 @@ def _dashboard_catalogue_page(
             ).fetchall()
         elif source == "dashboard" and after_id is None:
             rows = conn.execute(
-                """
-                SELECT id, account, shortcode, published_at, likes, comments, caption,
+                f"""
+                SELECT id, account, shortcode, published_at, likes, comments, {_sql_text_prefix('caption', 481)},
                        post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
-                       hook_text, music_song, music_artist, music_audio_id, uses_original_audio,
-                       is_promo, hidden, is_deleted, transcript
+                       {_sql_text_prefix('hook_text', 361, strip=True)}, music_song, music_artist, music_audio_id, uses_original_audio,
+                       is_promo, hidden, is_deleted, {_SQL_TRANSCRIPT_PRESENT}
                 FROM dashboard_posts
                 ORDER BY account,
                          CASE WHEN published_at IS NULL THEN 1 ELSE 0 END,
@@ -1556,8 +1572,9 @@ def _dashboard_catalogue_page(
             ).fetchall()
         elif source == "canonical":
             rows = conn.execute(
-                """
-                SELECT id, title, caption, hook_text, published_at, likes, comments,
+                f"""
+                SELECT id, {_sql_text_prefix('title', 481)}, {_sql_text_prefix('caption', 481)},
+                       {_sql_text_prefix('hook_text', 361, strip=True)}, published_at, likes, comments,
                        post_type_label, shortcode, image_path, is_animated,
                        source_row_number, created_at, section, is_hot, hot_rate_multiplier,
                        is_promo, hidden, is_deleted, updated_at
@@ -1570,11 +1587,11 @@ def _dashboard_catalogue_page(
             ).fetchall()
         elif source == "dashboard":
             rows = conn.execute(
-                """
-                SELECT id, account, shortcode, published_at, likes, comments, caption,
+                f"""
+                SELECT id, account, shortcode, published_at, likes, comments, {_sql_text_prefix('caption', 481)},
                        post_type_label, is_animated, permalink, is_hot, hot_rate_multiplier,
-                       hook_text, music_song, music_artist, music_audio_id, uses_original_audio,
-                       is_promo, hidden, is_deleted, transcript
+                       {_sql_text_prefix('hook_text', 361, strip=True)}, music_song, music_artist, music_audio_id, uses_original_audio,
+                       is_promo, hidden, is_deleted, {_SQL_TRANSCRIPT_PRESENT}
                 FROM dashboard_posts
                 WHERE id > ? AND id <= ?
                 ORDER BY id ASC
@@ -1606,7 +1623,7 @@ def _dashboard_catalogue_page(
                 "permalink": f"https://www.instagram.com/p/{shortcode}/" if shortcode else "",
                 "caption": caption,
                 "captionTruncated": caption_truncated,
-                "excerpt": post.get("title") or "",
+                "excerpt": _dashboard_catalogue_text_preview(post.get("title"))[0],
                 "section": post.get("section") or "",
                 "ocrText": ocr_text,
                 "coverUrl": f"/api/dashboard/covers/{handle}/{post['id']}",
@@ -1660,7 +1677,7 @@ def _dashboard_catalogue_page(
                     f"https://www.instagram.com/reels/audio/{post['music_audio_id']}/"
                     if post.get("music_audio_id") else None
                 ),
-                "transcriptAvailable": bool(str(post.get("transcript") or "").strip()),
+                "transcriptAvailable": bool(post.get("transcript_available")),
             })
 
     from .research_collaboration import attach_collaboration

@@ -81,6 +81,78 @@ def observe(connect, raw, code="Sample", at="2026-10-09T00:00:00Z"):
         conn.execute("INSERT OR REPLACE INTO engagement_observations VALUES (?, ?, ?)", (code, at, json.dumps(raw)))
 
 
+@pytest.mark.parametrize("source", ["canonical", "dashboard"])
+@pytest.mark.parametrize("cursor", [False, True])
+def test_page_bounds_large_text_without_losing_preview_or_transcript(catalogue, monkeypatch, source, cursor):
+    table = "posts" if source == "canonical" else "dashboard_posts"
+    row_id = add(catalogue, table=table)
+    caption = "😀" * 480 + " complete caption " * 5000
+    ocr = main._SQL_WHITESPACE * 100 + "Visible OCR " * 5000 + main._SQL_WHITESPACE
+    with catalogue() as conn:
+        conn.execute(f"UPDATE {table} SET caption = ?, hook_text = ? WHERE id = ?", (caption, ocr, row_id))
+        if source == "canonical":
+            conn.execute("UPDATE posts SET title = ? WHERE id = ?", ("Full title " * 5000, row_id))
+        else:
+            conn.execute("UPDATE dashboard_posts SET transcript = ? WHERE id = ?", ("Transcript " * 50000, row_id))
+
+    fetched = []
+
+    class Cursor:
+        def __init__(self, raw):
+            self.raw = raw
+
+        def fetchall(self):
+            rows = self.raw.fetchall()
+            fetched.extend(dict(row) for row in rows)
+            return rows
+
+    class Connection:
+        def __init__(self, raw):
+            self.raw = raw
+
+        def execute(self, sql, params=()):
+            return Cursor(self.raw.execute(sql, params))
+
+    @contextmanager
+    def bounded_connect():
+        with catalogue() as conn:
+            yield Connection(conn)
+
+    monkeypatch.setattr(main, "connect", bounded_connect)
+    monkeypatch.setattr(collab, "attach_collaboration", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engagement_refresh, "attach_freshness", lambda *args, **kwargs: None)
+    options = {"after_id": 0, "until_id": row_id} if cursor else {}
+    post = main._dashboard_catalogue_page(source, 0, 10, "test", **options)[0]
+    assert post["caption"] == "😀" * 480 + "…"
+    assert post["captionTruncated"] is True
+    assert post["ocrText"] == main._dashboard_catalogue_text_preview(main._clean_ocr_text(ocr), 360)[0]
+    # Validate the database-to-API boundary, not merely the final JSON size.
+    assert len(fetched[0]["caption"]) == 481
+    assert len(fetched[0]["hook_text"]) == 361
+    if source == "canonical":
+        assert len(fetched[0]["title"]) == 481
+        assert len(post["excerpt"]) <= 481
+    else:
+        assert "transcript" not in fetched[0]
+        assert fetched[0]["transcript_available"] == 1
+        assert post["transcriptAvailable"] is True
+
+    # Stored detail text remains intact.
+    with catalogue() as conn:
+        assert conn.execute(f"SELECT caption FROM {table}").fetchone()["caption"] == caption
+
+
+@pytest.mark.parametrize("value", [None, "", main._SQL_WHITESPACE * 100, "-", "~", "Visible"])
+def test_sql_text_preview_preserves_whitespace_sentinels_and_transcript_presence(value):
+    with sqlite3.connect(":memory:") as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE sample (hook_text TEXT, transcript TEXT)")
+        conn.execute("INSERT INTO sample VALUES (?, ?)", (value, value))
+        row = conn.execute(f"SELECT {main._sql_text_prefix('hook_text', 220, strip=True)}, {main._SQL_TRANSCRIPT_PRESENT} FROM sample").fetchone()
+    assert main._clean_ocr_text(row["hook_text"]) == main._clean_ocr_text(value)[:220]
+    assert bool(row["transcript_available"]) == bool(str(value or "").strip())
+
+
 @pytest.mark.parametrize(("raw", "coauthors", "status", "partners"), [
     ({"coauthorProducers": [{"username": "@OpenAI", "id": "CANARY"}, "openai"]}, None, True, ["openai"]),
     ({"coauthorProducers": []}, "openai", False, []),

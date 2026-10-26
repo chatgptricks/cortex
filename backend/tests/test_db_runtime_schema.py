@@ -199,6 +199,60 @@ def test_victor_receives_promos_without_admin_access(monkeypatch, tmp_path) -> N
     assert access["is_admin"] is False
 
 
+def test_access_uses_one_fresh_read_and_immediately_observes_revocation(monkeypatch) -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        "CREATE TABLE dashboard_users (email TEXT PRIMARY KEY, role TEXT, private_profile_field TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO dashboard_users VALUES ('person@example.com', 'admin', 'not-access-data')"
+    )
+
+    @contextmanager
+    def connect():
+        yield connection
+
+    monkeypatch.setattr(db, "connect", connect)
+    queries = []
+    connection.set_trace_callback(queries.append)
+    access = db.get_dashboard_user_access(" PERSON@example.com ")
+    assert access["is_admin"] is True
+    assert "private_profile_field" not in access
+    assert len(queries) == 1
+    assert queries[0].startswith("SELECT * FROM dashboard_users WHERE email = ")
+
+    connection.execute("UPDATE dashboard_users SET role = 'viewer'")
+    assert db.get_dashboard_user_access("person@example.com")["is_admin"] is False
+    connection.execute("DELETE FROM dashboard_users")
+    assert db.get_dashboard_user_access("person@example.com") is None
+    connection.close()
+
+
+def test_usage_logging_preserves_rows_without_requesting_inserted_id(monkeypatch) -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE usage_log (id INTEGER PRIMARY KEY, email TEXT, path TEXT, method TEXT, ts TEXT)")
+
+    class UsageConnection:
+        def executemany(self, sql, rows):
+            return connection.executemany(sql, rows)
+
+        def execute(self, *args):
+            raise AssertionError("Usage logging must not request PostgreSQL's unused inserted ID")
+
+    @contextmanager
+    def connect():
+        yield UsageConnection()
+
+    monkeypatch.setattr(db, "connect", connect)
+    monkeypatch.setattr(db, "utc_now", lambda: "2026-10-26T12:00:00+00:00")
+    db.log_usage_event(" PERSON@example.com ", "/api/dashboard/me", "GET")
+    assert connection.execute("SELECT email, path, method, ts FROM usage_log").fetchall() == [
+        ("person@example.com", "/api/dashboard/me", "GET", "2026-10-26T12:00:00+00:00")
+    ]
+    connection.close()
+
+
 def test_runtime_migration_adds_soft_delete_to_both_post_tables():
     connection = sqlite3.connect(':memory:')
     connection.row_factory = sqlite3.Row
