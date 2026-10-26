@@ -159,6 +159,28 @@ def test_new_title_without_id_cannot_inherit_an_older_exact_audio(stored):
     assert post["ai"] is None and post["oa"] is False
 
 
+@pytest.mark.parametrize("placeholder", [0, "0", " 0 ", "000", "0.0", "-1", -5, None])
+def test_zero_audio_ids_are_unknown_not_a_shared_sound(stored, placeholder):
+    connect, _ = stored
+    with connect() as conn:
+        add(conn, "placeholder", music_audio_id=placeholder,
+            raw={"musicInfo": {"audio_id": placeholder, "uses_original_audio": False}})
+        report = music.build_music_catalogue(conn, ACCOUNTS, now=NOW)
+    assert report["posts"][0]["ai"] is None
+    assert report["coverage"]["audio_id_posts"] == 0
+    assert report["coverage"]["unknown_audio_posts"] == 1
+
+
+@pytest.mark.parametrize("placeholder", ["0", "000", "-1", "null"])
+def test_zero_promoted_audio_id_can_recover_real_id_from_stored_payload(stored, placeholder):
+    connect, _ = stored
+    with connect() as conn:
+        add(conn, "recover", music_song="Song", music_artist="Artist", music_audio_id=placeholder,
+            uses_original_audio=0, product_type="clips", raw={"musicInfo": {"audio_id": "12345"}})
+        post = music.build_music_catalogue(conn, ACCOUNTS, now=NOW)["posts"][0]
+    assert post["ai"] == "12345"
+
+
 def test_read_is_batched_read_only_and_never_transfers_media_payload(stored):
     connect, statements = stored
     with connect() as conn:
@@ -172,6 +194,39 @@ def test_read_is_batched_read_only_and_never_transfers_media_payload(stored):
     queries = [q for q in statements if q.lstrip().upper().startswith("SELECT")]
     assert len(queries) <= 6
     assert not any(q.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER")) for q in statements)
+
+
+def test_scope_filters_precede_large_json_projection(stored):
+    connect, statements = stored
+    with connect() as conn:
+        add(conn, "visible", raw={"musicInfo": {"song_name": "Song"}})
+        add(conn, "excluded", account="outside", raw={"musicInfo": {"song_name": "Secret"}})
+        add(conn, "ab", table="posts", section="ab")
+        statements.clear()
+        result = music.build_music_catalogue(conn, ACCOUNTS, now=NOW)
+    assert [p["sc"] for p in result["posts"]] == ["visible"]
+    source_queries = [q for q in statements if q.startswith("SELECT") and "music_rows" in q]
+    assert any("FROM dashboard_posts WHERE LOWER(account) IN (" in q for q in source_queries)
+    assert any("FROM posts WHERE COALESCE(section, '') <> 'ab'" in q for q in source_queries)
+
+
+def test_dashboard_parse_skip_keeps_all_recoverable_music_and_metric_fields(stored, monkeypatch):
+    connect, _ = stored
+    with connect() as conn:
+        add(conn, "plain", raw={"displayUrl": "HEAVY" * 1000, "childPosts": []}, product_type="feed")
+        add(conn, "raw-metrics", raw={"productType": "clips", "videoViewCount": 300,
+                                      "videoPlayCount": 400, "videoDuration": 1.5})
+        add(conn, "escaped")
+        conn.execute("UPDATE dashboard_posts SET raw_json = ? WHERE shortcode = 'escaped'", ('{"\\u006dusicInfo":{"song_name":"Recovered"}}',))
+        rows = {r["shortcode"]: r for r in music._read_source(conn, "dashboard_posts", music._columns(conn, "dashboard_posts"))}
+        optimized = music.build_music_catalogue(conn, ACCOUNTS, now=NOW)
+        monkeypatch.setattr(music, "_dashboard_raw_needed", lambda *args: "1 = 1")
+        assert music.build_music_catalogue(conn, ACCOUNTS, now=NOW) == optimized
+        report = {p["sc"]: p for p in optimized["posts"]}
+    assert rows["plain"]["r_song"] is None and rows["plain"]["r_product"] is None
+    assert report["raw-metrics"]["pt"] == "clips" and report["raw-metrics"]["v"] == 300
+    assert report["raw-metrics"]["pl"] == 400 and report["raw-metrics"]["dur"] == 1.5
+    assert report["escaped"]["ms"] == "Recovered"
 
 
 def test_route_requires_auth_and_does_not_change_overview_route(stored, monkeypatch):

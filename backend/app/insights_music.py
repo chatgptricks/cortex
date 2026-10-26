@@ -39,6 +39,14 @@ def _text(value: Any) -> str | None:
     return str(value).strip() or None if isinstance(value, (str, int)) and not isinstance(value, bool) else None
 
 
+def _audio_id(value: Any) -> str | None:
+    """Provider zero placeholders do not identify a shared Instagram sound."""
+    value = _text(value)
+    if not value or not value.strip("0") or value.startswith("-") or value.lower() in {"0.0", "null", "none", "undefined", "nan"}:
+        return None
+    return value
+
+
 def _bool(value: Any) -> bool | None:
     if value is True or value == 1 or isinstance(value, str) and value.lower() in {"true", "1"}:
         return True
@@ -75,6 +83,29 @@ def _projection(conn: Any, has_raw: bool) -> str:
     return ", ".join(fields)
 
 
+def _dashboard_raw_needed(conn: Any, columns: set[str]) -> str:
+    """A cheap negative check before parsing our serialized provider payload.
+
+    Missing literal keys prove there is nothing to recover. Escaped Unicode
+    keys conservatively keep the normal parser path. False positives (a key
+    mentioned in caption text or nested media) only cost a parse, never data.
+    """
+    def contains(value: str) -> str:
+        literal = "'" + value.replace("'", "''") + "'"
+        return f"POSITION({literal} IN raw_json) > 0" if getattr(conn, "is_postgres", False) else f"instr(raw_json, {literal}) > 0"
+
+    needed = [contains('"musicInfo"'), contains('\\u')]
+    fallbacks = {
+        "post_type_label": ("type",), "product_type": ("productType",),
+        "video_views": ("videoViewCount",), "video_plays": ("videoPlayCount", "igPlayCount"),
+        "video_duration": ("videoDuration",),
+    }
+    for column, keys in fallbacks.items():
+        missing = "1 = 1" if column not in columns else f"NULLIF(TRIM({column}), '') IS NULL" if column in {"post_type_label", "product_type"} else f"{column} IS NULL"
+        needed.append(f"({missing} AND ({' OR '.join(contains(chr(34) + key + chr(34)) for key in keys)}))")
+    return " OR ".join(needed)
+
+
 def _read_source(conn: Any, table: str, columns: set[str], where: str = "1 = 1",
                  params: list[Any] | None = None) -> list[dict[str, Any]]:
     """Extract scalar facts in SQL; malformed legacy JSON never transfers blobs.
@@ -89,12 +120,19 @@ def _read_source(conn: Any, table: str, columns: set[str], where: str = "1 = 1",
     postgres = bool(getattr(conn, "is_postgres", False) and raw)
     raw_source = "raw_json"
     promoted_music = {"music_song", "music_artist", "music_audio_id", "uses_original_audio", "product_type"}
-    if raw and table == "dashboard_posts" and promoted_music <= columns:
+    if raw and table == "dashboard_posts":
         # Fully promoted audio needs no second parse of a potentially huge
         # carousel payload. Unknown/incomplete audio still gets a stored-data
         # recovery attempt; absence of a provider field is never guessed.
-        complete = " AND ".join(f"NULLIF(TRIM({name}), '') IS NOT NULL" for name in sorted(promoted_music - {"uses_original_audio"}))
-        raw_source = f"CASE WHEN {complete} AND uses_original_audio IS NOT NULL THEN NULL ELSE raw_json END AS raw_json"
+        complete = "0 = 1"
+        if promoted_music <= columns:
+            complete = " AND ".join(f"NULLIF(TRIM({name}), '') IS NOT NULL" for name in sorted(promoted_music - {"uses_original_audio"}))
+            complete += (" AND REPLACE(TRIM(music_audio_id), '0', '') <> ''"
+                         " AND SUBSTR(TRIM(music_audio_id), 1, 1) <> '-'"
+                         " AND LOWER(TRIM(music_audio_id)) NOT IN ('0.0','null','none','undefined','nan')"
+                         " AND uses_original_audio IS NOT NULL")
+        needed = _dashboard_raw_needed(conn, columns)
+        raw_source = f"CASE WHEN ({complete}) OR NOT ({needed}) THEN NULL ELSE raw_json END AS raw_json"
     source_fields = ", ".join([*selected, *([raw_source] if raw else [])])
     order = "id" if "id" in columns else "shortcode"
     source = f"(SELECT {source_fields} FROM {table} WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?) music_rows"
@@ -138,7 +176,7 @@ def _music(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "ms": _text(row.get("music_song")) or _text(row.get("r_song")),
         "ma": _text(row.get("music_artist")) or _text(row.get("r_artist")),
-        "ai": _text(row.get("music_audio_id")) or _text(row.get("r_audio")),
+        "ai": _audio_id(row.get("music_audio_id")) or _audio_id(row.get("r_audio")),
         "oa": _bool(row.get("uses_original_audio")) if row.get("uses_original_audio") is not None else _bool(row.get("r_original")),
     }
 
@@ -148,10 +186,21 @@ def build_music_catalogue(conn: Any, accounts: list[dict[str, Any]], *, now: dat
     current = now or datetime.now(UTC)
     registry = {a["handle"].lower(): a for a in accounts}
     columns = {table: _columns(conn, table) for table in ("dashboard_posts", "posts", "engagement_observations")}
-    rows = _read_source(conn, "dashboard_posts", columns["dashboard_posts"])
+    handles = sorted(registry)
+    rows = []
+    if handles:
+        scope, parameters = ("LOWER(account) = ANY(?)", [handles]) if getattr(conn, "is_postgres", False) else (f"LOWER(account) IN ({','.join('?' for _ in handles)})", handles)
+        rows = _read_source(conn, "dashboard_posts", columns["dashboard_posts"], scope, parameters)
     canonical = next((a["handle"] for a in accounts if a.get("is_canonical")), None)
     if canonical:
-        rows += [row | {"account": canonical} for row in _read_source(conn, "posts", columns["posts"])]
+        # Filter unpublished uploads and AB candidates before touching any
+        # historical payload, preserving the same published-post membership.
+        conditions = []
+        if "section" in columns["posts"]:
+            conditions.append("COALESCE(section, '') <> 'ab'")
+        if "published_at" in columns["posts"]:
+            conditions.append("(NULLIF(TRIM(shortcode), '') IS NOT NULL OR NULLIF(TRIM(published_at), '') IS NOT NULL)")
+        rows += [row | {"account": canonical} for row in _read_source(conn, "posts", columns["posts"], " AND ".join(conditions) or "1 = 1")]
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
