@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
+import logging
 import math
 import threading
 import time
@@ -25,6 +26,9 @@ _RAW = {
     "r_plays": "videoPlayCount", "r_igplays": "igPlayCount", "r_duration": "videoDuration",
 }
 _WINDOW = 12_000
+_CATALOGUE_BATCH = 2_000
+_CATALOGUE_WORKERS = 4
+logger = logging.getLogger("uvicorn.error")
 _CACHE_TTL_SECONDS = 300
 _CACHE_LOCK = threading.Lock()
 _CACHE_ENTRY: tuple[tuple[Any, ...], float, dict[str, Any]] | None = None
@@ -220,6 +224,57 @@ def _read_source(conn: Any, table: str, columns: set[str], where: str = "1 = 1",
             return result
 
 
+def _read_catalogue_source(conn: Any, table: str, columns: set[str], where: str = "1 = 1",
+                           params: list[Any] | None = None, *, connection_factory: Callable[[], Any] | None = None) -> list[dict[str, Any]]:
+    """Read one complete source in bounded, indexed, parallel SQL batches.
+
+    Only the full shared Music catalogue uses this path. Capture eligible
+    identifiers first, then hydrate those identifiers on at most four pooled
+    connections. This avoids repeatedly walking OFFSET history and makes the
+    three large provider-data reads share work without flooding the API pool.
+    Original account/publication conditions are retained in every batch.
+    """
+    if not getattr(conn, "is_postgres", False) or connection_factory is None:
+        return _read_source(conn, table, columns, where, params)
+    if "shortcode" not in columns:
+        return []
+    started = time.monotonic()
+    key = "id" if "id" in columns else "shortcode"
+    # Observation identity is already a bounded set captured from eligible
+    # source posts. Split that set directly instead of sending all 90k codes
+    # again in every hydration query. Each batch is a strict subset of it.
+    supplied_codes = bool(table == "engagement_observations" and key == "shortcode"
+                          and where == "shortcode = ANY(?)" and params and len(params) == 1
+                          and isinstance(params[0], list))
+    identifiers = sorted(set(params[0])) if supplied_codes else [row[key] for row in conn.execute(
+        f"SELECT {key} FROM {table} WHERE {where} ORDER BY {key}", params or [],
+    ).fetchall()]
+    logger.info("Music source index table=%s rows=%d seconds=%.3f", table, len(identifiers), time.monotonic() - started)
+    batches = [identifiers[start:start + _CATALOGUE_BATCH] for start in range(0, len(identifiers), _CATALOGUE_BATCH)]
+    if not batches:
+        return []
+
+    def load_batch(batch: list[Any]) -> list[dict[str, Any]]:
+        batch_started = time.monotonic()
+        with connection_factory() as connection:
+            batch_where = where if supplied_codes else f"({where}) AND {key} = ANY(?)"
+            batch_params = [batch] if supplied_codes else [*(params or []), batch]
+            rows = _read_source(connection, table, columns, batch_where, batch_params)
+        elapsed = time.monotonic() - batch_started
+        if elapsed >= 5:
+            logger.info("Music source batch table=%s rows=%d seconds=%.3f", table, len(rows), elapsed)
+        return rows
+
+    try:
+        with ThreadPoolExecutor(max_workers=_CATALOGUE_WORKERS, thread_name_prefix="music-read") as pool:
+            rows = [row for batch in pool.map(load_batch, batches) for row in batch]
+    except Exception as error:
+        logger.warning("Music source failed table=%s seconds=%.3f error_type=%s", table, time.monotonic() - started, type(error).__name__)
+        raise
+    logger.info("Music source complete table=%s rows=%d seconds=%.3f", table, len(rows), time.monotonic() - started)
+    return rows
+
+
 def _music(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "ms": _text(row.get("music_song")) or _text(row.get("r_song")),
@@ -288,8 +343,10 @@ def music_metadata_for_posts(conn: Any, posts: list[dict[str, Any]], registry: d
     return result
 
 
-def build_music_catalogue(conn: Any, accounts: list[dict[str, Any]], *, now: datetime | None = None) -> dict[str, Any]:
+def build_music_catalogue(conn: Any, accounts: list[dict[str, Any]], *, now: datetime | None = None,
+                          connection_factory: Callable[[], Any] | None = None) -> dict[str, Any]:
     """One physical post per shortcode, preserving every represented account."""
+    started = time.monotonic()
     current = now or datetime.now(UTC)
     registry = {a["handle"].lower(): a for a in accounts}
     columns = {table: _columns(conn, table) for table in ("dashboard_posts", "posts", "engagement_observations")}
@@ -297,7 +354,8 @@ def build_music_catalogue(conn: Any, accounts: list[dict[str, Any]], *, now: dat
     rows = []
     if handles:
         scope, parameters = ("LOWER(account) = ANY(?)", [handles]) if getattr(conn, "is_postgres", False) else (f"LOWER(account) IN ({','.join('?' for _ in handles)})", handles)
-        rows = _read_source(conn, "dashboard_posts", columns["dashboard_posts"], scope, parameters)
+        rows = _read_catalogue_source(conn, "dashboard_posts", columns["dashboard_posts"], scope, parameters,
+                                      connection_factory=connection_factory)
     canonical = next((a["handle"] for a in accounts if a.get("is_canonical")), None)
     if canonical:
         # Filter unpublished uploads and AB candidates before touching any
@@ -307,7 +365,8 @@ def build_music_catalogue(conn: Any, accounts: list[dict[str, Any]], *, now: dat
             conditions.append("COALESCE(section, '') <> 'ab'")
         if "published_at" in columns["posts"]:
             conditions.append("(NULLIF(TRIM(shortcode), '') IS NOT NULL OR NULLIF(TRIM(published_at), '') IS NOT NULL)")
-        rows += [row | {"account": canonical} for row in _read_source(conn, "posts", columns["posts"], " AND ".join(conditions) or "1 = 1")]
+        rows += [row | {"account": canonical} for row in _read_catalogue_source(
+            conn, "posts", columns["posts"], " AND ".join(conditions) or "1 = 1", connection_factory=connection_factory)]
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -326,11 +385,13 @@ def build_music_catalogue(conn: Any, accounts: list[dict[str, Any]], *, now: dat
 
     observations = {}
     codes = sorted({str(row["shortcode"]) for group in grouped.values() for row in group if row.get("shortcode")})
-    batch_size = _WINDOW if getattr(conn, "is_postgres", False) else 400
+    parallel = bool(getattr(conn, "is_postgres", False) and connection_factory is not None)
+    batch_size = max(1, len(codes)) if parallel else _WINDOW if getattr(conn, "is_postgres", False) else 400
     for start in range(0, len(codes), batch_size):
         batch = codes[start:start + batch_size]
         where, params = ("shortcode = ANY(?)", [batch]) if getattr(conn, "is_postgres", False) else (f"shortcode IN ({','.join('?' for _ in batch)})", batch)
-        for row in _read_source(conn, "engagement_observations", columns["engagement_observations"], where, params):
+        for row in _read_catalogue_source(conn, "engagement_observations", columns["engagement_observations"], where, params,
+                                          connection_factory=connection_factory):
             # A mismatched retained payload must not decorate another post.
             if row.get("r_code") and str(row["r_code"]) != str(row["shortcode"]):
                 continue
@@ -380,6 +441,7 @@ def build_music_catalogue(conn: Any, accounts: list[dict[str, Any]], *, now: dat
         })
     posts.sort(key=lambda p: (p["d"] or "", p["sc"]), reverse=True)
     known = sum(bool(p["ms"] or p["ma"] or p["ai"] or p["oa"] is True) for p in posts)
+    logger.info("Music catalogue complete posts=%d seconds=%.3f", len(posts), time.monotonic() - started)
     return {
         "posts": posts,
         "accounts": [{"handle": a["handle"], "group": a["group"], "threshold": a.get("hot_threshold"), "label": a.get("label")} for a in accounts],

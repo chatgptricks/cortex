@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -359,6 +360,137 @@ def test_failed_cache_calculation_does_not_poison_next_read():
     assert music._INFLIGHT == {} and music._CACHE_ENTRY is None
     result = music.cached_music_catalogue(ACCOUNTS, lambda: {"posts": []}, database_identity="shared-db")
     assert result == {"posts": []}
+
+
+def test_parallel_catalogue_preserves_complete_results_and_account_scope(stored, monkeypatch):
+    connect, _ = stored
+    with connect() as conn:
+        for index in range(12):
+            add(conn, f"p{index}", music_song=f"Song {index}", music_audio_id=str(100 + index),
+                hidden=int(index == 9))
+            observation(conn, f"p{index}", {"shortCode": f"p{index}", "likesCount": 200 + index,
+                        "musicInfo": {"song_name": f"New {index}", "audio_id": str(200 + index)}})
+        add(conn, "p0", table="posts", likes=500)
+        add(conn, "private-account", account="not-in-roster", music_song="Must not appear")
+        add(conn, "ab-only", table="posts", section="ab")
+        expected = music.build_music_catalogue(conn, ACCOUNTS, now=NOW)
+
+    def translated(sql, params):
+        values = iter(params or [])
+        expanded = []
+        def replace(match):
+            batch = next(values)
+            expanded.extend(batch)
+            return "IN (" + ",".join("?" for _ in batch) + ")"
+        if "= ANY(?)" in sql:
+            return re.sub(r"= ANY\(\?\)", replace, sql), expanded
+        return sql, params or []
+
+    class Postgres:
+        is_postgres = True
+        def __init__(self, raw):
+            self.raw = raw
+        def execute(self, sql, params=()):
+            sql, params = translated(sql, params)
+            return self.raw.execute(sql, params)
+
+    @contextmanager
+    def postgres_connect():
+        with connect() as raw:
+            yield Postgres(raw)
+
+    original_read = music._read_source
+    reads = []
+    def read(connection, table, columns, where="1 = 1", params=None):
+        reads.append((table, where, params))
+        where, params = translated(where, params)
+        return original_read(connection.raw, table, columns, where, params)
+    monkeypatch.setattr(music, "_read_source", read)
+    monkeypatch.setattr(music, "_CATALOGUE_BATCH", 2)
+    with postgres_connect() as conn:
+        actual = music.build_music_catalogue(conn, ACCOUNTS, now=NOW, connection_factory=postgres_connect)
+    assert actual == expected
+    assert len(reads) > 4
+    assert all(len(params[-1]) <= 2 for _, _, params in reads)
+    assert all("LOWER(account) = ANY(?)" in where for table, where, _ in reads if table == "dashboard_posts")
+    assert all("COALESCE(section, '') <> 'ab'" in where for table, where, _ in reads if table == "posts")
+    assert all(len(params) == 1 for table, _, params in reads if table == "engagement_observations")
+
+
+def test_parallel_catalogue_limits_connections_and_keeps_source_order(monkeypatch):
+    class Cursor:
+        def fetchall(self):
+            return [{"id": value} for value in range(1, 17)]
+
+    class Postgres:
+        is_postgres = True
+        def execute(self, sql, params):
+            assert sql == "SELECT id FROM dashboard_posts WHERE account = ? ORDER BY id"
+            assert params == ["allowed"]
+            return Cursor()
+
+    lock = threading.Lock()
+    ready, release = threading.Event(), threading.Event()
+    active = peak = opened = closed = 0
+
+    @contextmanager
+    def connect():
+        nonlocal active, peak, opened, closed
+        with lock:
+            active += 1
+            opened += 1
+            peak = max(peak, active)
+            if active == 4:
+                ready.set()
+        try:
+            yield object()
+        finally:
+            with lock:
+                active -= 1
+                closed += 1
+
+    def read(conn, table, columns, where, params):
+        assert where == "(account = ?) AND id = ANY(?)"
+        assert params[0] == "allowed"
+        assert release.wait(3)
+        return [{"id": value} for value in params[1]]
+
+    monkeypatch.setattr(music, "_read_source", read)
+    monkeypatch.setattr(music, "_CATALOGUE_BATCH", 2)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(music._read_catalogue_source, Postgres(), "dashboard_posts", {"id", "shortcode"},
+                              "account = ?", ["allowed"], connection_factory=connect)
+        assert ready.wait(3)
+        assert peak == 4 and opened == 4
+        release.set()
+        rows = pending.result(timeout=3)
+    assert [row["id"] for row in rows] == list(range(1, 17))
+    assert peak == 4 and active == 0 and opened == closed == 8
+
+
+def test_parallel_catalogue_failure_propagates_without_partial_result(monkeypatch):
+    class Postgres:
+        is_postgres = True
+        def execute(self, *args):
+            raise AssertionError("Known observation codes need no duplicate index scan")
+
+    closed = []
+    @contextmanager
+    def connect():
+        try:
+            yield Postgres()
+        finally:
+            closed.append(True)
+
+    def fail(*args):
+        raise RuntimeError("test batch failure")
+
+    monkeypatch.setattr(music, "_read_source", fail)
+    monkeypatch.setattr(music, "_CATALOGUE_BATCH", 2)
+    with pytest.raises(RuntimeError, match="test batch failure"):
+        music._read_catalogue_source(Postgres(), "engagement_observations", {"shortcode"},
+                                     "shortcode = ANY(?)", [["a", "b", "c"]], connection_factory=connect)
+    assert closed
 
 
 def test_music_route_cache_rechecks_roster_and_avoids_reopening_catalogue_connection(stored, monkeypatch):

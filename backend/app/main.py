@@ -789,7 +789,7 @@ def insights_music() -> dict[str, Any]:
     accounts = list_accounts(active_only=True, research_only=True)
     def load() -> dict[str, Any]:
         with connect() as conn:
-            return build_music_catalogue(conn, accounts)
+            return build_music_catalogue(conn, accounts, connection_factory=connect)
     return cached_music_catalogue(accounts, load, database_identity=DATABASE_URL or str(DB_PATH))
 
 
