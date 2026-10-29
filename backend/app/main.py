@@ -2031,52 +2031,42 @@ def dashboard_posts(request: Request) -> Response:
 @app.post('/api/dashboard/stacks/merge')
 def dashboard_stacks_merge(keys: Annotated[str, Form()]) -> dict[str, Any]:
     from .topic_stacks import merge
-    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
-    with _DASHBOARD_POSTS_CACHE_LOCK:
-        try:
-            parsed = json.loads(keys)
-            if not isinstance(parsed, list):
-                raise ValueError('Select at least two posts.')
-            result = merge(parsed)
-        except (ValueError, TypeError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        _DASHBOARD_POSTS_CACHE_CONTENT = None
-        _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0
+    try:
+        parsed = json.loads(keys)
+        if not isinstance(parsed, list):
+            raise ValueError('Select at least two posts.')
+        result = merge(parsed)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_dashboard_posts_cache()
     return result
 
 
 @app.post('/api/dashboard/stacks/separate')
 def dashboard_stacks_separate(keys: Annotated[str, Form()]) -> dict[str, Any]:
     from .topic_stacks import separate
-    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
-    with _DASHBOARD_POSTS_CACHE_LOCK:
-        try:
-            parsed = json.loads(keys)
-            if not isinstance(parsed, list):
-                raise ValueError('Select at least one post.')
-            result = separate(parsed)
-        except (ValueError, TypeError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        _DASHBOARD_POSTS_CACHE_CONTENT = None
-        _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0
+    try:
+        parsed = json.loads(keys)
+        if not isinstance(parsed, list):
+            raise ValueError('Select at least one post.')
+        result = separate(parsed)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_dashboard_posts_cache()
     return result
 
 
 @app.post('/api/dashboard/stacks/find-similar')
 def dashboard_stacks_find_similar(post_key: Annotated[str, Form()]) -> dict[str, Any]:
     from .topic_stacks import JevUnavailable, find_similar
-    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
     try:
         result = find_similar(post_key)
     except JevUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    # Do not hold the shared Research-cache lock during the full similarity
-    # scan. Only the tiny invalidation assignment needs synchronization.
-    with _DASHBOARD_POSTS_CACHE_LOCK:
-        _DASHBOARD_POSTS_CACHE_CONTENT = None
-        _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0
+    # Invalidate both the shared payload and paginated catalogue revision.
+    _invalidate_dashboard_posts_cache()
     return result
 
 
@@ -2084,12 +2074,9 @@ def dashboard_stacks_find_similar(post_key: Annotated[str, Form()]) -> dict[str,
 def admin_stacks_regroup_recent() -> dict[str, Any]:
     """Explicitly rebuild topic membership for posts from the last 72 hours."""
     from .topic_stacks import regroup_recent
-    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
     payload = _dashboard_posts_payload()
     result = regroup_recent(payload['posts'], hours=72)
-    with _DASHBOARD_POSTS_CACHE_LOCK:
-        _DASHBOARD_POSTS_CACHE_CONTENT = None
-        _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0
+    _invalidate_dashboard_posts_cache()
     return {'ok': True, **result}
 
 
@@ -2102,8 +2089,7 @@ def dashboard_stack_members(account: str, shortcode: str) -> dict[str, Any]:
     clean_account = account.strip().lstrip('@').lower()
     clean_shortcode = shortcode.strip()
     post_key = f'{clean_account}:{clean_shortcode}'
-    keys = set(stack_keys(post_key))
-    if not keys:
+    if not stack_keys(post_key):
         snapshot = _queue_v2_post_snapshot(clean_account, clean_shortcode)
         source = {
             'account': clean_account, 'shortcode': clean_shortcode,
@@ -2111,9 +2097,13 @@ def dashboard_stack_members(account: str, shortcode: str) -> dict[str, Any]:
         } if snapshot else None
         if source:
             attach([source])
-            keys = set(stack_keys(post_key))
-    pairs = [tuple(key.split(':', 1)) for key in keys if ':' in key]
     with connect() as conn:
+        member = conn.execute('SELECT stack_id FROM topic_stack_members WHERE post_key = ?', (post_key,)).fetchone()
+        stack_id = member['stack_id'] if member else None
+        keys = [row['post_key'] for row in conn.execute(
+            'SELECT post_key FROM topic_stack_members WHERE stack_id = ? ORDER BY post_key', (stack_id,),
+        ).fetchall()] if stack_id else []
+        pairs = [tuple(key.split(':', 1)) for key in keys if ':' in key]
         snapshots = _queue_v2_post_snapshot_cache(
             conn,
             [{'post_account': member_account, 'post_shortcode': member_shortcode} for member_account, member_shortcode in pairs],
@@ -2123,7 +2113,7 @@ def dashboard_stack_members(account: str, shortcode: str) -> dict[str, Any]:
         for member_account, member_shortcode in pairs
         if (member_account, member_shortcode) in snapshots
     ]
-    return {'posts': posts, 'stackSize': len(keys)}
+    return {'posts': posts, 'stackId': stack_id, 'postKeys': keys, 'stackSize': len(keys)}
 
 
 @app.get("/api/dashboard/posts/{account}/{shortcode}/transcript")
@@ -4147,8 +4137,10 @@ def _queue_v2_post_snapshot_cache(conn: Any, rows: list[Any]) -> dict[tuple[str,
     if post_keys:
         marks = ','.join('?' for _ in post_keys)
         memberships = conn.execute(
-            f'''SELECT post_key, stack_id, COUNT(*) OVER (PARTITION BY stack_id) AS stack_size
-                FROM topic_stack_members WHERE post_key IN ({marks})''', tuple(post_keys)
+            f'''SELECT member.post_key, member.stack_id,
+                       (SELECT COUNT(*) FROM topic_stack_members all_members
+                        WHERE all_members.stack_id = member.stack_id) AS stack_size
+                FROM topic_stack_members member WHERE member.post_key IN ({marks})''', tuple(post_keys)
         ).fetchall()
         for member in memberships:
             account, shortcode = member['post_key'].split(':', 1)

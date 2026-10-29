@@ -356,6 +356,29 @@ def test_stack_filters_dates_before_limit_and_reports_filtered_total(setup):
     assert response["pagination"]["next_offset"] is None
 
 
+def test_stack_id_pagination_returns_all_permitted_members_across_accounts(setup):
+    client, connect, queries = setup
+    stack_id = '0123456789abcdef0123456789abcdef'
+    with connect() as conn:
+        conn.execute("UPDATE topic_stack_members SET stack_id = ? WHERE stack_id = 'shared'", (stack_id,))
+        conn.execute("INSERT INTO topic_stack_members VALUES ('alpha:Historic',?,'[]',1790856000)", (stack_id,))
+    queries.clear()
+    offset = 0
+    members = []
+    while offset is not None:
+        response = client.get(f'/api/v1/research/stacks/{stack_id}/posts?limit=1&offset={offset}',
+                              headers={'x-accounts': 'alpha,beta'})
+        assert response.status_code == 200
+        page = response.json()
+        assert page['stack_id'] == stack_id
+        assert page['pagination']['total'] == 3
+        members.extend((post['account'], post['shortcode']) for post in page['data'])
+        offset = page['pagination']['next_offset']
+    assert set(members) == {('alpha', 'Recent'), ('alpha', 'Historic'), ('beta', 'Foreign')}
+    assert len(members) == 3
+    assert not [query for query in queries if re_mutation(query)]
+
+
 def test_tracker_monthly_costa_rica_boundary_and_missing_month_is_unknown(setup):
     client, connect, _ = setup
     with connect() as conn:
