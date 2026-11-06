@@ -383,6 +383,7 @@ def test_speech_preserves_answer_language_even_when_dashboard_locale_differs(lan
 def test_speech_cleanup_only_removes_display_syntax_preserving_labels_metrics_and_words():
     answer = "## My choice\n**Recreate** [@rival’s reel](https://sentientdash.app/index.html?post=rival%3AClip) — 6,562 likes.\n- It shows a robot folding laundry."
     assert voice._plain(answer) == "My choice\nRecreate @rival’s reel — 6,562 likes.\nIt shows a robot folding laundry."
+    assert voice._plain("@a_b @__account__ @some__account__name") == "@a_b @__account__ @some__account__name"
 
 
 def test_url_only_legacy_answer_is_rejected_without_inventing_a_spoken_summary(client, monkeypatch):

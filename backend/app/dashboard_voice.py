@@ -236,7 +236,7 @@ def _plain(text):
     text = re.sub(r"\[([^\]]*)\]\(([^)]*)\)", r"\1", text)
     text = _URL.sub("", text)
     text = re.sub(r"(?m)^\s{0,3}(?:#{1,6}\s+|>\s*|[-*+]\s+)", "", text)
-    text = re.sub(r"\*\*([^*]+)\*\*|__([^_]+)__", lambda match: match.group(1) or match.group(2), text)
+    text = re.sub(r"(?<![\w@])(?:\*\*([^*]+)\*\*|__([^_]+)__)(?!\w)", lambda match: match.group(1) or match.group(2), text)
     text = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
     return text.strip()
