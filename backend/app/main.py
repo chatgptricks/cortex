@@ -10113,6 +10113,8 @@ app.include_router(hooks_router)
 
 from .dashboard_assistant import router as dashboard_assistant_router
 app.include_router(dashboard_assistant_router)
+from .dashboard_voice import router as dashboard_voice_router
+app.include_router(dashboard_voice_router)
 from .dashboard_rankings import router as dashboard_rankings_router
 app.include_router(dashboard_rankings_router)
 from .dashboard_post_search import router as dashboard_post_search_router
