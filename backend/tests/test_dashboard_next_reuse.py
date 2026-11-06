@@ -94,7 +94,7 @@ def test_complete_history_all_formats_hidden_deleted_and_account_scope(stored, t
 
 
 @pytest.mark.parametrize("target,canonical", [("alpha", True), ("beta", False)])
-@pytest.mark.parametrize("date", [None, ""])
+@pytest.mark.parametrize("date", [None, "", "invalid timestamp"])
 def test_undated_stored_posts_still_exclude_identity_and_text(stored, target, canonical, date):
     caption = "Scientists discover enormous crystalline formations beneath distant Antarctic glaciers"
     ocr = "Rare mineral structures reveal ancient microbial colonies inside frozen volcanic caves"
@@ -104,6 +104,7 @@ def test_undated_stored_posts_still_exclude_identity_and_text(stored, target, ca
     assert history.post_count == 1
     assert history.filter_candidates([candidate("Undated"), candidate(caption=caption), candidate(ocr_text=ocr)]) == []
     assert history.examples[0]["shortcode"] == "Undated"
+    assert history.examples[0]["published_at"] is None
 
 
 def test_canonical_uses_enriched_dashboard_metadata_and_full_text(stored):
@@ -260,13 +261,30 @@ def test_invalid_target_and_incomplete_history_fail_closed(stored, monkeypatch):
         reuse.load_history("beta")
 
 
-def test_malformed_publication_metadata_is_not_silently_ignored(stored):
+def test_unknown_queue_publication_metadata_is_not_silently_ignored(stored):
     with stored() as conn:
-        post(conn, "UnknownDate", published_at="invalid timestamp")
+        queue(conn, "Source", final_permalinks="invalid json")
     with pytest.raises(ValueError, match="Unable to verify"):
         reuse.load_history("beta")
+
+
+def test_unrelated_account_invalid_link_does_not_block_target(stored):
     with stored() as conn:
-        conn.execute("DELETE FROM dashboard_posts")
-        queue(conn, "Source", final_permalinks="invalid json")
+        queue(conn, "Unrelated", target="alpha", final_permalinks=json.dumps([
+            {"account": "alpha", "url": "malformed URL"}]), recommended_accounts='["beta"]')
+        queue(conn, "OtherLegacy", final_permalinks="[]", final_permalink="malformed URL", recommended_accounts='["alpha"]')
+    history = reuse.load_history("beta")
+    assert history.post_count == 0
+    assert len(history.filter_candidates([candidate("Unrelated"), candidate("OtherLegacy")])) == 2
+
+
+@pytest.mark.parametrize("links", [
+    [{"account": "beta", "url": "malformed URL"}],
+    [{"account": "", "url": "https://instagram.com/p/Unknown/"}],
+    ["unknown destination"],
+])
+def test_target_or_unknown_account_invalid_link_still_fails_closed(stored, links):
+    with stored() as conn:
+        queue(conn, "Source", final_permalinks=json.dumps(links))
     with pytest.raises(ValueError, match="Unable to verify"):
         reuse.load_history("beta")

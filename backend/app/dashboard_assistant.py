@@ -370,7 +370,9 @@ async def next_tool_call(client, api_key: str, instructions: str, inputs: list, 
     payload = response.json()
     calls = [item for item in payload.get("output", []) if item.get("type") == "function_call"]
     if payload.get("status") == "incomplete" or len(calls) != 1 or calls[0].get("name") != tool["name"]:
-        raise ValueError("Expected a single permitted recommendation tool.")
+        error = ValueError("Expected a single permitted recommendation tool.")
+        error.code = "provider_incomplete" if payload.get("status") == "incomplete" else "provider_invalid_tool"
+        raise error
     arguments = json.loads(calls[0].get("arguments") or "{}")
     if not isinstance(arguments, dict):
         raise ValueError("Expected recommendation tool arguments.")
@@ -432,6 +434,7 @@ async def respond_next(request: Request, body: ChatRequest, api_key: str, messag
     if not message:
         return clarify_next(slots, body.language)
     unavailable = "No pude consultar los datos del dashboard en este momento." if body.language == "es" else "Dashboard data is temporarily unavailable."
+    phase = "prepare"
     async with httpx.AsyncClient(timeout=httpx.Timeout(45, connect=10)) as client:
         try:
             prepared = await next_tool_call(client, api_key,
@@ -465,11 +468,13 @@ async def respond_next(request: Request, body: ChatRequest, api_key: str, messag
                         return next_reply(no_verified)
                     return next_reply("No encontré posts recientes de competidores con ese formato en el dashboard." if body.language == "es" else "I found no recent competitor posts in that format in the dashboard.")
                 if bundle.get("status") != "ready" or not bundle.get("candidates"):
-                    return next_reply(unavailable)
+                    return {**next_reply(unavailable), "error_code": "next_" + bundle.get("error_code", "candidate_unavailable")}
                 reviewed_keys = {row["key"] for row in bundle["candidates"]}
                 if reviewed_keys & excluded_keys:
                     raise ValueError("Previously rejected candidates cannot be reconsidered.")
+                phase = "history_search"
                 bundle["candidates"] = await dashboard_next_semantic.retrieve_prior_posts(client, api_key, bundle, next_tool_call)
+                phase = "history_review"
                 bundle["candidates"] = await unpublished_next_candidates(client, api_key, bundle)
                 if bundle["candidates"]:
                     break
@@ -478,6 +483,7 @@ async def respond_next(request: Request, body: ChatRequest, api_key: str, messag
                 # Bounded review cost is not evidence that the remaining
                 # catalogue contains no fresh story. Recommend nothing safely.
                 return next_reply(no_verified)
+            phase = "selection"
             choice = await next_tool_call(client, api_key,
                 INSTRUCTIONS + "\nFor /next select ONE candidate from the supplied verified dashboard data to recreate for the target account. "
                 "Prioritize topic/audience fit from the target's recent captions, freshness and observed engagement, rather than blindly taking the largest likes count. Candidates have been checked against the destination's stored publication history and reused content was excluded. "
@@ -503,8 +509,10 @@ async def respond_next(request: Request, body: ChatRequest, api_key: str, messag
             if reason and len(reason.split()) <= 40 and not re.search(r"https?://|www\.|[<>\[\]{}]", reason, re.I):
                 answer += ".\n" + reason[:300]
             return next_reply(answer, sources=bundle.get("sources", []))
-        except (ValueError, TypeError, KeyError, TimeoutError, httpx.HTTPError):
-            return next_reply(unavailable)
+        except (ValueError, TypeError, KeyError, TimeoutError, httpx.HTTPError) as exc:
+            # Machine-readable stages aid production diagnosis; never expose
+            # provider bodies, SQL errors, credentials or stored captions.
+            return {**next_reply(unavailable), "error_code": "next_" + phase + "_" + getattr(exc, "code", "unavailable")}
 
 
 async def respond(request: Request, body: ChatRequest, api_key: str) -> dict:

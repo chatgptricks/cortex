@@ -60,24 +60,36 @@ def _list(value):
     return parsed
 
 
-def _published_links(row):
+def _published_links(row, target):
     links = []
-    for item in _list(row.get("final_permalinks")):
+    saved = _list(row.get("final_permalinks"))
+    for item in saved:
         if not isinstance(item, dict):
             raise ValueError("Stored Queue publication metadata is incomplete.")
-        account, code = _handle(item.get("account")), _code_from_link(item.get("url"))
-        if not _HANDLE.fullmatch(account) or not code:
+        account = _handle(item.get("account"))
+        if not _HANDLE.fullmatch(account):
+            raise ValueError("Stored Queue publication metadata is incomplete.")
+        if account != target:
+            continue
+        code = _code_from_link(item.get("url"))
+        if not code:
             raise ValueError("Stored Queue publication metadata is incomplete.")
         links.append((account, code))
-    if links:
+    if saved:
         return links
     # A legacy singular URL proves publication only on its first destination,
     # matching Queue's own projection; a multi-account assignment is not proof.
-    if code := _code_from_link(row.get("final_permalink")):
+    if str(row.get("final_permalink") or "").strip():
         destinations = [_handle(value) for value in _list(row.get("recommended_accounts"))]
         account = destinations[0] if destinations else _handle(row.get("post_account"))
-        if _HANDLE.fullmatch(account):
-            return [(account, code)]
+        if not _HANDLE.fullmatch(account):
+            raise ValueError("Stored Queue publication metadata is incomplete.")
+        if account != target:
+            return []
+        code = _code_from_link(row.get("final_permalink"))
+        if not code:
+            raise ValueError("Stored Queue publication metadata is incomplete.")
+        return [(account, code)]
     return []
 
 
@@ -170,6 +182,7 @@ def load_history(target: str) -> ReuseHistory:
     target = _handle(target)
     if not _HANDLE.fullmatch(target):
         raise ValueError("Invalid /next destination.")
+    stage = "history_source"
     try:
         with db.connect() as conn:
             # Posts, stack identities, and Queue deliveries must describe one
@@ -185,14 +198,13 @@ def load_history(target: str) -> ReuseHistory:
             rows = conn.execute(cte + "SELECT account, shortcode, caption, hook_text, published_at FROM catalogue", params).fetchall()
             now = datetime.now(UTC)
             posts = {}
+            stage = "history_dates"
             for row in rows:
                 raw_published = row["published_at"]
                 published = kit._date(raw_published)
-                if str(raw_published or "").strip() and not published:
-                    raise ValueError("A stored publication timestamp is invalid.")
                 if published and published > now:
                     continue
-                # A persisted shortcode with a missing date can still be an
+                # A persisted shortcode with a missing/invalid date can be an
                 # old published post. Retain its identity/text conservatively;
                 # an incomplete timestamp must never prove unused history.
                 code = str(row["shortcode"] or "")
@@ -200,11 +212,13 @@ def load_history(target: str) -> ReuseHistory:
                     continue
                 posts[code] = {"account": target, "shortcode": code, "key": target + ":" + code,
                                "caption": str(row["caption"] or ""), "ocr_text": str(row["hook_text"] or ""),
-                               "published_at": row["published_at"]}
+                               "published_at": raw_published if published else None}
             # Read persisted memberships directly: the topic_stacks helpers
             # can initialize or classify, which is forbidden for /next reads.
+            stage = "history_stacks"
             memberships = {str(row["post_key"]): str(row["stack_id"]) for row in conn.execute(
                 "SELECT post_key, stack_id FROM topic_stack_members").fetchall() if row["stack_id"]}
+            stage = "history_queue"
             queue_rows = conn.execute(
                 "SELECT post_account, post_shortcode, post_permalink, post_caption, final_permalink, "
                 "final_permalinks, recommended_accounts, closed_at, completed_at, updated_at "
@@ -212,7 +226,7 @@ def load_history(target: str) -> ReuseHistory:
             source_keys, source_codes = set(), set()
             for raw in queue_rows:
                 row = dict(raw)
-                published_codes = [code for account, code in _published_links(row) if account == target]
+                published_codes = [code for account, code in _published_links(row, target)]
                 if not published_codes:
                     continue
                 source_account = _handle(row.get("post_account"))
@@ -227,6 +241,9 @@ def load_history(target: str) -> ReuseHistory:
                         posts[code] = {"account": target, "shortcode": code, "key": target + ":" + code,
                                        "caption": str(row.get("post_caption") or ""), "ocr_text": "",
                                        "published_at": row.get("closed_at") or row.get("completed_at") or row.get("updated_at")}
+        stage = "history_index"
         return ReuseHistory(target, list(posts.values()), memberships, source_keys, source_codes)
     except Exception as exc:
-        raise ValueError("Unable to verify complete stored destination publication history.") from exc
+        error = ValueError("Unable to verify complete stored destination publication history.")
+        error.code = stage
+        raise error from exc

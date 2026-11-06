@@ -41,6 +41,7 @@ async def candidate_bundle(request, slots: dict, entries: dict, read_operation, 
     """
     sources = []
     target = None
+    stage = "candidate_roster"
     state = {} if state is None else state
     excluded_keys = set(excluded_keys or ())
     if state.setdefault("request", request) is not request:
@@ -97,6 +98,7 @@ async def candidate_bundle(request, slots: dict, entries: dict, read_operation, 
             state["history"] = await anyio.to_thread.run_sync(dashboard_next_reuse.load_history, target["handle"])
             state["history_target"] = target["handle"]
         history = state["history"]
+        stage = "candidate_ranking"
         ranking = None
         candidates, seen = [], set()
         for hours in (24, 168, 720):
@@ -116,6 +118,7 @@ async def candidate_bundle(request, slots: dict, entries: dict, read_operation, 
                 seen.add(key)
                 if key in excluded_keys:
                     continue
+                stage = "candidate_detail"
                 detail = await read("/api/dashboard/posts/{account}/{shortcode}/detail", {"path": {"account": account, "shortcode": code}})
                 if _name(detail.get("account")) != account or detail.get("shortcode") != code:
                     raise _Unavailable()
@@ -140,5 +143,6 @@ async def candidate_bundle(request, slots: dict, entries: dict, read_operation, 
         return {"status": "ready", "target": target, "candidates": candidates, "sources": sources,
                 "criteria": criteria, "target_examples": history.examples, "history_complete": True,
                 "history_posts_checked": history.post_count, "_history": history}
-    except (ValueError, TypeError, KeyError, TimeoutError, httpx.HTTPError):
-        return {"status": "unavailable", "target": target, "candidates": [], "sources": []}
+    except (ValueError, TypeError, KeyError, TimeoutError, httpx.HTTPError) as exc:
+        return {"status": "unavailable", "target": target, "candidates": [], "sources": [],
+                "error_code": getattr(exc, "code", stage)}
