@@ -274,6 +274,121 @@ def test_each_oauth_tool_revalidates_the_original_access_token(hosted, monkeypat
     assert actions == []
 
 
+@pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
+@pytest.mark.parametrize("stage", ["connect", "schema", "lookup", "last_used", "commit"])
+def test_oauth_storage_failure_is_unavailable_without_invalidating_token(
+    hosted, monkeypatch, caplog, path, stage
+):
+    from app import mcp_oauth
+
+    client, *_ = hosted
+    tokens = create_oauth(client)
+    secret_detail = "database failure: " + tokens["access_token"] + " " + tokens["refresh_token"]
+    real_connect = mcp_oauth.connect
+
+    class FailingConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, statement, parameters=()):
+            if ((stage == "schema" and statement.startswith("CREATE TABLE")) or
+                (stage == "lookup" and statement.startswith("SELECT * FROM mcp_oauth_tokens")) or
+                (stage == "last_used" and statement.startswith("UPDATE mcp_oauth_grants SET last_used_at"))):
+                raise sqlite3.OperationalError(secret_detail)
+            return self.connection.execute(statement, parameters)
+
+    @contextmanager
+    def unavailable_connect():
+        if stage == "connect":
+            raise sqlite3.OperationalError(secret_detail)
+        with real_connect() as connection:
+            if stage == "commit":
+                # Fail the actual SQLite COMMIT; allow rollback on exit. This
+                # does not simulate a commit whose outcome was lost in transit.
+                connection.set_authorizer(lambda action, arg, *_:
+                    sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_TRANSACTION and arg == "COMMIT"
+                    else sqlite3.SQLITE_OK)
+            yield FailingConnection(connection)
+
+    with monkeypatch.context() as patch, caplog.at_level("ERROR", logger="app.main"):
+        patch.setattr(mcp_oauth, "connect", unavailable_connect)
+        response = client.post(path, headers={"Authorization": "Bearer " + tokens["access_token"],
+            "Accept": "application/json, text/event-stream"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "OAuth authentication is temporarily unavailable."}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["retry-after"] == "2"
+    assert "www-authenticate" not in response.headers
+    assert caplog.records
+    assert all(record.exc_info is None and record.stack_info is None for record in caplog.records)
+    for secret in [tokens["access_token"], tokens["refresh_token"], secret_detail]:
+        assert secret not in response.text + str(response.headers) + caplog.text
+    # A validation outage neither revokes the grant nor requires new consent.
+    with real_connect() as connection:
+        assert connection.execute("SELECT revoked_at FROM mcp_oauth_grants").fetchone()[0] is None
+    assert rpc(client, tokens["access_token"], "tools/list").status_code == 200
+
+
+def test_internal_oauth_validation_failure_does_not_request_reconnection(hosted, monkeypatch, caplog):
+    from app import main
+
+    client, _, _, actions = hosted
+    tokens = create_oauth(client)
+    verify = main.authenticate_access_token
+    checks = []
+
+    def unavailable_before_internal_call(credential, path, method):
+        checks.append((path, method))
+        if len(checks) == 2:
+            raise RuntimeError("unexpected failure " + tokens["access_token"] + tokens["refresh_token"])
+        return verify(credential, path, method)
+
+    with monkeypatch.context() as patch, caplog.at_level("ERROR", logger="app.main"):
+        patch.setattr(main, "authenticate_access_token", unavailable_before_internal_call)
+        result, data = tool_data(rpc(client, tokens["access_token"], "tools/call",
+            {"name": "post_dashboard_test_action", "arguments": {"confirm": True}}))
+    assert checks == [("/mcp", "POST"), ("/mcp", "POST")]
+    assert result["isError"] and data["status"] == 503
+    assert data["data"] == {"detail": "OAuth authentication is temporarily unavailable."}
+    assert "mcp/www_authenticate" not in (result.get("_meta") or {})
+    assert actions == []
+    assert caplog.records
+    assert all(record.exc_info is None and record.stack_info is None for record in caplog.records)
+    for secret in [tokens["access_token"], tokens["refresh_token"]]:
+        assert secret not in json.dumps(result) + caplog.text
+    assert rpc(client, tokens["access_token"], "tools/list").status_code == 200
+
+
+@pytest.mark.parametrize("kind", ["malformed", "unknown", "expired", "revoked", "refresh"])
+def test_invalid_oauth_credentials_still_get_invalid_token_challenge(hosted, caplog, kind):
+    from app import mcp_oauth
+
+    client, *_ = hosted
+    tokens = create_oauth(client)
+    token = tokens["access_token"]
+    if kind in {"expired", "revoked"}:
+        with mcp_oauth.connect() as connection:
+            if kind == "expired":
+                connection.execute("UPDATE mcp_oauth_tokens SET expires_at = ? WHERE token_hash = ?",
+                    ("2000-01-01T00:00:00+00:00", mcp_oauth._hash(token)))
+            else:
+                connection.execute("UPDATE mcp_oauth_grants SET revoked_at = ?", (mcp_oauth.utc_now(),))
+    elif kind == "malformed":
+        token = "sad_oauth_at_invalid"
+    elif kind == "unknown":
+        token = mcp_oauth.ACCESS_PREFIX + "a" * 43
+    else:
+        token = tokens["refresh_token"]
+    response = rpc(client, token, "tools/list")
+    assert response.status_code == 401
+    assert 'error="invalid_token"' in response.headers["www-authenticate"]
+    assert response.headers["cache-control"] == "no-store"
+    assert "retry-after" not in response.headers
+    assert not any(record.getMessage() == "OAuth access-token validation failed." for record in caplog.records)
+
+
 def test_oauth_transport_keeps_origin_protection_and_canonical_alias(hosted):
     client, *_ = hosted
     token = create_oauth(client)["access_token"]

@@ -167,6 +167,14 @@ explicitly. Access tokens last 15 minutes; connections last 90 days. Refresh
 tokens rotate, and reuse revokes the entire connection. All secret values
 are stored as SHA-256 hashes, and OAuth responses use no-store caching.
 
+OAuth access-token validation failures caused by storage outages or unexpected
+server errors return `503` with `Retry-After: 2`, without an authentication
+challenge. Invalid, expired or revoked tokens still return `401 invalid_token`.
+Logs for unexpected validation failures use a fixed message without exception
+details or tracebacks. Clients must serialize refreshes per connection:
+simultaneous reuse of one refresh token revokes the entire connection, including
+the replacement tokens, under the existing replay-detection policy.
+
 Tokens are bound to the canonical `/mcp` resource and are rejected on direct
 REST requests. Internal tool dispatch revalidates the token and owner's
 permissions without forwarding it as a REST bearer credential. Revocation
@@ -180,7 +188,8 @@ required. Schema creation is additive through the existing startup migration.
 
 OAuth protocol, replay, permission isolation and legacy compatibility tests
 are in `backend/tests/test_mcp_oauth.py` and
-`backend/tests/test_mcp_oauth_integration.py`.
+`backend/tests/test_mcp_oauth_integration.py`. Deterministic SQLite rotation
+concurrency and rollback coverage is in `backend/tests/test_mcp_oauth_concurrency.py`.
 
 ## Website data API
 

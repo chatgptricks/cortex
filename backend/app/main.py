@@ -239,7 +239,13 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         except HTTPException as exc:
             return auth_error(exc.detail, exc.status_code, exc.headers)
         except Exception:
-            return auth_error("Invalid or expired OAuth access token.", 401)
+            # Only explicit credential failures warrant invalid_token. Storage
+            # outages and other validation failures must fail closed without
+            # telling MCP clients to discard a potentially valid connection.
+            # Exception messages/tracebacks can contain bearer or DB secrets.
+            logging.getLogger(__name__).error("OAuth access-token validation failed.")
+            return auth_error("OAuth authentication is temporarily unavailable.", 503,
+                              {"Retry-After": "2"})
     if path in _OAUTH_OPEN_PATHS:
         response = await call_next(request)
         response.headers.update({"Cache-Control": "no-store", "Pragma": "no-cache"})
