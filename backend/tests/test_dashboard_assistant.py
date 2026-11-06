@@ -4,6 +4,7 @@ from collections import defaultdict, deque
 from types import SimpleNamespace
 
 import httpx
+import anyio
 import pytest
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.testclient import TestClient
@@ -193,3 +194,100 @@ def test_ui_action_cannot_select_an_account_absent_from_real_controls(app, monke
     monkeypatch.setattr(httpx, 'AsyncClient', client)
     result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='Filter does.not.exist', language='en'), 'test-key'))
     assert result['ui_actions'] == [] and 'not available' in result['answer']
+
+
+def test_single_page_and_upstream_coverage_are_marked_partial(app):
+    @app.get('/api/insights/fixture/page')
+    def pages(offset: int = 0):
+        return {"data": [{"likes": 1}], "pagination": {"has_more": True, "next_offset": offset + 1}}
+
+    @app.get('/api/insights/fixture/coverage')
+    def incomplete_coverage():
+        return {"data": [], "coverage": {"complete": False}}
+
+    app.openapi_schema = None
+    entries = assistant.operations(app)
+    for path in ('/api/insights/fixture/page', '/api/insights/fixture/coverage'):
+        entry = next(e for e in entries.values() if e['path'] == path)
+        result, source = asyncio.run(assistant.read_operation(request(app), entry, {}))
+        assert result['complete'] is False and source['partial'] is True
+
+
+def test_analytics_follows_opaque_promo_cursors_and_detects_cycles(app):
+    calls = []
+
+    @app.get('/api/admin/fixture/promos')
+    def promos(request: Request, cursor: str | None = None, cycle: bool = False):
+        assert request.headers.get('authorization') == 'Bearer signed-in-member'
+        calls.append(cursor)
+        if cursor is None:
+            return {"items": [{"likes": 1}], "next_cursor": "2026-11-05|evolving.ai|Post1"}
+        if cursor.endswith('Post1'):
+            return {"items": [{"likes": 9}], "next_cursor": "2026-11-04|evolving.ai|Post2"}
+        return {"items": [{"likes": 100}], "next_cursor": "2026-11-05|evolving.ai|Post1" if cycle else None}
+
+    app.openapi_schema = None
+    entry = next(e for e in assistant.operations(app).values() if e['path'] == '/api/admin/fixture/promos')
+    analysis = {"items_path": "items", "aggregations": [{"op": "sum", "field": "likes", "as": "likes"}]}
+    result, source = asyncio.run(assistant.read_operation(request(app), entry, {}, analysis))
+    assert result['complete'] and result['data']['complete'] and not source['partial']
+    assert result['data']['data'] == [{"row_count": 3, "likes": 110, "likes_known": 3}]
+    assert len(calls) == 3
+    calls.clear()
+    result, source = asyncio.run(assistant.read_operation(request(app), entry, {"query": {"cycle": True}}, analysis))
+    assert not result['complete'] and not result['data']['complete'] and source['partial']
+    assert len(calls) == 3  # No duplicated rows or infinite cursor loop.
+
+
+def test_analytics_budget_bounds_all_pages_and_flags_partial(app, monkeypatch):
+    calls = []
+    @app.get('/api/insights/fixture/page')
+    def pages(offset: int = 0):
+        calls.append(offset)
+        return {"data": [{"text": "x" * 150}], "pagination": {"has_more": True, "next_offset": offset + 1}}
+    app.openapi_schema = None
+    entry = next(e for e in assistant.operations(app).values() if e['path'] == '/api/insights/fixture/page')
+    monkeypatch.setattr(assistant, 'MAX_READ_BYTES', 400)
+    result, source = asyncio.run(assistant.read_operation(request(app), entry, {}, {"items_path": "data"}))
+    assert calls == [0, 1]
+    assert result['data']['input_rows'] == 1 and not result['complete'] and source['partial']
+
+
+def test_generated_links_are_included_in_model_context_budget(monkeypatch):
+    monkeypatch.setattr(assistant, 'MAX_TOOL_BYTES', 100)
+    result = assistant.bounded_data({"account": "evolving.ai", "shortcode": "Post1"})
+    assert result['truncated'] and 'data' not in result
+
+
+def test_cancelling_request_stops_work_and_releases_active_slot(app, monkeypatch):
+    monkeypatch.setenv('OPENAI_API_KEY', 'test')
+    state = {"started": False, "cancelled": False}
+    async def blocked(*args):
+        state['started'] = True
+        try:
+            await anyio.sleep_forever()
+        finally:
+            state['cancelled'] = True
+    async def disconnected():
+        return state['started']
+    monkeypatch.setattr(assistant, 'respond', blocked)
+    req = request(app)
+    req.is_disconnected = disconnected
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(assistant.assistant_chat(req, assistant.ChatRequest(message='cancel this question')))
+    assert error.value.status_code == 499
+    assert state == {"started": True, "cancelled": True}
+    assert not assistant._active
+
+
+def test_completed_answer_stops_disconnect_watch_and_preserves_response(app, monkeypatch):
+    monkeypatch.setenv('OPENAI_API_KEY', 'test')
+    expected = {"answer": "Hello.", "sources": [], "ui_actions": []}
+    async def answer(*args):
+        await anyio.sleep(0)
+        return expected
+    monkeypatch.setattr(assistant, 'respond', answer)
+    with TestClient(app) as client:
+        result = client.post('/api/dashboard/assistant/chat', headers={"Authorization": "Bearer signed-in-member"}, json={"message": "hello"})
+    assert result.status_code == 200 and result.json() == expected
+    assert not assistant._active
