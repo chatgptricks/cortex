@@ -9,7 +9,7 @@ import os
 import re
 import threading
 import time
-from typing import Literal
+from typing import Literal, get_args
 from urllib.parse import parse_qs, quote, urlsplit
 import wave
 
@@ -36,7 +36,19 @@ _active = set()
 _lock = threading.Lock()
 _URL = re.compile(r"https?://[^\s<>\[\]()`]+|/index\.html\?[^\s<>\[\]()`]+")
 _KEY = re.compile(r"([a-z0-9_.]{1,30}):([A-Za-z0-9_-]{1,64})\Z")
-_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"}
+VoiceName = Literal["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"]
+_VOICE_ORDER = get_args(VoiceName)
+_VOICES = set(_VOICE_ORDER)
+_VOICE_SAMPLES = {
+    "results": {
+        "es": "Aquí están los resultados que encontré. Puedes abrir cada publicación para revisarla en el dashboard.",
+        "en": "Here are the results I found. You can open each post to review it in the dashboard.",
+    },
+    "next": {
+        "es": "Te recomiendo recrear este reel por su historia clara y su ritmo visual. Te dejé el enlace para que revises la referencia.",
+        "en": "I recommend recreating this reel for its clear story and visual pacing. I've left the link so you can review the reference.",
+    },
+}
 _TRANSCRIPTION_TERMS = ("Sentient", "Sentient Dash", "dashboard", "reel", "reels", "carousel", "carrusel", "likes", "caption", "publicación")
 _MIME = {"audio/webm": "webm", "video/webm": "webm", "audio/mp4": "mp4", "video/mp4": "mp4",
          "audio/m4a": "mp4", "audio/x-m4a": "mp4", "audio/wav": "wav", "audio/x-wav": "wav",
@@ -49,6 +61,19 @@ class SpeechRequest(BaseModel):
     question: str = Field(default="", max_length=4_000)
     language: Literal["en", "es"] = "es"
     mode: Literal["auto", "filter", "research", "next"] = "auto"
+    voice: VoiceName | None = None
+
+
+class VoicePreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    voice: VoiceName
+    language: Literal["en", "es"]
+    sample: Literal["results", "next"]
+
+
+def _default_voice():
+    configured = os.getenv("OPENAI_VOICE", "").strip() or "marin"
+    return configured if configured in _VOICES else "marin"
 
 
 @contextmanager
@@ -265,10 +290,13 @@ def _narration(body, results):
     return instructions, json.dumps(payload, ensure_ascii=False, default=str)
 
 
-async def _synthesize(body, results, api_key):
-    instructions, payload = _narration(body, results)
+async def _synthesize(body, results, api_key, *, instructions=None, payload=None):
+    if instructions is None or payload is None:
+        default_instructions, default_payload = _narration(body, results)
+        instructions = default_instructions if instructions is None else instructions
+        payload = default_payload if payload is None else payload
     model = os.getenv("OPENAI_VOICE_MODEL", "").strip() or "gpt-realtime-2.1-mini"
-    voice = os.getenv("OPENAI_VOICE", "").strip() or "marin"
+    voice = body.voice or _default_voice()
     if voice not in _VOICES:
         raise ValueError("Unsupported server voice configuration")
     pcm = bytearray()
@@ -345,6 +373,44 @@ async def _connected(request, operation):
     return result
 
 
+def _audio_response(audio, transcript):
+    headers = dict(PRIVATE)
+    if transcript:
+        headers["X-Sentient-Speech-Transcript"] = base64.b64encode(transcript.encode("utf-8")).decode("ascii")
+        headers["X-Sentient-Speech-Transcript-Encoding"] = "base64-utf8"
+    return Response(audio, media_type="audio/wav", headers=headers)
+
+
+@router.get("/voices")
+async def voices(request: Request):
+    require_browser(request)
+    return JSONResponse({"voices": [{"id": name, "name": name.title()} for name in _VOICE_ORDER],
+                         "default_voice": _default_voice(), "samples": _VOICE_SAMPLES}, headers=PRIVATE)
+
+
+@router.post("/voice-preview")
+async def voice_preview(request: Request, body: VoicePreviewRequest):
+    email, api_key = require_browser(request), _api_key()
+    sample_text = _VOICE_SAMPLES[body.sample][body.language]
+    preview = SpeechRequest(text=sample_text, language=body.language, voice=body.voice)
+    instructions = (
+        "Read the provided sample text VERBATIM in " + ("Spanish" if body.language == "es" else "English") + ". "
+        "This is a fixed fictional voice audition, not a dashboard answer. Use a warm, clear, natural delivery. "
+        "Do not answer a question, translate, paraphrase, add greetings, commentary, or additional facts. "
+        "Speak exactly the sample text and stop."
+    )
+    with _slot(email):
+        try:
+            with anyio.fail_after(55):
+                audio, transcript = await _connected(request, lambda: _synthesize(
+                    preview, [], api_key, instructions=instructions, payload=sample_text))
+                return _audio_response(audio, transcript)
+        except TimeoutError:
+            raise HTTPException(504, "Voice preview took too long. Try again.", headers=PRIVATE)
+        except (httpx.HTTPError, WebSocketException, OSError, ValueError, TypeError, binascii.Error):
+            raise HTTPException(502, "Voice preview is temporarily unavailable.", headers=PRIVATE)
+
+
 @router.post("/transcribe", openapi_extra={"requestBody": {"required": True, "content": {"multipart/form-data": {
     "schema": {"type": "object", "required": ["file"], "properties": {
         "file": {"type": "string", "format": "binary"}, "language": {"type": "string", "enum": ["en", "es"]}}}}}}})
@@ -379,11 +445,7 @@ async def speech(request: Request, body: SpeechRequest):
                         results = []
                     return await _synthesize(body, results, api_key)
                 audio, transcript = await _connected(request, generate)
-                headers = dict(PRIVATE)
-                if transcript:
-                    headers["X-Sentient-Speech-Transcript"] = base64.b64encode(transcript.encode("utf-8")).decode("ascii")
-                    headers["X-Sentient-Speech-Transcript-Encoding"] = "base64-utf8"
-                return Response(audio, media_type="audio/wav", headers=headers)
+                return _audio_response(audio, transcript)
         except TimeoutError:
             raise HTTPException(504, "Voice playback took too long. Try again.", headers=PRIVATE)
         except (httpx.HTTPError, WebSocketException, OSError, ValueError, TypeError, binascii.Error):

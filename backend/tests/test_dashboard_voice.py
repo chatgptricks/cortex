@@ -76,6 +76,73 @@ def test_missing_configuration_and_empty_answers(client, monkeypatch):
     assert client.post("/api/dashboard/assistant/speech", json={"text": "Answer", "voice": "unexpected"}).status_code == 422
 
 
+def test_voice_catalogue_has_ordered_allowlist_validated_default_and_fixed_samples(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_VOICE", "coral")
+    response = client.get("/api/dashboard/assistant/voices")
+    assert response.status_code == 200 and response.headers["cache-control"] == "private, no-store"
+    payload = response.json()
+    expected = ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"]
+    assert payload["voices"] == [{"id": name, "name": name.title()} for name in expected]
+    assert payload["default_voice"] == "coral"
+    assert payload["samples"] == voice._VOICE_SAMPLES
+    assert voice.VoicePreviewRequest.model_json_schema()["properties"]["voice"]["enum"] == expected
+    monkeypatch.setenv("OPENAI_VOICE", "invalid-server-config")
+    assert client.get("/api/dashboard/assistant/voices").json()["default_voice"] == "marin"
+    assert client.get("/api/dashboard/assistant/voices", headers={"x-kind": "agent_code"}).status_code == 403
+
+
+@pytest.mark.parametrize("language,sample,selected", [("es", "next", "coral"), ("en", "results", "cedar")])
+def test_voice_preview_uses_fixed_verbatim_sample_without_dashboard_lookup(client, monkeypatch, language, sample, selected):
+    narration = voice._VOICE_SAMPLES[sample][language]
+    payload = events()
+    payload.insert(-1, {"type": "response.output_audio_transcript.done", "transcript": narration})
+    socket = Socket(payload)
+    monkeypatch.setenv("OPENAI_VOICE", "marin")
+    monkeypatch.setattr(voice, "websocket_connect", lambda *args, **kwargs: socket)
+    monkeypatch.setattr(voice, "_narration", lambda *args: pytest.fail("Preview must not use answer narration"))
+    monkeypatch.setattr(voice, "_stored_results", lambda *args: pytest.fail("Preview must not read posts"))
+    monkeypatch.setattr(voice.db, "connect", lambda: pytest.fail("Preview must not query the database"))
+    response = client.post("/api/dashboard/assistant/voice-preview", json={"voice": selected, "language": language, "sample": sample})
+    assert response.status_code == 200 and response.headers["content-type"] == "audio/wav"
+    assert response.content.startswith(b"RIFF") and response.headers["cache-control"] == "private, no-store"
+    assert base64.b64decode(response.headers["x-sentient-speech-transcript"]).decode("utf-8") == narration
+    assert socket.sent[0]["session"]["audio"]["output"]["voice"] == selected
+    assert "VERBATIM" in socket.sent[0]["session"]["instructions"]
+    assert socket.sent[1]["item"]["content"] == [{"type": "input_text", "text": narration}]
+    assert socket.closed and not voice._active
+    assert voice._default_voice() == "marin"
+
+
+@pytest.mark.parametrize("changes", [{"voice": "unknown"}, {"language": "fr"}, {"sample": "custom"}, {"text": "arbitrary content"}])
+def test_voice_preview_rejects_unsupported_schema_before_provider(client, monkeypatch, changes):
+    monkeypatch.setattr(voice, "_synthesize", lambda *args, **kwargs: pytest.fail("Invalid preview must not contact provider"))
+    body = {"voice": "coral", "language": "es", "sample": "results", **changes}
+    assert client.post("/api/dashboard/assistant/voice-preview", json=body).status_code == 422
+
+
+def test_preview_uses_same_browser_auth_and_shared_busy_guard(client, monkeypatch):
+    body = {"voice": "coral", "language": "es", "sample": "results"}
+    assert client.post("/api/dashboard/assistant/voice-preview", headers={"x-kind": "agent_code"}, json=body).status_code == 403
+    voice._active.add("tester@example.test")
+    assert client.post("/api/dashboard/assistant/voice-preview", json=body).status_code == 429
+    voice._active.clear()
+    async def timeout(*args, **kwargs):
+        raise TimeoutError()
+    monkeypatch.setattr(voice, "_synthesize", timeout)
+    assert client.post("/api/dashboard/assistant/voice-preview", json=body).status_code == 504
+    assert not voice._active
+
+
+def test_personal_voice_override_changes_speech_session_without_server_default(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_VOICE", "marin")
+    socket = Socket(events())
+    monkeypatch.setattr(voice, "websocket_connect", lambda *args, **kwargs: socket)
+    response = client.post("/api/dashboard/assistant/speech", json={"text": "Existing answer", "voice": "coral"})
+    assert response.status_code == 200
+    assert socket.sent[0]["session"]["audio"]["output"]["voice"] == "coral"
+    assert voice._default_voice() == "marin"
+
+
 @pytest.mark.parametrize("data,mime,status", [(b"", "audio/webm", 422), (WEBM, "image/png", 415),
                                              (b"fake recording", "audio/webm", 415)])
 def test_invalid_uploads_never_contact_provider(client, monkeypatch, data, mime, status):
@@ -383,7 +450,7 @@ def test_real_app_middleware_allows_voice_without_admin_or_read_marker(monkeypat
     async def transcribe(*args):
         called.append("transcribe")
         return "Latest post"
-    async def synthesize(*args):
+    async def synthesize(*args, **kwargs):
         called.append("speech")
         return b"RIFF-audio", "Existing answer"
     monkeypatch.setattr(voice, "_transcribe", transcribe)
@@ -395,7 +462,10 @@ def test_real_app_middleware_allows_voice_without_admin_or_read_marker(monkeypat
     assert client.post("/api/dashboard/assistant/transcribe", headers=headers,
                        files={"file": ("audio.webm", WEBM, "audio/webm")}).status_code == 200
     assert client.post("/api/dashboard/assistant/speech", headers=headers, json={"text": "Existing answer"}).status_code == 200
-    assert called == ["transcribe", "speech"]
+    assert client.get("/api/dashboard/assistant/voices", headers=headers).status_code == 200
+    assert client.post("/api/dashboard/assistant/voice-preview", headers=headers,
+                       json={"voice": "coral", "language": "es", "sample": "results"}).status_code == 200
+    assert called == ["transcribe", "speech", "speech"]
     assert client.post("/api/admin/users", headers=headers).status_code == 403
 
 
@@ -416,3 +486,6 @@ def test_real_app_rejects_missing_invalid_or_revoked_identity_before_voice(monke
     assert client.post("/api/dashboard/assistant/transcribe", headers=headers,
                        files={"file": ("audio.webm", WEBM, "audio/webm")}).status_code == expected
     assert client.post("/api/dashboard/assistant/speech", headers=headers, json={"text": "Existing answer"}).status_code == expected
+    assert client.get("/api/dashboard/assistant/voices", headers=headers).status_code == expected
+    assert client.post("/api/dashboard/assistant/voice-preview", headers=headers,
+                       json={"voice": "coral", "language": "es", "sample": "results"}).status_code == expected
