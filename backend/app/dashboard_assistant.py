@@ -1,6 +1,6 @@
 """The dashboard companion reads Cortex through the caller's existing API boundary."""
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import os
 import re
@@ -43,12 +43,27 @@ class ResearchFilters(BaseModel):
     text_scope: Literal["all", "caption"] = "all"
     min_likes: int | None = Field(default=None, ge=0, le=10**12)
     min_comments: int | None = Field(default=None, ge=0, le=10**12)
+    likes_operator: Literal["gt", "gte"] = "gte"
+    comments_operator: Literal["gt", "gte"] = "gte"
     accounts: list[str] = Field(default_factory=list, max_length=100)
     from_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     to_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     sort: Literal["newest", "oldest", "likes-desc", "comments-desc"] = "newest"
     promos_only: bool = False
     media: Literal["all", "video", "static"] = "all"
+
+
+def research_filters(arguments: dict) -> dict:
+    validated = ResearchFilters.model_validate(arguments)
+    filters = validated.model_dump(exclude={"likes_operator", "comments_operator"})
+    for metric in ("likes", "comments"):
+        value = filters["min_" + metric]
+        if value is not None and getattr(validated, metric + "_operator") == "gt": filters["min_" + metric] = value + 1
+    filters["accounts"] = [a.strip().removeprefix("@").lower() for a in filters["accounts"]]
+    if any(not re.fullmatch(r"[a-z0-9_.]{1,64}", a) for a in filters["accounts"]): raise ValueError("Invalid account handle.")
+    for key in ("from_date", "to_date"):
+        if filters[key]: date.fromisoformat(filters[key])
+    return filters
 
 
 def require_browser(request: Request) -> str:
@@ -197,15 +212,16 @@ TOOLS = [
     {"type": "function", "name": "analyze_cortex", "description": "Analyze the FULL authorized JSON returned by any discovered read endpoint, without sending the full dataset to the model. Automatically follows supported pagination (up to 40 pages), and reports complete=false if incomplete. Use query_cortex first to inspect the shape when needed. analysis_json: {items_path: 'posts' (or data/items/etc., empty string for a root array), filters: [{field:'a',op:'eq',value:'evolving.ai'}], fields:['a','sc','d','l','dashboard_url'], sort:[{field:'d',direction:'desc'}], limit:10}. Filters: eq, ne, contains (case-insensitive text), in (list), is_null (boolean), gt/gte/lt/lte (numbers), after/before (ISO dates), within_last_hours (number, uses server now). Optional group_by (up to 3 fields) and aggregations [{field:'l',op:'sum',as:'likes'}]; ops count,count_distinct,sum,avg,min,max. Unknown numeric values remain unknown; known-value counts are returned. Field names must come from the actual API shape. For exact engagement rankings use the dedicated insights/top-posts endpoint because it merges fresh observations before sorting.", "strict": True,
      "parameters": {"type": "object", "properties": {"operation": {"type": "string"}, "parameters_json": {"type": "string"}, "analysis_json": {"type": "string"}}, "required": ["operation", "parameters_json", "analysis_json"], "additionalProperties": False}},
 
-    {"type": "function", "name": "show_research_posts", "description": "Apply filters visibly to the dashboard Research page. Use ONLY when the user asks to show/filter/open a result set in the dashboard, not for a simple factual question. This is a reversible UI action and changes no posts. Caption scope matches the complete query phrase only in captions. min_likes and min_comments are inclusive integer thresholds, so more than 5000 means min_likes=5001. Empty accounts means all accessible accounts. Use empty query and null thresholds/dates to clear those filters. Unspecified filters should be cleared so the requested result set is shown.", "strict": True,
+    {"type": "function", "name": "show_research_posts", "description": "Apply filters visibly to the dashboard Research page. Use ONLY when the user asks to show/filter/open a result set in the dashboard, not for a simple factual question. This is a reversible UI action and changes no posts. Caption scope matches the complete query phrase only in captions. Keep the user's threshold number unchanged. likes_operator/comments_operator: gt means strictly more than, gte means at least. For more than 5000 likes send min_likes=5000, likes_operator=gt; the server handles the arithmetic. Empty accounts means all accessible accounts. Use empty query and null thresholds/dates to clear those filters. Unspecified filters should be cleared so the requested result set is shown.", "strict": True,
      "parameters": {"type": "object", "properties": {
        "query": {"type": "string"}, "text_scope": {"type": "string", "enum": ["all", "caption"]},
        "min_likes": {"type": ["integer", "null"]}, "min_comments": {"type": ["integer", "null"]},
+       "likes_operator": {"type": "string", "enum": ["gt", "gte"]}, "comments_operator": {"type": "string", "enum": ["gt", "gte"]},
        "accounts": {"type": "array", "items": {"type": "string"}},
        "from_date": {"type": ["string", "null"]}, "to_date": {"type": ["string", "null"]},
        "sort": {"type": "string", "enum": ["newest", "oldest", "likes-desc", "comments-desc"]},
        "promos_only": {"type": "boolean"}, "media": {"type": "string", "enum": ["all", "video", "static"]}},
-       "required": ["query", "text_scope", "min_likes", "min_comments", "accounts", "from_date", "to_date", "sort", "promos_only", "media"], "additionalProperties": False}},
+       "required": ["query", "text_scope", "min_likes", "min_comments", "likes_operator", "comments_operator", "accounts", "from_date", "to_date", "sort", "promos_only", "media"], "additionalProperties": False}},
 
 ]
 
@@ -268,9 +284,9 @@ async def respond(request: Request, body: ChatRequest, api_key: str) -> dict:
                         if source and source not in sources:
                             sources.append(source)
                     elif call["name"] == "show_research_posts":
-                        filters = ResearchFilters.model_validate(arguments).model_dump()
+                        filters = research_filters(arguments)
                         ui_actions = [{"type": "research_filters", "filters": filters}]
-                        tool_result = {"ok": True, "message": "The dashboard will apply these filters when this answer is delivered. Keep the reply to a short confirmation.", "filters": filters}
+                        return {"answer": "Filtros aplicados." if body.language == "es" else "Filters applied.", "sources": sources, "reaction": "happy", "model": model_name(), "ui_actions": ui_actions}
                     else:
                         raise ValueError("Unknown tool.")
                 except (ValueError, TypeError, KeyError):

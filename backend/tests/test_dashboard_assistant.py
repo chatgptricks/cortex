@@ -158,7 +158,7 @@ def test_ui_action_is_structured_and_validated(app, monkeypatch):
     def provider(req):
         calls.append(json.loads(req.content))
         if len(calls) == 1:
-            return httpx.Response(200, json={"output": [{"type": "function_call", "call_id": "show", "name": "show_research_posts", "arguments": json.dumps(filters)}]})
+            return httpx.Response(200, json={"output": [{"type": "function_call", "call_id": "show", "name": "show_research_posts", "arguments": json.dumps(filters | {"min_likes": 5000, "likes_operator": "gt", "comments_operator": "gte"})}]})
         return httpx.Response(200, json={"output": [{"type": "message", "content": [{"type": "output_text", "text": "Filtros aplicados."}]}]})
     def client(**kwargs):
         kwargs.setdefault('transport', httpx.MockTransport(provider))
@@ -166,4 +166,7 @@ def test_ui_action_is_structured_and_validated(app, monkeypatch):
     monkeypatch.setattr(httpx, 'AsyncClient', client)
     result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='Mostrá posts con Elon Musk en el caption y más de 5000 likes'), 'test-key'))
     assert result['ui_actions'] == [{"type": "research_filters", "filters": filters}]
+    assert result['answer'] == 'Filtros aplicados.' and len(calls) == 1
+    assert assistant.research_filters(filters | {'min_likes': 5000, 'likes_operator': 'gte'})['min_likes'] == 5000
+    assert assistant.research_filters(filters | {'accounts': ['@Evolving.AI']})['accounts'] == ['evolving.ai']
     with pytest.raises(ValueError): assistant.ResearchFilters.model_validate(filters | {'sort': 'javascript:alert(1)'})
