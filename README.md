@@ -108,6 +108,26 @@ the server-side `TRICKS_DASH_REFRESH_PASSWORD` check.
 
 ## Deploying
 
+### Dashboard companion
+
+`GET /api/dashboard/assistant/status` and `POST /api/dashboard/assistant/chat`
+require the signed-in Firebase browser session. Chat uses the existing
+`OPENAI_API_KEY`; `OPENAI_ASSISTANT_MODEL` optionally overrides the existing
+caption model (`OPENAI_CAPTION_MODEL`, default `gpt-5-mini`). No new secret is
+needed for an installation already generating captions.
+
+The assistant discovers operations from Cortex's OpenAPI/product catalogue,
+then performs bounded JSON reads through normal authentication middleware with
+the caller's credential and role preview. It never runs write operations,
+downloads, credential-management endpoints or arbitrary URLs. Read endpoints
+retain their ordinary product behavior, including existing cache refreshes.
+Responses include source links and disclose unavailable/truncated data.
+OpenAI Responses calls use `store: false`; no conversation is stored by Cortex.
+Each API process limits a user to one active answer, 10 requests per minute
+and 60 per hour, with a 120-second answer deadline.
+
+### Release
+
 Render auto-deploys on push to `main` (see `render.yaml`). Confirm a deploy actually landed via
 `GET /api/health`, which reports the live `commit` hash. **Never push to
 `main` while an account import/backfill is running** — a redeploy restarts

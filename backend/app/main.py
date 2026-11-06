@@ -787,16 +787,20 @@ def insights_posts() -> dict[str, Any]:
 
 
 @app.get("/api/insights/music")
-def insights_music() -> dict[str, Any]:
+def insights_music(known_generated_at: str | None = Query(None, max_length=64)) -> dict[str, Any]:
     """Music analysis over retained metadata, with no scrape or enrichment writes."""
-    from .insights_music import build_music_catalogue, cached_music_catalogue
+    from .insights_music import build_music_catalogue
+    from .insights_music_cache import cached_report
     from .config import DATABASE_URL, DB_PATH
 
     accounts = list_accounts(active_only=True, research_only=True)
     def load() -> dict[str, Any]:
         with connect() as conn:
             return build_music_catalogue(conn, accounts, connection_factory=connect)
-    return cached_music_catalogue(accounts, load, database_identity=DATABASE_URL or str(DB_PATH))
+    report = cached_report(accounts, load, database_identity=DATABASE_URL or str(DB_PATH), connection_factory=connect)
+    if isinstance(known_generated_at, str) and known_generated_at == report["coverage"]["generated_at"]:
+        return {"not_modified": True, "coverage": {"generated_at": known_generated_at}, "cache": report["cache"]}
+    return report
 
 
 @app.get("/api/insights/music/page", summary="Read a bounded page of music, exact audio IDs and post engagement")
@@ -10084,6 +10088,9 @@ def reset_hot_check(password: Annotated[str, Form()], account: Annotated[str, Fo
 
 
 app.include_router(hooks_router)
+
+from .dashboard_assistant import router as dashboard_assistant_router
+app.include_router(dashboard_assistant_router)
 
 # Hosted agent access shares the API process and its authentication boundary.
 from .product_mcp import install as install_product_mcp

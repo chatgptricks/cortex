@@ -11,7 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app import insights_music as music, main
+from app import insights_music as music, insights_music_cache, main
 
 
 ACCOUNTS = [
@@ -25,6 +25,9 @@ NOW = datetime(2026, 10, 25, tzinfo=UTC)
 def isolated_music_cache(monkeypatch):
     monkeypatch.setattr(music, "_CACHE_ENTRY", None)
     monkeypatch.setattr(music, "_INFLIGHT", {})
+    monkeypatch.setattr(insights_music_cache, "_ENTRIES", insights_music_cache.OrderedDict())
+    monkeypatch.setattr(insights_music_cache, "_INFLIGHT", {})
+    monkeypatch.setattr(insights_music_cache, "_RETRY_AFTER", {})
 
 
 @pytest.fixture
@@ -58,6 +61,7 @@ def stored(tmp_path, monkeypatch):
             published_at TEXT, updated_at TEXT, likes INTEGER, comments INTEGER,
             post_type_label TEXT, hidden INTEGER DEFAULT 0, is_deleted INTEGER DEFAULT 0)""")
         conn.execute("CREATE TABLE engagement_observations (shortcode TEXT PRIMARY KEY, observed_at TEXT, raw_json TEXT)")
+        insights_music_cache.ensure_schema(conn)
     monkeypatch.setattr(main, "connect", connect)
     monkeypatch.setattr(main, "list_accounts", lambda **kwargs: ACCOUNTS)
     statements.clear()
@@ -501,7 +505,10 @@ def test_music_route_cache_rechecks_roster_and_avoids_reopening_catalogue_connec
     def forbidden_connection():
         raise AssertionError("A warm music catalogue should not reopen its data connection")
     monkeypatch.setattr(main, "connect", forbidden_connection)
-    assert main.insights_music() is first
+    assert main.insights_music()["posts"] is first["posts"]
+    same = main.insights_music(known_generated_at=first["coverage"]["generated_at"])
+    assert same["not_modified"] is True
+    assert "posts" not in same and "accounts" not in same
     monkeypatch.setattr(main, "list_accounts", lambda **kwargs: ACCOUNTS[:1])
     with pytest.raises(AssertionError, match="warm music catalogue"):
         main.insights_music()
