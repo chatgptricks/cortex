@@ -23,6 +23,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from pydantic import BaseModel, Field
 
 from .db import connect, utc_now
+from .assistant_access import is_assistant_read
 from .jev_features import JevFeatureUnavailable, ask_jev
 
 logger = logging.getLogger(__name__)
@@ -700,7 +701,7 @@ _HOOK_SELECT = """SELECT h.id, h.source_table, h.source_id, h.source_kind, h.acc
                WHERE h.source_kind = 'ocr'"""
 
 
-def _all_hooks(owner_email: str, terms: list[str] | None = None) -> list[dict[str, Any]]:
+def _all_hooks(owner_email: str, terms: list[str] | None = None, *, stored_only: bool = False) -> list[dict[str, Any]]:
     """Hooks that could contain any of `terms` (all hooks when no terms).
 
     The SQL filter is a superset of `_has_term` on the folded search text;
@@ -716,15 +717,17 @@ def _all_hooks(owner_email: str, terms: list[str] | None = None) -> list[dict[st
             params.append(f"% {stem} %" if len(stem) < 4 else f"% {stem}%")
         where = " AND (h.search_text IS NULL OR " + " OR ".join(clauses) + ")"
     with connect() as conn:
-        ensure_schema(conn)
+        if not stored_only:
+            ensure_schema(conn)
         rows = conn.execute(_HOOK_SELECT + where, (owner_email, *params)).fetchall()
     return [_row_dict(row) for row in rows]
 
 
-def _top_liked_hooks(owner_email: str, limit: int, exclude: set[str] | None = None) -> list[dict[str, Any]]:
+def _top_liked_hooks(owner_email: str, limit: int, exclude: set[str] | None = None, *, stored_only: bool = False) -> list[dict[str, Any]]:
     exclude = exclude or set()
     with connect() as conn:
-        ensure_schema(conn)
+        if not stored_only:
+            ensure_schema(conn)
         rows = conn.execute(
             _HOOK_SELECT + " ORDER BY COALESCE(h.likes, -1) DESC, h.id LIMIT ?",
             (owner_email, limit + len(exclude)),
@@ -793,12 +796,15 @@ _RELATED_MIN_CONTEXT = 0.6
 _RELATED_POOL = 24
 
 
-def search_hooks(query: str, mode: str, owner_email: str, limit: int = 24) -> tuple[list[dict[str, Any]], str | None]:
+def search_hooks(query: str, mode: str, owner_email: str, limit: int = 24, *, stored_only: bool = False) -> tuple[list[dict[str, Any]], str | None]:
+    read_options = {"stored_only": True} if stored_only else {}
+    if stored_only:
+        mode = "words"
     phrase = _fold(query)
     if not phrase:
-        return _dedupe(_top_liked_hooks(owner_email, limit * 3))[:limit], None
+        return _dedupe(_top_liked_hooks(owner_email, limit * 3, **read_options))[:limit], None
     terms = _tokens(query) or phrase.split()
-    rows = _all_hooks(owner_email, terms)
+    rows = _all_hooks(owner_email, terms, **read_options)
     word_matches = []
     for row in rows:
         row["wordScore"], row["wordCoverage"] = _word_match(query, row)
@@ -937,9 +943,10 @@ def _safe_categorize(limit: int = 6) -> None:
         logger.exception("Hooks automatic categorization failed")
 
 
-def _status(owner_email: str) -> dict[str, Any]:
+def _status(owner_email: str, *, stored_only: bool = False) -> dict[str, Any]:
     with connect() as conn:
-        ensure_schema(conn)
+        if not stored_only:
+            ensure_schema(conn)
         counts = conn.execute(
             """SELECT COUNT(*) AS total,
                       SUM(CASE WHEN source_kind = 'caption' THEN 1 ELSE 0 END) AS captions,
@@ -980,10 +987,18 @@ def list_hooks(
 ) -> dict[str, Any]:
     response.headers["Cache-Control"] = "private, no-store"
     owner = _owner(request)
-    sync = sync_remote_sources(request) if _REMOTE_SOURCE_BASE else sync_sources()
-    results, warning = search_hooks(q.strip(), mode, owner, limit)
-    status = _status(owner)
-    if status["pending"]:
+    stored_only = is_assistant_read(request)
+    if stored_only:
+        # The companion reads the existing index, never syncs or categorizes.
+        mode = "words"
+        sync = {"stored_only": True}
+        results, warning = search_hooks(q.strip(), mode, owner, limit, stored_only=True)
+        status = _status(owner, stored_only=True)
+    else:
+        sync = sync_remote_sources(request) if _REMOTE_SOURCE_BASE else sync_sources()
+        results, warning = search_hooks(q.strip(), mode, owner, limit)
+        status = _status(owner)
+    if status["pending"] and not stored_only:
         background_tasks.add_task(_safe_categorize, 6)
     return {
         "query": q.strip(), "mode": mode,
@@ -1045,13 +1060,19 @@ def _draft_row(row: Any) -> dict[str, Any]:
 @router.get("/drafts", dependencies=[Depends(require_dev)])
 def list_drafts(request: Request, response: Response) -> dict[str, Any]:
     response.headers["Cache-Control"] = "private, no-store"
+    stored_only = is_assistant_read(request)
     with connect() as conn:
-        ensure_schema(conn)
+        if not stored_only:
+            ensure_schema(conn)
         rows = conn.execute(
-            "SELECT * FROM hook_drafts WHERE owner_email = ? ORDER BY updated_at DESC, id LIMIT 100",
-            (_owner(request),),
+            "SELECT * FROM hook_drafts" + ("" if stored_only else " WHERE owner_email = ?")
+            + " ORDER BY updated_at DESC, id LIMIT 100",
+            () if stored_only else (_owner(request),),
         ).fetchall()
-    return {"drafts": [_draft_row(row) for row in rows]}
+    result = {"drafts": [_draft_row(row) for row in rows]}
+    if stored_only:
+        result["complete"] = len(rows) < 100
+    return result
 
 
 @router.post("/drafts", dependencies=[Depends(require_dev)])

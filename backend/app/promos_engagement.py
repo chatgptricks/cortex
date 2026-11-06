@@ -457,7 +457,7 @@ def engagement_accounts(*, now: datetime | None = None) -> dict[str, Any]:
 
 
 def build_promos_engagement(*, days: int = 0, format: str = "all", now: datetime | None = None,
-                            accounts: list[str] | None = None) -> dict[str, Any]:
+                            accounts: list[str] | None = None, persist_cache: bool = True) -> dict[str, Any]:
     """Reuse all-history/all-format account benchmarks for exactly seven days.
 
     Explicit legacy windows and format filters retain their separate keys.
@@ -476,17 +476,20 @@ def build_promos_engagement(*, days: int = 0, format: str = "all", now: datetime
         roster = [account for account in roster if account["handle"].lower() in requested]
     handles = [account["handle"].lower() for account in roster]
     with db.connect() as conn:
-        if not _columns(conn, "promos_engagement_cache"):
+        cache_ready = bool(_columns(conn, "promos_engagement_cache"))
+        if not cache_ready and persist_cache:
             benchmark_cache.ensure_schema(conn)
-        cached = benchmark_cache.load(conn, handles, days, format, current)
+            cache_ready = True
+        cached = benchmark_cache.load(conn, handles, days, format, current) if cache_ready else {}
     missing = [account for account in roster if account["handle"].lower() not in cached]
     recalculated = {}
     if missing:
         fresh = calculate_promos_engagement(days=days, format=format, now=current, _roster=missing)
         recalculated = {account["handle"]: account for account in fresh["accounts"]}
-        with db.connect() as conn:
-            for handle, account in recalculated.items():
-                benchmark_cache.save(conn, handle, days, format, current, account)
+        if persist_cache:
+            with db.connect() as conn:
+                for handle, account in recalculated.items():
+                    benchmark_cache.save(conn, handle, days, format, current, account)
     result = []
     for account in roster:
         handle = account["handle"].lower()

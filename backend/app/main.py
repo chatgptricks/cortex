@@ -321,8 +321,10 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
         return JSONResponse(
             {"detail": "This Google account is not authorized for Sentient Dash."}, status_code=403
         )
+    from .assistant_access import is_assistant_read, apply_assistant_read_access
+    request.state.user_email = email
     client_time_zone = request.headers.get("x-sentient-time-zone", "").strip()
-    if client_time_zone in {"America/Costa_Rica", "America/Bogota"} and client_time_zone != access.get("time_zone"):
+    if not is_assistant_read(request) and client_time_zone in {"America/Costa_Rica", "America/Bogota"} and client_time_zone != access.get("time_zone"):
         # The browser is the most reliable source for a person's real clock.
         # Persist it so coordinators see Colombia's one-hour offset in the
         # shared scheduler on their next refresh as well.
@@ -367,6 +369,7 @@ async def _require_firebase_user(request, call_next):  # type: ignore[no-untyped
     # requests, or assigned-work workflow.
     if "pd" not in request.state.operating_roles:
         request.state.operating_roles.append("pd")
+    apply_assistant_read_access(request)
     if path.startswith("/api/admin/") and not (
         request.state.is_admin or request.state.is_dev or
         (path == "/api/admin/promos" or path.startswith("/api/admin/promos/"))
@@ -2093,7 +2096,7 @@ def admin_stacks_regroup_recent() -> dict[str, Any]:
 
 
 @app.get('/api/dashboard/stacks/{account}/{shortcode}')
-def dashboard_stack_members(account: str, shortcode: str) -> dict[str, Any]:
+def dashboard_stack_members(account: str, shortcode: str, request: Request = None) -> dict[str, Any]:
     """Load one persisted stack for Queue and other detail views on demand."""
     from .topic_stacks import attach, stack_keys
     # Queue reads one persisted group. Bootstrap only this one post if a
@@ -2101,7 +2104,8 @@ def dashboard_stack_members(account: str, shortcode: str) -> dict[str, Any]:
     clean_account = account.strip().lstrip('@').lower()
     clean_shortcode = shortcode.strip()
     post_key = f'{clean_account}:{clean_shortcode}'
-    if not stack_keys(post_key):
+    from .assistant_access import is_assistant_read
+    if not (request is not None and is_assistant_read(request)) and not stack_keys(post_key):
         snapshot = _queue_v2_post_snapshot(clean_account, clean_shortcode)
         source = {
             'account': clean_account, 'shortcode': clean_shortcode,
@@ -5392,7 +5396,8 @@ def dashboard_queue_v2(request: Request, date: str | None = None, archive: bool 
         clauses.append("designer_email = ?")
         params.append(caller)
     with connect() as conn:
-        expired_ids = _queue_v2_purge_expired(conn)
+        from .assistant_access import is_assistant_read
+        expired_ids = [] if is_assistant_read(request) else _queue_v2_purge_expired(conn)
         if expired_ids:
             _queue_v2_publish(conn, "retention_purged", "queue-retention@sentientdash.app", expired_ids)
         # Never run HOT routing in this public read path. It scans/imports
@@ -8620,14 +8625,17 @@ def admin_promos_engagement_accounts() -> Response:
 
 @app.get("/api/admin/promos/engagement")
 def admin_promos_engagement(
+    request: Request,
     days: int = Query(0, ge=0, le=90),
     format: Literal["all", "reel", "carousel", "image"] = "all",
     accounts: list[str] | None = Query(None),
 ) -> Response:
     if days not in {0, 30, 90}:
         raise HTTPException(status_code=422, detail="days must be 0, 30, or 90")
+    from .assistant_access import is_assistant_read
+    read_options = {"persist_cache": False} if is_assistant_read(request) else {}
     return JSONResponse(
-        build_promos_engagement(days=days, format=format, accounts=accounts),
+        build_promos_engagement(days=days, format=format, accounts=accounts, **read_options),
         headers={"Cache-Control": "private, no-store", "Vary": "Authorization"},
     )
 

@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.testclient import TestClient
 
 from app import dashboard_assistant as assistant
+from app.assistant_access import apply_assistant_read_access
 
 
 @pytest.fixture
@@ -22,19 +23,24 @@ def app(monkeypatch):
             request.state.user_email = "member@example.com"
             request.state.credential_kind = "firebase"
             request.state.time_zone = "America/Costa_Rica"
+            request.state.operating_role = "pd"
+            apply_assistant_read_access(request)
         return await call_next(request)
 
     @value.get("/api/dashboard/me")
     def me(request: Request):
         if not getattr(request.state, "user_email", ""):
             raise HTTPException(401, "Sign in")
-        return {"role": request.headers.get("x-queue-role-preview") or "pd"}
+        return {"role": request.state.operating_role}
 
-    @value.get("/api/tracker/accounts/{account}")
-    def tracker(account: str, request: Request, limit: int = 30):
-        if request.headers.get("x-queue-role-preview") == "pd":
+    @value.get("/api/tracker/accounts/{handle}")
+    def tracker(handle: str, request: Request, limit: int = 30):
+        if not getattr(request.state, "assistant_read_only", False):
             raise HTTPException(403, "Coordinator required")
-        return {"account": account, "followers": 12345, "limit": limit}
+        assert request.headers.get("authorization") == "Bearer signed-in-member"
+        assert "x-queue-role-preview" not in request.headers
+        assert "x-sentient-time-zone" not in request.headers
+        return {"account": handle, "followers": 12345, "limit": limit}
 
     @value.delete("/api/admin/accounts/{account}")
     def remove(account: str):
@@ -47,7 +53,7 @@ def app(monkeypatch):
 
 
 def request(app, *, preview="", credential="firebase"):
-    return SimpleNamespace(app=app, headers={"authorization": "Bearer signed-in-member", "x-queue-role-preview": preview}, state=SimpleNamespace(user_email="member@example.com", credential_kind=credential, time_zone="America/Costa_Rica"))
+    return SimpleNamespace(app=app, headers={"authorization": "Bearer signed-in-member", "x-queue-role-preview": preview, "x-sentient-time-zone": "Pacific/Honolulu"}, state=SimpleNamespace(user_email="member@example.com", credential_kind=credential, time_zone="America/Costa_Rica"))
 
 
 @pytest.mark.parametrize("message,mode,expected", [
@@ -107,14 +113,14 @@ def test_research_mode_enforces_no_ui_actions_and_preserves_authorized_reads(app
         if len(calls) == 2:
             assert "cannot change dashboard filters" in json.loads(payload["input"][-1]["output"])["error"]
             return httpx.Response(200, json={"output": [{"type": "function_call", "call_id": "read", "name": "query_cortex", "arguments": json.dumps({"operation": operation, "parameters_json": "{}"})}]})
-        assert json.loads(payload["input"][-1]["output"])["data"] == {"role": "vc"}
-        return httpx.Response(200, json={"output": [{"type": "message", "content": [{"type": "output_text", "text": "Your role is VC."}]}]})
+        assert json.loads(payload["input"][-1]["output"])["data"] == {"role": "pd"}
+        return httpx.Response(200, json={"output": [{"type": "message", "content": [{"type": "output_text", "text": "Your role is PD."}]}]})
     def client(**kwargs):
         kwargs.setdefault("transport", httpx.MockTransport(provider))
         return original(**kwargs)
     monkeypatch.setattr(httpx, "AsyncClient", client)
     result = asyncio.run(assistant.respond(request(app, preview="vc"), assistant.ChatRequest(message=message, mode=mode, language="en"), "test-key"))
-    assert result["ui_actions"] == [] and result["answer"] == "Your role is VC."
+    assert result["ui_actions"] == [] and result["answer"] == "Your role is PD."
     assert len(result["sources"]) == 1 and len(calls) == 3
     assert any(tool["name"] == "show_research_posts" for tool in assistant.TOOLS)
 
@@ -173,32 +179,38 @@ def test_browser_session_required_and_status_has_no_key(app, monkeypatch):
 
 def test_catalogue_discovers_product_routes_and_excludes_recursive_chat(app):
     entries = assistant.operations(app)
-    assert any(entry["path"] == "/api/tracker/accounts/{account}" for entry in entries.values())
+    assert any(entry["path"] == "/api/tracker/accounts/{handle}" for entry in entries.values())
     assert not any("/assistant/" in entry["path"] for entry in entries.values())
     result = assistant.search_operations(entries, "tracker followers")
-    assert result["operations"][0]["path"] == "/api/tracker/accounts/{account}"
+    assert result["operations"][0]["path"] == "/api/tracker/accounts/{handle}"
 
 
-def test_reads_reapply_caller_identity_and_preview_role(app):
-    entry = next(entry for entry in assistant.operations(app).values() if entry["path"] == "/api/tracker/accounts/{account}")
-    denied, _ = asyncio.run(assistant.read_operation(request(app, preview="pd"), entry, {"path": {"account": "example"}}))
+def test_reads_reauthenticate_same_caller_without_forwarding_preview_headers(app):
+    entry = next(entry for entry in assistant.operations(app).values() if entry["path"] == "/api/tracker/accounts/{handle}")
+    with TestClient(app) as client:
+        direct = client.get("/api/tracker/accounts/example", headers={"Authorization": "Bearer signed-in-member", "x-queue-role-preview": "vc"})
+    assert direct.status_code == 403
+    for preview in ("pd", "vc"):
+        result, source = asyncio.run(assistant.read_operation(request(app, preview=preview), entry, {"path": {"handle": "example"}, "query": {"limit": 99999}}))
+        assert result["data"] == {"account": "example", "followers": 12345, "limit": 100}
+        assert source["url"] == "https://sentientdash.app/tracker.html"
+    original = request(app)
+    original.headers["authorization"] = "Bearer invalid-user"
+    denied, _ = asyncio.run(assistant.read_operation(original, entry, {"path": {"handle": "example"}}))
     assert denied["status"] == 403
-    result, source = asyncio.run(assistant.read_operation(request(app, preview="vc"), entry, {"path": {"account": "example"}, "query": {"limit": 99999}}))
-    assert result["data"] == {"account": "example", "followers": 12345, "limit": 100}
-    assert source["url"] == "https://sentientdash.app/tracker.html"
 
 
 def test_write_and_path_injection_never_dispatch(app):
     entries = assistant.operations(app)
-    write = next(entry for entry in entries.values() if entry["write"])
+    write = next(entry for entry in assistant.catalogue(app.openapi()).values() if entry["write"])
     with pytest.raises(ValueError, match="changes data"):
         assistant.prepare_read(write, {"path": {"account": "example"}})
-    read = next(entry for entry in entries.values() if "{account}" in entry["path"] and not entry["write"])
+    read = next(entry for entry in entries.values() if "{handle}" in entry["path"] and not entry["write"])
     for value in ("../users", "%2e%2e", "https://outside.example", "one?admin=true"):
         with pytest.raises(ValueError):
-            assistant.prepare_read(read, {"path": {"account": value}})
+            assistant.prepare_read(read, {"path": {"handle": value}})
     with pytest.raises(ValueError):
-        assistant.prepare_read(read, {"path": {"account": "example"}, "query": {"secret": "x"}})
+        assistant.prepare_read(read, {"path": {"handle": "example"}, "query": {"secret": "x"}})
 
 
 def test_large_results_are_explicitly_unavailable_not_fake_totals():
@@ -216,8 +228,8 @@ def test_tool_loop_uses_real_reads_and_stateless_provider(app, monkeypatch):
         calls.append(data)
         if len(calls) == 1:
             return httpx.Response(200, json={"output": [{"type": "function_call", "call_id": "one", "name": "query_cortex", "arguments": json.dumps({"operation": operation, "parameters_json": "{}"})}]})
-        assert json.loads(data["input"][-1]["output"])["data"] == {"role": "vc"}
-        return httpx.Response(200, json={"output": [{"type": "message", "content": [{"type": "output_text", "text": "Tu rol actual es VC."}]}]})
+        assert json.loads(data["input"][-1]["output"])["data"] == {"role": "pd"}
+        return httpx.Response(200, json={"output": [{"type": "message", "content": [{"type": "output_text", "text": "Tu rol actual es PD."}]}]})
 
     def client(**kwargs):
         kwargs.setdefault("transport", httpx.MockTransport(provider))
@@ -225,7 +237,7 @@ def test_tool_loop_uses_real_reads_and_stateless_provider(app, monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", client)
     result = asyncio.run(assistant.respond(request(app, preview="vc"), assistant.ChatRequest(message="¿Cuál es mi rol?"), "server-only-key"))
-    assert result["answer"] == "Tu rol actual es VC."
+    assert result["answer"] == "Tu rol actual es PD."
     assert len(result["sources"]) == 1
     assert all(call["store"] is False and call["include"] == ["reasoning.encrypted_content"] for call in calls)
     assert "server-only-key" not in json.dumps(result)
@@ -248,14 +260,16 @@ def test_limits_and_provider_failures_release_active_request(app, monkeypatch):
 
 
 def test_analytics_follows_every_page_with_caller_permissions(app):
-    @app.get('/api/insights/fixture/page')
+    @app.get('/api/insights/music/page')
     def pages(request: Request, offset: int = 0, limit: int = 100):
         assert request.headers.get('authorization') == 'Bearer signed-in-member'
-        assert request.headers.get('x-queue-role-preview') == 'vc'
+        assert request.headers.get('x-queue-role-preview') is None
+        assert request.headers.get('x-sentient-time-zone') is None
+        assert getattr(request.state, 'assistant_read_only', False)
         total = 227
         return {"data": [{"likes": i} for i in range(offset, min(offset + limit, total))], "pagination": {"has_more": offset + limit < total, "next_offset": offset + limit if offset + limit < total else None}}
     app.openapi_schema = None
-    entry = next(e for e in assistant.operations(app).values() if e['path'] == '/api/insights/fixture/page')
+    entry = next(e for e in assistant.operations(app).values() if e['path'] == '/api/insights/music/page')
     result, source = asyncio.run(assistant.read_operation(request(app, preview='vc'), entry, {'query': {'limit': 100}}, {'items_path': 'data', 'sort': [{'field': 'likes', 'direction': 'desc'}], 'limit': 1}))
     assert result['data']['input_rows'] == 227
     assert result['data']['data'] == [{'likes': 226}]
@@ -328,17 +342,17 @@ def test_ui_action_cannot_select_an_account_absent_from_real_controls(app, monke
 
 
 def test_single_page_and_upstream_coverage_are_marked_partial(app):
-    @app.get('/api/insights/fixture/page')
+    @app.get('/api/insights/music/page')
     def pages(offset: int = 0):
         return {"data": [{"likes": 1}], "pagination": {"has_more": True, "next_offset": offset + 1}}
 
-    @app.get('/api/insights/fixture/coverage')
+    @app.get('/api/insights/posts')
     def incomplete_coverage():
         return {"data": [], "coverage": {"complete": False}}
 
     app.openapi_schema = None
     entries = assistant.operations(app)
-    for path in ('/api/insights/fixture/page', '/api/insights/fixture/coverage'):
+    for path in ('/api/insights/music/page', '/api/insights/posts'):
         entry = next(e for e in entries.values() if e['path'] == path)
         result, source = asyncio.run(assistant.read_operation(request(app), entry, {}))
         assert result['complete'] is False and source['partial'] is True
@@ -347,7 +361,7 @@ def test_single_page_and_upstream_coverage_are_marked_partial(app):
 def test_analytics_follows_opaque_promo_cursors_and_detects_cycles(app):
     calls = []
 
-    @app.get('/api/admin/fixture/promos')
+    @app.get('/api/admin/promos')
     def promos(request: Request, cursor: str | None = None, cycle: bool = False):
         assert request.headers.get('authorization') == 'Bearer signed-in-member'
         calls.append(cursor)
@@ -358,7 +372,7 @@ def test_analytics_follows_opaque_promo_cursors_and_detects_cycles(app):
         return {"items": [{"likes": 100}], "next_cursor": "2026-11-05|evolving.ai|Post1" if cycle else None}
 
     app.openapi_schema = None
-    entry = next(e for e in assistant.operations(app).values() if e['path'] == '/api/admin/fixture/promos')
+    entry = next(e for e in assistant.operations(app).values() if e['path'] == '/api/admin/promos')
     analysis = {"items_path": "items", "aggregations": [{"op": "sum", "field": "likes", "as": "likes"}]}
     result, source = asyncio.run(assistant.read_operation(request(app), entry, {}, analysis))
     assert result['complete'] and result['data']['complete'] and not source['partial']
@@ -372,12 +386,12 @@ def test_analytics_follows_opaque_promo_cursors_and_detects_cycles(app):
 
 def test_analytics_budget_bounds_all_pages_and_flags_partial(app, monkeypatch):
     calls = []
-    @app.get('/api/insights/fixture/page')
+    @app.get('/api/insights/music/page')
     def pages(offset: int = 0):
         calls.append(offset)
         return {"data": [{"text": "x" * 150}], "pagination": {"has_more": True, "next_offset": offset + 1}}
     app.openapi_schema = None
-    entry = next(e for e in assistant.operations(app).values() if e['path'] == '/api/insights/fixture/page')
+    entry = next(e for e in assistant.operations(app).values() if e['path'] == '/api/insights/music/page')
     monkeypatch.setattr(assistant, 'MAX_READ_BYTES', 400)
     result, source = asyncio.run(assistant.read_operation(request(app), entry, {}, {"items_path": "data"}))
     assert calls == [0, 1]

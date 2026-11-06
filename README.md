@@ -116,20 +116,31 @@ require the signed-in Firebase browser session. Chat uses the existing
 caption model (`OPENAI_CAPTION_MODEL`, default `gpt-5-mini`). No new secret is
 needed for an installation already generating captions.
 
-Chat accepts a per-message `mode` (`auto`, `filter`, or `research`). Leading
-`/filter` and `/research` shortcuts also work directly in `message`, with the
-shortcut taking precedence over the mode field. `/filter` requests the existing
-Research page controls; `/research` returns queried results in chat and cannot
-apply UI filters. Shortcuts are case-insensitive, require a following query,
-and do not carry over to later messages. Messages without a shortcut or mode
-retain normal automatic behavior.
+The assistant searches stored dashboard data first for every factual request,
+not only shortcuts; it does not substitute web results or unsupported model
+knowledge for missing records. Answers stay concise and use internal post links.
 
-The assistant discovers operations from Cortex's OpenAPI/product catalogue,
-then performs bounded JSON reads through normal authentication middleware with
-the caller's credential and role preview. It never runs write operations,
-downloads, credential-management endpoints or arbitrary URLs. Read endpoints
-retain their ordinary product behavior, including existing cache refreshes.
-Responses include source links and disclose unavailable/truncated data.
+Chat accepts modes `auto`, `filter`, `research`, and `next`, or a leading
+case-insensitive slash shortcut (the prefix takes precedence). `/filter` applies
+existing Research page controls; `/research` answers in chat without changing
+filters. `/next` recommends one stored competitor post to recreate for a
+Sentient account. It asks for missing reel/image/carousel format and destination
+before searching. A bounded `pending_next` response can be returned as
+`next_context` on the clarification reply; a fresh slash command resets it.
+Destination accounts and competitor groups come from the live registry. The
+shortlist uses exact-format, recent stored rankings plus captions/OCR and target
+account examples; links and selection keys are validated by the server. It does
+not claim that a recommendation has never been recreated or queued.
+
+All authenticated, allowlisted Firebase users receive the same assistant-only
+read access to reviewed dashboard product routes, independent of their UI role.
+Each internal read revalidates the original session and carries a private,
+route-bound in-process capability that cannot be supplied by an HTTP header.
+Identity reads retain the real caller. Normal browser/MCP roles do not change.
+Writes, credentials, binary exports, operational logs, paid refreshes and
+external-fetch GETs are excluded. Queue retention, stack bootstrapping and Hooks
+synchronization/categorization are suppressed in this read context. Sources and
+incomplete coverage are retained; failed reads produce a short localized notice.
 OpenAI Responses calls use `store: false`; no conversation is stored by Cortex.
 Each API process limits a user to one active answer, 10 requests per minute
 and 60 per hour, with a 120-second answer deadline.
