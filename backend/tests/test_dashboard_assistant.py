@@ -152,7 +152,7 @@ def test_analytics_follows_every_page_with_caller_permissions(app):
 
 
 def test_ui_action_is_structured_and_validated(app, monkeypatch):
-    filters = {"query": "Elon Musk", "text_scope": "caption", "min_likes": 5001, "min_comments": None, "accounts": [], "from_date": None, "to_date": None, "sort": "newest", "promos_only": False, "media": "all"}
+    filters = {"query": "Elon Musk", "min_likes": 5001, "min_comments": None, "accounts": [], "from_date": None, "to_date": None, "sort": "newest", "promos_only": False, "post_type": "All posts", "collabs_only": False}
     calls = []
     original = httpx.AsyncClient
     def provider(req):
@@ -164,9 +164,15 @@ def test_ui_action_is_structured_and_validated(app, monkeypatch):
         kwargs.setdefault('transport', httpx.MockTransport(provider))
         return original(**kwargs)
     monkeypatch.setattr(httpx, 'AsyncClient', client)
-    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='Mostrá posts con Elon Musk en el caption y más de 5000 likes'), 'test-key'))
+    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='Buscá Elon Musk con más de 5000 likes usando los filtros disponibles'), 'test-key'))
     assert result['ui_actions'] == [{"type": "research_filters", "filters": filters}]
     assert result['answer'] == 'Filtros aplicados.' and len(calls) == 1
     assert assistant.research_filters(filters | {'min_likes': 5000, 'likes_operator': 'gte'})['min_likes'] == 5000
     assert assistant.research_filters(filters | {'accounts': ['@Evolving.AI']})['accounts'] == ['evolving.ai']
     with pytest.raises(ValueError): assistant.ResearchFilters.model_validate(filters | {'sort': 'javascript:alert(1)'})
+
+
+def test_ui_filters_reject_nonexistent_controls():
+    for unsupported in ({"text_scope": "caption"}, {"media": "static"}, {"max_likes": 5000}, {"post_type": "Reel"}, {"sort": "most-views"}, {"audio_id": "1234"}):
+        with pytest.raises(ValueError): assistant.research_filters({"query": ""} | unsupported)
+    assert assistant.research_filters({"query": "", "post_type": "Carousel", "sort": "hot-rate", "collabs_only": True})['post_type'] == 'Carousel'
