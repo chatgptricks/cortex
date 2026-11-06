@@ -68,6 +68,72 @@ def run(app, **body):
     return asyncio.run(assistant.respond(request(app), assistant.ChatRequest(**body), "test-key"))
 
 
+def direct_tool_call(responses, *, max_output_tokens=1200):
+    requests = []
+    def provider(req):
+        requests.append(json.loads(req.content))
+        status, payload = responses[min(len(requests) - 1, len(responses) - 1)]
+        return httpx.Response(status, json=payload)
+    async def invoke():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+            return await assistant.next_tool_call(client, "test-key", "Prepare only.",
+                [{"role": "user", "content": "reel for chatgptricks"}], assistant.NEXT_PREPARE_TOOL,
+                max_output_tokens=max_output_tokens)
+    return invoke, requests
+
+
+@pytest.mark.parametrize("initial_budget, retry_budget", [(1200, 2400), (2400, 4800), (4000, 8000), (5000, 8000)])
+def test_budget_incomplete_tool_call_retries_once_with_more_room(initial_budget, retry_budget):
+    arguments = {"post_format": "reel", "target_account": "chatgptricks"}
+    partial = function_call("prepare_next_recommendation", {})
+    partial["arguments"] = '{"post_format":'
+    invoke, requests = direct_tool_call([
+        (200, {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "output": [partial]}),
+        (200, {"status": "completed", "output": [function_call("prepare_next_recommendation", arguments)]}),
+    ], max_output_tokens=initial_budget)
+    assert asyncio.run(invoke()) == arguments
+    assert [row["max_output_tokens"] for row in requests] == [initial_budget, retry_budget]
+    assert {key: value for key, value in requests[0].items() if key != "max_output_tokens"} == {
+        key: value for key, value in requests[1].items() if key != "max_output_tokens"}
+
+
+def test_repeated_budget_exhaustion_stays_fail_closed_after_two_calls():
+    invoke, requests = direct_tool_call([(200, {
+        "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [{"type": "reasoning", "summary": []}],
+    })])
+    with pytest.raises(ValueError) as failure:
+        asyncio.run(invoke())
+    assert failure.value.code == "provider_incomplete"
+    assert [row["max_output_tokens"] for row in requests] == [1200, 2400]
+
+
+@pytest.mark.parametrize("payload", [
+    {"status": "incomplete", "incomplete_details": {"reason": "content_filter"}, "output": []},
+    {"status": "incomplete", "output": []},
+    {"status": "failed", "output": []},
+    {"status": "completed", "output": [function_call("unknown_tool", {})]},
+    {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+     "output": [function_call("unknown_tool", {})]},
+    {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+     "output": [function_call("prepare_next_recommendation", {}), function_call("prepare_next_recommendation", {})]},
+])
+def test_non_budget_or_invalid_tool_failures_are_not_retried(payload):
+    invoke, requests = direct_tool_call([(200, payload)])
+    with pytest.raises(ValueError) as failure:
+        asyncio.run(invoke())
+    assert failure.value.code in {"provider_incomplete", "provider_invalid_tool"}
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+def test_http_provider_failures_are_not_retried(status):
+    invoke, requests = direct_tool_call([(status, {"error": {"message": "provider failure"}})])
+    with pytest.raises(HTTPException if status == 429 else httpx.HTTPStatusError):
+        asyncio.run(invoke())
+    assert len(requests) == 1
+
+
 @pytest.mark.parametrize("message, mode, expected", [
     (" /NeXt ", "auto", ("next", "")),
     ("/next reel for chatgptricks", "research", ("next", "reel for chatgptricks")),
@@ -380,6 +446,7 @@ def test_semantic_history_review_excludes_rewritten_story_before_selection(app, 
             return [function_call("prepare_next_recommendation", {"post_format": "reel", "target_account": "chatgptricks"})]
         if turn == 2:
             assert payload["tools"][0]["name"] == "check_next_publication_history"
+            assert payload["max_output_tokens"] == 4000
             assert "OldStory" in json.dumps(payload)
             return [function_call("check_next_publication_history", {"checks": [
                 {"candidate_key": "evolving.ai:VALID_123", "status": "already_posted", "matched_post_key": "chatgptricks:OldStory"},
@@ -392,22 +459,70 @@ def test_semantic_history_review_excludes_rewritten_story_before_selection(app, 
     assert len(calls) == 3
 
 
-@pytest.mark.parametrize("checks", [[],
-    [{"candidate_key": "evolving.ai:VALID_123", "status": "new", "matched_post_key": None}] * 2,
-    [{"candidate_key": "invented", "status": "new", "matched_post_key": None}] * 2,
-    [{"candidate_key": "evolving.ai:VALID_123", "status": "already_posted", "matched_post_key": "invented"},
-     {"candidate_key": "evolving.ai:NEW_456", "status": "new", "matched_post_key": None}],
+@pytest.mark.parametrize("checks, expected_code", [([], "check_count"),
+    ([{"candidate_key": "evolving.ai:VALID_123", "status": "new", "matched_post_key": None}] * 2, "candidate_identity"),
+    ([{"candidate_key": "invented", "status": "new", "matched_post_key": None}] * 2, "candidate_identity"),
+    ([{"candidate_key": "evolving.ai:VALID_123", "status": "already_posted", "matched_post_key": "invented"},
+      {"candidate_key": "evolving.ai:NEW_456", "status": "new", "matched_post_key": None}], "prior_match"),
+    ([{"candidate_key": "evolving.ai:VALID_123", "status": "new"},
+      {"candidate_key": "evolving.ai:NEW_456", "status": "new", "matched_post_key": None}], "check_shape"),
+    ([{"candidate_key": "evolving.ai:VALID_123", "status": "new", "matched_post_key": "chatgptricks:OldStory"},
+      {"candidate_key": "evolving.ai:NEW_456", "status": "new", "matched_post_key": None}], "prior_match"),
 ])
-def test_incomplete_or_forged_reuse_checks_cannot_allow_recommendation(app, monkeypatch, checks):
+def test_incomplete_or_forged_reuse_checks_cannot_allow_recommendation(app, monkeypatch, checks, expected_code):
     candidate_stub(monkeypatch, history_bundle())
     def answer(payload, turn):
         if turn == 1:
             return [function_call("prepare_next_recommendation", {"post_format": "reel", "target_account": "chatgptricks"})]
-        assert turn == 2
+        assert turn in (2, 3)
+        if turn == 3:
+            assert expected_code in payload["instructions"]
         return [function_call("check_next_publication_history", {"checks": checks})]
-    provider_mock(monkeypatch, answer)
+    calls = provider_mock(monkeypatch, answer)
     result = run(app, message="/next reel for chatgptricks")
     assert "?post=" not in result["answer"]
+    assert result["error_code"] == "next_history_review_" + expected_code
+    assert len(calls) == 3
+
+
+def test_missing_review_check_is_repaired_once_without_erasing_a_prior_veto(app, monkeypatch):
+    candidate_stub(monkeypatch, history_bundle())
+    review_inputs = []
+    def answer(payload, turn):
+        if turn == 1:
+            return [function_call("prepare_next_recommendation", {"post_format": "reel", "target_account": "chatgptricks"})]
+        if turn in (2, 3):
+            assert payload["tools"][0]["name"] == "check_next_publication_history"
+            review_inputs.append(payload["input"])
+            if turn == 2:
+                checks = [{"candidate_key": "evolving.ai:VALID_123", "status": "already_posted", "matched_post_key": "chatgptricks:OldStory"}]
+            else:
+                assert "check_count" in payload["instructions"] and "REQUIRED_CANDIDATE_KEYS=" in payload["instructions"]
+                checks = [{"candidate_key": key, "status": "new", "matched_post_key": None}
+                          for key in ("evolving.ai:VALID_123", "evolving.ai:NEW_456")]
+            return [function_call("check_next_publication_history", {"checks": checks})]
+        assert turn == 4 and payload["tools"][0]["name"] == "choose_next_post"
+        assert "VALID_123" not in json.dumps(payload["input"]), "a valid earlier duplicate verdict must remain a veto"
+        return [function_call("choose_next_post", {"account": "evolving.ai", "shortcode": "NEW_456", "reason": "A fresh relevant story."})]
+    calls = provider_mock(monkeypatch, answer)
+    result = run(app, message="/next reel for chatgptricks")
+    assert "evolving.ai%3ANEW_456" in result["answer"] and not result.get("error_code")
+    assert len(calls) == 4 and review_inputs[0] == review_inputs[1]
+
+
+@pytest.mark.parametrize("missing, expected_code", [("history", "history_missing"), ("prior", "prior_missing")])
+def test_missing_review_evidence_never_retries_the_model(monkeypatch, missing, expected_code):
+    bundle = history_bundle()
+    if missing == "history":
+        bundle["history_complete"] = False
+    else:
+        bundle["candidates"][0]["prior_posts"] = []
+    async def no_provider(*args, **kwargs):
+        raise AssertionError("Missing evidence cannot be repaired by a provider")
+    monkeypatch.setattr(assistant, "next_tool_call", no_provider)
+    with pytest.raises(ValueError) as failure:
+        asyncio.run(assistant.unpublished_next_candidates(None, "test-key", bundle))
+    assert failure.value.code == expected_code
 
 
 def test_uncertain_or_already_posted_candidates_never_reach_selector(app, monkeypatch):
