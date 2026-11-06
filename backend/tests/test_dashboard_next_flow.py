@@ -525,6 +525,29 @@ def test_missing_review_evidence_never_retries_the_model(monkeypatch, missing, e
     assert failure.value.code == expected_code
 
 
+def test_reuse_review_can_veto_using_verified_history_retrieved_for_another_candidate(monkeypatch):
+    bundle = history_bundle()
+    bundle["candidates"][1]["prior_posts"] = [{"key": "chatgptricks:SharedStory", "caption": "Earlier publication of the first candidate's story"}]
+    calls = []
+    async def review(client, api_key, instructions, inputs, tool, **kwargs):
+        calls.append(tool)
+        properties = tool["parameters"]["properties"]["checks"]["items"]["properties"]
+        assert properties["candidate_key"]["enum"] == ["evolving.ai:VALID_123", "evolving.ai:NEW_456"]
+        assert set(properties["matched_post_key"]["enum"]) == {None, "chatgptricks:OldStory", "chatgptricks:SharedStory"}
+        assert "another candidate is also valid evidence" in instructions
+        return {"checks": [
+            {"candidate_key": "evolving.ai:VALID_123", "status": "already_posted", "matched_post_key": "chatgptricks:SharedStory"},
+            {"candidate_key": "evolving.ai:NEW_456", "status": "new", "matched_post_key": None},
+        ]}
+    monkeypatch.setattr(assistant, "next_tool_call", review)
+    result = asyncio.run(assistant.unpublished_next_candidates(None, "test-key", bundle))
+    assert [row["key"] for row in result] == ["evolving.ai:NEW_456"]
+    assert len(calls) == 1, "a valid duplicate match must not trigger a repair or fail the complete request"
+    original_properties = assistant.NEXT_REUSE_TOOL["parameters"]["properties"]["checks"]["items"]["properties"]
+    assert "enum" not in original_properties["candidate_key"], "per-request IDs must not leak into another user's tool schema"
+    assert "enum" not in original_properties["matched_post_key"]
+
+
 def test_uncertain_or_already_posted_candidates_never_reach_selector(app, monkeypatch):
     candidate_stub(monkeypatch, history_bundle())
     def answer(payload, turn):
