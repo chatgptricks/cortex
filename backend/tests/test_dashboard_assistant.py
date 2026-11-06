@@ -248,6 +248,7 @@ def test_limits_and_provider_failures_release_active_request(app, monkeypatch):
     async def failure(*args):
         raise httpx.ConnectError("private provider detail")
     monkeypatch.setattr(assistant, "respond", failure)
+    monkeypatch.setattr(assistant, "resolve_reply_language", failure)
     with TestClient(app) as client:
         headers = {"Authorization": "Bearer signed-in-member"}
         result = client.post("/api/dashboard/assistant/chat", headers=headers, json={"message": "hola"})
@@ -415,7 +416,8 @@ def test_cancelling_request_stops_work_and_releases_active_slot(app, monkeypatch
             state['cancelled'] = True
     async def disconnected():
         return state['started']
-    monkeypatch.setattr(assistant, 'respond', blocked)
+    monkeypatch.setattr(assistant, 'resolve_reply_language', blocked)
+    monkeypatch.setattr(assistant, 'respond', lambda *args: pytest.fail('Cancelled language resolution must not start chat'))
     req = request(app)
     req.is_disconnected = disconnected
     with pytest.raises(HTTPException) as error:
@@ -427,7 +429,10 @@ def test_cancelling_request_stops_work_and_releases_active_slot(app, monkeypatch
 
 def test_completed_answer_stops_disconnect_watch_and_preserves_response(app, monkeypatch):
     monkeypatch.setenv('OPENAI_API_KEY', 'test')
-    expected = {"answer": "Hello.", "sources": [], "ui_actions": []}
+    expected = {"answer": "Hello.", "sources": [], "ui_actions": [], "language": "en"}
+    async def language(*args):
+        return "en"
+    monkeypatch.setattr(assistant, "resolve_reply_language", language)
     async def answer(*args):
         await anyio.sleep(0)
         return expected

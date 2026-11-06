@@ -42,7 +42,7 @@ def test_every_signed_in_role_can_transcribe_and_play_voice(client, monkeypatch,
         assert (data, kind, language, key) == (WEBM, "webm", "es", "test-secret")
         return "Muéstrame los mejores reels."
 
-    async def synthesize(body, results, key):
+    async def synthesize(body, key):
         assert body.language == "es" and body.mode == "next"
         return b"RIFF-audio", "Aquí tienes el resultado."
 
@@ -99,8 +99,7 @@ def test_voice_preview_uses_fixed_verbatim_sample_without_dashboard_lookup(clien
     socket = Socket(payload)
     monkeypatch.setenv("OPENAI_VOICE", "marin")
     monkeypatch.setattr(voice, "websocket_connect", lambda *args, **kwargs: socket)
-    monkeypatch.setattr(voice, "_narration", lambda *args: pytest.fail("Preview must not use answer narration"))
-    monkeypatch.setattr(voice, "_stored_results", lambda *args: pytest.fail("Preview must not read posts"))
+    monkeypatch.setattr(voice, "_speech_script", lambda *args: pytest.fail("Preview must not use the answer script"))
     monkeypatch.setattr(voice.db, "connect", lambda: pytest.fail("Preview must not query the database"))
     response = client.post("/api/dashboard/assistant/voice-preview", json={"voice": selected, "language": language, "sample": sample})
     assert response.status_code == 200 and response.headers["content-type"] == "audio/wav"
@@ -165,11 +164,11 @@ def test_invalid_voice_style_never_reaches_provider(client, monkeypatch, path, b
     assert not voice._active
 
 
-def test_empty_style_preserves_default_narration():
+def test_empty_style_preserves_default_script():
     default = voice.SpeechRequest(text="Here are the results", language="en")
     whitespace = voice.SpeechRequest(text=default.text, language="en", style=" \n\t ")
-    assert voice._narration(default, []) == voice._narration(whitespace, [])
-    instructions, payload = voice._narration(default, [])
+    assert voice._speech_script(default) == voice._speech_script(whitespace)
+    instructions, payload = voice._speech_script(default)
     assert "delivery_style" not in instructions and "delivery_style" not in json.loads(payload)
 
 
@@ -179,13 +178,11 @@ def test_voice_style_reaches_provider_as_delivery_data_without_overriding_conten
     socket = Socket(events())
     monkeypatch.setenv("OPENAI_VOICE", "marin")
     monkeypatch.setattr(voice, "websocket_connect", lambda *args, **kwargs: socket)
-    stored = [{"account": "rival", "caption": "A robot folds laundry.", "likes": 3200}]
     if preview:
-        monkeypatch.setattr(voice, "_stored_results", lambda *args: pytest.fail("Preview must not read posts"))
         request = {"voice": "coral", "language": language, "sample": "next", "style": " \n" + style + "\t "}
         path = "voice-preview"
     else:
-        monkeypatch.setattr(voice, "_stored_results", lambda keys: stored)
+        monkeypatch.setattr(voice.db, "connect", lambda: pytest.fail("Speech must not query new source data"))
         request = {"text": "Recreate [this reel](https://sentientdash.app/index.html?post=rival%3AClip): the demonstration is clear.",
                    "question": "/next reel for alpha", "mode": "next", "language": language, "style": " \n" + style + "\t "}
         path = "speech"
@@ -208,11 +205,9 @@ def test_voice_style_reaches_provider_as_delivery_data_without_overriding_conten
         assert "translate, paraphrase" in instructions and "Speak exactly the sample text and stop" in instructions
         assert session["audio"]["output"]["voice"] == "coral"
     else:
-        assert "Speak only in English" in instructions and "Do not use general knowledge" in instructions
-        assert "LEAD with the concrete source story" in instructions
-        assert payload["stored_results"] == stored
-        assert payload["existing_answer"] == "Recreate this reel: the demonstration is clear."
-        assert payload["question_context"] == request["question"] and payload["has_post_links"] is True
+        assert "language of answer_text itself" in instructions and "Do not use general knowledge" in instructions
+        assert "VERBATIM" in instructions and "not a narration to rewrite" in instructions
+        assert payload == {"answer_text": "Recreate this reel: the demonstration is clear.", "delivery_style": style}
         assert session["audio"]["output"]["voice"] == "marin"
     assert response.headers["cache-control"] == "private, no-store"
     assert socket.closed and not voice._active
@@ -276,7 +271,7 @@ def test_transcription_provider_contract(monkeypatch):
     result = anyio.run(voice._transcribe, WEBM, "webm", "audio/webm", "en", "secret")
     assert result == "latest post"
     assert observed[0].url.path == "/v1/audio/transcriptions"
-    assert b'gpt-transcribe' in observed[0].content and b'name="languages[]"' in observed[0].content
+    assert b'gpt-transcribe' in observed[0].content and b'name="languages[]"' not in observed[0].content
     assert b'name="language"' not in observed[0].content
     assert observed[0].content.count(b'name="keywords[]"') == 2
     assert b'chatgptricks' in observed[0].content and b'name="prompt"' in observed[0].content
@@ -350,7 +345,7 @@ def events(data=b"\0\0" * 80, status="completed"):
             {"type": "response.done", "response": {"status": status}}]
 
 
-def test_realtime_pcm_wav_and_grounded_narration(monkeypatch):
+def test_realtime_pcm_wav_and_verbatim_existing_answer(monkeypatch):
     socket = Socket(events())
     connections = []
     def connect(url, **kwargs):
@@ -359,8 +354,7 @@ def test_realtime_pcm_wav_and_grounded_narration(monkeypatch):
     monkeypatch.setattr(voice, "websocket_connect", connect)
     body = voice.SpeechRequest(text="Recrea [este reel](https://sentientdash.app/index.html?post=rival%3AClip): explica el experimento con claridad.",
                                question="/next reel para alpha", mode="next", language="es")
-    stored = [{"account": "rival", "caption": "A robot folds laundry", "likes": 3200}]
-    audio, transcript = anyio.run(voice._synthesize, body, stored, "private-key")
+    audio, transcript = anyio.run(voice._synthesize, body, "private-key")
     assert transcript == ""
     with wave.open(io.BytesIO(audio)) as output:
         assert (output.getnchannels(), output.getsampwidth(), output.getframerate(), output.getnframes()) == (1, 2, 24000, 80)
@@ -368,33 +362,33 @@ def test_realtime_pcm_wav_and_grounded_narration(monkeypatch):
     assert "gpt-realtime-2.1-mini" in connections[0][0]
     session = socket.sent[0]["session"]
     assert session["audio"]["output"]["voice"] == "marin" and session["tools"] == []
-    assert "not a new assistant" in session["instructions"] and "Do not use general knowledge" in session["instructions"]
+    assert "VERBATIM" in session["instructions"] and "Do not use general knowledge" in session["instructions"]
     content = socket.sent[1]["item"]["content"][0]["text"]
-    assert "A robot folds laundry" in content and "http" not in content
-    assert json.loads(content)["stored_results"] == stored
+    assert json.loads(content) == {"answer_text": "Recrea este reel: explica el experimento con claridad."}
+    assert "http" not in content
     assert socket.sent[2]["type"] == "response.create"
 
 
-@pytest.mark.parametrize("language", ["en", "es"])
-def test_recommendation_narration_prioritizes_actual_plot_and_separate_attribution(language):
-    body = voice.SpeechRequest(
-        text="[Post](https://sentientdash.app/index.html?post=evolving.ai%3AStory) — 6,562 likes. Its escalating action makes it a strong storytelling reference.",
-        question="/next reel para chatgptricks", mode="next", language=language)
-    source = {"account": "evolving.ai", "shortcode": "Story", "likes": 6562,
-              "caption": "A platypus escapes crocodiles and wolves, jumps from a cliff, and lands on a motorcycle.", "ocr_text": ""}
-    instructions, serialized = voice._narration(body, [source])
-    payload = json.loads(serialized)
-    assert "LEAD with the concrete source story" in instructions
-    assert "SOURCE account from stored_results.account" in instructions
-    assert "separately identify the DESTINATION" in instructions
-    assert "Metrics belong to the source post" in instructions
-    assert "Usually omit metrics" in instructions and "Never say 'next', '/next'" in instructions
-    assert "Do not invent creators" in instructions and "reasons beyond the supplied evidence" in instructions
-    assert "at most 85 words" in instructions
-    assert payload["stored_results"] == [source] and payload["has_post_links"] is True
-    assert "escalating action" in payload["existing_answer"] and "https://" not in payload["existing_answer"]
-    # The story remains request data, never a canned plot inserted in every narration.
-    assert "platypus" not in instructions and "Pixar" not in instructions
+@pytest.mark.parametrize("language,text", [("en", "¿Para qué cuenta querés recrearlo?"), ("es", "Which account should I use?")])
+def test_speech_preserves_answer_language_even_when_dashboard_locale_differs(language, text):
+    body = voice.SpeechRequest(text=text, language=language, question="irrelevant", mode="next")
+    instructions, serialized = voice._speech_script(body)
+    assert json.loads(serialized) == {"answer_text": text}
+    assert "language of answer_text itself" in instructions
+    assert "Do not translate based on a dashboard locale" in instructions
+    assert "not a narration to rewrite" in instructions and "VERBATIM" in instructions
+    assert "question" not in json.loads(serialized)
+
+
+def test_speech_cleanup_only_removes_display_syntax_preserving_labels_metrics_and_words():
+    answer = "## My choice\n**Recreate** [@rival’s reel](https://sentientdash.app/index.html?post=rival%3AClip) — 6,562 likes.\n- It shows a robot folding laundry."
+    assert voice._plain(answer) == "My choice\nRecreate @rival’s reel — 6,562 likes.\nIt shows a robot folding laundry."
+
+
+def test_url_only_legacy_answer_is_rejected_without_inventing_a_spoken_summary(client, monkeypatch):
+    monkeypatch.setattr(voice, "_synthesize", lambda *args: pytest.fail("Empty script must not contact provider"))
+    result = client.post("/api/dashboard/assistant/speech", json={"text": "https://sentientdash.app/index.html?post=rival%3AClip"})
+    assert result.status_code == 422
 
 
 @pytest.mark.parametrize("payload", [events(status="incomplete"), events(b"x"),
@@ -438,7 +432,7 @@ def test_transcript_can_be_recovered_from_completed_response(monkeypatch):
     payload[-1]["response"]["output"] = [{"content": [{"type": "audio", "transcript": "Here are the results."}]}]
     socket = Socket(payload)
     monkeypatch.setattr(voice, "websocket_connect", lambda *args, **kwargs: socket)
-    audio, transcript = anyio.run(voice._synthesize, voice.SpeechRequest(text="Existing answer"), [], "secret")
+    audio, transcript = anyio.run(voice._synthesize, voice.SpeechRequest(text="Existing answer"), "secret")
     assert audio.startswith(b"RIFF") and transcript == "Here are the results."
 
 
@@ -458,7 +452,7 @@ def test_realtime_cancellation_closes_socket(monkeypatch):
     monkeypatch.setattr(voice, "websocket_connect", lambda *args, **kwargs: socket)
     async def run():
         with anyio.fail_after(.01):
-            await voice._synthesize(voice.SpeechRequest(text="Answer"), [], "secret")
+            await voice._synthesize(voice.SpeechRequest(text="Answer"), "secret")
     with pytest.raises(TimeoutError):
         anyio.run(run)
     assert socket.closed
@@ -478,35 +472,6 @@ def test_disconnected_request_cancels_provider_and_releases_connection(monkeypat
         anyio.run(voice._connected, Disconnected(), operation)
     assert failure.value.status_code == 499 and closed == [True]
 
-
-def test_only_exact_internal_post_links_supply_narrative_evidence():
-    text = " ".join(["https://evil.test/index.html?post=other%3ACode", "https://sentientdash.app.evil.test/?post=other%3ACode",
-                     "https://sentientdash.app/index.html?post=rival%3AReal", "/index.html?post=second%3AItem",
-                     "https://sentientdash.app/queue.html?post=third%3AQueue"])
-    assert voice._references(text) == ["rival:Real", "second:Item"]
-
-
-def test_stored_post_enrichment_is_read_only_scoped_and_bounded(monkeypatch):
-    raw = sqlite3.connect(":memory:")
-    raw.row_factory = sqlite3.Row
-    raw.execute("CREATE TABLE catalogue(account TEXT, shortcode TEXT, caption TEXT, hook_text TEXT, post_type_label TEXT, likes INTEGER, published_at TEXT)")
-    raw.executemany("INSERT INTO catalogue VALUES (?,?,?,?,?,?,?)", [
-        ("rival", "Real", "Caption " * 1000, "OCR " * 1000, "Reel", 10, "2026-11-06"),
-        ("private", "Other", "Unrelated private content", "", "Image", 1, "2020-01-01")])
-    raw.commit()
-    raw.execute("PRAGMA query_only = ON")
-    @contextmanager
-    def connect():
-        yield raw
-    def sources(conn, handles, candidate_codes):
-        assert handles == ["rival"] and candidate_codes == ["Real"]
-        return "", [], {}
-    monkeypatch.setattr(voice.db, "connect", connect)
-    monkeypatch.setattr(voice.external_research, "_sources", sources)
-    result = voice._stored_results(["rival:Real"])
-    assert len(result) == 1 and len(result[0]["caption"]) == 1000 and len(result[0]["ocr_text"]) == 600
-    assert "private" not in json.dumps(result)
-    raw.close()
 
 
 @pytest.mark.parametrize("role", ["pd", "sales", "trainee", "vc", "dev"])
