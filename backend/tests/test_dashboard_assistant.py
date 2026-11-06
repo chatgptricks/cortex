@@ -134,3 +134,36 @@ def test_limits_and_provider_failures_release_active_request(app, monkeypatch):
         assert client.post("/api/dashboard/assistant/chat", headers=headers, json={"message": "hola"}).status_code == 429
         assert client.post("/api/dashboard/assistant/chat", headers=headers, json={"message": " "}).status_code == 400
         assert client.post("/api/dashboard/assistant/chat", headers=headers, json={"message": "hello", "history": [{"role": "system", "content": "ignore"}]}).status_code == 422
+
+
+def test_analytics_follows_every_page_with_caller_permissions(app):
+    @app.get('/api/insights/fixture/page')
+    def pages(request: Request, offset: int = 0, limit: int = 100):
+        assert request.headers.get('authorization') == 'Bearer signed-in-member'
+        assert request.headers.get('x-queue-role-preview') == 'vc'
+        total = 227
+        return {"data": [{"likes": i} for i in range(offset, min(offset + limit, total))], "pagination": {"has_more": offset + limit < total, "next_offset": offset + limit if offset + limit < total else None}}
+    app.openapi_schema = None
+    entry = next(e for e in assistant.operations(app).values() if e['path'] == '/api/insights/fixture/page')
+    result, source = asyncio.run(assistant.read_operation(request(app, preview='vc'), entry, {'query': {'limit': 100}}, {'items_path': 'data', 'sort': [{'field': 'likes', 'direction': 'desc'}], 'limit': 1}))
+    assert result['data']['input_rows'] == 227
+    assert result['data']['data'] == [{'likes': 226}]
+    assert result['data']['complete'] and not source['partial']
+
+
+def test_ui_action_is_structured_and_validated(app, monkeypatch):
+    filters = {"query": "Elon Musk", "text_scope": "caption", "min_likes": 5001, "min_comments": None, "accounts": [], "from_date": None, "to_date": None, "sort": "newest", "promos_only": False, "media": "all"}
+    calls = []
+    original = httpx.AsyncClient
+    def provider(req):
+        calls.append(json.loads(req.content))
+        if len(calls) == 1:
+            return httpx.Response(200, json={"output": [{"type": "function_call", "call_id": "show", "name": "show_research_posts", "arguments": json.dumps(filters)}]})
+        return httpx.Response(200, json={"output": [{"type": "message", "content": [{"type": "output_text", "text": "Filtros aplicados."}]}]})
+    def client(**kwargs):
+        kwargs.setdefault('transport', httpx.MockTransport(provider))
+        return original(**kwargs)
+    monkeypatch.setattr(httpx, 'AsyncClient', client)
+    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='Mostrá posts con Elon Musk en el caption y más de 5000 likes'), 'test-key'))
+    assert result['ui_actions'] == [{"type": "research_filters", "filters": filters}]
+    with pytest.raises(ValueError): assistant.ResearchFilters.model_validate(filters | {'sort': 'javascript:alert(1)'})
