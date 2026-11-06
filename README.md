@@ -144,6 +144,17 @@ Instagram cover images for search indexing and hook display.
 
 ## Agent connection credentials
 
+Admin and Dev agents can read individual HOT calibration data using
+`GET /api/admin/engagement/checkpoints` or the hosted MCP tool
+`get_admin_engagement_checkpoints`. Read-only connections are supported.
+Filter by `account` and `days` (1–90, default 30), and paginate with
+`limit` (1–100) and `offset`. The response includes account thresholds and
+30-day suggestions, individual first-HOT-check likes, stored later checkpoints,
+publication metadata and measurement coverage. New checks preserve their
+receipt/evaluation times and the threshold actually applied. Legacy values
+remain available with unknown historical metadata represented as `null`.
+Reading this endpoint never starts an Instagram scrape or sends notifications.
+
 Authenticated users can create and revoke their own agent connection codes
 at the frontend's `/agents.html` page. Cortex stores hashes, expiry and last
 use metadata; codes inherit the owner's current roles on each request.

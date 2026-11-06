@@ -1797,6 +1797,8 @@ def _process_short_term_items(
     from .db import connect, utc_now
 
     with connect() as conn:
+        from .engagement_checkpoints import ensure_schema as ensure_checkpoint_schema
+        ensure_checkpoint_schema(conn)
         existing_rows = conn.execute(
             f"SELECT shortcode FROM {table} WHERE 1=1{scope_sql}", scope_params
         ).fetchall()
@@ -1867,10 +1869,9 @@ def _process_short_term_items(
         if comments is not None:
             set_clauses.append("comments = ?")
             params.append(comments)
-        if info["finalize_8h"] and _likes_are_known(item.get("likesCount")):
-            set_clauses += ["likes_at_8h = ?", "comments_at_8h = ?", "refreshed_8h = 1"]
-            params += [likes, comments]
-            engagement_summary["finalized_8h"] += 1
+        finalize_8h = info["finalize_8h"] and _likes_are_known(item.get("likesCount"))
+        hot_values = None
+        hot_alert = None
         # Only run the one-time HOT check when the like count is real. With an
         # unknown/hidden count, _apply_likes_floor returns the 500 baseline,
         # which at the ~1h mark computes to a rate of ~500/hr and would
@@ -1897,12 +1898,8 @@ def _process_short_term_items(
             threshold = cfg["hot_threshold"]
             multiplier = round(rate_per_hour / threshold, 3) if threshold else 0.0
             is_hot = 1 if rate_per_hour >= threshold else 0
-            set_clauses += ["is_hot = ?", "likes_at_1h = ?", "hot_checked = 1", "hot_rate_multiplier = ?"]
-            params += [is_hot, likes, multiplier]
+            hot_values = (is_hot, likes, multiplier, now_iso if is_hot else None)
             if is_hot:
-                set_clauses.append("hot_marked_at = ?")
-                params.append(now_iso)
-                engagement_summary["hot_marked"] += 1
                 # Queue the alert; it's sent only after the row is committed,
                 # so a Slack hiccup can never leave us having announced a post
                 # we failed to actually mark as HOT.
@@ -1912,25 +1909,49 @@ def _process_short_term_items(
                 # are already being watched in the dashboard. Override with
                 # SLACK_ALERT_GROUPS (comma-separated, or "all").
                 if _slack_alerts_cover(cfg["group"]):
-                    pending_alerts.append(
-                        {
-                            "account": account,
-                            "post_id": info["id"],
-                            "likes": likes,
-                            "multiplier": multiplier,
-                            "rate_per_hour": round(rate_per_hour),
-                            "threshold": threshold,
-                            "age_hours": info["age_hours"],
-                            "permalink": item.get("url") or f"https://www.instagram.com/p/{shortcode}/",
-                            # Needed to build the dashboard deep link; the
-                            # dashboard keys a post by account + shortcode.
-                            "shortcode": shortcode,
-                            "caption": _clean_text(item.get("caption")),
-                        }
-                    )
+                    hot_alert = {
+                        "account": account,
+                        "post_id": info["id"],
+                        "likes": likes,
+                        "multiplier": multiplier,
+                        "rate_per_hour": round(rate_per_hour),
+                        "threshold": threshold,
+                        "age_hours": info["age_hours"],
+                        "permalink": item.get("url") or f"https://www.instagram.com/p/{shortcode}/",
+                        # Needed to build the dashboard deep link; the
+                        # dashboard keys a post by account + shortcode.
+                        "shortcode": shortcode,
+                        "caption": _clean_text(item.get("caption")),
+                    }
         params.append(info["id"])
         with connect() as conn:
             conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE id = ?", params)
+            from .engagement_checkpoints import record, record_later
+            checkpoint_kwargs = {
+                "account": account, "shortcode": shortcode, "item": item,
+                "observed_at": now_iso, "evaluated_at": now.isoformat(),
+                "age_hours": info["age_hours"],
+            }
+            # Competing ingestion passes can read the same unchecked row.
+            # Claim each first observation in the same transaction as its
+            # snapshot so a later reading cannot replace the first one.
+            if finalize_8h and conn.execute(
+                f"UPDATE {table} SET likes_at_8h = ?, comments_at_8h = ?, refreshed_8h = 1 "
+                "WHERE id = ? AND refreshed_8h = 0", (likes, comments, info["id"])
+            ).rowcount == 1:
+                record(conn, checkpoint="8h", **checkpoint_kwargs)
+                engagement_summary["finalized_8h"] += 1
+            if hot_values is not None and conn.execute(
+                f"UPDATE {table} SET is_hot = ?, likes_at_1h = ?, hot_checked = 1, "
+                "hot_rate_multiplier = ?, hot_marked_at = ? WHERE id = ? AND hot_checked = 0",
+                (*hot_values, info["id"]),
+            ).rowcount == 1:
+                record(conn, checkpoint="first_hot_check", hot_threshold=threshold,
+                       is_hot=is_hot, rate_multiplier=multiplier, **checkpoint_kwargs)
+                engagement_summary["hot_marked"] += is_hot
+                if hot_alert is not None:
+                    pending_alerts.append(hot_alert)
+            record_later(conn, **checkpoint_kwargs)
             from .engagement_refresh import observe
             observe(conn, shortcode, item, now_iso)
         engagement_summary["updated"] += 1
@@ -2361,6 +2382,8 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
         select_cols += ", permalink"
 
     with connect() as conn:
+        from .engagement_checkpoints import ensure_schema as ensure_checkpoint_schema
+        ensure_checkpoint_schema(conn)
         rows = conn.execute(
             f"SELECT {select_cols} FROM {table} "
             f"WHERE shortcode IS NOT NULL AND shortcode != ''{scope_sql}",
@@ -2382,7 +2405,8 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
         if not (in_daily_window or mark_30 or mark_120):
             continue
         permalink = (row["permalink"] if has_permalink_column else None) or f"https://www.instagram.com/p/{shortcode}/"
-        eligible[shortcode] = {"id": row["id"], "mark_30": mark_30, "mark_120": mark_120, "permalink": permalink}
+        eligible[shortcode] = {"id": row["id"], "mark_30": mark_30, "mark_120": mark_120,
+                               "permalink": permalink, "age_hours": age_hours}
 
     from .ingestion_jobs import current
     journal = current()
@@ -2435,6 +2459,10 @@ def run_daily_cycle(account: str) -> dict[str, Any]:
         params.append(info["id"])
         with connect() as conn:
             conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE id = ?", params)
+            if info.get("age_hours") is not None:
+                from .engagement_checkpoints import record_later
+                record_later(conn, account=account, shortcode=shortcode, item=item,
+                             observed_at=now_iso, evaluated_at=now.isoformat(), age_hours=info["age_hours"])
             from .engagement_refresh import observe
             observe(conn, shortcode, item, now_iso)
         summary["updated"] += 1
@@ -2727,10 +2755,12 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
     where_params: list[Any] = [clean] if table == "posts" else [handle, clean]
 
     with connect() as conn:
+        from .engagement_checkpoints import ensure_schema as ensure_checkpoint_schema
+        ensure_checkpoint_schema(conn)
         row = conn.execute(
-            f"SELECT id, likes, comments, permalink, cover_image_path, cover_source_url FROM {table} WHERE {where}"
+            f"SELECT id, likes, comments, published_at, permalink, cover_image_path, cover_source_url FROM {table} WHERE {where}"
             if table != "posts"
-            else f"SELECT id, likes, comments, image_path FROM {table} WHERE {where}",
+            else f"SELECT id, likes, comments, published_at, image_path FROM {table} WHERE {where}",
             where_params,
         ).fetchone()
     if row is None:
@@ -2801,6 +2831,8 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
     comments = item.get("commentsCount")
     comments = comments if isinstance(comments, int) and comments >= 0 else None
 
+    if not shared:
+        observed_at = utc_now()
     set_clauses = ["likes = ?", "updated_at = ?", "is_deleted = 0"]
     params: list[Any] = [likes, utc_now()]
     if comments is not None:
@@ -2809,6 +2841,13 @@ def refresh_single_post(handle: str, shortcode: str) -> dict[str, Any]:
 
     with connect() as conn:
         conn.execute(f"UPDATE {table} SET {', '.join(set_clauses)} WHERE {where}", [*params, *where_params])
+        from .engagement_checkpoints import record_later
+        evaluated = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        age_hours = _post_age_hours(dict(row).get("published_at"), evaluated)
+        if age_hours is not None:
+            record_later(conn, account=handle, shortcode=clean, item=item,
+                         observed_at=observed_at, evaluated_at=observed_at,
+                         age_hours=age_hours, source="manual_refresh")
         observe(conn, clean, item, observed_at)
 
     before = dict(row)
