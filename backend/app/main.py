@@ -48,6 +48,7 @@ from .apify_sync import (
     store_avatar_from_url,
 )
 from .post_media import PostMediaError, build_zip, collect_media, fetch_one
+from .catalogue_revision import advance_generation, read_generation
 from .config import (
     DATA_DIR,
     disk_usage_path,
@@ -1300,7 +1301,6 @@ def tracker_refresh_job(job_id: str) -> dict[str, Any]:
 _DASHBOARD_POSTS_CACHE_LOCK = threading.Lock()
 _DASHBOARD_POSTS_CACHE_CONTENT: bytes | None = None
 _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0.0
-_DASHBOARD_CATALOGUE_GENERATION = 0
 # A complete Research load is split into bounded pages.  Queue attribution and
 # durable topic memberships are shared by every one of those pages, so reading
 # either table for every page turns a 67k-post load into millions of duplicate
@@ -1323,14 +1323,15 @@ def _invalidate_dashboard_posts_cache() -> None:
     make a manual refresh, catch-up, curation flag, or single-post reload
     appear to have done nothing.
     """
-    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT, _DASHBOARD_CATALOGUE_GENERATION
+    global _DASHBOARD_POSTS_CACHE_CONTENT, _DASHBOARD_POSTS_CACHE_EXPIRES_AT
     with _DASHBOARD_POSTS_CACHE_LOCK:
         _DASHBOARD_POSTS_CACHE_CONTENT = None
         _DASHBOARD_POSTS_CACHE_EXPIRES_AT = 0.0
-        # Stack operations do not change a source row's timestamp.  Advancing
-        # this generation makes the page manifest change too, so a browser
-        # cannot retain a page revision with stale stack membership.
-        _DASHBOARD_CATALOGUE_GENERATION += 1
+        # Stack and metadata edits may keep both source high-water marks.
+        # Persist their version so other workers observe the invalidation and
+        # a deploy/restart cannot reset it and force an unchanged full reload.
+        with connect() as conn:
+            advance_generation(conn, utc_now())
 
 # Queue opens the same HOT candidate list for every signed-in teammate. Keep
 # that read shared for a couple of seconds so a live refresh from several
@@ -1426,6 +1427,7 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
         queue = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS max_id FROM queue_requests"
         ).fetchone()
+        generation = read_generation(conn)
 
     sources = [
         {"source": "canonical", "upperBound": int(canonical["max_id"] or 0)},
@@ -1434,7 +1436,7 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
     fingerprint = {
         "sources": sources,
         "queue": int(queue["max_id"] or 0),
-        "catalogue_generation": _DASHBOARD_CATALOGUE_GENERATION,
+        "catalogue_generation": generation,
         "projection_version": 2,
     }
     revision = hashlib.sha256(
@@ -1445,7 +1447,7 @@ def _dashboard_catalogue_manifest() -> dict[str, Any]:
         "sources": sources,
         "metricsAvailable": True,
         "projectionVersion": 2,
-        "projectionGeneration": _DASHBOARD_CATALOGUE_GENERATION,
+        "projectionGeneration": generation,
     }
 
 

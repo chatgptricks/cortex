@@ -242,6 +242,7 @@ def test_catalogue_pages_cover_every_source_row_without_full_feed_materializatio
             CREATE TABLE accounts (
                 id INTEGER PRIMARY KEY, updated_at TEXT
             );
+            CREATE TABLE scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
             """
         )
         connection.executemany(

@@ -1,8 +1,11 @@
 """Ground /next recommendations exclusively in the caller's stored dashboard data."""
+import json
 import re
 
+import anyio
 import httpx
 
+from . import dashboard_next_reuse
 from .dashboard_rankings import dashboard_post_url
 
 _HANDLE = re.compile(r"[a-z0-9_.]{1,30}\Z")
@@ -25,22 +28,33 @@ def _payload(result, *, complete=True):
     return result["data"]
 
 
-async def candidate_bundle(request, slots: dict, entries: dict, read_operation) -> dict:
-    """Return bounded candidates; never fetch the web, mutate Queue, or infer reuse.
+async def candidate_bundle(request, slots: dict, entries: dict, read_operation, *, excluded_keys=None, state=None) -> dict:
+    """Return bounded candidates checked against the destination's stored history.
 
-    All reads re-enter existing authenticated APIs through read_operation. The
-    ranking evaluates its complete competitor/format/window set before taking
-    twelve candidates. This is a recent editorial shortlist, not an all-time
-    maximum or proof that a post has never been recreated.
+    Discovery reads re-enter authenticated APIs through read_operation. The
+    complete target history is read internally only after roster verification.
+    Ranking evaluates its complete competitor/format/window set before taking
+    twelve eligible candidates. Publication identity checks cover all stored
+    target history; nearby prior stories are supplied for semantic review.
+    A response-local state reuses verified reads and history across semantic
+    review batches. Rejected candidates are skipped before their detail read.
     """
     sources = []
     target = None
+    state = {} if state is None else state
+    excluded_keys = set(excluded_keys or ())
+    if state.setdefault("request", request) is not request:
+        return {"status": "unavailable", "target": None, "candidates": [], "sources": []}
+    read_cache = state.setdefault("reads", {})
 
     async def read(path, parameters, analysis=None, *, complete=True):
         entry = next((item for item in entries.values() if item["path"] == path and not item["write"]), None)
         if entry is None:
             raise _Unavailable()
-        result, source = await read_operation(request, entry, parameters, analysis)
+        cache_key = json.dumps([path, parameters, analysis], sort_keys=True)
+        if cache_key not in read_cache:
+            read_cache[cache_key] = await read_operation(request, entry, parameters, analysis)
+        result, source = read_cache[cache_key]
         payload = _payload(result, complete=complete)
         if source and source not in sources:
             sources.append(source)
@@ -77,45 +91,54 @@ async def candidate_bundle(request, slots: dict, entries: dict, read_operation) 
         if not handles:
             return {"status": "empty", "target": target, "candidates": [], "sources": sources,
                     "reason": "no_competitor_accounts"}
+        # The target is validated through the authenticated roster before any
+        # internal history read. Never download its full history to the model.
+        if state.get("history_target") != target["handle"]:
+            state["history"] = await anyio.to_thread.run_sync(dashboard_next_reuse.load_history, target["handle"])
+            state["history_target"] = target["handle"]
+        history = state["history"]
         ranking = None
+        candidates, seen = [], set()
         for hours in (24, 168, 720):
             ranking = await read("/api/insights/top-posts", {"query": {
                 "account": ",".join(handles), "post_format": post_format,
-                "hours": hours, "metric": "likes", "limit": 12,
+                "hours": hours, "metric": "likes", "limit": 50,
             }})
             if ranking.get("coverage", {}).get("complete") is not True or not isinstance(ranking.get("data"), list):
                 raise _Unavailable()
-            if ranking["data"]:
+            for row in ranking["data"]:
+                account, code = _name(row.get("account")), str(row.get("shortcode") or "")
+                if account not in handles or not _CODE.fullmatch(code):
+                    raise _Unavailable()
+                key = account + ":" + code
+                if key in seen:
+                    continue
+                seen.add(key)
+                if key in excluded_keys:
+                    continue
+                detail = await read("/api/dashboard/posts/{account}/{shortcode}/detail", {"path": {"account": account, "shortcode": code}})
+                if _name(detail.get("account")) != account or detail.get("shortcode") != code:
+                    raise _Unavailable()
+                candidate = {**{name: row.get(name) for name in (
+                    "published_at", "likes", "comments", "views", "metrics_updated_at")},
+                    "account": account, "shortcode": code, "key": key, "format": post_format,
+                    "dashboard_url": dashboard_post_url(account, code),
+                    "caption": str(detail.get("caption") or ""), "ocr_text": str(detail.get("ocrText") or "")}
+                eligible = history.filter_candidates([candidate])
+                for item in eligible:
+                    if not item.get("reuse_uncertain"):
+                        candidates.append({**item, "caption": item["caption"][:2400], "ocr_text": item["ocr_text"][:1200]})
+                if len(candidates) >= 12:
+                    break
+            if candidates:
                 break
         criteria = {"hours": hours, "window": ranking.get("window"), "format": post_format,
                     "metric": "likes", "same_subcategory": bool(related), "competitor_accounts": handles}
-        if not ranking["data"]:
-            return {"status": "empty", "target": target, "candidates": [], "sources": sources, "criteria": criteria}
-        candidates, seen = [], set()
-        for row in ranking["data"][:12]:
-            account, code = _name(row.get("account")), str(row.get("shortcode") or "")
-            if account not in handles or not _CODE.fullmatch(code):
-                raise _Unavailable()
-            key = account + ":" + code
-            if key in seen:
-                continue
-            seen.add(key)
-            detail = await read("/api/dashboard/posts/{account}/{shortcode}/detail", {"path": {"account": account, "shortcode": code}})
-            if _name(detail.get("account")) != account or detail.get("shortcode") != code:
-                raise _Unavailable()
-            candidates.append({**{name: row.get(name) for name in (
-                "published_at", "likes", "comments", "views", "metrics_updated_at")},
-                "account": account, "shortcode": code, "key": key, "format": post_format,
-                "dashboard_url": dashboard_post_url(account, code),
-                "caption": str(detail.get("caption") or "")[:1200], "ocr_text": str(detail.get("ocrText") or "")[:500]})
-        # Three recent captions give the selector real editorial context for
-        # the destination, instead of inferring its niche from the handle.
-        target_posts = await read("/api/dashboard/posts/search", {"query": {
-            "account": target["handle"], "sort": "newest", "limit": 3,
-        }}, complete=False)
-        examples = [{"caption": str(row.get("caption") or "")[:600], "published_at": row.get("published_at")}
-                    for row in target_posts.get("data", [])[:3] if _name(row.get("account")) == target["handle"]]
+        if not candidates:
+            return {"status": "empty", "target": target, "candidates": [], "sources": sources, "criteria": criteria,
+                    "reason": "no_unpublished_candidates" if seen else "no_recent_candidates"}
         return {"status": "ready", "target": target, "candidates": candidates, "sources": sources,
-                "criteria": criteria, "target_examples": examples, "reuse_checked": False}
+                "criteria": criteria, "target_examples": history.examples, "history_complete": True,
+                "history_posts_checked": history.post_count, "_history": history}
     except (ValueError, TypeError, KeyError, TimeoutError, httpx.HTTPError):
         return {"status": "unavailable", "target": target, "candidates": [], "sources": []}

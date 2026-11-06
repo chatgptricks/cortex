@@ -31,6 +31,7 @@ def catalogue(monkeypatch, tmp_path):
                 coauthors TEXT, enriched_at TEXT, raw_json TEXT
             );
             CREATE TABLE engagement_observations (shortcode TEXT PRIMARY KEY, observed_at TEXT, raw_json TEXT);
+            CREATE TABLE scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE queue_requests (
                 id INTEGER PRIMARY KEY, post_account TEXT, post_shortcode TEXT, status TEXT,
                 designer_email TEXT, coordinator_email TEXT, production_points INTEGER,
@@ -418,7 +419,7 @@ def test_projection_upgrade_invalidates_legacy_manifest_etag(catalogue):
     manifest = main._dashboard_catalogue_manifest()
     assert manifest["projectionVersion"] == 2
     previous = {"sources": manifest["sources"], "queue": 0,
-                "catalogue_generation": main._DASHBOARD_CATALOGUE_GENERATION}
+                "catalogue_generation": manifest["projectionGeneration"]}
     old_revision = hashlib.sha256(json.dumps(previous, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
     response = main.dashboard_posts_manifest(Request({"type": "http", "headers": [(b"if-none-match", f'"{old_revision}"'.encode())]}))
     assert response.status_code == 200
@@ -434,7 +435,6 @@ def test_projection_upgrade_invalidates_legacy_manifest_etag(catalogue):
 ])
 def test_metadata_enrichment_invalidates_cached_catalogue_without_new_ids(catalogue, monkeypatch, function, result, invoke):
     add(catalogue)
-    monkeypatch.setattr(main, "_DASHBOARD_CATALOGUE_GENERATION", 0)
     monkeypatch.setattr(main, "_DASHBOARD_POSTS_CACHE_CONTENT", b"old catalogue")
     monkeypatch.setattr(main, "_DASHBOARD_POSTS_CACHE_EXPIRES_AT", 10000)
     monkeypatch.setattr(main, "_require_admin", lambda password: None)
@@ -459,7 +459,6 @@ def test_metadata_enrichment_invalidates_cached_catalogue_without_new_ids(catalo
 
 
 def test_empty_enrichment_does_not_force_a_catalogue_reload(catalogue, monkeypatch):
-    monkeypatch.setattr(main, "_DASHBOARD_CATALOGUE_GENERATION", 0)
     monkeypatch.setattr(main, "_ENRICH_RUN", {"running": True, "result": None, "error": None})
     monkeypatch.setattr(apify_sync, "enrich_from_existing_runs", lambda **kwargs: {"updated": 0})
     before = main._dashboard_catalogue_manifest()
@@ -474,7 +473,6 @@ def test_empty_enrichment_does_not_force_a_catalogue_reload(catalogue, monkeypat
 ])
 def test_partial_committed_enrichment_remains_visible_after_later_failure(catalogue, monkeypatch, function, state, invoke):
     add(catalogue)
-    monkeypatch.setattr(main, "_DASHBOARD_CATALOGUE_GENERATION", 0)
     monkeypatch.setattr(main, "_DASHBOARD_POSTS_CACHE_CONTENT", b"old catalogue")
     monkeypatch.setattr(main, "_DASHBOARD_POSTS_CACHE_EXPIRES_AT", 10000)
     monkeypatch.setattr(main, state, {"running": True, "result": None, "error": None})

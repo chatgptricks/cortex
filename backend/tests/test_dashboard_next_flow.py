@@ -1,6 +1,7 @@
 """Behavioral coverage for dashboard-first /next clarification and recommendation."""
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -8,10 +9,20 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import dashboard_assistant as assistant
+from app.dashboard_next_semantic import retrieve_prior_posts as real_retrieve_prior_posts
 from test_dashboard_assistant import app, request  # noqa: F401 — shared auth fixture
 
 
 EMPTY_CONTEXT = {"post_format": None, "target_account": None}
+
+
+@pytest.fixture(autouse=True)
+def prepared_history_evidence(monkeypatch):
+    # Retrieval has its own tests; these flow fixtures already supply the
+    # candidate/history evidence whose semantic verdict is under test.
+    async def retrieved(_client, _api_key, bundle, _tool_call):
+        return bundle["candidates"]
+    monkeypatch.setattr(assistant.dashboard_next_semantic, "retrieve_prior_posts", retrieved)
 
 
 def function_call(name, arguments, call_id="call"):
@@ -40,9 +51,14 @@ def provider_mock(monkeypatch, answer):
 def candidate_stub(monkeypatch, value):
     calls = []
 
-    async def bundle(req, slots, entries, read_operation):
+    async def bundle(req, slots, entries, read_operation, *, excluded_keys=None, state=None):
         calls.append((req, slots, entries, read_operation))
-        return value
+        result = {**value}
+        if "candidates" in value:
+            result["candidates"] = [row for row in value["candidates"] if row["key"] not in (excluded_keys or ())]
+            if value.get("status") == "ready" and excluded_keys and not result["candidates"]:
+                result.update(status="empty", reason="no_unpublished_candidates")
+        return result
 
     monkeypatch.setattr(assistant.dashboard_next, "candidate_bundle", bundle)
     return calls
@@ -115,12 +131,12 @@ def test_partial_next_clarifies_before_candidate_search(app, monkeypatch, slots,
 
 def ready_bundle():
     return {
-        "status": "ready",
+        "status": "ready", "history_complete": True, "history_posts_checked": 0,
         "target": {"handle": "chatgptricks", "label": "ChatGPT Tricks", "group": "sentient", "subcategory": "ai_automation"},
         "post_format": "reel",
         "window_hours": 24,
         "candidates": [{
-            "account": "evolving.ai", "shortcode": "VALID_123", "likes": 12450,
+            "key": "evolving.ai:VALID_123", "account": "evolving.ai", "shortcode": "VALID_123", "likes": 12450,
             "comments": 85, "published_at": "2026-11-05T12:00:00+00:00",
             "caption": "A new AI animation demo", "ocrText": "AI animation",
             "dashboard_url": "https://sentientdash.app/index.html?post=evolving.ai%3AVALID_123",
@@ -345,3 +361,161 @@ def test_one_successful_data_read_preserves_grounded_response_after_another_read
     assert len(reads) == 2
     assert result["answer"] == "Your role is PD."
     assert result["sources"] == [source] and result["ui_actions"] == []
+
+
+def history_bundle():
+    bundle = ready_bundle()
+    bundle["history_posts_checked"] = 12000
+    candidate = bundle["candidates"][0]
+    candidate["prior_posts"] = [{"key": "chatgptricks:OldStory", "caption": "Same demonstration previously published", "published_at": "2023-01-01"}]
+    bundle["candidates"].append({**candidate, "key": "evolving.ai:NEW_456", "shortcode": "NEW_456", "caption": "A materially new announcement",
+                                 "dashboard_url": assistant.dashboard_next.dashboard_post_url("evolving.ai", "NEW_456")})
+    return bundle
+
+
+def test_semantic_history_review_excludes_rewritten_story_before_selection(app, monkeypatch):
+    candidate_stub(monkeypatch, history_bundle())
+    def answer(payload, turn):
+        if turn == 1:
+            return [function_call("prepare_next_recommendation", {"post_format": "reel", "target_account": "chatgptricks"})]
+        if turn == 2:
+            assert payload["tools"][0]["name"] == "check_next_publication_history"
+            assert "OldStory" in json.dumps(payload)
+            return [function_call("check_next_publication_history", {"checks": [
+                {"candidate_key": "evolving.ai:VALID_123", "status": "already_posted", "matched_post_key": "chatgptricks:OldStory"},
+                {"candidate_key": "evolving.ai:NEW_456", "status": "new", "matched_post_key": None} ]})]
+        assert "VALID_123" not in json.dumps(payload["input"])
+        return [function_call("choose_next_post", {"account": "evolving.ai", "shortcode": "NEW_456", "reason": "A fresh relevant announcement."})]
+    calls = provider_mock(monkeypatch, answer)
+    result = run(app, message="/next reel for chatgptricks", language="en")
+    assert "evolving.ai%3ANEW_456" in result["answer"] and "VALID_123" not in result["answer"]
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("checks", [[],
+    [{"candidate_key": "evolving.ai:VALID_123", "status": "new", "matched_post_key": None}] * 2,
+    [{"candidate_key": "invented", "status": "new", "matched_post_key": None}] * 2,
+    [{"candidate_key": "evolving.ai:VALID_123", "status": "already_posted", "matched_post_key": "invented"},
+     {"candidate_key": "evolving.ai:NEW_456", "status": "new", "matched_post_key": None}],
+])
+def test_incomplete_or_forged_reuse_checks_cannot_allow_recommendation(app, monkeypatch, checks):
+    candidate_stub(monkeypatch, history_bundle())
+    def answer(payload, turn):
+        if turn == 1:
+            return [function_call("prepare_next_recommendation", {"post_format": "reel", "target_account": "chatgptricks"})]
+        assert turn == 2
+        return [function_call("check_next_publication_history", {"checks": checks})]
+    provider_mock(monkeypatch, answer)
+    result = run(app, message="/next reel for chatgptricks")
+    assert "?post=" not in result["answer"]
+
+
+def test_uncertain_or_already_posted_candidates_never_reach_selector(app, monkeypatch):
+    candidate_stub(monkeypatch, history_bundle())
+    def answer(payload, turn):
+        if turn == 1:
+            return [function_call("prepare_next_recommendation", {"post_format": "reel", "target_account": "chatgptricks"})]
+        assert turn == 2
+        return [function_call("check_next_publication_history", {"checks": [
+            {"candidate_key": "evolving.ai:VALID_123", "status": "already_posted", "matched_post_key": "chatgptricks:OldStory"},
+            {"candidate_key": "evolving.ai:NEW_456", "status": "uncertain", "matched_post_key": None}]})]
+    provider_mock(monkeypatch, answer)
+    result = run(app, message="/next reel for chatgptricks", language="es")
+    assert "sin repetir" in result["answer"] and "?post=" not in result["answer"]
+
+
+def test_unchecked_history_is_not_a_usable_bundle(app, monkeypatch):
+    bundle = ready_bundle(); bundle.pop("history_complete")
+    candidate_stub(monkeypatch, bundle)
+    calls = provider_mock(monkeypatch, lambda *_: [function_call("prepare_next_recommendation", {"post_format": "reel", "target_account": "chatgptricks"})])
+    assert "?post=" not in run(app, message="/next reel for chatgptricks")["answer"]
+    assert len(calls) == 1
+
+
+def test_semantic_veto_continues_to_thirteenth_candidate(app, monkeypatch):
+    template = history_bundle()
+    base = template["candidates"][0]
+    rows = [{**base, "key": f"evolving.ai:P{i:02}", "shortcode": f"P{i:02}",
+             "dashboard_url": assistant.dashboard_next.dashboard_post_url("evolving.ai", f"P{i:02}")} for i in range(13)]
+    batch_calls, states = [], []
+    async def next_batch(req, slots, entries, read_operation, *, excluded_keys=None, state=None):
+        batch_calls.append(set(excluded_keys or ()))
+        states.append(state)
+        return {**template, "_history": object(), "candidates": [row for row in rows if row["key"] not in excluded_keys][:12]}
+    monkeypatch.setattr(assistant.dashboard_next, "candidate_bundle", next_batch)
+    def answer(payload, turn):
+        tool = payload["tools"][0]["name"]
+        if tool == "prepare_next_recommendation":
+            return [function_call(tool, {"post_format": "reel", "target_account": "chatgptricks"})]
+        if tool == "check_next_publication_history":
+            supplied = json.loads(payload["input"][0]["content"])["candidates"]
+            return [function_call(tool, {"checks": [{"candidate_key": row["key"],
+                "status": "new" if row["shortcode"] == "P12" else "already_posted",
+                "matched_post_key": None if row["shortcode"] == "P12" else "chatgptricks:OldStory"} for row in supplied]})]
+        assert tool == "choose_next_post" and turn == 4
+        assert "_history" not in json.dumps(payload["input"])
+        assert "evolving.ai:P00" not in json.dumps(payload["input"])
+        return [function_call(tool, {"account": "evolving.ai", "shortcode": "P12", "reason": "A new relevant story."})]
+    calls = provider_mock(monkeypatch, answer)
+    result = run(app, message="/next reel for chatgptricks")
+    assert "evolving.ai%3AP12" in result["answer"]
+    assert len(calls) == 4 and len(batch_calls) == 2
+    assert not batch_calls[0] and len(batch_calls[1]) == 12
+    assert states[0] is states[1]
+
+
+def test_semantic_review_budget_never_falls_back_to_unreviewed_candidate(app, monkeypatch):
+    template = history_bundle()
+    base = template["candidates"][0]
+    batches = []
+    async def next_batch(req, slots, entries, read_operation, *, excluded_keys=None, state=None):
+        index = len(batches)
+        batches.append(set(excluded_keys or ()))
+        return {**template, "candidates": [{**base, "key": f"evolving.ai:B{index}", "shortcode": f"B{index}"}]}
+    monkeypatch.setattr(assistant.dashboard_next, "candidate_bundle", next_batch)
+    def answer(payload, _):
+        tool = payload["tools"][0]["name"]
+        if tool == "prepare_next_recommendation":
+            return [function_call(tool, {"post_format": "reel", "target_account": "chatgptricks"})]
+        assert tool == "check_next_publication_history", "unverified candidates must never reach selection"
+        rows = json.loads(payload["input"][0]["content"])["candidates"]
+        return [function_call(tool, {"checks": [{"candidate_key": row["key"], "status": "uncertain", "matched_post_key": None} for row in rows]})]
+    calls = provider_mock(monkeypatch, answer)
+    result = run(app, message="/next reel for chatgptricks", language="es")
+    assert "sin repetir" in result["answer"] and "?post=" not in result["answer"]
+    assert len(batches) == assistant.MAX_NEXT_REUSE_BATCHES == 4
+    assert len(calls) == assistant.MAX_NEXT_REUSE_BATCHES + 1
+    assert [len(keys) for keys in batches] == [0, 1, 2, 3]
+
+
+def test_full_next_flow_retrieves_then_reviews_then_selects(app, monkeypatch):
+    monkeypatch.setattr(assistant.dashboard_next_semantic, "retrieve_prior_posts", real_retrieve_prior_posts)
+    bundle = history_bundle()
+    searches = []
+    def retrieve(rows):
+        searches.extend(row["reuse_search_text"] for row in rows)
+        return rows
+    bundle["_history"] = SimpleNamespace(filter_candidates=retrieve)
+    candidate_stub(monkeypatch, bundle)
+    def answer(payload, turn):
+        tool = payload["tools"][0]["name"]
+        if turn == 1:
+            assert tool == "prepare_next_recommendation"
+            return [function_call(tool, {"post_format": "reel", "target_account": "chatgptricks"})]
+        if turn == 2:
+            assert tool == "prepare_publication_history_search" and payload["max_output_tokens"] == 2400
+            return [function_call(tool, {"queries": [{"candidate_key": row["key"], "search_text": "Specific demonstration. Demostración específica."} for row in bundle["candidates"]]})]
+        if turn == 3:
+            assert tool == "check_next_publication_history"
+            assert "reuse_search_text" not in json.dumps(payload["input"])
+            return [function_call(tool, {"checks": [
+                {"candidate_key": "evolving.ai:VALID_123", "status": "already_posted", "matched_post_key": "chatgptricks:OldStory"},
+                {"candidate_key": "evolving.ai:NEW_456", "status": "new", "matched_post_key": None}]})]
+        assert turn == 4 and tool == "choose_next_post"
+        assert "_history" not in json.dumps(payload["input"])
+        assert "VALID_123" not in json.dumps(payload["input"])
+        return [function_call(tool, {"account": "evolving.ai", "shortcode": "NEW_456", "reason": "A new relevant announcement."})]
+    calls = provider_mock(monkeypatch, answer)
+    result = run(app, message="/next reel for chatgptricks")
+    assert "evolving.ai%3ANEW_456" in result["answer"]
+    assert len(searches) == 2 and len(calls) == 4

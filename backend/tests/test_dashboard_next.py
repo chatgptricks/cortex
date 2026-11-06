@@ -3,9 +3,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from app import dashboard_next
 from app.dashboard_next import candidate_bundle
 
-PATHS = ["/api/dashboard/accounts", "/api/insights/top-posts", "/api/dashboard/posts/{account}/{shortcode}/detail", "/api/dashboard/posts/search"]
+PATHS = ["/api/dashboard/accounts", "/api/insights/top-posts", "/api/dashboard/posts/{account}/{shortcode}/detail"]
 ENTRIES = {str(i): {"path": path, "write": False} for i, path in enumerate(PATHS)}
 ROSTER = [
     {"handle": "our.ai", "label": "Our AI", "group": "sentient", "subcategory": "ai_automation"},
@@ -16,7 +17,15 @@ ROSTER = [
 ]
 
 
-def harness(*, roster=None, empty_until=0, fail_path=None, incomplete=False, forged_account=None):
+@pytest.fixture(autouse=True)
+def history(monkeypatch):
+    value = SimpleNamespace(post_count=150, examples=[{"caption": "Our editorial context"}],
+                            filter_candidates=lambda rows: [{**row, "prior_posts": [{"key": "our.ai:Older", "caption": "Older context"}]} for row in rows])
+    monkeypatch.setattr(dashboard_next.dashboard_next_reuse, "load_history", lambda target: value)
+    return value
+
+
+def harness(*, roster=None, empty_until=0, fail_path=None, incomplete=False, forged_account=None, ranking_rows=None):
     request = SimpleNamespace(headers={"authorization": "Bearer caller", "x-queue-role-preview": "pd"})
     calls = []
     accounts = ROSTER if roster is None else roster
@@ -37,14 +46,17 @@ def harness(*, roster=None, empty_until=0, fail_path=None, incomplete=False, for
             account = forged_account or query["account"].split(",")[0]
             data = {"data": [] if query["hours"] <= empty_until else [{"account": account, "shortcode": "Post123", "likes": 9000, "dashboard_url": "https://attacker.example/"}],
                     "coverage": {"complete": not incomplete}, "window": {"from": "start", "to": "end"}}
+            if ranking_rows is not None:
+                data["data"] = ranking_rows.get(query["hours"], [])
         elif path == PATHS[2]:
             data = {**parameters["path"], "caption": "caption " * 500, "ocrText": "cover " * 300}
         else:
             data = {"data": [{"account": "our.ai", "caption": "Target's current editorial topic"}], "pagination": {"has_more": True}}
-        return {"status": 200, "complete": path != PATHS[3], "truncated": False, "data": data}, source
+        return {"status": 200, "complete": True, "truncated": False, "data": data}, source
 
-    def run(account="our.ai", format="reel"):
-        return asyncio.run(candidate_bundle(request, {"account": account, "format": format}, ENTRIES, read))
+    def run(account="our.ai", format="reel", *, excluded_keys=None, state=None):
+        return asyncio.run(candidate_bundle(request, {"account": account, "format": format}, ENTRIES, read,
+                                          excluded_keys=excluded_keys, state=state))
     return run, calls
 
 
@@ -54,12 +66,12 @@ def test_exact_format_and_verified_competitors_only(format):
     result = run(format=format)
     assert result["status"] == "ready"
     query = next(params["query"] for path, params, _ in calls if path == PATHS[1])
-    assert query == {"account": "competitor.ai", "post_format": format, "hours": 24, "metric": "likes", "limit": 12}
+    assert query == {"account": "competitor.ai", "post_format": format, "hours": 24, "metric": "likes", "limit": 50}
     assert result["candidates"][0]["dashboard_url"] == "https://sentientdash.app/index.html?post=competitor.ai%3APost123"
     assert result["candidates"][0]["format"] == format
-    assert len(result["candidates"][0]["caption"]) == 1200
-    assert len(result["candidates"][0]["ocr_text"]) == 500
-    assert result["target_examples"] and result["reuse_checked"] is False
+    assert len(result["candidates"][0]["caption"]) == 2400
+    assert len(result["candidates"][0]["ocr_text"]) == 1200
+    assert result["target_examples"] and result["history_complete"] is True
     assert not any("queue" in path for path, _, _ in calls)
 
 
@@ -123,3 +135,58 @@ def test_incomplete_ranking_or_unexpected_source_cannot_produce_recommendation()
     assert run()["status"] == "unavailable"
     assert len(calls) == 2
     assert harness(forged_account="other.owned")[0]()["status"] == "unavailable"
+
+
+def test_known_reused_candidates_are_excluded_and_search_expands(history):
+    history.filter_candidates = lambda rows: []
+    run, calls = harness()
+    result = run()
+    assert result["status"] == "empty" and result["reason"] == "no_unpublished_candidates"
+    assert [params["query"]["hours"] for path, params, _ in calls if path == PATHS[1]] == [24, 168, 720]
+    assert sum(path == PATHS[2] for path, _, _ in calls) == 1
+
+
+def test_history_failure_cannot_fall_back_to_unchecked_recommendation(monkeypatch):
+    def fail(_):
+        raise ValueError("Cannot read target history")
+    monkeypatch.setattr(dashboard_next.dashboard_next_reuse, "load_history", fail)
+    run, calls = harness()
+    assert run()["status"] == "unavailable"
+    assert len(calls) == 1
+
+
+def test_textless_unverifiable_candidate_is_not_recommended(history):
+    history.filter_candidates = lambda rows: [{**row, "reuse_uncertain": True} for row in rows]
+    assert harness()[0]()["status"] == "empty"
+
+
+def test_semantic_rejections_continue_past_twelve_without_repeating_reads(history, monkeypatch):
+    history_reads = []
+    monkeypatch.setattr(dashboard_next.dashboard_next_reuse, "load_history", lambda target: history_reads.append(target) or history)
+    rows = [{"account": "competitor.ai", "shortcode": f"Post{i:02}", "likes": 100 - i} for i in range(14)]
+    run, calls = harness(ranking_rows={24: rows})
+    state = {}
+    first = run(state=state)
+    assert len(first["candidates"]) == 12
+    second = run(state=state, excluded_keys={row["key"] for row in first["candidates"]})
+    assert [row["shortcode"] for row in second["candidates"]] == ["Post12", "Post13"]
+    assert second["_history"] is first["_history"] is history
+    assert history_reads == ["our.ai"]
+    assert sum(path == PATHS[0] for path, _, _ in calls) == 1
+    assert sum(path == PATHS[1] for path, _, _ in calls) == 1
+    detail_codes = [params["path"]["shortcode"] for path, params, _ in calls if path == PATHS[2]]
+    assert len(detail_codes) == len(set(detail_codes)) == 14
+
+
+def test_semantic_rejections_expand_the_window_with_the_same_history(history):
+    today = {"account": "competitor.ai", "shortcode": "Today", "likes": 200}
+    week = {"account": "competitor.ai", "shortcode": "Week", "likes": 100}
+    run, calls = harness(ranking_rows={24: [today], 168: [today, week]})
+    state = {}
+    first = run(state=state)
+    second = run(state=state, excluded_keys={row["key"] for row in first["candidates"]})
+    assert second["criteria"]["hours"] == 168
+    assert [row["shortcode"] for row in second["candidates"]] == ["Week"]
+    assert second["_history"] is history
+    assert [params["query"]["hours"] for path, params, _ in calls if path == PATHS[1]] == [24, 168]
+    assert [params["path"]["shortcode"] for path, params, _ in calls if path == PATHS[2]] == ["Today", "Week"]

@@ -118,7 +118,7 @@ def top_posts(response: Response,
               post_format: Literal["all", "reel", "carousel", "image", "video"] = "all",
               all_time: bool = False,
               metric: Literal["likes", "comments", "views"] = "likes",
-              limit: Annotated[int, Query(ge=1, le=20)] = 1) -> dict:
+              limit: Annotated[int, Query(ge=1, le=100)] = 1) -> dict:
     """Use this for most-liked/viewed/commented posts, including last 24 hours.
 
     Every matching stored post across all accessible dashboard accounts is

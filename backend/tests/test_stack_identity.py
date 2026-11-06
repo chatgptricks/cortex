@@ -45,7 +45,6 @@ def workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(main, '_dashboard_catalogue_context', lambda: (
         {'test': 'competitors'}, {'handle': 'chatgptricks'},
     ))
-    monkeypatch.setattr(main, '_DASHBOARD_CATALOGUE_GENERATION', 0)
     monkeypatch.setattr(main, '_DASHBOARD_CATALOGUE_DECORATION', None)
     monkeypatch.setattr(main, '_DASHBOARD_CATALOGUE_DECORATION_REVISION', '')
     monkeypatch.setattr(main, '_DASHBOARD_POSTS_CACHE_CONTENT', b'old catalogue')
