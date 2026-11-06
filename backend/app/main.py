@@ -10106,5 +10106,12 @@ def engagement_refresh_status() -> dict[str, Any]:
 @app.get("/api/dashboard/posts/metrics")
 def dashboard_metric_updates(after_at: str = Query('', max_length=64), after_code: str = Query('', max_length=128),
                              limit: int = Query(500, ge=1, le=1000)) -> dict[str, Any]:
+    """Incremental metric synchronization, ordered by metric update time.
+
+    after_at filters the observation/update timestamp, not published_at.
+    This is not a publication-date filter or a ranking endpoint. For posts
+    published within a calendar range, use /api/insights/music/page with
+    from/to and sort; it includes posts even when music is unknown.
+    """
     from .engagement_refresh import metric_updates
     return metric_updates(after_at, after_code, limit)
