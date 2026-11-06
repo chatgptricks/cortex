@@ -176,3 +176,20 @@ def test_ui_filters_reject_nonexistent_controls():
     for unsupported in ({"text_scope": "caption"}, {"media": "static"}, {"max_likes": 5000}, {"post_type": "Reel"}, {"sort": "most-views"}, {"audio_id": "1234"}):
         with pytest.raises(ValueError): assistant.research_filters({"query": ""} | unsupported)
     assert assistant.research_filters({"query": "", "post_type": "Carousel", "sort": "hot-rate", "collabs_only": True})['post_type'] == 'Carousel'
+
+
+def test_ui_action_cannot_select_an_account_absent_from_real_controls(app, monkeypatch):
+    @app.get('/api/dashboard/accounts')
+    def accounts(request: Request):
+        assert request.headers.get('authorization') == 'Bearer signed-in-member'
+        return {"accounts": [{"handle": "evolving.ai"}]}
+    app.openapi_schema = None
+    original = httpx.AsyncClient
+    def provider(req):
+        return httpx.Response(200, json={"output": [{"type": "function_call", "call_id": "show", "name": "show_research_posts", "arguments": json.dumps({"query": "", "accounts": ["does.not.exist"]})}]})
+    def client(**kwargs):
+        kwargs.setdefault('transport', httpx.MockTransport(provider))
+        return original(**kwargs)
+    monkeypatch.setattr(httpx, 'AsyncClient', client)
+    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='Filter does.not.exist', language='en'), 'test-key'))
+    assert result['ui_actions'] == [] and 'not available' in result['answer']

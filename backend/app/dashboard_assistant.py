@@ -285,6 +285,13 @@ async def respond(request: Request, body: ChatRequest, api_key: str) -> dict:
                             sources.append(source)
                     elif call["name"] == "show_research_posts":
                         filters = research_filters(arguments)
+                        if filters["accounts"]:
+                            account_entry = next((entry for entry in entries.values() if entry["path"] == "/api/dashboard/accounts" and not entry["write"]), None)
+                            if account_entry is None: raise ValueError("Account controls are not available.")
+                            verified, _ = await read_operation(request, account_entry, {}, {"items_path": "accounts", "filters": [{"field": "handle", "op": "in", "value": filters["accounts"]}], "fields": ["handle"], "limit": 100})
+                            available = {row.get("handle") for row in verified.get("data", {}).get("data", [])}
+                            if verified.get("status") != 200 or not set(filters["accounts"]) <= available:
+                                return {"answer": "Esa cuenta no está disponible en los filtros de Research." if body.language == "es" else "That account is not available in the Research filters.", "sources": [], "reaction": "confused", "model": model_name(), "ui_actions": []}
                         ui_actions = [{"type": "research_filters", "filters": filters}]
                         return {"answer": "Filtros aplicados." if body.language == "es" else "Filters applied.", "sources": sources, "reaction": "happy", "model": model_name(), "ui_actions": ui_actions}
                     else:
