@@ -174,9 +174,30 @@ def test_ui_action_is_structured_and_validated(app, monkeypatch):
 
 
 def test_ui_filters_reject_nonexistent_controls():
-    for unsupported in ({"text_scope": "caption"}, {"media": "static"}, {"max_likes": 5000}, {"post_type": "Reel"}, {"sort": "most-views"}, {"audio_id": "1234"}):
+    for unsupported in ({"text_scope": "caption"}, {"limit": 3}, {"media": "static"}, {"max_likes": 5000}, {"post_type": "Reel"}, {"sort": "most-views"}, {"audio_id": "1234"}):
         with pytest.raises(ValueError): assistant.research_filters({"query": ""} | unsupported)
     assert assistant.research_filters({"query": "", "post_type": "Carousel", "sort": "hot-rate", "collabs_only": True})['post_type'] == 'Carousel'
+
+
+def test_caption_mentions_and_top_n_page_request_use_existing_controls(app, monkeypatch):
+    original = httpx.AsyncClient
+    calls = []
+    def provider(req):
+        payload = json.loads(req.content)
+        calls.append(payload)
+        assert 'do not over-interpret a casual caption reference' in payload['instructions']
+        action_tool = next(tool for tool in payload['tools'] if tool['name'] == 'show_research_posts')
+        assert 'limit' not in action_tool['parameters']['properties']
+        assert 'text_scope' not in action_tool['parameters']['properties']
+        return httpx.Response(200, json={"output": [{"type": "function_call", "call_id": "show", "name": "show_research_posts", "arguments": json.dumps({"query": "Elon Musk", "sort": "newest"})}]})
+    def client(**kwargs):
+        kwargs.setdefault('transport', httpx.MockTransport(provider))
+        return original(**kwargs)
+    monkeypatch.setattr(httpx, 'AsyncClient', client)
+    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='Filter the page to show the 3 latest posts whose caption mentions Elon Musk.', language='en'), 'test-key'))
+    assert result['ui_actions'] == [{"type": "research_filters", "filters": assistant.research_filters({"query": "Elon Musk", "sort": "newest"})}]
+    assert result['answer'] == 'Filters applied.'
+    assert len(calls) == 1
 
 
 def test_ui_action_cannot_select_an_account_absent_from_real_controls(app, monkeypatch):
