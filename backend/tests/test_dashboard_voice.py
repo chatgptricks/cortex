@@ -233,6 +233,28 @@ def test_realtime_pcm_wav_and_grounded_narration(monkeypatch):
     assert socket.sent[2]["type"] == "response.create"
 
 
+@pytest.mark.parametrize("language", ["en", "es"])
+def test_recommendation_narration_prioritizes_actual_plot_and_separate_attribution(language):
+    body = voice.SpeechRequest(
+        text="[Post](https://sentientdash.app/index.html?post=evolving.ai%3AStory) — 6,562 likes. Its escalating action makes it a strong storytelling reference.",
+        question="/next reel para chatgptricks", mode="next", language=language)
+    source = {"account": "evolving.ai", "shortcode": "Story", "likes": 6562,
+              "caption": "A platypus escapes crocodiles and wolves, jumps from a cliff, and lands on a motorcycle.", "ocr_text": ""}
+    instructions, serialized = voice._narration(body, [source])
+    payload = json.loads(serialized)
+    assert "LEAD with the concrete source story" in instructions
+    assert "SOURCE account from stored_results.account" in instructions
+    assert "separately identify the DESTINATION" in instructions
+    assert "Metrics belong to the source post" in instructions
+    assert "Usually omit metrics" in instructions and "Never say 'next', '/next'" in instructions
+    assert "Do not invent creators" in instructions and "reasons beyond the supplied evidence" in instructions
+    assert "at most 85 words" in instructions
+    assert payload["stored_results"] == [source] and payload["has_post_links"] is True
+    assert "escalating action" in payload["existing_answer"] and "https://" not in payload["existing_answer"]
+    # The story remains request data, never a canned plot inserted in every narration.
+    assert "platypus" not in instructions and "Pixar" not in instructions
+
+
 @pytest.mark.parametrize("payload", [events(status="incomplete"), events(b"x"),
                                      [{"type": "session.updated"}, {"type": "error", "error": {"message": "secret"}}],
                                      [{"type": "session.updated"}, {"type": "response.output_audio.delta", "delta": "invalid!"}],
