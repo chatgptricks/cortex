@@ -318,11 +318,12 @@ def test_reload_counts_marks_post_deleted_after_two_empty_direct_checks(monkeypa
         connection.execute(
             """CREATE TABLE dashboard_posts (
                 id INTEGER PRIMARY KEY, account TEXT, shortcode TEXT, likes INTEGER, comments INTEGER,
-                permalink TEXT, cover_image_path TEXT, cover_source_url TEXT, is_deleted INTEGER, updated_at TEXT
+                permalink TEXT, cover_image_path TEXT, cover_source_url TEXT, is_deleted INTEGER, updated_at TEXT,
+                published_at TEXT
             )"""
         )
         connection.execute(
-            "INSERT INTO dashboard_posts VALUES (1, 'account', 'post', 100, 10, '', '', '', 0, '2026-09-10')"
+            "INSERT INTO dashboard_posts VALUES (1, 'account', 'post', 100, 10, '', '', '', 0, '2026-09-10', '2026-09-10')"
         )
 
     @contextmanager

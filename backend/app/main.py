@@ -135,6 +135,8 @@ from .external_research import router as website_research_router
 from .external_workspace import router as website_workspace_router
 app.include_router(website_research_router)
 app.include_router(website_workspace_router)
+from .hot_calibration import router as hot_calibration_router
+app.include_router(hot_calibration_router)
 
 DEFAULT_PERSON_OPTIONS = [
     "Elon Musk",
@@ -8469,6 +8471,11 @@ def admin_slack_status() -> dict[str, Any]:
 def admin_list_accounts() -> dict[str, Any]:
     """Full roster including inactive accounts, for the admin UI.
 
+    Admin agents can read individual first-hour measurements, stored later
+    checkpoints and capture metadata with GET /api/admin/engagement/checkpoints
+    (MCP get_admin_engagement_checkpoints). That read-only endpoint supports
+    account filtering and paginated publication windows up to 90 days.
+
     Enriched with a suggested HOT threshold, current follower count from the
     tracker snapshots, and the published date of the oldest post we have on
     file (how far back a "extract history" backfill has actually reached,
@@ -8544,7 +8551,12 @@ def admin_list_accounts() -> dict[str, Any]:
         account["followers"] = latest.get("followers_count") if latest else None
         account["oldest_post_at"] = stat["oldest_post_at"] if stat else None
 
-    return {"accounts": accounts}
+    return {"accounts": accounts, "engagement_checkpoints": {
+        "tool": "get_admin_engagement_checkpoints",
+        "path": "/api/admin/engagement/checkpoints",
+        "read_only": True,
+        "max_days": 90,
+    }}
 
 
 @app.get("/api/admin/accounts/{handle}/media-kit")

@@ -1038,6 +1038,8 @@ def _ensure_runtime_schema_extensions(conn: Any) -> None:
     bootstrap above so a newly deployed backend cannot outrun its database.
     """
     _ensure_ocr_queue_schema(conn)
+    from .engagement_checkpoints import ensure_schema as ensure_engagement_checkpoints_schema
+    ensure_engagement_checkpoints_schema(conn)
     from .agent_connections import ensure_schema as ensure_agent_connections_schema
     ensure_agent_connections_schema(conn)
     from .mcp_oauth import ensure_schema as ensure_mcp_oauth_schema
