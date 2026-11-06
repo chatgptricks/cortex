@@ -37,6 +37,7 @@ _lock = threading.Lock()
 _URL = re.compile(r"https?://[^\s<>\[\]()`]+|/index\.html\?[^\s<>\[\]()`]+")
 _KEY = re.compile(r"([a-z0-9_.]{1,30}):([A-Za-z0-9_-]{1,64})\Z")
 _VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"}
+_TRANSCRIPTION_TERMS = ("Sentient", "Sentient Dash", "dashboard", "reel", "reels", "carousel", "carrusel", "likes", "caption", "publicación")
 _MIME = {"audio/webm": "webm", "video/webm": "webm", "audio/mp4": "mp4", "video/mp4": "mp4",
          "audio/m4a": "mp4", "audio/x-m4a": "mp4", "audio/wav": "wav", "audio/x-wav": "wav",
          "audio/wave": "wav", "audio/mpeg": "mp3", "audio/mp3": "mp3"}
@@ -137,8 +138,35 @@ async def _upload(request):
             file.close()
 
 
+def _transcription_context():
+    """Optional spelling context, never a transcript correction or new lookup."""
+    keywords = list(_TRANSCRIPTION_TERMS)
+    try:
+        with db.connect() as conn:
+            if getattr(conn, "is_postgres", False):
+                conn.execute("SET TRANSACTION READ ONLY")
+                conn.execute("SET LOCAL statement_timeout = '3s'")
+            rows = conn.execute("SELECT handle, label FROM accounts WHERE is_active = 1 "
+                                "ORDER BY CASE WHEN group_name = 'sentient' THEN 0 ELSE 1 END, handle LIMIT 60").fetchall()
+        for row in rows:
+            handle = str(row["handle"] or "").strip().removeprefix("@").lower()
+            if re.fullmatch(r"[a-z0-9_.]{1,30}", handle):
+                keywords.append(handle)
+            label = str(row["label"] or "").strip()
+            if 1 <= len(label) <= 80 and not any(character in label for character in "<>\r\n"):
+                keywords.append(label)
+    except Exception:
+        # Name hints improve recognition; unavailable roster metadata must not
+        # block transcription or change the words that were actually spoken.
+        pass
+    return {"prompt": "Questions about Sentient Dash posts, account handles, and engagement metrics. "
+                      "Preguntas sobre publicaciones, cuentas, reels, carruseles y métricas del dashboard.",
+            "keywords[]": list(dict.fromkeys(keywords))[:100]}
+
+
 async def _transcribe(data, kind, mime, language, api_key):
     fields = {"model": os.getenv("OPENAI_TRANSCRIBE_MODEL", "").strip() or "gpt-transcribe", "response_format": "json"}
+    fields.update(await anyio.to_thread.run_sync(_transcription_context))
     if language:
         fields["languages[]"] = language
     async with httpx.AsyncClient(timeout=httpx.Timeout(45, connect=10)) as client:
@@ -228,6 +256,7 @@ async def _synthesize(body, results, api_key):
     if voice not in _VOICES:
         raise ValueError("Unsupported server voice configuration")
     pcm = bytearray()
+    transcript = ""
     async with websocket_connect("wss://api.openai.com/v1/realtime?model=" + quote(model, safe=""),
                                  additional_headers={"Authorization": "Bearer " + api_key}, open_timeout=10,
                                  close_timeout=2, max_size=1_000_000, max_queue=8) as socket:
@@ -257,17 +286,25 @@ async def _synthesize(body, results, api_key):
                 if len(pcm) + len(chunk) > MAX_PCM:
                     raise ValueError("Voice output exceeded its limit")
                 pcm.extend(chunk)
+            elif kind == "response.output_audio_transcript.done":
+                if isinstance(event.get("transcript"), str):
+                    transcript = " ".join(event["transcript"].split())[:1200]
             elif kind == "response.done":
                 response = event.get("response")
                 if not isinstance(response, dict) or response.get("status") != "completed" or not pcm or len(pcm) % 2:
                     raise ValueError("Voice response was incomplete")
+                if not transcript and isinstance(response.get("output"), list):
+                    spoken = [part["transcript"] for item in response["output"]
+                              if isinstance(item, dict) and isinstance(item.get("content"), list)
+                              for part in item["content"] if isinstance(part, dict) and isinstance(part.get("transcript"), str)]
+                    transcript = " ".join(" ".join(spoken).split())[:1200]
                 buffer = io.BytesIO()
                 with wave.open(buffer, "wb") as output:
                     output.setnchannels(1)
                     output.setsampwidth(2)
                     output.setframerate(24000)
                     output.writeframes(bytes(pcm))
-                return buffer.getvalue()
+                return buffer.getvalue(), transcript
         raise ValueError("Voice connection ended before completion")
 
 
@@ -325,8 +362,12 @@ async def speech(request: Request, body: SpeechRequest):
                     except Exception:
                         results = []
                     return await _synthesize(body, results, api_key)
-                audio = await _connected(request, generate)
-                return Response(audio, media_type="audio/wav", headers=PRIVATE)
+                audio, transcript = await _connected(request, generate)
+                headers = dict(PRIVATE)
+                if transcript:
+                    headers["X-Sentient-Speech-Transcript"] = base64.b64encode(transcript.encode("utf-8")).decode("ascii")
+                    headers["X-Sentient-Speech-Transcript-Encoding"] = "base64-utf8"
+                return Response(audio, media_type="audio/wav", headers=headers)
         except TimeoutError:
             raise HTTPException(504, "Voice playback took too long. Try again.", headers=PRIVATE)
         except (httpx.HTTPError, WebSocketException, OSError, ValueError, TypeError, binascii.Error):

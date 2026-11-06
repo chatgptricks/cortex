@@ -21,6 +21,7 @@ def client(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-secret")
     voice._usage.clear()
     voice._active.clear()
+    monkeypatch.setattr(voice, "_transcription_context", lambda: {"prompt": "Dashboard post questions", "keywords[]": ["Sentient", "chatgptricks"]})
     app = FastAPI()
 
     @app.middleware("http")
@@ -43,7 +44,7 @@ def test_every_signed_in_role_can_transcribe_and_play_voice(client, monkeypatch,
 
     async def synthesize(body, results, key):
         assert body.language == "es" and body.mode == "next"
-        return b"RIFF-audio"
+        return b"RIFF-audio", "Aquí tienes el resultado."
 
     monkeypatch.setattr(voice, "_transcribe", transcribe)
     monkeypatch.setattr(voice, "_synthesize", synthesize)
@@ -54,6 +55,7 @@ def test_every_signed_in_role_can_transcribe_and_play_voice(client, monkeypatch,
                            json={"text": "Aquí tienes el resultado", "question": "/next reel", "language": "es", "mode": "next"})
     assert response.status_code == 200 and response.headers["content-type"] == "audio/wav"
     assert response.headers["cache-control"] == "private, no-store"
+    assert base64.b64decode(response.headers["x-sentient-speech-transcript"]).decode("utf-8") == "Aquí tienes el resultado."
     assert "test-secret" not in response.text
     assert not voice._active
 
@@ -127,12 +129,47 @@ def test_transcription_provider_contract(monkeypatch):
         observed.append(request)
         return httpx.Response(200, json={"text": " latest post "})
     original = httpx.AsyncClient
+    monkeypatch.setattr(voice, "_transcription_context", lambda: {"prompt": "Dashboard accounts", "keywords[]": ["Sentient", "chatgptricks"]})
     monkeypatch.setattr(voice.httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(provider), **kwargs))
     result = anyio.run(voice._transcribe, WEBM, "webm", "audio/webm", "en", "secret")
     assert result == "latest post"
     assert observed[0].url.path == "/v1/audio/transcriptions"
     assert b'gpt-transcribe' in observed[0].content and b'name="languages[]"' in observed[0].content
     assert b'name="language"' not in observed[0].content
+    assert observed[0].content.count(b'name="keywords[]"') == 2
+    assert b'chatgptricks' in observed[0].content and b'name="prompt"' in observed[0].content
+
+
+def test_transcription_context_reads_only_active_handles_and_sanitized_labels(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE accounts(handle TEXT, label TEXT, is_active INTEGER, group_name TEXT)")
+    conn.executemany("INSERT INTO accounts VALUES(?,?,?,?)", [
+        ("chatgptricks", "ChatGPT Tricks", 1, "sentient"), ("evolving.ai", "Evolving AI", 1, "competitors"),
+        ("hidden", "Inactive Label", 0, "sentient"), ("unsafe", "bad\nkeyword", 1, "competitors"),
+        ("markup", "<bad>", 1, "competitors"),
+        *[(f"account{i:03}", "Label " + str(i), 1, "competitors") for i in range(100)]])
+    conn.commit()
+    conn.execute("PRAGMA query_only = ON")
+    @contextmanager
+    def connect():
+        yield conn
+    monkeypatch.setattr(voice.db, "connect", connect)
+    context = voice._transcription_context()
+    assert "chatgptricks" in context["keywords[]"] and "ChatGPT Tricks" in context["keywords[]"]
+    assert "hidden" not in context["keywords[]"] and "Inactive Label" not in context["keywords[]"]
+    assert len(context["keywords[]"]) <= 100
+    assert not any(any(character in term for character in "<>\r\n") for term in context["keywords[]"])
+    conn.close()
+
+
+def test_transcription_context_failure_keeps_bounded_common_hints(monkeypatch):
+    def unavailable():
+        raise RuntimeError("private database detail")
+    monkeypatch.setattr(voice.db, "connect", unavailable)
+    context = voice._transcription_context()
+    assert context["keywords[]"] == list(voice._TRANSCRIPTION_TERMS)
+    assert "private" not in json.dumps(context)
 
 
 @pytest.mark.parametrize("status,payload,expected", [(429, {"error": "secret"}, 429), (500, {"error": "secret"}, 502),
@@ -181,7 +218,8 @@ def test_realtime_pcm_wav_and_grounded_narration(monkeypatch):
     body = voice.SpeechRequest(text="Recrea [este reel](https://sentientdash.app/index.html?post=rival%3AClip): explica el experimento con claridad.",
                                question="/next reel para alpha", mode="next", language="es")
     stored = [{"account": "rival", "caption": "A robot folds laundry", "likes": 3200}]
-    audio = anyio.run(voice._synthesize, body, stored, "private-key")
+    audio, transcript = anyio.run(voice._synthesize, body, stored, "private-key")
+    assert transcript == ""
     with wave.open(io.BytesIO(audio)) as output:
         assert (output.getnchannels(), output.getsampwidth(), output.getframerate(), output.getnframes()) == (1, 2, 24000, 80)
     assert socket.closed
@@ -214,6 +252,30 @@ def test_realtime_audio_size_bound(client, monkeypatch):
     monkeypatch.setattr(voice, "websocket_connect", lambda *args, **kwargs: socket)
     assert client.post("/api/dashboard/assistant/speech", json={"text": "Answer"}).status_code == 502
     assert socket.closed
+
+
+def test_exact_provider_transcript_header_is_ascii_bounded_and_wav_stays_unchanged(client, monkeypatch):
+    narration = "Aquí están los resultados: el ornitorrinco escapa de los cocodrilos. " * 30
+    payload = events()
+    payload.insert(-1, {"type": "response.output_audio_transcript.done", "transcript": narration})
+    socket = Socket(payload)
+    monkeypatch.setattr(voice, "websocket_connect", lambda *args, **kwargs: socket)
+    response = client.post("/api/dashboard/assistant/speech", json={"text": "Existing answer", "language": "es"})
+    assert response.status_code == 200 and response.content.startswith(b"RIFF")
+    assert response.headers["x-sentient-speech-transcript-encoding"] == "base64-utf8"
+    encoded = response.headers["x-sentient-speech-transcript"]
+    assert encoded.isascii()
+    assert base64.b64decode(encoded).decode("utf-8") == " ".join(narration.split())[:1200]
+    assert "cocodrilos" not in encoded
+
+
+def test_transcript_can_be_recovered_from_completed_response(monkeypatch):
+    payload = events()
+    payload[-1]["response"]["output"] = [{"content": [{"type": "audio", "transcript": "Here are the results."}]}]
+    socket = Socket(payload)
+    monkeypatch.setattr(voice, "websocket_connect", lambda *args, **kwargs: socket)
+    audio, transcript = anyio.run(voice._synthesize, voice.SpeechRequest(text="Existing answer"), [], "secret")
+    assert audio.startswith(b"RIFF") and transcript == "Here are the results."
 
 
 def test_realtime_rate_limit_does_not_expose_provider_error(client, monkeypatch):
@@ -301,7 +363,7 @@ def test_real_app_middleware_allows_voice_without_admin_or_read_marker(monkeypat
         return "Latest post"
     async def synthesize(*args):
         called.append("speech")
-        return b"RIFF-audio"
+        return b"RIFF-audio", "Existing answer"
     monkeypatch.setattr(voice, "_transcribe", transcribe)
     monkeypatch.setattr(voice, "_synthesize", synthesize)
     # Do not start background ingestion/startup maintenance in this integration
