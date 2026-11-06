@@ -86,11 +86,24 @@ def test_complete_history_all_formats_hidden_deleted_and_account_scope(stored, t
         post(conn, "Elsewhere", account="rival")
         post(conn, "Future", account=target, canonical=canonical,
              published_at=(datetime.now(UTC) + timedelta(days=10)).isoformat())
-        post(conn, "Unpublished", account=target, canonical=canonical, published_at=None)
+        post(conn, "Undated", account=target, canonical=canonical, published_at=None)
     history = reuse.load_history(target)
-    assert history.post_count == 220
-    assert history.filter_candidates([candidate("Historic0"), candidate("Historic219")]) == []
-    assert [item["shortcode"] for item in history.filter_candidates([candidate("Elsewhere"), candidate("Future"), candidate("Unpublished")])] == ["Elsewhere", "Future", "Unpublished"]
+    assert history.post_count == 221
+    assert history.filter_candidates([candidate("Historic0"), candidate("Historic219"), candidate("Undated")]) == []
+    assert [item["shortcode"] for item in history.filter_candidates([candidate("Elsewhere"), candidate("Future")])] == ["Elsewhere", "Future"]
+
+
+@pytest.mark.parametrize("target,canonical", [("alpha", True), ("beta", False)])
+@pytest.mark.parametrize("date", [None, ""])
+def test_undated_stored_posts_still_exclude_identity_and_text(stored, target, canonical, date):
+    caption = "Scientists discover enormous crystalline formations beneath distant Antarctic glaciers"
+    ocr = "Rare mineral structures reveal ancient microbial colonies inside frozen volcanic caves"
+    with stored() as conn:
+        post(conn, "Undated", account=target, canonical=canonical, published_at=date, caption=caption, hook_text=ocr)
+    history = reuse.load_history(target)
+    assert history.post_count == 1
+    assert history.filter_candidates([candidate("Undated"), candidate(caption=caption), candidate(ocr_text=ocr)]) == []
+    assert history.examples[0]["shortcode"] == "Undated"
 
 
 def test_canonical_uses_enriched_dashboard_metadata_and_full_text(stored):
@@ -119,7 +132,7 @@ def test_persisted_same_event_stack_excludes_but_other_destination_does_not(stor
 
 def test_closed_queue_exact_destination_copies_and_not_yet_imported(stored):
     with stored() as conn:
-        queue(conn, "Inspiration--copy-123", post_permalink="https://www.instagram.com/reel/Inspiration/?ref=source")
+        queue(conn, "Inspiration--copy-123", post_permalink="https://www.instagram.com/reels/Inspiration/?ref=source")
         queue(conn, "OtherDestination", target="alpha", final="OtherDelivered")
         queue(conn, "AssignedOnly", final="NotPublished", status="scheduled")
         queue(conn, "Legacy", final="LegacyDelivered", final_permalinks="[]", recommended_accounts='["beta","alpha"]')

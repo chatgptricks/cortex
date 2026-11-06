@@ -50,7 +50,7 @@ def _code_from_link(value):
     if url.scheme not in {"https", "http"} or url.hostname not in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
         return None
     parts = url.path.strip("/").split("/")
-    return parts[1] if len(parts) == 2 and parts[0] in {"p", "reel", "tv"} and _CODE.fullmatch(parts[1]) else None
+    return parts[1] if len(parts) == 2 and parts[0] in {"p", "reel", "reels", "tv"} and _CODE.fullmatch(parts[1]) else None
 
 
 def _list(value):
@@ -182,16 +182,19 @@ def load_history(target: str) -> ReuseHistory:
             cte, params, registry = external_research._sources(conn, [target])
             if target not in registry or registry[target].get("group_name") != "sentient":
                 raise ValueError("The /next destination must be a stored Sentient account.")
-            rows = conn.execute(cte + "SELECT account, shortcode, caption, hook_text, published_at FROM catalogue "
-                                "WHERE published_at IS NOT NULL AND published_at <> ''", params).fetchall()
+            rows = conn.execute(cte + "SELECT account, shortcode, caption, hook_text, published_at FROM catalogue", params).fetchall()
             now = datetime.now(UTC)
             posts = {}
             for row in rows:
-                published = kit._date(row["published_at"])
-                if not published:
+                raw_published = row["published_at"]
+                published = kit._date(raw_published)
+                if str(raw_published or "").strip() and not published:
                     raise ValueError("A stored publication timestamp is invalid.")
-                if published > now:
+                if published and published > now:
                     continue
+                # A persisted shortcode with a missing date can still be an
+                # old published post. Retain its identity/text conservatively;
+                # an incomplete timestamp must never prove unused history.
                 code = str(row["shortcode"] or "")
                 if not _CODE.fullmatch(code):
                     continue
