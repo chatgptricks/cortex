@@ -429,7 +429,7 @@ def test_cancelling_request_stops_work_and_releases_active_slot(app, monkeypatch
 
 def test_completed_answer_stops_disconnect_watch_and_preserves_response(app, monkeypatch):
     monkeypatch.setenv('OPENAI_API_KEY', 'test')
-    expected = {"answer": "Hello.", "sources": [], "ui_actions": [], "language": "en"}
+    expected = {"answer": "Hello.", "sources": [], "ui_actions": [], "language": "en", "mode": "auto"}
     async def language(*args):
         return "en"
     monkeypatch.setattr(assistant, "resolve_reply_language", language)

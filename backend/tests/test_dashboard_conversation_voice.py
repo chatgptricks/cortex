@@ -27,12 +27,12 @@ def test_voice_next_clarification_uses_spoken_language_and_returns_it(app, monke
         payload = json.loads(request.content)
         name = payload["tool_choice"]["name"]
         calls.append(name)
-        if name == "resolve_reply_language":
+        if name == "resolve_voice_request":
             data = json.loads(payload["input"][0]["content"])
             assert data["current_message"] == message and data["fallback_language"] == ui
             assert "actually speaking/writing" in payload["instructions"]
             assert "Proper names, quoted captions" in payload["instructions"]
-            return httpx.Response(200, json=tool(name, {"language": language}))
+            return httpx.Response(200, json=tool(name, {"language": language, "mode": "next", "continue_next": False, "needs_query": False}))
         assert name == "prepare_next_recommendation"
         return httpx.Response(200, json=tool(name, {"post_format": "reel", "target_account": None}))
 
@@ -43,7 +43,7 @@ def test_voice_next_clarification_uses_spoken_language_and_returns_it(app, monke
     assert response.status_code == 200
     assert response.json()["answer"] == expected and response.json()["language"] == language
     assert response.json()["pending_next"] == {"post_format": "reel", "target_account": None}
-    assert calls == ["resolve_reply_language", "prepare_next_recommendation"]
+    assert calls == ["resolve_voice_request", "prepare_next_recommendation"]
 
 
 @pytest.mark.parametrize("language,ui,message,expected", [
@@ -57,7 +57,7 @@ def test_filter_confirmation_and_voice_prompt_use_same_resolved_language(app, mo
     def provider(request):
         payload = json.loads(request.content)
         if isinstance(payload["tool_choice"], dict):
-            return httpx.Response(200, json=tool("resolve_reply_language", {"language": language}))
+            return httpx.Response(200, json=tool("resolve_voice_request", {"language": language, "mode": "filter", "continue_next": False, "needs_query": False}))
         instructions = payload["instructions"]
         assert "using the SAME words" in instructions and "no separate narrator" in instructions
         assert "at most 80 words" in instructions and "overrides the link-only" in instructions

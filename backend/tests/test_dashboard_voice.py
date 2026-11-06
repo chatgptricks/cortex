@@ -295,6 +295,7 @@ def test_transcription_context_reads_only_active_handles_and_sanitized_labels(mo
     context = voice._transcription_context()
     assert "chatgptricks" in context["keywords[]"] and "ChatGPT Tricks" in context["keywords[]"]
     assert "hidden" not in context["keywords[]"] and "Inactive Label" not in context["keywords[]"]
+    assert {"filter", "research", "next", "filtro", "filtrar", "investiga", "siguiente", "próximo post"}.issubset(context["keywords[]"])
     assert len(context["keywords[]"]) <= 100
     assert not any(any(character in term for character in "<>\r\n") for term in context["keywords[]"])
     conn.close()
