@@ -87,7 +87,7 @@ def _registry(conn: Any, handles: list[str]) -> dict[str, dict[str, Any]]:
         f"SELECT {','.join(fields)} FROM accounts WHERE LOWER(handle) IN ({marks}) AND is_active = 1", handles).fetchall()}
 
 
-def _sources(conn: Any, handles: list[str], *, public_only: bool = False) -> tuple[str, list[Any], dict[str, dict[str, Any]]]:
+def _sources(conn: Any, handles: list[str], *, public_only: bool = False, candidate_codes: list[str] | None = None) -> tuple[str, list[Any], dict[str, dict[str, Any]]]:
     """A compact union with one account-relative row per persisted post.
 
     Canonical curation takes precedence over a duplicate dashboard copy. This
@@ -130,6 +130,9 @@ def _sources(conn: Any, handles: list[str], *, public_only: bool = False) -> tup
             fields.extend(("LOWER(account) AS account", "1 AS source_priority"))
             where = f"LOWER(account) IN ({','.join('?' for _ in handles)}) AND shortcode IS NOT NULL AND shortcode <> ''"
             params.extend(handles)
+        if candidate_codes is not None:
+            where += " AND shortcode IN (" + ",".join("?" for _ in candidate_codes) + ")" if candidate_codes else " AND 1 = 0"
+            params.extend(candidate_codes)
         parts.append(f"SELECT {','.join(fields)} FROM {table} WHERE {where}")
     if not parts:
         # A schema-independent empty relation, with the columns callers use.

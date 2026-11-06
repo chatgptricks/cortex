@@ -6,7 +6,7 @@ from fastapi import APIRouter, Query, Response
 
 from . import db, external_research as reads
 from .apify_sync import list_accounts
-from .dashboard_rankings import dashboard_post_url
+from .dashboard_rankings import dashboard_post_url, candidate_codes
 
 router = APIRouter(prefix="/api/dashboard/posts", tags=["Research"])
 
@@ -31,7 +31,9 @@ def search_posts(response: Response, q: Annotated[str, Query(max_length=200)] = 
     """
     handles = reads._handles({"account_handles": [a["handle"] for a in list_accounts(active_only=True, research_only=True)]}, account)
     with db.connect() as conn:
-        source, params, registry = reads._sources(conn, handles)
+        if getattr(conn, "is_postgres", False): conn.execute("SET LOCAL statement_timeout = '25s'")
+        codes = candidate_codes(conn, query=q, text_scope=text_scope, promos_only=promos_only, handles=handles) if q.strip() or promos_only else None
+        source, params, registry = reads._sources(conn, handles, candidate_codes=codes if codes is None or len(codes) <= 20000 else None)
         where, values = reads._filters(start=start, end=end)
         params.extend(values)
         if q.strip():

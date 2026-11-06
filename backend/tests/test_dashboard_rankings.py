@@ -110,3 +110,19 @@ def test_search_complete_captions_thresholds_latest_promos_and_all_keys(stored, 
         promos = client.get('/api/dashboard/posts/search', params={"promos_only": True, "limit": 10}).json()
         assert [p["shortcode"] for p in promos["data"]] == ["Fresh", "LongCaption"]
         assert client.get('/api/dashboard/posts/search', params={"account": "unavailable"}).status_code == 404
+
+
+def test_format_rankings_all_time_and_offset_dates(stored):
+    with stored() as conn:
+        conn.execute("ALTER TABLE dashboard_posts ADD COLUMN post_type_label TEXT")
+        add(conn, "CarouselWinner", 9999, post_type_label="Carousel")
+        add(conn, "ReelWinner", 100, post_type_label="Reel", published=NOW - timedelta(days=100))
+        add(conn, "CurrentReel", 10, post_type_label="Reel", published=NOW - timedelta(minutes=5))
+        add(conn, "OffsetReel", 20, post_type_label="Reel")
+        conn.execute("UPDATE dashboard_posts SET published_at=? WHERE shortcode='OffsetReel'", ((NOW - timedelta(minutes=1)).astimezone(__import__('datetime').timezone(timedelta(hours=12))).isoformat(),))
+    app = FastAPI(); app.include_router(ranks.router)
+    with TestClient(app) as client:
+        result = client.get('/api/insights/top-posts', params={"post_format": "reel", "account": "beta", "all_time": True, "limit": 3}).json()
+        assert [p['shortcode'] for p in result['data']] == ['ReelWinner', 'OffsetReel', 'CurrentReel']
+        recent = client.get('/api/insights/top-posts', params={"post_format": "reel"}).json()
+        assert recent['data'][0]['shortcode'] == 'OffsetReel'

@@ -422,9 +422,9 @@ def _normalize_posts(rows: list[dict[str, Any]], observations: dict[str, dict[st
                 metrics.setdefault("analysis." + _snake(name), number)
         product = str(merged.get("product_type") or raw.get("productType") or "").lower()
         kind = str(merged.get("post_type_label") or raw.get("type") or "Image")
-        if product in {"clips", "reels", "reel"}:
+        if product in {"clips", "reels", "reel"} or kind.lower().startswith("reel"):
             kind = "Reel"
-        elif kind.lower() in {"sidecar", "carousel"} or (metrics.get("slide_count") or 0) > 1:
+        elif kind.lower().startswith(("sidecar", "carousel")) or (metrics.get("slide_count") or 0) > 1:
             kind = "Carousel"
         elif kind.lower().startswith("video") or merged.get("is_animated"):
             kind = "Video"
