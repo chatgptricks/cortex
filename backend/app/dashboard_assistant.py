@@ -36,6 +36,25 @@ class ChatRequest(BaseModel):
     history: list[HistoryMessage] = Field(default_factory=list, max_length=12)
     language: Literal["en", "es"] = "es"
     page: str = Field(default="/", max_length=100)
+    mode: Literal["auto", "filter", "research"] = "auto"
+
+
+SHORTCUT = re.compile(r"^/(filter|research)(?=\s|$)", re.IGNORECASE)
+
+
+def request_mode(body: ChatRequest) -> tuple[str, str]:
+    message = body.message.strip()
+    shortcut = SHORTCUT.match(message)
+    mode = shortcut.group(1).lower() if shortcut else body.mode
+    if shortcut:
+        message = message[shortcut.end():].strip()
+    if not message:
+        if shortcut or mode != "auto":
+            detail = "Escribí una consulta después del comando." if body.language == "es" else "Write a query after the command."
+        else:
+            detail = "Escribí una pregunta primero." if body.language == "es" else "Write a question first."
+        raise HTTPException(400, detail)
+    return mode, message
 
 
 class ResearchFilters(BaseModel):
@@ -281,22 +300,31 @@ If the user simply greets you or asks about general navigation, answer without u
 """
 
 
+MODE_INSTRUCTIONS = {
+    "auto": "The current message has no explicit shortcut mode. Interpret this request normally. Do not carry a /filter or /research mode over from conversation history; those shortcuts apply only to the message that uses them.",
+    "filter": "The user explicitly selected /filter for THIS message. This is an explicit request to apply the available dashboard Research page filters, even if the query is phrased as a question. Use show_research_posts for representable requests instead of only returning a list of matching posts. You may discover/read relevant Cortex data to ground accounts or resolve the requested filter values. Preserve the user's meaning and use only existing controls and their exact options. Do not invent a count limit or unsupported filter. If a strict requested condition cannot be represented by those controls, briefly identify that unavailable condition and suggest /research for querying it; do not silently weaken it or automatically substitute a different task. The application confirms successfully applied filters. This mode does not persist to later messages.",
+    "research": "The user explicitly selected /research for THIS message. Answer by discovering and querying the relevant authorized Cortex Research/API read operations, and return the requested evidence and internal dashboard post links in chat. For post text searches use the documented Research search; for exact engagement rankings use the dedicated top-posts endpoint as instructed above. Analyze or paginate as needed for complete results. Never apply, clear or change dashboard page filters, navigate the page, or claim that you did: show_research_posts is unavailable in this mode, even if the query itself uses the words filter/show. This mode does not persist to later messages.",
+}
+
+
 async def respond(request: Request, body: ChatRequest, api_key: str) -> dict:
+    mode, message = request_mode(body)
+    tools = [tool for tool in TOOLS if mode != "research" or tool["name"] != "show_research_posts"]
     entries = operations(request.app)
     page = body.page if body.page in {*PAGES.values(), "/index.html", "/mobile/"} else "/"
-    context = {"page": page, "language": body.language, "now": datetime.now(timezone.utc).isoformat(), "time_zone": getattr(request.state, "time_zone", "America/Costa_Rica")}
+    context = {"page": page, "language": body.language, "mode": mode, "now": datetime.now(timezone.utc).isoformat(), "time_zone": getattr(request.state, "time_zone", "America/Costa_Rica")}
     history = [{"role": item.role, "content": item.content} for item in body.history][-10:]
     if sum(len(item["content"]) for item in history) > 32_000:
         history = history[-4:]
-    inputs = [*history, {"role": "user", "content": body.message.strip()}]
+    inputs = [*history, {"role": "user", "content": message}]
     sources = []
     ui_actions = []
     calls = 0
     async with httpx.AsyncClient(timeout=httpx.Timeout(45, connect=10)) as client:
         for turn in range(MAX_TURNS):
             result = await client.post("https://api.openai.com/v1/responses", headers={"Authorization": "Bearer " + api_key}, json={
-                "model": model_name(), "store": False, "instructions": INSTRUCTIONS + "\nVIEW_CONTEXT=" + json.dumps(context),
-                "input": inputs, "tools": TOOLS, "include": ["reasoning.encrypted_content"], "tool_choice": "none" if turn == MAX_TURNS - 1 else "auto",
+                "model": model_name(), "store": False, "instructions": INSTRUCTIONS + "\nThe following mode guidance takes precedence over default action-selection guidance for this message.\nCURRENT_REQUEST_MODE: " + MODE_INSTRUCTIONS[mode] + "\nVIEW_CONTEXT=" + json.dumps(context),
+                "input": inputs, "tools": tools, "include": ["reasoning.encrypted_content"], "tool_choice": "none" if turn == MAX_TURNS - 1 else "auto",
                 "reasoning": {"effort": "low"}, "max_output_tokens": 3_000,
             })
             if result.status_code == 429:
@@ -330,6 +358,10 @@ async def respond(request: Request, body: ChatRequest, api_key: str) -> dict:
                         tool_result, source = await read_operation(request, entry, json.loads(arguments.get("parameters_json", "{}")), json.loads(arguments["analysis_json"]) if call["name"] == "analyze_cortex" else None)
                         if source and source not in sources:
                             sources.append(source)
+                    elif call["name"] == "show_research_posts" and mode == "research":
+                        # Enforce the explicit mode even if a provider returns
+                        # a tool call which was not offered in this request.
+                        tool_result = {"error": "Research mode cannot change dashboard filters. Use the available Cortex read tools and answer in chat."}
                     elif call["name"] == "show_research_posts":
                         filters = research_filters(arguments)
                         if filters["accounts"]:
@@ -380,8 +412,7 @@ async def respond_until_disconnected(request: Request, body: ChatRequest, api_ke
 @router.post("/chat")
 async def assistant_chat(request: Request, body: ChatRequest) -> dict:
     email = require_browser(request)
-    if not body.message.strip():
-        raise HTTPException(400, "Write a question first.")
+    request_mode(body)  # Validate empty shortcuts before charging quota or contacting a provider.
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(503, "The assistant is not configured yet.")

@@ -50,6 +50,116 @@ def request(app, *, preview="", credential="firebase"):
     return SimpleNamespace(app=app, headers={"authorization": "Bearer signed-in-member", "x-queue-role-preview": preview}, state=SimpleNamespace(user_email="member@example.com", credential_kind=credential, time_zone="America/Costa_Rica"))
 
 
+@pytest.mark.parametrize("message,mode,expected", [
+    (" /FiLtEr   Elon Musk ", "auto", ("filter", "Elon Musk")),
+    ("/RESEARCH\nlatest posts", "auto", ("research", "latest posts")),
+    ("/research latest posts", "filter", ("research", "latest posts")),
+    ("/filter latest posts", "research", ("filter", "latest posts")),
+    ("latest posts", "research", ("research", "latest posts")),
+    ("/researcher latest posts", "auto", ("auto", "/researcher latest posts")),
+    ("/filtering posts", "auto", ("auto", "/filtering posts")),
+    ("/filter/posts", "auto", ("auto", "/filter/posts")),
+    ("Explain /filter", "auto", ("auto", "Explain /filter")),
+])
+def test_shortcut_parsing_has_exact_boundary_and_prefix_precedence(message, mode, expected):
+    assert assistant.request_mode(assistant.ChatRequest(message=message, mode=mode)) == expected
+
+
+@pytest.mark.parametrize("message,mode,language,detail", [
+    ("/filter", "auto", "es", "Escribí una consulta después del comando."),
+    ("  /RESEARCH \n", "auto", "en", "Write a query after the command."),
+    (" ", "research", "es", "Escribí una consulta después del comando."),
+    (" ", "filter", "en", "Write a query after the command."),
+])
+def test_empty_shortcuts_fail_before_quota_or_provider(app, monkeypatch, message, mode, language, detail):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    async def unexpected_provider(*args):
+        raise AssertionError("Empty shortcuts must never contact the provider")
+    monkeypatch.setattr(assistant, "respond", unexpected_provider)
+    with TestClient(app) as client:
+        result = client.post("/api/dashboard/assistant/chat", headers={"Authorization": "Bearer signed-in-member"}, json={"message": message, "mode": mode, "language": language})
+    assert result.status_code == 400 and result.json()["detail"] == detail
+    assert not assistant._usage and not assistant._active
+
+
+def test_unknown_shortcut_mode_is_rejected_by_request_schema(app):
+    with TestClient(app) as client:
+        result = client.post("/api/dashboard/assistant/chat", headers={"Authorization": "Bearer signed-in-member"}, json={"message": "hello", "mode": "write"})
+    assert result.status_code == 422
+    assert not assistant._usage and not assistant._active
+
+
+@pytest.mark.parametrize("message,mode", [("/research filter posts about AI", "auto"), ("filter posts about AI", "research")])
+def test_research_mode_enforces_no_ui_actions_and_preserves_authorized_reads(app, monkeypatch, message, mode):
+    original = httpx.AsyncClient
+    calls = []
+    operation = next(name for name, entry in assistant.operations(app).items() if entry["path"] == "/api/dashboard/me")
+    def provider(req):
+        payload = json.loads(req.content)
+        calls.append(payload)
+        context = json.loads(payload["instructions"].split("\nVIEW_CONTEXT=", 1)[1])
+        assert context["mode"] == "research"
+        assert {tool["name"] for tool in payload["tools"]} == {"search_cortex_endpoints", "query_cortex", "analyze_cortex"}
+        if len(calls) == 1:
+            assert payload["input"][-1] == {"role": "user", "content": "filter posts about AI"}
+            # A provider can emit an unoffered tool; the server still enforces the mode.
+            return httpx.Response(200, json={"output": [{"type": "function_call", "call_id": "blocked", "name": "show_research_posts", "arguments": '{"query":"AI"}'}]})
+        if len(calls) == 2:
+            assert "cannot change dashboard filters" in json.loads(payload["input"][-1]["output"])["error"]
+            return httpx.Response(200, json={"output": [{"type": "function_call", "call_id": "read", "name": "query_cortex", "arguments": json.dumps({"operation": operation, "parameters_json": "{}"})}]})
+        assert json.loads(payload["input"][-1]["output"])["data"] == {"role": "vc"}
+        return httpx.Response(200, json={"output": [{"type": "message", "content": [{"type": "output_text", "text": "Your role is VC."}]}]})
+    def client(**kwargs):
+        kwargs.setdefault("transport", httpx.MockTransport(provider))
+        return original(**kwargs)
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    result = asyncio.run(assistant.respond(request(app, preview="vc"), assistant.ChatRequest(message=message, mode=mode, language="en"), "test-key"))
+    assert result["ui_actions"] == [] and result["answer"] == "Your role is VC."
+    assert len(result["sources"]) == 1 and len(calls) == 3
+    assert any(tool["name"] == "show_research_posts" for tool in assistant.TOOLS)
+
+
+def test_filter_shortcut_applies_existing_controls_even_for_a_question(app, monkeypatch):
+    original = httpx.AsyncClient
+    def provider(req):
+        payload = json.loads(req.content)
+        context = json.loads(payload["instructions"].split("\nVIEW_CONTEXT=", 1)[1])
+        assert context["mode"] == "filter"
+        assert "even if the query is phrased as a question" in payload["instructions"]
+        assert payload["input"][-1]["content"] == "which carousels mention Elon Musk with more than 5000 likes?"
+        action_tool = next(tool for tool in payload["tools"] if tool["name"] == "show_research_posts")
+        assert "limit" not in action_tool["parameters"]["properties"]
+        return httpx.Response(200, json={"output": [{"type": "function_call", "call_id": "show", "name": "show_research_posts", "arguments": json.dumps({"query": "Elon Musk", "min_likes": 5000, "likes_operator": "gt", "post_type": "Carousel"})}]})
+    def client(**kwargs):
+        kwargs.setdefault("transport", httpx.MockTransport(provider))
+        return original(**kwargs)
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message="/filter which carousels mention Elon Musk with more than 5000 likes?", language="en"), "test-key"))
+    assert result["answer"] == "Filters applied."
+    filters = result["ui_actions"][0]["filters"]
+    assert filters["query"] == "Elon Musk" and filters["min_likes"] == 5001 and filters["post_type"] == "Carousel"
+
+
+@pytest.mark.parametrize("previous_mode", ["filter", "research"])
+def test_history_shortcuts_do_not_select_current_request_mode(app, monkeypatch, previous_mode):
+    original = httpx.AsyncClient
+    def provider(req):
+        payload = json.loads(req.content)
+        context = json.loads(payload["instructions"].split("\nVIEW_CONTEXT=", 1)[1])
+        assert context["mode"] == "auto"
+        assert "Do not carry a /filter or /research mode over" in payload["instructions"]
+        assert any(tool["name"] == "show_research_posts" for tool in payload["tools"])
+        assert payload["input"][-1] == {"role": "user", "content": "What can you help me with?"}
+        return httpx.Response(200, json={"output": [{"type": "message", "content": [{"type": "output_text", "text": "I can help with the dashboard."}]}]})
+    def client(**kwargs):
+        kwargs.setdefault("transport", httpx.MockTransport(provider))
+        return original(**kwargs)
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    body = assistant.ChatRequest(message="What can you help me with?", history=[{"role": "user", "content": f"/{previous_mode} Elon Musk"}, {"role": "assistant", "content": "Done."}])
+    result = asyncio.run(assistant.respond(request(app), body, "test-key"))
+    assert result["ui_actions"] == []
+
+
 def test_browser_session_required_and_status_has_no_key(app, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "private-test-key")
     with TestClient(app) as client:

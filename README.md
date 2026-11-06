@@ -116,6 +116,14 @@ require the signed-in Firebase browser session. Chat uses the existing
 caption model (`OPENAI_CAPTION_MODEL`, default `gpt-5-mini`). No new secret is
 needed for an installation already generating captions.
 
+Chat accepts a per-message `mode` (`auto`, `filter`, or `research`). Leading
+`/filter` and `/research` shortcuts also work directly in `message`, with the
+shortcut taking precedence over the mode field. `/filter` requests the existing
+Research page controls; `/research` returns queried results in chat and cannot
+apply UI filters. Shortcuts are case-insensitive, require a following query,
+and do not carry over to later messages. Messages without a shortcut or mode
+retain normal automatic behavior.
+
 The assistant discovers operations from Cortex's OpenAPI/product catalogue,
 then performs bounded JSON reads through normal authentication middleware with
 the caller's credential and role preview. It never runs write operations,
