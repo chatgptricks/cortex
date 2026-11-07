@@ -10,8 +10,11 @@ from app import dashboard_assistant as assistant
 from test_dashboard_assistant import app, request  # noqa: F401 — authenticated fixture
 
 
-def metadata(mode, language="es"):
-    return {"language": language, "mode": mode, "continue_next": False, "needs_query": False}
+def metadata(mode, language="es", *, shape=None, count=None, sufficient=None):
+    return {"language": language,
+            "result_shape": shape or ("all_matching_posts" if mode == "filter" else "selected_posts"),
+            "requested_count": count, "page_filters_sufficient": mode == "filter" if sufficient is None else sufficient,
+            "mode": mode, "continue_next": False, "needs_query": False}
 
 
 def function_call(name, arguments):
@@ -150,3 +153,95 @@ def test_explicit_typed_modes_keep_precedence_over_automatic_routing(app, monkey
         response = client.post("/api/dashboard/assistant/chat", headers={"Authorization": "Bearer signed-in-member"},
                                json={"message": message, "mode": selected})
     assert response.status_code == 200 and response.json()["mode"] == expected
+
+
+@pytest.mark.parametrize("shape,count,sufficient,expected", [
+    ("all_matching_posts", 2, True, "research"),  # Count wins even if both other fields claim filtering works.
+    ("selected_posts", None, True, "research"),  # Implicit best/latest selection cannot use a full page.
+    ("analysis", None, True, "research"),
+    ("all_matching_posts", None, False, "research"),  # Any unsupported criterion requires research.
+    ("all_matching_posts", None, True, "filter"),
+])
+def test_independent_outcome_facts_override_automatic_filter_mode(monkeypatch, shape, count, sufficient, expected):
+    async def classify(client, key, instructions, inputs, tool, **kwargs):
+        properties = tool["parameters"]["properties"]
+        assert set(tool["parameters"]["required"]) == set(properties)
+        assert properties["requested_count"]["minimum"] == 1
+        assert "NOT a result count" in properties["requested_count"]["description"]
+        return metadata("filter", shape=shape, count=count, sufficient=sufficient)
+
+    monkeypatch.setattr(assistant, "next_tool_call", classify)
+    result = asyncio.run(assistant.resolve_dashboard_request(assistant.ChatRequest(message="Una consulta"), "test"))
+    assert result["mode"] == expected
+
+
+@pytest.mark.parametrize("message,selected", [("/filter Show the top two posts", "auto"), ("Show the top two posts", "filter")])
+def test_explicit_filter_lock_survives_result_shape_guard(monkeypatch, message, selected):
+    async def classify(*args, **kwargs):
+        return metadata("research", shape="selected_posts", count=2, sufficient=False)
+
+    monkeypatch.setattr(assistant, "next_tool_call", classify)
+    body = assistant.ChatRequest(message=message, mode=selected, input_mode="voice")
+    result = asyncio.run(assistant.resolve_voice_request(body, "test"))
+    assert result["mode"] == "filter"
+
+
+@pytest.mark.parametrize("input_mode,language,message", [
+    ("text", "es", "Filtra los 2 posts con más likes de evolving.ai"),
+    ("voice", "en", "Filter the two most liked posts from evolving.ai"),
+    ("text", "en", "Filter to the most liked post from evolving.ai"),
+])
+def test_production_top_count_regression_queries_exact_results_without_changing_page(app, monkeypatch, input_mode, language, message):
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    original = httpx.AsyncClient
+    calls, reads = [], []
+    count = 1 if message.startswith("Filter to") else 2
+
+    @app.get("/api/insights/top-posts")
+    def top_posts(account: str, limit: int):
+        reads.append((account, limit))
+        assert account == "evolving.ai" and limit == count
+        return {"posts": [{"account": account, "shortcode": f"Post{i}", "likes": 9000 - i} for i in range(limit)]}
+
+    app.openapi_schema = None
+    operation = next(name for name, entry in assistant.operations(app).items() if entry["path"] == "/api/insights/top-posts")
+
+    def provider(req):
+        payload = json.loads(req.content)
+        calls.append(payload)
+        if len(calls) == 1:
+            name = "resolve_voice_request" if input_mode == "voice" else "resolve_dashboard_request"
+            assert payload["tool_choice"] == {"type": "function", "name": name}
+            assert json.loads(payload["input"][0]["content"])["current_message"] == message
+            # Reproduce a wrong mode decision; the independent semantic facts
+            # must stop it from opening every post sorted by likes.
+            return httpx.Response(200, json=function_call(name, metadata("filter", language,
+                shape="selected_posts", count=count, sufficient=False)))
+        assert all(tool["name"] != "show_research_posts" for tool in payload["tools"])
+        assert json.loads(payload["instructions"].split("\nVIEW_CONTEXT=", 1)[1])["mode"] == "research"
+        if len(calls) == 2:
+            assert payload["input"][-1]["content"] == message
+            # Even an unoffered page action from the answer model is blocked.
+            return httpx.Response(200, json=function_call("show_research_posts", {"accounts": ["evolving.ai"], "sort": "likes-desc"}))
+        if len(calls) == 3:
+            assert "cannot change dashboard filters" in json.loads(payload["input"][-1]["output"])["error"]
+            return httpx.Response(200, json=function_call("query_cortex", {"operation": operation,
+                "parameters_json": json.dumps({"query": {"account": "evolving.ai", "limit": count}})}))
+        posts = json.loads(payload["input"][-1]["output"])["data"]["posts"]
+        answer = "\n".join(f"[Post {i + 1}]({post['dashboard_url']})" for i, post in enumerate(posts))
+        return httpx.Response(200, json={"output": [{"type": "message", "content": [{"type": "output_text", "text": answer}]}]})
+
+    def client(**kwargs):
+        kwargs.setdefault("transport", httpx.MockTransport(provider))
+        return original(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    with TestClient(app) as client:
+        response = client.post("/api/dashboard/assistant/chat", headers={"Authorization": "Bearer signed-in-member"},
+            json={"message": message, "language": "en", "input_mode": input_mode, "history": [], "page": "/"})
+    assert response.status_code == 200
+    result = response.json()
+    assert result["mode"] == "research" and result["ui_actions"] == []
+    assert result["language"] == language
+    assert result["answer"].count("https://sentientdash.app/") == count
+    assert reads == [("evolving.ai", count)] and len(calls) == 4

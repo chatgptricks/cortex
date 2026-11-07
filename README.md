@@ -133,6 +133,10 @@ intelligent research of stored dashboard data. They apply page filters only for
 a browsable set fully represented by existing controls. Factual questions,
 exact-N lists/rankings, semantic matches, and unsupported conditions stay in
 research; only resolved filter requests can execute a page-filter action.
+The structured routing decision separately extracts result shape, requested
+post count, and whether page controls satisfy the whole request. The server
+rejects automatic filtering unless all three agree on an unbounded, representable
+post set; metric thresholds do not count as requested result counts.
 Explicit shortcuts and selected modes take precedence. `/filter` applies
 existing Research page controls; `/research` answers in chat without changing
 filters. `/next` recommends one stored competitor post to recreate for a

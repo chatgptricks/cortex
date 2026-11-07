@@ -13,7 +13,10 @@ from test_dashboard_assistant import app, request  # noqa: F401 — shared authe
 
 
 def voice_metadata(mode="auto", language="es", *, continuation=False, needs_query=False):
-    return {"language": language, "mode": mode, "continue_next": continuation, "needs_query": needs_query}
+    shape = "clarification" if needs_query else {"filter": "all_matching_posts", "research": "selected_posts", "next": "next_recommendation", "auto": "conversation"}[mode]
+    return {"language": language, "result_shape": shape, "requested_count": None,
+            "page_filters_sufficient": mode == "filter" and not needs_query,
+            "mode": mode, "continue_next": continuation, "needs_query": needs_query}
 
 
 def provider_tool(name, values):
@@ -157,6 +160,9 @@ def test_spoken_next_uses_existing_required_slot_workflow(app, monkeypatch):
 @pytest.mark.parametrize("bad", [
     {"mode": "delete"}, {"language": "fr"}, {"mode": ["filter"]}, {"language": []},
     {"continue_next": 1}, {"needs_query": "false"}, {"unexpected": "secret"},
+    {"result_shape": "filter"}, {"result_shape": []}, {"requested_count": True},
+    {"requested_count": 0}, {"requested_count": -1}, {"requested_count": 2.5},
+    {"page_filters_sufficient": "true"}, {"page_filters_sufficient": 1},
 ])
 def test_invalid_voice_metadata_rejected_before_dispatch(monkeypatch, bad):
     async def classify(*args, **kwargs):

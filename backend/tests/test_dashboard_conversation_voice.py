@@ -32,7 +32,8 @@ def test_voice_next_clarification_uses_spoken_language_and_returns_it(app, monke
             assert data["current_message"] == message and data["fallback_language"] == ui
             assert "actually speaking/writing" in payload["instructions"]
             assert "Proper names, quoted captions" in payload["instructions"]
-            return httpx.Response(200, json=tool(name, {"language": language, "mode": "next", "continue_next": False, "needs_query": False}))
+            return httpx.Response(200, json=tool(name, {"language": language, "result_shape": "next_recommendation", "requested_count": None,
+                "page_filters_sufficient": False, "mode": "next", "continue_next": False, "needs_query": False}))
         assert name == "prepare_next_recommendation"
         return httpx.Response(200, json=tool(name, {"post_format": "reel", "target_account": None}))
 
@@ -57,7 +58,8 @@ def test_filter_confirmation_and_voice_prompt_use_same_resolved_language(app, mo
     def provider(request):
         payload = json.loads(request.content)
         if isinstance(payload["tool_choice"], dict):
-            return httpx.Response(200, json=tool("resolve_voice_request", {"language": language, "mode": "filter", "continue_next": False, "needs_query": False}))
+            return httpx.Response(200, json=tool("resolve_voice_request", {"language": language, "result_shape": "all_matching_posts", "requested_count": None,
+                "page_filters_sufficient": True, "mode": "filter", "continue_next": False, "needs_query": False}))
         instructions = payload["instructions"]
         assert "using the SAME words" in instructions and "no separate narrator" in instructions
         assert "at most 80 words" in instructions and "overrides the link-only" in instructions
