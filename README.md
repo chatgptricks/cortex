@@ -139,9 +139,13 @@ rejects automatic filtering unless all three agree on an unbounded, representabl
 post set; metric thresholds do not count as requested result counts.
 Explicit shortcuts and selected modes take precedence. `/filter` applies
 existing Research page controls; `/research` answers in chat without changing
-filters. `/next` recommends one stored competitor post to recreate for a
-Sentient account. It asks for missing reel/image/carousel format and destination
-before searching. A bounded `pending_next` response can be returned as
+filters. `/next` recommends 1–10 stored competitor posts to recreate for a
+Sentient account (one by default). Its `option_count` stays with missing
+reel/image/carousel format and destination during clarification. It checks each
+candidate against the destination's history and reviews up to four batches to
+fill the requested count. If a later batch fails or the review budget runs out,
+it can select from the already verified subset and briefly report the shortfall;
+it never bypasses selection or adds unreviewed posts. A bounded `pending_next` response can be returned as
 `next_context` on the clarification reply; a fresh slash command resets it.
 Destination accounts and competitor groups come from the live registry. The
 shortlist uses exact-format, recent stored rankings plus captions/OCR and target

@@ -13,7 +13,7 @@ from app.dashboard_next_semantic import retrieve_prior_posts as real_retrieve_pr
 from test_dashboard_assistant import app, request  # noqa: F401 — shared auth fixture
 
 
-EMPTY_CONTEXT = {"post_format": None, "target_account": None}
+EMPTY_CONTEXT = {"post_format": None, "target_account": None, "option_count": 1}
 
 
 @pytest.fixture(autouse=True)
@@ -26,6 +26,8 @@ def prepared_history_evidence(monkeypatch):
 
 
 def function_call(name, arguments, call_id="call"):
+    if name == "choose_next_post" and set(arguments) == {"account", "shortcode", "reason"}:
+        arguments = {"choices": [{"candidate_key": arguments["account"] + ":" + arguments["shortcode"], "reason": arguments["reason"]}]}
     return {"type": "function_call", "call_id": call_id, "name": name, "arguments": json.dumps(arguments)}
 
 
@@ -166,6 +168,7 @@ def test_bare_next_asks_before_provider_or_data(app, monkeypatch, language, expe
     {"post_format": "video", "target_account": "chatgptricks"},
     {"post_format": "reel", "target_account": "x" * 65},
     {"post_format": None, "target_account": None, "trusted": True},
+    {"option_count": True}, {"option_count": 0}, {"option_count": 11}, {"option_count": 2.5},
 ])
 def test_invalid_next_context_is_rejected(app, context):
     with TestClient(app) as client:
@@ -188,7 +191,7 @@ def test_partial_next_clarifies_before_candidate_search(app, monkeypatch, slots,
 
     calls = provider_mock(monkeypatch, answer)
     result = run(app, message="/next reel" if slots["post_format"] else "/next para chatgptricks", language="es")
-    assert result["pending_next"] == slots
+    assert result["pending_next"] == {**slots, "option_count": 1}
     for term in question_terms:
         assert term in result["answer"].lower()
     assert result["ui_actions"] == [] and result["sources"] == []
@@ -226,7 +229,7 @@ def test_next_followup_preserves_explicit_slots_and_returns_verified_internal_po
     calls = provider_mock(monkeypatch, answer)
     result = run(app, message="reel", mode="next", language="en", next_context={"post_format": None, "target_account": "chatgptricks"})
     assert len(candidate_calls) == 1 and len(calls) == 2
-    assert candidate_calls[0][1] == {"post_format": "reel", "target_account": "chatgptricks"}
+    assert candidate_calls[0][1] == {"post_format": "reel", "target_account": "chatgptricks", "option_count": 1}
     assert candidate_calls[0][0].headers["authorization"] == "Bearer signed-in-member"
     assert "https://sentientdash.app/index.html?post=evolving.ai%3AVALID_123" in result["answer"]
     assert "instagram.com" not in result["answer"]
@@ -241,7 +244,7 @@ def test_invalid_target_clarifies_instead_of_recommending_a_competitor_as_destin
     provider_mock(monkeypatch, lambda *_: [function_call("prepare_next_recommendation", {"post_format": "carousel", "target_account": "evolving.ai"})])
     result = run(app, message="/next carousel for evolving.ai", language="es")
     assert len(candidate_calls) == 1
-    assert result["pending_next"] == {"post_format": "carousel", "target_account": None}
+    assert result["pending_next"] == {"post_format": "carousel", "target_account": None, "option_count": 1}
     assert "cuenta" in result["answer"].lower()
     assert result["ui_actions"] == [] and "?post=" not in result["answer"]
 
@@ -321,7 +324,7 @@ def test_fresh_next_does_not_take_slots_from_old_history(app, monkeypatch):
 
     provider_mock(monkeypatch, answer)
     result = run(app, message="/next image", history=[{"role": "user", "content": "/next reel for OLD_ACCOUNT"}, {"role": "assistant", "content": "Previous recommendation"}], next_context={"post_format": "reel", "target_account": "OLD_ACCOUNT"})
-    assert result["pending_next"] == {"post_format": "image", "target_account": None}
+    assert result["pending_next"] == {"post_format": "image", "target_account": None, "option_count": 1}
     assert not candidate_calls
 
 
@@ -642,7 +645,7 @@ def test_full_next_flow_retrieves_then_reviews_then_selects(app, monkeypatch):
             return [function_call(tool, {"post_format": "reel", "target_account": "chatgptricks"})]
         if turn == 2:
             assert tool == "prepare_publication_history_search" and payload["max_output_tokens"] == 2400
-            return [function_call(tool, {"queries": [{"candidate_key": row["key"], "search_text": "Specific demonstration. Demostración específica."} for row in bundle["candidates"]]})]
+            return [function_call(tool, {"queries": {row["key"]: "Specific demonstration. Demostración específica." for row in bundle["candidates"]}})]
         if turn == 3:
             assert tool == "check_next_publication_history"
             assert "reuse_search_text" not in json.dumps(payload["input"])

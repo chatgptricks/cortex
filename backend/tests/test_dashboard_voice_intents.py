@@ -153,7 +153,7 @@ def test_spoken_next_uses_existing_required_slot_workflow(app, monkeypatch):
     data = response.json()
     assert data["mode"] == "next" and data["language"] == "es"
     assert data["answer"] == "¿Reel, imagen o carrusel, y para qué cuenta?"
-    assert data["pending_next"] == {"post_format": None, "target_account": None}
+    assert data["pending_next"] == {"post_format": None, "target_account": None, "option_count": 1}
     assert calls == ["resolve_voice_request", "prepare_next_recommendation"]
 
 

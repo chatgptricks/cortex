@@ -43,7 +43,7 @@ def test_voice_next_clarification_uses_spoken_language_and_returns_it(app, monke
             json={"message": message, "mode": "next", "language": ui, "input_mode": "voice"})
     assert response.status_code == 200
     assert response.json()["answer"] == expected and response.json()["language"] == language
-    assert response.json()["pending_next"] == {"post_format": "reel", "target_account": None}
+    assert response.json()["pending_next"] == {"post_format": "reel", "target_account": None, "option_count": 1}
     assert calls == ["resolve_voice_request", "prepare_next_recommendation"]
 
 
