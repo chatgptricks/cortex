@@ -153,8 +153,8 @@ def test_history_shortcuts_do_not_select_current_request_mode(app, monkeypatch, 
         payload = json.loads(req.content)
         context = json.loads(payload["instructions"].split("\nVIEW_CONTEXT=", 1)[1])
         assert context["mode"] == "auto"
-        assert "Do not carry a /filter or /research mode over" in payload["instructions"]
-        assert any(tool["name"] == "show_research_posts" for tool in payload["tools"])
+        assert "Do not carry a completed /filter or /research mode over" in payload["instructions"]
+        assert all(tool["name"] != "show_research_posts" for tool in payload["tools"])
         assert payload["input"][-1] == {"role": "user", "content": "What can you help me with?"}
         return httpx.Response(200, json={"output": [{"type": "message", "content": [{"type": "output_text", "text": "I can help with the dashboard."}]}]})
     def client(**kwargs):
@@ -249,6 +249,7 @@ def test_limits_and_provider_failures_release_active_request(app, monkeypatch):
         raise httpx.ConnectError("private provider detail")
     monkeypatch.setattr(assistant, "respond", failure)
     monkeypatch.setattr(assistant, "resolve_reply_language", failure)
+    monkeypatch.setattr(assistant, "resolve_dashboard_request", failure)
     with TestClient(app) as client:
         headers = {"Authorization": "Bearer signed-in-member"}
         result = client.post("/api/dashboard/assistant/chat", headers=headers, json={"message": "hola"})
@@ -290,7 +291,7 @@ def test_ui_action_is_structured_and_validated(app, monkeypatch):
         kwargs.setdefault('transport', httpx.MockTransport(provider))
         return original(**kwargs)
     monkeypatch.setattr(httpx, 'AsyncClient', client)
-    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='Buscá Elon Musk con más de 5000 likes usando los filtros disponibles'), 'test-key'))
+    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='Buscá Elon Musk con más de 5000 likes usando los filtros disponibles', mode='filter'), 'test-key'))
     assert result['ui_actions'] == [{"type": "research_filters", "filters": filters}]
     assert result['answer'] == 'Filtros aplicados.' and len(calls) == 1
     assert assistant.research_filters(filters | {'min_likes': 5000, 'likes_operator': 'gte'})['min_likes'] == 5000
@@ -319,7 +320,7 @@ def test_caption_mentions_and_top_n_page_request_use_existing_controls(app, monk
         kwargs.setdefault('transport', httpx.MockTransport(provider))
         return original(**kwargs)
     monkeypatch.setattr(httpx, 'AsyncClient', client)
-    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='Filter the page to show the 3 latest posts whose caption mentions Elon Musk.', language='en'), 'test-key'))
+    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='/filter Show the 3 latest posts whose caption mentions Elon Musk.', language='en'), 'test-key'))
     assert result['ui_actions'] == [{"type": "research_filters", "filters": assistant.research_filters({"query": "Elon Musk", "sort": "newest"})}]
     assert result['answer'] == 'Filters applied.'
     assert len(calls) == 1
@@ -338,7 +339,7 @@ def test_ui_action_cannot_select_an_account_absent_from_real_controls(app, monke
         kwargs.setdefault('transport', httpx.MockTransport(provider))
         return original(**kwargs)
     monkeypatch.setattr(httpx, 'AsyncClient', client)
-    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='Filter does.not.exist', language='en'), 'test-key'))
+    result = asyncio.run(assistant.respond(request(app), assistant.ChatRequest(message='/filter does.not.exist', language='en'), 'test-key'))
     assert result['ui_actions'] == [] and 'not available' in result['answer']
 
 
@@ -416,7 +417,7 @@ def test_cancelling_request_stops_work_and_releases_active_slot(app, monkeypatch
             state['cancelled'] = True
     async def disconnected():
         return state['started']
-    monkeypatch.setattr(assistant, 'resolve_reply_language', blocked)
+    monkeypatch.setattr(assistant, 'resolve_dashboard_request', blocked)
     monkeypatch.setattr(assistant, 'respond', lambda *args: pytest.fail('Cancelled language resolution must not start chat'))
     req = request(app)
     req.is_disconnected = disconnected
@@ -430,9 +431,9 @@ def test_cancelling_request_stops_work_and_releases_active_slot(app, monkeypatch
 def test_completed_answer_stops_disconnect_watch_and_preserves_response(app, monkeypatch):
     monkeypatch.setenv('OPENAI_API_KEY', 'test')
     expected = {"answer": "Hello.", "sources": [], "ui_actions": [], "language": "en", "mode": "auto"}
-    async def language(*args):
-        return "en"
-    monkeypatch.setattr(assistant, "resolve_reply_language", language)
+    async def classify(*args):
+        return {"language": "en", "mode": "auto", "continue_next": False, "needs_query": False}
+    monkeypatch.setattr(assistant, "resolve_dashboard_request", classify)
     async def answer(*args):
         await anyio.sleep(0)
         return expected

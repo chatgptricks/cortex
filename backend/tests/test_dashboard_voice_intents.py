@@ -84,6 +84,7 @@ def test_explicit_command_is_authoritative_even_if_classifier_ignores_lock(monke
     assert result["continue_next"] is False
 
 
+@pytest.mark.parametrize("input_mode", ["text", "voice"])
 @pytest.mark.parametrize("message,mode,continuation,retained", [
     ("reel", "next", True, True),
     ("mejor imagen", "next", True, True),
@@ -92,7 +93,7 @@ def test_explicit_command_is_authoritative_even_if_classifier_ignores_lock(monke
     ("quiero el próximo post", "next", False, False),
     ("¿qué hace el filtro?", "auto", False, False),
 ])
-def test_voice_followup_only_retains_next_slots_for_actual_continuation(app, monkeypatch, message, mode, continuation, retained):
+def test_followup_only_retains_next_slots_for_actual_continuation(app, monkeypatch, input_mode, message, mode, continuation, retained):
     monkeypatch.setenv("OPENAI_API_KEY", "test")
     slots = assistant.NextContext(post_format=None, target_account="chatgptricks")
     observed = []
@@ -107,7 +108,7 @@ def test_voice_followup_only_retains_next_slots_for_actual_continuation(app, mon
     monkeypatch.setattr(assistant, "respond", respond)
     with TestClient(app) as client:
         response = client.post("/api/dashboard/assistant/chat", headers={"Authorization": "Bearer signed-in-member"},
-            json={"message": message, "input_mode": "voice", "next_context": slots.model_dump()})
+            json={"message": message, "input_mode": input_mode, "next_context": slots.model_dump()})
     assert response.status_code == 200 and response.json()["mode"] == mode
     assert observed[0].next_context == (slots if retained else None)
     assert assistant.request_mode(observed[0])[0] == mode
@@ -186,19 +187,20 @@ def test_cancelling_during_voice_intent_resolution_never_dispatches(app, monkeyp
     assert state == {"started": True, "cancelled": True} and not assistant._active
 
 
-def test_typed_natural_language_does_not_gain_voice_mode_routing(app, monkeypatch):
+def test_typed_natural_next_uses_semantic_routing(app, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test")
-    async def language(*args):
-        return "en"
+    async def classify(client, key, instructions, inputs, tool, **kwargs):
+        assert tool["name"] == "resolve_dashboard_request"
+        return voice_metadata("next", "en")
     async def respond(req, body, key):
-        assert assistant.request_mode(body)[0] == "auto"
+        assert assistant.request_mode(body)[0] == "next"
         return {"answer": "OK", "ui_actions": []}
-    monkeypatch.setattr(assistant, "resolve_reply_language", language)
-    monkeypatch.setattr(assistant, "resolve_voice_request", lambda *args: pytest.fail("Typed turns preserve existing command routing"))
+    monkeypatch.setattr(assistant, "next_tool_call", classify)
+    monkeypatch.setattr(assistant, "resolve_reply_language", lambda *args: pytest.fail("Automatic turns resolve intent and language together"))
     monkeypatch.setattr(assistant, "respond", respond)
     with TestClient(app) as client:
         response = client.post("/api/dashboard/assistant/chat", headers={"Authorization": "Bearer signed-in-member"}, json={"message": "next"})
-    assert response.status_code == 200 and response.json()["mode"] == "auto"
+    assert response.status_code == 200 and response.json()["mode"] == "next"
 
 
 @pytest.mark.parametrize("mode,previous,clarification,message", [

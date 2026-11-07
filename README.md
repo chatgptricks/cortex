@@ -127,7 +127,13 @@ retrieved captions. Oversized tool queries are rejected for reformulation before
 execution. Direct API searches and the user's original message are unchanged.
 
 Chat accepts modes `auto`, `filter`, `research`, and `next`, or a leading
-case-insensitive slash shortcut (the prefix takes precedence). `/filter` applies
+case-insensitive slash shortcut (the prefix takes precedence). Automatic typed
+and spoken queries use one combined language/intent decision, defaulting to
+intelligent research of stored dashboard data. They apply page filters only for
+a browsable set fully represented by existing controls. Factual questions,
+exact-N lists/rankings, semantic matches, and unsupported conditions stay in
+research; only resolved filter requests can execute a page-filter action.
+Explicit shortcuts and selected modes take precedence. `/filter` applies
 existing Research page controls; `/research` answers in chat without changing
 filters. `/next` recommends one stored competitor post to recreate for a
 Sentient account. It asks for missing reel/image/carousel format and destination
