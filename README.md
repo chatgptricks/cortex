@@ -120,6 +120,12 @@ The assistant searches stored dashboard data first for every factual request,
 not only shortcuts; it does not substitute web results or unsupported model
 knowledge for missing records. Answers stay concise and use internal post links.
 
+Assistant-generated Research searches use at most three main words, selecting
+a meaningful phrase instead of copying the request. Account, date and engagement
+criteria stay in their filters; longer exact phrases are verified against the
+retrieved captions. Oversized tool queries are rejected for reformulation before
+execution. Direct API searches and the user's original message are unchanged.
+
 Chat accepts modes `auto`, `filter`, `research`, and `next`, or a leading
 case-insensitive slash shortcut (the prefix takes precedence). `/filter` applies
 existing Research page controls; `/research` answers in chat without changing
