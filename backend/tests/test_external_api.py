@@ -360,6 +360,88 @@ def test_promo_manual_hashtag_and_negative_filter_before_pagination(setup):
     assert "_public_manual_promo" not in json.dumps(kit)
 
 
+def test_filtered_public_posts_hydrate_only_eligible_codes_and_keep_fresh_metrics(setup, monkeypatch):
+    client, connect = setup
+    key = create(client)["key"]
+    with connect() as conn:
+        conn.execute("UPDATE posts SET is_promo = 1 WHERE shortcode = 'PublicA'")
+        conn.execute("UPDATE dashboard_posts SET caption = 'Published #AITOOLSENTIENT! text' WHERE shortcode = 'PublicB'")
+        conn.execute("UPDATE dashboard_posts SET is_promo = 1 WHERE shortcode IN ('Hidden','Deleted','Future','Other')")
+        conn.execute("UPDATE posts SET is_promo = 1 WHERE shortcode = 'InternalDraft'")
+        # A refreshed dashboard copy cannot restore a removed canonical mark,
+        # and an older hidden canonical row still excludes every duplicate.
+        conn.executemany("""INSERT INTO posts
+            (id,section,shortcode,published_at,updated_at,caption,likes,hidden,is_deleted,is_promo)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""", [
+            (12, "historical", "RemovedMark", "2026-10-02T10:00:00Z", "2026-10-07T12:00:00Z", "Ordinary caption", 1, 0, 0, 0),
+            (13, "historical", "OlderHidden", "2026-10-02T10:00:00Z", "2026-10-07T12:00:00Z", "Hidden caption", 1, 1, 0, 1),
+        ])
+        conn.executemany("""INSERT INTO dashboard_posts
+            (account,shortcode,published_at,updated_at,caption,likes,hidden,is_deleted,is_promo)
+            VALUES ('alpha',?,'2026-10-02T10:00:00Z','2026-10-08T12:00:00Z',?,5,0,0,?)""", [
+            ("RemovedMark", "Ordinary caption", 1), ("OlderHidden", "Hidden caption", 1),
+            ("bad/code", "Invalid shortcode", 1),
+            *((f"Organic{index}", "Ordinary published caption", 0) for index in range(1000)),
+        ])
+        conn.execute("CREATE TABLE engagement_observations (shortcode TEXT PRIMARY KEY, observed_at TEXT, raw_json TEXT)")
+        conn.executemany("INSERT INTO engagement_observations VALUES (?,'2026-10-09T17:00:00Z',?)", [
+            ("PublicA", json.dumps({"shortCode": "PublicA", "likesCount": 900, "commentsCount": 90})),
+            ("PublicB", json.dumps({"shortCode": "PublicB", "likesCount": 700, "commentsCount": 70})),
+            # Provider caption text never replaces the published caption used
+            # by public Promo classification.
+            ("PublicC", json.dumps({"shortCode": "PublicC", "caption": "#aitoolsentient", "likesCount": 999})),
+            *((f"Organic{index}", json.dumps({"shortCode": f"Organic{index}", "likesCount": 9999})) for index in range(1000)),
+        ])
+    hydrated = []
+    read_observations = account_media_kit._public_observation_rows
+
+    def capture_observations(conn, codes):
+        hydrated.extend(codes)
+        return read_observations(conn, codes)
+
+    monkeypatch.setattr(account_media_kit, "_public_observation_rows", capture_observations)
+    path = "/api/v1/accounts/alpha/posts"
+    response = client.get(path, params={"is_promo": "true", "limit": 1}, headers=headers(key))
+    assert response.status_code == 200
+    result = response.json()
+    assert result["pagination"] == {"limit": 1, "offset": 0, "total": 2, "has_more": True, "next_offset": 1}
+    assert hydrated == ["PublicA", "PublicB"]
+    assert result["data"][0]["shortcode"] == "PublicB"
+    assert result["data"][0]["likes"] == 700
+    assert result["data"][0]["comments"] == 70
+    assert result["data"][0]["metrics_updated_at"] == "2026-10-09T17:00:00+00:00"
+    hydrated.clear()
+    second = client.get(path, params={"is_promo": "true", "offset": 1}, headers=headers(key)).json()
+    assert second["data"][0]["shortcode"] == "PublicA"
+    assert second["data"][0]["likes"] == 900
+    assert second["data"][0]["caption"] == "Published caption"
+    assert second["data"][0]["is_promo"] is True
+    assert hydrated == ["PublicA", "PublicB"]
+    hydrated.clear()
+    dated = client.get(path, params={"is_promo": "true", "from": "2026-10-02", "to": "2026-10-02"}, headers=headers(key)).json()
+    assert dated["data"] == [] and dated["pagination"]["total"] == 0
+    assert hydrated == []
+    assert "CANARY" not in response.text
+
+
+def test_private_filtered_export_does_not_load_post_history_or_observations(setup, monkeypatch):
+    client, connect = setup
+    key = create(client)["key"]
+    with connect() as conn:
+        conn.execute("UPDATE account_snapshots SET private = 1 WHERE handle = 'alpha'")
+
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("A private profile must not load its post history or metric observations.")
+
+    monkeypatch.setattr(account_media_kit, "_post_rows", unexpected_read)
+    monkeypatch.setattr(account_media_kit, "_public_observation_rows", unexpected_read)
+    for is_promo in ("true", "false"):
+        response = client.get("/api/v1/accounts/alpha/posts", params={"is_promo": is_promo}, headers=headers(key))
+        assert response.status_code == 200
+        assert response.json()["data"] == []
+        assert response.json()["pagination"]["total"] == 0
+
+
 @pytest.mark.parametrize(("caption", "expected"), [
     ("#aitoolsentient", True), ("#AITOOLSENTIENT", True),
     ("Try #AiToolSentient, today.", True), ("(#aitoolsentient)", True),

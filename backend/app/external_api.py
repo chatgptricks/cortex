@@ -578,6 +578,18 @@ def _pagination(data: list[Any], limit: int, offset: int) -> dict[str, Any]:
     return {"limit": limit, "offset": offset, "total": total, "has_more": next_offset is not None, "next_offset": next_offset}
 
 
+def _matches_public_post(post: dict[str, Any], excluded_codes: set[str], now: datetime,
+                         start: date | None, end: date | None, is_promo: bool | None) -> bool:
+    published = account_media_kit._date(post["published_at"])
+    code = post["shortcode"]
+    if post["hidden"] or post["is_deleted"] or code in excluded_codes or not code or not _SHORTCODE.fullmatch(code) or not published or published > now:
+        return False
+    day = published.astimezone(LOCAL_ZONE).date()
+    if start and day < start or end and day > end:
+        return False
+    return is_promo is None or is_public_promo(post) == is_promo
+
+
 def _public_posts(clean: str, start: date | None = None, end: date | None = None,
                   is_promo: bool | None = None, shortcode: str | None = None) -> tuple[datetime, list[dict[str, Any]]]:
     """Exported posts for one account (or one shortcode), newest first, after public exclusions."""
@@ -585,11 +597,26 @@ def _public_posts(clean: str, start: date | None = None, end: date | None = None
     with db.connect() as conn:
         row = conn.execute("SELECT is_canonical FROM accounts WHERE handle = ?", (clean,)).fetchone()
         canonical = bool(row["is_canonical"])
+        snapshots = conn.execute("SELECT * FROM account_snapshots WHERE LOWER(handle) = ? ORDER BY captured_at DESC", (clean,)).fetchall()
+        latest = next((dict(snap) for snap in snapshots if (captured := account_media_kit._date(snap["captured_at"])) and captured <= now), {})
+        if account_media_kit._bool(latest.get("private")):
+            return now, []
         rows = account_media_kit._post_rows(conn, "dashboard_posts", clean, canonical, shortcode, compact_public=True)
         if canonical:
             rows += account_media_kit._post_rows(conn, "posts", clean, True, shortcode, compact_public=True)
-        snapshots = conn.execute("SELECT * FROM account_snapshots WHERE LOWER(handle) = ? ORDER BY captured_at DESC", (clean,)).fetchall()
-        latest = next((dict(snap) for snap in snapshots if (captured := account_media_kit._date(snap["captured_at"])) and captured <= now), {})
+        excluded_codes = {str(row.get("shortcode") or "").strip() for row in rows
+                          if account_media_kit._bool(row.get("hidden")) or account_media_kit._bool(row.get("is_deleted"))}
+        # Eligibility uses the canonical manual flag, merged published caption,
+        # publication date and privacy flags, none of which observations change.
+        # Hydrate metrics only after that decision: a promotional export should
+        # not read every organic post's retained provider payload as well.
+        candidates, _ = account_media_kit._normalize_posts(rows, {}, clean)
+        eligible = {post["shortcode"] for post in candidates if _matches_public_post(post, excluded_codes, now, start, end, is_promo)}
+        if not eligible:
+            return now, []
+        # Keep every duplicate source row for an eligible code so canonical
+        # curation and the freshest promoted/observed metrics still agree.
+        rows = [row for row in rows if str(row.get("shortcode") or "").strip() in eligible]
         observations = {}
         if account_media_kit._columns(conn, "engagement_observations"):
             codes = sorted({str(value["shortcode"]) for value in rows if value.get("shortcode")})
@@ -597,30 +624,21 @@ def _public_posts(clean: str, start: date | None = None, end: date | None = None
                 batch = codes[index:index + 200]
                 readings = account_media_kit._public_observation_rows(conn, batch)
                 observations.update({reading["shortcode"]: dict(reading) for reading in readings})
-    excluded_codes = {str(row.get("shortcode") or "").strip() for row in rows
-                      if account_media_kit._bool(row.get("hidden")) or account_media_kit._bool(row.get("is_deleted"))}
     normalized, _ = account_media_kit._normalize_posts(rows, observations, clean)
     data = []
-    if not account_media_kit._bool(latest.get("private")):
-        for post in normalized:
-            published = account_media_kit._date(post["published_at"])
-            code = post["shortcode"]
-            if post["hidden"] or post["is_deleted"] or code in excluded_codes or not code or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code) or not published or published > now:
-                continue
-            day = published.astimezone(LOCAL_ZONE).date()
-            if start and day < start or end and day > end:
-                continue
-            caption = post["public_caption"]
-            promo = is_public_promo(post)
-            if is_promo is not None and promo != is_promo:
-                continue
-            data.append({"shortcode": code, "caption": caption if isinstance(caption, str) and caption else None,
-                         "is_promo": promo,
-                         **public_collaboration(post, clean),
-                         "published_at": published.isoformat(timespec="seconds"),
-                         "permalink": f"https://www.instagram.com/p/{code}/", "format": post["format"],
-                         **{metric: post["metrics"].get(metric) for metric in ("likes", "comments", "video_views", "video_plays")},
-                         "metrics_updated_at": post["metrics_updated_at"]})
+    for post in normalized:
+        if not _matches_public_post(post, excluded_codes, now, start, end, is_promo):
+            continue
+        published = account_media_kit._date(post["published_at"])
+        code = post["shortcode"]
+        caption = post["public_caption"]
+        data.append({"shortcode": code, "caption": caption if isinstance(caption, str) and caption else None,
+                     "is_promo": is_public_promo(post),
+                     **public_collaboration(post, clean),
+                     "published_at": published.isoformat(timespec="seconds"),
+                     "permalink": f"https://www.instagram.com/p/{code}/", "format": post["format"],
+                     **{metric: post["metrics"].get(metric) for metric in ("likes", "comments", "video_views", "video_plays")},
+                     "metrics_updated_at": post["metrics_updated_at"]})
     data.sort(key=lambda post: (post["published_at"], post["shortcode"]), reverse=True)
     return now, data
 
