@@ -364,6 +364,8 @@ def test_filtered_public_posts_hydrate_only_eligible_codes_and_keep_fresh_metric
     client, connect = setup
     key = create(client)["key"]
     with connect() as conn:
+        conn.execute("ALTER TABLE posts ADD COLUMN raw_json TEXT")
+        conn.execute("ALTER TABLE posts ADD COLUMN analysis_summary TEXT")
         conn.execute("UPDATE posts SET is_promo = 1 WHERE shortcode = 'PublicA'")
         conn.execute("UPDATE dashboard_posts SET caption = 'Published #AITOOLSENTIENT! text' WHERE shortcode = 'PublicB'")
         conn.execute("UPDATE dashboard_posts SET is_promo = 1 WHERE shortcode IN ('Hidden','Deleted','Future','Other')")
@@ -392,25 +394,41 @@ def test_filtered_public_posts_hydrate_only_eligible_codes_and_keep_fresh_metric
             ("PublicC", json.dumps({"shortCode": "PublicC", "caption": "#aitoolsentient", "likesCount": 999})),
             *((f"Organic{index}", json.dumps({"shortCode": f"Organic{index}", "likesCount": 9999})) for index in range(1000)),
         ])
+        # Large provider and analysis payloads must never be read or compacted
+        # for organic posts while exporting only promotional content.
+        large_payload = json.dumps({"caption": "#aitoolsentient", "unrelated": "x" * 8000})
+        conn.execute("UPDATE dashboard_posts SET raw_json = ?, analysis_summary = ? WHERE shortcode LIKE 'Organic%'", (large_payload, large_payload))
+        conn.execute("UPDATE posts SET raw_json = ? WHERE shortcode = 'PublicA'", (json.dumps({"shortCode": "PublicA", "likesCount": 1}),))
     hydrated = []
+    compacted = []
     read_observations = account_media_kit._public_observation_rows
+    compact_rows = account_media_kit._compact_public_rows
 
     def capture_observations(conn, codes):
         hydrated.extend(codes)
         return read_observations(conn, codes)
 
+    def capture_compact_rows(conn, table, selected, where, parameters, *, order):
+        compacted.append((table, where, list(parameters)))
+        assert "shortcode IN (" in where
+        assert set(parameters) - {"alpha"} <= {"PublicA", "PublicB"}
+        return compact_rows(conn, table, selected, where, parameters, order=order)
+
     monkeypatch.setattr(account_media_kit, "_public_observation_rows", capture_observations)
+    monkeypatch.setattr(account_media_kit, "_compact_public_rows", capture_compact_rows)
     path = "/api/v1/accounts/alpha/posts"
     response = client.get(path, params={"is_promo": "true", "limit": 1}, headers=headers(key))
     assert response.status_code == 200
     result = response.json()
     assert result["pagination"] == {"limit": 1, "offset": 0, "total": 2, "has_more": True, "next_offset": 1}
     assert hydrated == ["PublicA", "PublicB"]
+    assert {table for table, _, _ in compacted} == {"dashboard_posts", "posts", "engagement_observations"}
     assert result["data"][0]["shortcode"] == "PublicB"
     assert result["data"][0]["likes"] == 700
     assert result["data"][0]["comments"] == 70
     assert result["data"][0]["metrics_updated_at"] == "2026-10-09T17:00:00+00:00"
     hydrated.clear()
+    compacted.clear()
     second = client.get(path, params={"is_promo": "true", "offset": 1}, headers=headers(key)).json()
     assert second["data"][0]["shortcode"] == "PublicA"
     assert second["data"][0]["likes"] == 900
@@ -418,9 +436,11 @@ def test_filtered_public_posts_hydrate_only_eligible_codes_and_keep_fresh_metric
     assert second["data"][0]["is_promo"] is True
     assert hydrated == ["PublicA", "PublicB"]
     hydrated.clear()
+    compacted.clear()
     dated = client.get(path, params={"is_promo": "true", "from": "2026-10-02", "to": "2026-10-02"}, headers=headers(key)).json()
     assert dated["data"] == [] and dated["pagination"]["total"] == 0
     assert hydrated == []
+    assert compacted == []
     assert "CANARY" not in response.text
 
 
@@ -440,6 +460,43 @@ def test_private_filtered_export_does_not_load_post_history_or_observations(setu
         assert response.status_code == 200
         assert response.json()["data"] == []
         assert response.json()["pagination"]["total"] == 0
+
+
+def test_public_campaign_payload_reads_are_chunked_and_preserve_normalized_duplicates(setup, monkeypatch):
+    client, connect = setup
+    key = create(client)["key"]
+    with connect() as conn:
+        conn.executemany("""INSERT INTO dashboard_posts
+            (account,shortcode,published_at,updated_at,caption,likes,hidden,is_deleted,is_promo,raw_json)
+            VALUES ('alpha',?,'2026-10-02T10:00:00Z','2026-10-08T12:00:00Z','#aitoolsentient',5,0,0,1,'{}')""",
+                         [(f"Bulk{index}",) for index in range(201)])
+        conn.execute("""INSERT INTO dashboard_posts
+            (account,shortcode,published_at,updated_at,caption,likes,hidden,is_deleted,is_promo,raw_json)
+            VALUES ('alpha',' Bulk0 ','2026-10-02T10:00:00Z','2026-10-09T17:00:00Z','#aitoolsentient',999,0,0,1,'{}')""")
+        conn.execute("""INSERT INTO dashboard_posts
+            (account,shortcode,published_at,updated_at,caption,likes,hidden,is_deleted,is_promo,raw_json)
+            VALUES ('beta','Bulk0','2026-10-02T10:00:00Z','2026-10-09T17:00:00Z','CANARY_OTHER_ACCOUNT',99999,0,0,1,'{}')""")
+    compact_rows = account_media_kit._compact_public_rows
+    batch_sizes = []
+
+    def capture_compact_rows(conn, table, selected, where, parameters, *, order):
+        assert "shortcode IN (" in where
+        codes = [value for value in parameters if value != "alpha"]
+        assert 0 < len(codes) <= 200
+        batch_sizes.append(len(codes))
+        return compact_rows(conn, table, selected, where, parameters, order=order)
+
+    monkeypatch.setattr(account_media_kit, "_compact_public_rows", capture_compact_rows)
+    path = "/api/v1/accounts/alpha/posts"
+    first = client.get(path, params={"is_promo": "true", "limit": 100}, headers=headers(key))
+    assert first.status_code == 200
+    assert first.json()["pagination"]["total"] == 201
+    assert len(first.json()["data"]) == 100
+    assert max(batch_sizes) == 200 and min(batch_sizes) == 2
+    last = client.get(path, params={"is_promo": "true", "limit": 100, "offset": 200}, headers=headers(key)).json()
+    assert [post["shortcode"] for post in last["data"]] == ["Bulk0"]
+    assert last["data"][0]["likes"] == 999
+    assert "CANARY" not in json.dumps(last)
 
 
 @pytest.mark.parametrize(("caption", "expected"), [

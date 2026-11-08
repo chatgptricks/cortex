@@ -601,22 +601,26 @@ def _public_posts(clean: str, start: date | None = None, end: date | None = None
         latest = next((dict(snap) for snap in snapshots if (captured := account_media_kit._date(snap["captured_at"])) and captured <= now), {})
         if account_media_kit._bool(latest.get("private")):
             return now, []
-        rows = account_media_kit._post_rows(conn, "dashboard_posts", clean, canonical, shortcode, compact_public=True)
+        metadata_rows = account_media_kit._post_rows(conn, "dashboard_posts", clean, canonical, shortcode, metadata_only=True)
         if canonical:
-            rows += account_media_kit._post_rows(conn, "posts", clean, True, shortcode, compact_public=True)
-        excluded_codes = {str(row.get("shortcode") or "").strip() for row in rows
+            metadata_rows += account_media_kit._post_rows(conn, "posts", clean, True, shortcode, metadata_only=True)
+        excluded_codes = {str(row.get("shortcode") or "").strip() for row in metadata_rows
                           if account_media_kit._bool(row.get("hidden")) or account_media_kit._bool(row.get("is_deleted"))}
         # Eligibility uses the canonical manual flag, merged published caption,
         # publication date and privacy flags, none of which observations change.
         # Hydrate metrics only after that decision: a promotional export should
         # not read every organic post's retained provider payload as well.
-        candidates, _ = account_media_kit._normalize_posts(rows, {}, clean)
+        candidates, _ = account_media_kit._normalize_posts(metadata_rows, {}, clean)
         eligible = {post["shortcode"] for post in candidates if _matches_public_post(post, excluded_codes, now, start, end, is_promo)}
         if not eligible:
             return now, []
-        # Keep every duplicate source row for an eligible code so canonical
-        # curation and the freshest promoted/observed metrics still agree.
-        rows = [row for row in rows if str(row.get("shortcode") or "").strip() in eligible]
+        # Read compact provider payloads only for eligible codes, preserving
+        # every duplicate source row and legacy whitespace-normalized identity.
+        codes = sorted({str(row["shortcode"]) for row in metadata_rows
+                        if row.get("shortcode") and str(row["shortcode"]).strip() in eligible})
+        rows = account_media_kit._post_rows(conn, "dashboard_posts", clean, canonical, compact_public=True, shortcodes=codes)
+        if canonical:
+            rows += account_media_kit._post_rows(conn, "posts", clean, True, compact_public=True, shortcodes=codes)
         observations = {}
         if account_media_kit._columns(conn, "engagement_observations"):
             codes = sorted({str(value["shortcode"]) for value in rows if value.get("shortcode")})

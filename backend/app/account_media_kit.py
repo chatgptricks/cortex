@@ -321,10 +321,24 @@ def _public_observation_rows(conn: Any, codes: list[str]) -> list[dict[str, Any]
 
 
 def _post_rows(conn: Any, table: str, handle: str, canonical: bool, shortcode: str | None = None,
-               *, compact_public: bool = False) -> list[dict[str, Any]]:
-    """Every stored row for an account, or only one shortcode's rows when given."""
+               *, compact_public: bool = False, metadata_only: bool = False,
+               shortcodes: list[str] | None = None) -> list[dict[str, Any]]:
+    """Stored account rows, optionally selecting native metadata or bounded codes."""
+    if shortcodes is not None:
+        shortcodes = list(dict.fromkeys(shortcodes))
+        if not shortcodes:
+            return []
+        if len(shortcodes) > 200:
+            return [row for offset in range(0, len(shortcodes), 200)
+                    for row in _post_rows(conn, table, handle, canonical, shortcode,
+                                          compact_public=compact_public, metadata_only=metadata_only,
+                                          shortcodes=shortcodes[offset:offset + 200])]
     columns = _columns(conn, table)
     selected = sorted(columns & _METADATA | {key for key in columns if key in _METRICS or _performance_field(key)})
+    if metadata_only:
+        # Native metric columns remain necessary for _row_quality tie-breaking;
+        # provider JSON and analysis payloads never determine public eligibility.
+        selected = [field for field in selected if field not in {"raw_json", "analysis_summary"}]
     if not selected:
         return []
     conditions, parameters = [], []
@@ -336,6 +350,11 @@ def _post_rows(conn: Any, table: str, handle: str, canonical: bool, shortcode: s
             return []
         conditions.append("shortcode = ?")
         parameters.append(shortcode)
+    if shortcodes is not None:
+        if "shortcode" not in columns:
+            return []
+        conditions.append(f"shortcode IN ({','.join('?' for _ in shortcodes)})")
+        parameters.extend(shortcodes)
     scope = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     if compact_public and "raw_json" in selected:
         rows = _compact_public_rows(conn, table, selected, scope, parameters, order="id" if "id" in columns else "shortcode")
