@@ -369,6 +369,9 @@ If the user simply greets you or asks about general navigation, answer without u
 
 VOICE_INSTRUCTIONS = """This message came from the user's microphone. Have a direct, interactive conversation with the user. The answer you write here is also spoken aloud, using the SAME words; there is no separate narrator. Reply naturally and concisely, usually 1–3 short sentences and at most 80 words unless the user explicitly asks for more. Ask a natural clarification when needed. For a post result, include a short useful answer and the verified dashboard link with a descriptive visible label; this overrides the link-only formatting instruction. Keep facts and recommendations grounded in the existing dashboard rules. Do not announce a narration, describe your reasoning, or merely say 'here are the results' instead of answering. No separate voice script or duplicate written/spoken answer. Retain useful result links and metrics the user requested."""
 
+QUEUE_CONVERSATION = """For Queue scheduling questions or actions, keep the conversation simple: normally 1–3 short sentences. Never show API field names, flags, schema options or an implementation checklist to the user. Ask only missing details that affect the actual schedule: day, start time, duration, or person if not clear. Use the caller for 'my/me', use Lunch/Almuerzo as the title of a lunch, and treat it as one occasion unless the user explicitly requests recurrence. Do not propose unsupported recurrence or ask for a title/defaults.
+If the user already requested moving all pending requests after lunch, that instruction is sufficient; do not ask them to separately enable rescheduling, choose internal flags or confirm the same scope again. A request for one hour supplies the duration. For example, when only day/start are missing, ask simply '¿Qué día y a qué hora querés empezar el almuerzo?' If the user asks what information is needed without authorizing changes, briefly say day, start and duration; do not present a confirmation ceremony. When details and permission are clear, act and report the actual result concisely."""
+
 
 def response_instructions(body: ChatRequest) -> str:
     return INSTRUCTIONS + ("\n" + VOICE_INSTRUCTIONS if body.input_mode == "voice" else "")
@@ -758,7 +761,7 @@ async def respond(request: Request, body: ChatRequest, api_key: str) -> dict:
     async with httpx.AsyncClient(timeout=httpx.Timeout(45, connect=10)) as client:
         for turn in range(MAX_TURNS):
             result = await client.post("https://api.openai.com/v1/responses", headers={"Authorization": "Bearer " + api_key}, json={
-                "model": model_name(), "store": False, "instructions": response_instructions(body) + "\nThe following mode guidance takes precedence over default action-selection guidance for this message.\nCURRENT_REQUEST_MODE: " + MODE_INSTRUCTIONS[mode] + ("\n" + QUEUE_INSTRUCTIONS if queue_allowed else "") + "\nVIEW_CONTEXT=" + json.dumps(context),
+                "model": model_name(), "store": False, "instructions": response_instructions(body) + "\nThe following mode guidance takes precedence over default action-selection guidance for this message.\nCURRENT_REQUEST_MODE: " + MODE_INSTRUCTIONS[mode] + ("\n" + QUEUE_INSTRUCTIONS if queue_allowed else "") + "\n" + QUEUE_CONVERSATION + "\nVIEW_CONTEXT=" + json.dumps(context),
                 "input": inputs, "tools": tools, "include": ["reasoning.encrypted_content"], "tool_choice": "none" if turn == MAX_TURNS - 1 else "auto",
                 "reasoning": {"effort": "low"}, "max_output_tokens": 3_000,
             })
