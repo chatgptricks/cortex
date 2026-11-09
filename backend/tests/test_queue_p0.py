@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime
 import json
 import sqlite3
 
@@ -245,6 +246,131 @@ def test_edit_without_placement_fields_preserves_distinct_draft_placement(monkey
     with connect() as conn:
         draft = conn.execute("SELECT scheduled_date, scheduled_start_minutes FROM queue_schedule_drafts WHERE request_id = ?", (request_id,)).fetchone()
     assert tuple(draft) == ("2026-09-02", 720)
+
+
+def _freeze_queue_clock(monkeypatch, value="2026-11-09T09:30:00"):
+    frozen = datetime.fromisoformat(value).replace(tzinfo=main.SCHEDULER_TIMEZONE)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen.astimezone(tz) if tz else frozen.replace(tzinfo=None)
+
+    monkeypatch.setattr(main, "datetime", FrozenDateTime)
+
+
+@pytest.mark.parametrize("points, expected_start", [(3, 660), (8, 760)])
+def test_next_available_uses_gaps_without_moving_committed_drafts_or_personal_time(monkeypatch, tmp_path, points, expected_start):
+    connect = _canonical_queue_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "_queue_v2_access", lambda *args, **kwargs: ("vc@example.com", True, ["vc"]))
+    _freeze_queue_clock(monkeypatch)
+    request_id = _insert_queue_request(connect, status="scheduled", designer="pd@example.com")
+    occupied_id = _insert_queue_request(connect, status="scheduled", designer="pd@example.com", suffix="-occupied")
+    with connect() as conn:
+        conn.execute("UPDATE queue_requests SET scheduled_date = '2026-11-09', scheduled_start_minutes = 580 WHERE id = ?", (request_id,))
+        conn.execute("UPDATE queue_requests SET scheduled_date = '2026-11-09', scheduled_start_minutes = 600 WHERE id = ?", (occupied_id,))
+        conn.executemany(
+            """INSERT INTO queue_schedule_drafts
+               (request_id, coordinator_email, designer_email, scheduled_date, scheduled_start_minutes,
+                production_points, minutes_per_pp, updated_at)
+               VALUES (?, 'vc@example.com', 'pd@example.com', '2026-11-09', ?, 3, 10, 'now')""",
+            [(request_id, 580), (occupied_id, 720)],
+        )
+        conn.execute(
+            """INSERT INTO queue_tickets
+               (ticket_type, requester_email, block_category, scheduled_date, scheduled_start_minutes,
+                duration_minutes, created_at, updated_at)
+               VALUES ('time_block', 'pd@example.com', 'meeting', '2026-11-09', 640, 20, 'now', 'now')""",
+        )
+        original_request = tuple(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (occupied_id,)).fetchone())
+        original_draft = tuple(conn.execute("SELECT * FROM queue_schedule_drafts WHERE request_id = ?", (occupied_id,)).fetchone())
+        original_ticket = tuple(conn.execute("SELECT * FROM queue_tickets").fetchone())
+
+    def unexpected_reflow(*args, **kwargs):
+        pytest.fail("Next available must not reflow another request or draft")
+
+    monkeypatch.setattr(main, "_queue_v2_reflow_scheduled", unexpected_reflow)
+    monkeypatch.setattr(main, "_queue_v2_reflow_drafts", unexpected_reflow)
+    monkeypatch.setattr(main, "_queue_v2_slack_log", unexpected_reflow)
+    result = main.dashboard_queue_v2_edit(
+        request_id, request=None, production_points=points, move_to_next_available=True,
+        scheduled_date="ignored", scheduled_start_minutes=-1,
+    )["request"]
+
+    assert (result["scheduledDate"], result["scheduledStartMinutes"]) == ("2026-11-09", expected_start)
+    with connect() as conn:
+        assert tuple(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (occupied_id,)).fetchone()) == original_request
+        assert tuple(conn.execute("SELECT * FROM queue_schedule_drafts WHERE request_id = ?", (occupied_id,)).fetchone()) == original_draft
+        assert tuple(conn.execute("SELECT * FROM queue_tickets").fetchone()) == original_ticket
+        assert conn.execute("SELECT 1 FROM queue_schedule_drafts WHERE request_id = ?", (request_id,)).fetchone() is None
+
+
+@pytest.mark.parametrize("status", ["scheduled", "in_progress", "completed", "closed"])
+@pytest.mark.parametrize("clock, expected_date, expected_start", [
+    ("2026-11-09T09:30:00", "2026-11-09", 580),
+    ("2026-11-09T09:31:10", "2026-11-09", 580),
+    ("2026-11-09T23:59:59", "2026-11-10", 0),
+])
+def test_next_available_is_strictly_after_now_and_preserves_history(monkeypatch, tmp_path, status, clock, expected_date, expected_start):
+    connect = _canonical_queue_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "_queue_v2_access", lambda *args, **kwargs: ("vc@example.com", True, ["vc"]))
+    _freeze_queue_clock(monkeypatch, clock)
+    request_id = _insert_queue_request(connect, status=status, designer="pd@example.com")
+    with connect() as conn:
+        conn.execute("UPDATE queue_requests SET actual_started_at = '2026-09-01T16:00:00+00:00', completed_at = '2026-09-01T16:20:00+00:00', closed_at = '2026-09-01T16:30:00+00:00' WHERE id = ?", (request_id,))
+        conn.execute("UPDATE queue_requests SET scheduled_date = ?, scheduled_start_minutes = ? WHERE id = ?", (expected_date, expected_start, request_id))
+
+    result = main.dashboard_queue_v2_edit(request_id, request=None, production_points=3, move_to_next_available=True)["request"]
+
+    assert (result["scheduledDate"], result["scheduledStartMinutes"]) == (expected_date, expected_start)
+    assert result["status"] == status
+    assert result["designerEmail"] == "pd@example.com"
+    assert result["actualStartedAt"] == "2026-09-01T16:00:00+00:00"
+    assert result["completedAt"] == "2026-09-01T16:20:00+00:00"
+    assert result["closedAt"] == "2026-09-01T16:30:00+00:00"
+
+
+@pytest.mark.parametrize("minutes_per_pp, expected_unit, expected_start", [(None, 16, 660), (30, 30, 660)])
+def test_next_available_assigns_pool_to_explicit_designer_with_their_duration(monkeypatch, tmp_path, minutes_per_pp, expected_unit, expected_start):
+    connect = _canonical_queue_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "_queue_v2_access", lambda *args, **kwargs: ("vc@example.com", True, ["vc"]))
+    _freeze_queue_clock(monkeypatch)
+    request_id = _insert_queue_request(connect)
+    occupied_id = _insert_queue_request(connect, status="scheduled", designer="trainee@example.com")
+    with connect() as conn:
+        conn.execute("INSERT INTO dashboard_users (email, operating_role, operating_roles, minutes_per_pp, created_at, updated_at) VALUES ('trainee@example.com', 'trainee', '[\"trainee\"]', ?, 'now', 'now')", (minutes_per_pp,))
+        conn.execute("UPDATE queue_requests SET scheduled_date = '2026-11-09', scheduled_start_minutes = 620 WHERE id = ?", (occupied_id,))
+
+    result = main.dashboard_queue_v2_edit(
+        request_id, request=None, production_points=3, move_to_next_available=True, designer_email="trainee@example.com",
+    )["request"]
+
+    assert result["status"] == "scheduled"
+    assert result["designerEmail"] == "trainee@example.com"
+    assert result["coordinatorEmail"] == "vc@example.com"
+    assert result["minutesPerPP"] == expected_unit
+    assert result["durationMinutes"] == 3 * expected_unit
+    assert (result["scheduledDate"], result["scheduledStartMinutes"]) == ("2026-11-09", expected_start)
+
+
+@pytest.mark.parametrize("status, designer, selected, error_status", [
+    ("pool", None, None, 400), ("pool", None, "unknown@example.com", 400),
+    ("scheduled", "pd@example.com", "other@example.com", 400),
+    ("cancelled", "pd@example.com", None, 409),
+])
+def test_next_available_rejects_invalid_assignment_without_saving(monkeypatch, tmp_path, status, designer, selected, error_status):
+    connect = _canonical_queue_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "_queue_v2_access", lambda *args, **kwargs: ("vc@example.com", True, ["vc"]))
+    request_id = _insert_queue_request(connect, status=status, designer=designer)
+    with connect() as conn:
+        original = tuple(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone())
+
+    with pytest.raises(HTTPException) as error:
+        main.dashboard_queue_v2_edit(request_id, request=None, production_points=8, move_to_next_available=True, designer_email=selected)
+
+    assert error.value.status_code == error_status
+    with connect() as conn:
+        assert tuple(conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone()) == original
 
 
 def test_fresh_canonical_schema_allows_trainee_review_endpoint(monkeypatch, tmp_path):

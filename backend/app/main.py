@@ -4699,6 +4699,7 @@ def _queue_v2_lock_schedule(conn: Any) -> None:
 def _queue_v2_time_occupied(
     conn: Any, user_email: str, scheduled_date: str | None, *,
     exclude_ticket_id: int | None = None, exclude_request_id: int | None = None,
+    include_drafted_requests: bool = False,
 ) -> list[dict[str, Any]]:
     _queue_v2_lock_schedule(conn)
     date_scope = " AND d.scheduled_date = ?" if scheduled_date else ""
@@ -4721,7 +4722,8 @@ def _queue_v2_time_occupied(
            WHERE designer_email = ?{request_scope}
              AND status IN ('scheduled','in_progress','completed','closed')""",
         [user_email, *date_params],
-    ).fetchall() if int(row["id"]) not in drafted_ids and (exclude_request_id is None or int(row["id"]) != int(exclude_request_id))]
+    ).fetchall() if (include_drafted_requests or int(row["id"]) not in drafted_ids)
+        and (exclude_request_id is None or int(row["id"]) != int(exclude_request_id))]
     occupied = [_queue_v2_occupied(row) for row in requests]
     occupied.extend({
         "date": row["scheduled_date"], "start": int(row["scheduled_start_minutes"]),
@@ -7330,6 +7332,8 @@ def dashboard_queue_v2_edit(
     recommended_accounts: Annotated[str | None, Form()] = None,
     scheduled_date: Annotated[str | None, Form()] = None,
     scheduled_start_minutes: Annotated[int | None, Form()] = None,
+    move_to_next_available: Annotated[bool, Form()] = False,
+    designer_email: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
     """Coordinator-owned edits to a production request's specification.
 
@@ -7340,14 +7344,14 @@ def dashboard_queue_v2_edit(
     caller, _, _ = _queue_v2_access(request, coordinator=True)
     if production_points < 1:
         raise HTTPException(status_code=400, detail="Production points must be at least 1.")
-    if scheduled_date is not None:
+    if not move_to_next_available and scheduled_date is not None:
         try:
             parsed_date = datetime.strptime(scheduled_date, "%Y-%m-%d").date()
             if parsed_date.isoformat() != scheduled_date:
                 raise ValueError("Non-canonical date")
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
-    if scheduled_start_minutes is not None and (
+    if not move_to_next_available and scheduled_start_minutes is not None and (
         not isinstance(scheduled_start_minutes, int) or isinstance(scheduled_start_minutes, bool)
         or scheduled_start_minutes < SCHEDULER_START or scheduled_start_minutes >= SCHEDULER_END
         or scheduled_start_minutes % 10
@@ -7378,11 +7382,45 @@ def dashboard_queue_v2_edit(
             raise HTTPException(status_code=404, detail="Queue request not found.")
         row = dict(current)
         resolved_date, resolved_start = row.get("scheduled_date"), row.get("scheduled_start_minutes")
+        resolved_designer, resolved_coordinator = row.get("designer_email"), row.get("coordinator_email")
+        resolved_status, resolved_unit = row["status"], row.get("minutes_per_pp")
         placement_changed = (
             (scheduled_date is not None and scheduled_date != resolved_date)
             or (scheduled_start_minutes is not None and scheduled_start_minutes != resolved_start)
         )
-        if placement_changed:
+        if move_to_next_available:
+            submitted_designer = str(designer_email or "").strip().lower()
+            if row["status"] == "pool":
+                designer_row = conn.execute("SELECT * FROM dashboard_users WHERE email = ?", (submitted_designer,)).fetchone()
+                if not designer_row or "pd" not in _queue_v2_user_roles(dict(designer_row)):
+                    raise HTTPException(status_code=400, detail="Choose a Queue designer.")
+                resolved_designer, resolved_coordinator, resolved_status = submitted_designer, caller, "scheduled"
+                resolved_unit = _queue_v2_minutes_per_pp_for_user(dict(designer_row))
+                allowed = {item["account_handle"] for item in conn.execute(
+                    "SELECT account_handle FROM queue_designer_accounts WHERE designer_email = ?", (resolved_designer,),
+                ).fetchall()}
+                selected_accounts = [account for account in selected_accounts if account in allowed]
+            elif row["status"] not in {"scheduled", "in_progress", "completed", "closed"} or not resolved_designer:
+                raise HTTPException(status_code=409, detail="Only pooled or assigned requests can move to the next available slot.")
+            elif submitted_designer and submitted_designer != resolved_designer:
+                raise HTTPException(status_code=400, detail="This request must keep its assigned designer.")
+            local_now = datetime.now(SCHEDULER_TIMEZONE)
+            # Always start strictly after Now, including when Now is exactly
+            # on a ten-minute boundary. The shared slot finder handles midnight.
+            next_start = (local_now.hour * 60 + local_now.minute) // 10 * 10 + 10
+            occupied = _queue_v2_time_occupied(
+                conn, resolved_designer, None, exclude_request_id=request_id, include_drafted_requests=True,
+            )
+            resolved_date, resolved_start = next_available_slot(
+                local_now.date().isoformat(), next_start,
+                _queue_v2_duration({**row, "production_points": production_points, "minutes_per_pp": resolved_unit}),
+                occupied,
+            )
+            placement_changed = True
+            # Saving an automatic placement finalizes this request alone.
+            # Other committed blocks and collaborative drafts retain their slots.
+            conn.execute("DELETE FROM queue_schedule_drafts WHERE request_id = ?", (request_id,))
+        elif placement_changed:
             if (row.get("status") not in {"scheduled", "in_progress", "completed", "closed"}
                     or not row.get("designer_email") or not resolved_date or resolved_start is None):
                 raise HTTPException(status_code=409, detail="Only assigned requests can have their schedule edited.")
@@ -7402,9 +7440,10 @@ def dashboard_queue_v2_edit(
         conn.execute(
             """UPDATE queue_requests SET production_points = ?, priority = ?, tags = ?, brief = ?, notes = ?,
                reference_links = ?, recommended_accounts = ?, scheduled_date = ?, scheduled_start_minutes = ?,
-               updated_at = ? WHERE id = ?""",
+               designer_email = ?, coordinator_email = ?, status = ?, minutes_per_pp = ?, updated_at = ? WHERE id = ?""",
             (production_points, clean_priority, json.dumps(clean_tags), (brief or "").strip(), (notes or "").strip(),
-             json.dumps(clean_refs), json.dumps(selected_accounts), resolved_date, resolved_start, now, request_id),
+             json.dumps(clean_refs), json.dumps(selected_accounts), resolved_date, resolved_start,
+             resolved_designer, resolved_coordinator, resolved_status, resolved_unit, now, request_id),
         )
         # Keep an existing collaborative placement's provisional duration in
         # sync with the edited request so its live block and PP count change
@@ -7413,7 +7452,7 @@ def dashboard_queue_v2_edit(
             "UPDATE queue_schedule_drafts SET production_points = ?, updated_at = ? WHERE request_id = ?",
             (production_points, now, request_id),
         )
-        if placement_changed:
+        if placement_changed and not move_to_next_available:
             conn.execute(
                 """UPDATE queue_schedule_drafts SET scheduled_date = ?, scheduled_start_minutes = ?, updated_at = ?
                    WHERE request_id = ? AND designer_email != ?""",
@@ -7424,13 +7463,14 @@ def dashboard_queue_v2_edit(
             "recommendedAccounts": selected_accounts,
             **({"fromDate": row["scheduled_date"], "fromStart": row["scheduled_start_minutes"],
                 "scheduledDate": resolved_date, "scheduledStartMinutes": resolved_start} if placement_changed else {}),
+            **({"placement": "next_available", "designerEmail": resolved_designer} if move_to_next_available else {}),
         })
-        if row.get("designer_email") and row.get("status") in {"scheduled", "in_progress", "completed", "closed"}:
+        if not move_to_next_available and row.get("designer_email") and row.get("status") in {"scheduled", "in_progress", "completed", "closed"}:
             _queue_v2_reflow_scheduled(conn, row["designer_email"], caller, priority_id=request_id)
         draft_designers = {item["designer_email"] for item in conn.execute(
             "SELECT designer_email FROM queue_schedule_drafts WHERE request_id = ?", (request_id,),
         ).fetchall()}
-        if placement_changed:
+        if placement_changed and not move_to_next_available:
             draft_designers.add(row["designer_email"])
         for designer in draft_designers:
             _queue_v2_reflow_drafts(conn, designer)
