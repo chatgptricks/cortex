@@ -7328,16 +7328,24 @@ def dashboard_queue_v2_edit(
     tags: Annotated[str | None, Form()] = None, brief: Annotated[str | None, Form()] = None,
     notes: Annotated[str | None, Form()] = None, references: Annotated[str | None, Form()] = None,
     recommended_accounts: Annotated[str | None, Form()] = None,
+    scheduled_date: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
     """Coordinator-owned edits to a production request's specification.
 
-    Scheduling is intentionally still controlled through Submit so assignment
-    notifications remain a deliberate action. Changing PP immediately
-    cascades scheduled work forward when the larger block needs more room.
+    Existing assignments may have their date corrected without resetting work
+    history or sending another assignment notification. New assignments remain
+    controlled through Submit. Date and PP changes reflow conflicting work.
     """
     caller, _, _ = _queue_v2_access(request, coordinator=True)
     if production_points < 1:
         raise HTTPException(status_code=400, detail="Production points must be at least 1.")
+    if scheduled_date is not None:
+        try:
+            parsed_date = datetime.strptime(scheduled_date, "%Y-%m-%d").date()
+            if parsed_date.isoformat() != scheduled_date:
+                raise ValueError("Non-canonical date")
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
     row = _queue_v2_request(request_id)
     clean_priority = _queue_v2_priority(priority)
     clean_tags = _queue_v2_tags(tags)
@@ -7356,11 +7364,36 @@ def dashboard_queue_v2_edit(
     now = utc_now()
     with connect() as conn:
         _queue_v2_lock_schedule(conn)
+        # Read the assignment after acquiring the schedule lock so a concurrent
+        # Submit cannot make a date correction overwrite a newer placement.
+        current = conn.execute("SELECT * FROM queue_requests WHERE id = ?", (request_id,)).fetchone()
+        if current is None:
+            raise HTTPException(status_code=404, detail="Queue request not found.")
+        row = dict(current)
+        date_changed = scheduled_date is not None and scheduled_date != row.get("scheduled_date")
+        resolved_date, resolved_start = row.get("scheduled_date"), row.get("scheduled_start_minutes")
+        if date_changed:
+            if (row.get("status") not in {"scheduled", "in_progress", "completed", "closed"}
+                    or not row.get("designer_email") or resolved_start is None):
+                raise HTTPException(status_code=409, detail="Only assigned requests can have their schedule date edited.")
+            fixed = [dict(item) for item in conn.execute(
+                """SELECT * FROM queue_requests WHERE designer_email = ? AND id != ?
+                   AND status IN ('completed','closed') AND scheduled_date IS NOT NULL
+                   AND scheduled_start_minutes IS NOT NULL""",
+                (row["designer_email"], request_id),
+            ).fetchall()]
+            occupied = [_queue_v2_occupied(item) for item in fixed]
+            occupied.extend(_queue_v2_personal_time_occupied(conn, row["designer_email"]))
+            resolved_date, resolved_start = next_available_slot(
+                scheduled_date, int(resolved_start),
+                _queue_v2_duration({**row, "production_points": production_points}), occupied,
+            )
         conn.execute(
             """UPDATE queue_requests SET production_points = ?, priority = ?, tags = ?, brief = ?, notes = ?,
-               reference_links = ?, recommended_accounts = ?, updated_at = ? WHERE id = ?""",
+               reference_links = ?, recommended_accounts = ?, scheduled_date = ?, scheduled_start_minutes = ?,
+               updated_at = ? WHERE id = ?""",
             (production_points, clean_priority, json.dumps(clean_tags), (brief or "").strip(), (notes or "").strip(),
-             json.dumps(clean_refs), json.dumps(selected_accounts), now, request_id),
+             json.dumps(clean_refs), json.dumps(selected_accounts), resolved_date, resolved_start, now, request_id),
         )
         # Keep an existing collaborative placement's provisional duration in
         # sync with the edited request so its live block and PP count change
@@ -7369,15 +7402,23 @@ def dashboard_queue_v2_edit(
             "UPDATE queue_schedule_drafts SET production_points = ?, updated_at = ? WHERE request_id = ?",
             (production_points, now, request_id),
         )
+        if date_changed:
+            conn.execute(
+                "UPDATE queue_schedule_drafts SET scheduled_date = ?, updated_at = ? WHERE request_id = ? AND designer_email != ?",
+                (resolved_date, now, request_id, QUEUE_V2_POOL_DRAFT_DESIGNER),
+            )
         _queue_v2_log(conn, request_id, caller, "edited", {
             "productionPoints": production_points, "priority": clean_priority, "tags": clean_tags,
             "recommendedAccounts": selected_accounts,
+            **({"fromDate": row["scheduled_date"], "scheduledDate": resolved_date} if date_changed else {}),
         })
         if row.get("designer_email") and row.get("status") in {"scheduled", "in_progress", "completed", "closed"}:
             _queue_v2_reflow_scheduled(conn, row["designer_email"], caller, priority_id=request_id)
-        draft_designers = [item["designer_email"] for item in conn.execute(
+        draft_designers = {item["designer_email"] for item in conn.execute(
             "SELECT designer_email FROM queue_schedule_drafts WHERE request_id = ?", (request_id,),
-        ).fetchall()]
+        ).fetchall()}
+        if date_changed:
+            draft_designers.add(row["designer_email"])
         for designer in draft_designers:
             _queue_v2_reflow_drafts(conn, designer)
         _queue_v2_publish(conn, "request_edited", caller, [request_id])
