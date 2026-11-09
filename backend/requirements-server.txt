@@ -14,3 +14,4 @@ boto3>=1.35,<2.0
 
 # Hosted Streamable HTTP MCP and typed tool validation.
 mcp==1.30.0
+jsonschema>=4.20,<5.0

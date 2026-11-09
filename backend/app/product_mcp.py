@@ -69,7 +69,13 @@ def resolve(value: Any, spec: dict, seen: frozenset = frozenset()) -> Any:
         for key in ref.split("/")[1:]:
             target = target[key.replace("~1", "/").replace("~0", "~")]
         return resolve(target, spec, seen | {ref})
-    return {k: resolve(v, spec, seen) for k, v in value.items() if k not in {"title", "discriminator"}}
+    # Annotation keys belong to a schema, but names inside a property/definition
+    # map belong to the API. A request field named "title" must not disappear
+    # while its required-list entry remains, or valid Queue writes are impossible.
+    maps = {"properties", "$defs", "definitions", "patternProperties"}
+    return {k: ({name: resolve(schema, spec, seen) for name, schema in v.items()}
+                if k in maps and isinstance(v, dict) else resolve(v, spec, seen))
+            for k, v in value.items() if k not in {"title", "discriminator"}}
 
 
 def catalogue(spec: dict) -> dict[str, dict]:

@@ -4752,6 +4752,84 @@ def _queue_v2_assert_time_available(
         raise HTTPException(status_code=409, detail="That time overlaps another Queue block.")
 
 
+def _queue_v2_reschedule_for_time_block(
+    conn: Any, designer: str, actor: str, scheduled_date: str, start: int, duration: int,
+    ticket_id: int, *, move_remaining: bool = False,
+) -> list[int]:
+    """Reflow only this day's unstarted work around a newly reserved hold.
+
+    Committed and provisional placements retain their own ordering. Shared
+    representations of one request can overlap each other, but every other
+    request must avoid both placements. Active/finished work and other dates
+    stay fixed; the shared slot finder may advance today's work into a later
+    free day without moving work already scheduled there.
+    """
+    _queue_v2_lock_schedule(conn)
+    requests = [dict(row) for row in conn.execute(
+        """SELECT * FROM queue_requests WHERE designer_email = ?
+           AND status IN ('scheduled','in_progress','completed','closed')
+           AND scheduled_date IS NOT NULL AND scheduled_start_minutes IS NOT NULL""",
+        (designer,),
+    ).fetchall()]
+    drafts = [dict(row) for row in conn.execute(
+        """SELECT d.request_id, d.scheduled_date, d.scheduled_start_minutes,
+                  COALESCE(d.production_points, r.production_points) AS production_points,
+                  COALESCE(d.minutes_per_pp, r.minutes_per_pp, 10) AS minutes_per_pp,
+                  r.status AS request_status
+           FROM queue_schedule_drafts d JOIN queue_requests r ON r.id = d.request_id
+           WHERE d.designer_email = ?""",
+        (designer,),
+    ).fetchall()]
+    moving_requests = [row for row in requests if row["status"] == "scheduled" and row["scheduled_date"] == scheduled_date]
+    moving_drafts = [row for row in drafts if row["request_status"] in {"pool", "scheduled"} and row["scheduled_date"] == scheduled_date]
+    moving_ids = {int(row["id"]) for row in moving_requests}
+    moving_draft_ids = {int(row["request_id"]) for row in moving_drafts}
+    occupied = [{**_queue_v2_occupied(row), "request_id": int(row["id"])}
+                for row in requests if int(row["id"]) not in moving_ids]
+    occupied.extend({
+        "date": row["scheduled_date"], "start": row["scheduled_start_minutes"],
+        "duration": int(row["production_points"]) * int(row["minutes_per_pp"]),
+        "request_id": int(row["request_id"]),
+    } for row in drafts if int(row["request_id"]) not in moving_draft_ids)
+    occupied.extend(_queue_v2_personal_time_occupied(conn, designer, exclude_ticket_id=ticket_id))
+    if any(item.get("date") == scheduled_date and intervals_conflict(
+        start, duration, int(item["start"]), int(item["duration"]), buffer_minutes=0,
+        other_buffer_minutes=int(item.get("buffer_minutes", SCHEDULER_BUFFER_MINUTES)),
+    ) for item in occupied if item.get("start") is not None):
+        raise HTTPException(status_code=409, detail="That time overlaps active or finished work, or another personal block.")
+    occupied.append({"date": scheduled_date, "start": start, "duration": duration, "buffer_minutes": 0})
+    jobs = [{"id": int(row["id"]), "row": row, "draft": False, "duration": _queue_v2_duration(row)}
+            for row in moving_requests]
+    jobs.extend({"id": int(row["request_id"]), "row": row, "draft": True,
+                 "duration": int(row["production_points"]) * int(row["minutes_per_pp"])} for row in moving_drafts)
+    durations: dict[int, int] = {}
+    for job in jobs:
+        durations[job["id"]] = max(durations.get(job["id"], 0), job["duration"])
+    changed: set[int] = set()
+    for job in sorted(jobs, key=lambda item: (int(item["row"]["scheduled_start_minutes"]), item["id"], item["draft"])):
+        row, request_id = job["row"], job["id"]
+        desired = max(int(row["scheduled_start_minutes"]), start + duration) if move_remaining else int(row["scheduled_start_minutes"])
+        resolved_date, resolved_start = next_available_slot(
+            scheduled_date, desired, durations[request_id],
+            [item for item in occupied if item.get("request_id") != request_id],
+        )
+        if resolved_date != row["scheduled_date"] or resolved_start != int(row["scheduled_start_minutes"]):
+            table, key = ("queue_schedule_drafts", "request_id") if job["draft"] else ("queue_requests", "id")
+            conn.execute(
+                f"UPDATE {table} SET scheduled_date = ?, scheduled_start_minutes = ?, updated_at = ? WHERE {key} = ?",
+                (resolved_date, resolved_start, utc_now(), request_id),
+            )
+            _queue_v2_log(conn, request_id, actor, "auto_reflowed", {
+                "fromDate": row["scheduled_date"], "fromStart": row["scheduled_start_minutes"],
+                "date": resolved_date, "start": resolved_start, "reason": "personal_time",
+                "timeBlockId": ticket_id, "draft": job["draft"],
+            })
+            changed.add(request_id)
+        occupied.append({"date": resolved_date, "start": resolved_start,
+                         "duration": durations[request_id], "request_id": request_id})
+    return sorted(changed)
+
+
 def _queue_v2_reflow_scheduled(conn: Any, designer: str, actor: str, priority_id: int | None = None) -> int:
     """Keep one designer's entire Queue timeline collision-free.
 
@@ -6546,17 +6624,30 @@ def dashboard_queue_v2_create_time_block(
     title: Annotated[str | None, Form()] = None,
     note: Annotated[str | None, Form()] = None,
     designer_email: Annotated[str | None, Form()] = None,
+    reschedule_conflicts: Annotated[bool, Form(description="Coordinator-only: reserve the block and move conflicting unstarted requests and drafts from this day.")] = False,
+    move_remaining_after_block: Annotated[bool, Form(description="Coordinator-only: move all unstarted requests and drafts from this day after the block, including work currently placed earlier. Implies reschedule_conflicts.")] = False,
 ) -> dict[str, Any]:
+    """Reserve personal time for the caller, or an explicitly chosen user.
+
+    A PD's block remains pending coordinator approval. Coordinators may also
+    move conflicts or all of this day's unstarted work after the block in one
+    atomic operation. Active/finished work, other users and existing placements
+    on other days remain fixed. New placements may spill into a later free day.
+    """
     caller, is_admin, roles = _queue_v2_access(request)
     coordinator = is_admin or "vc" in roles
     target_designer = str(designer_email or caller).strip().lower()
     if target_designer != caller and not coordinator:
         raise HTTPException(status_code=403, detail="Only VCs and admins can add time for another user.")
+    reflow = bool(reschedule_conflicts or move_remaining_after_block)
+    if reflow and not coordinator:
+        raise HTTPException(status_code=403, detail="Queue coordination access is required to reschedule requests around personal time.")
     clean_category = category.strip().lower()
     if clean_category not in QUEUE_V2_TIME_CATEGORIES:
         raise HTTPException(status_code=400, detail="Choose meeting, break, promo, focus, or other.")
     try:
-        datetime.strptime(scheduled_date, "%Y-%m-%d")
+        if datetime.strptime(scheduled_date, "%Y-%m-%d").date().isoformat() != scheduled_date:
+            raise ValueError("Non-canonical date")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Schedule date must use YYYY-MM-DD.") from exc
     start, duration = int(scheduled_start_minutes), int(duration_minutes)
@@ -6568,6 +6659,7 @@ def dashboard_queue_v2_create_time_block(
     clean_note = (note or "").strip()[:500]
     now = utc_now()
     with connect() as conn:
+        _queue_v2_lock_schedule(conn)
         try:
             user = conn.execute("SELECT email FROM dashboard_users WHERE email = ?", (target_designer,)).fetchone()
         except sqlite3.OperationalError:
@@ -6576,7 +6668,8 @@ def dashboard_queue_v2_create_time_block(
             user = True
         if not user:
             raise HTTPException(status_code=400, detail="Choose a valid Queue user.")
-        _queue_v2_assert_time_available(conn, target_designer, scheduled_date, start, duration)
+        if not reflow:
+            _queue_v2_assert_time_available(conn, target_designer, scheduled_date, start, duration)
         status = "approved" if coordinator else "pending"
         cursor = conn.execute(
             """INSERT INTO queue_tickets
@@ -6586,7 +6679,11 @@ def dashboard_queue_v2_create_time_block(
             (target_designer, status, clean_category, clean_title, scheduled_date, start, duration, clean_note, now, now),
         )
         ticket_id = int(cursor.lastrowid)
-        _queue_v2_publish(conn, "time_block_created", caller)
+        changed_ids = _queue_v2_reschedule_for_time_block(
+            conn, target_designer, caller, scheduled_date, start, duration, ticket_id,
+            move_remaining=bool(move_remaining_after_block),
+        ) if reflow else []
+        _queue_v2_publish(conn, "time_block_created", caller, changed_ids)
         row = dict(conn.execute("SELECT * FROM queue_tickets WHERE id = ?", (ticket_id,)).fetchone())
     # Personal time created by a PD is provisional and needs coordinator
     # approval. Coordinator-created blocks are already firm and stay out of
@@ -6598,7 +6695,8 @@ def dashboard_queue_v2_create_time_block(
             reason=clean_note, scheduled_date=scheduled_date,
             scheduled_start_minutes=start,
         )
-    return {"ok": True, "ticket": _queue_v2_ticket(row)}
+    return {"ok": True, "ticket": _queue_v2_ticket(row),
+            "changed_request_ids": changed_ids, "rescheduled_count": len(changed_ids)}
 
 
 @app.post("/api/dashboard/queue/v2/tickets/time-block/{ticket_id}")

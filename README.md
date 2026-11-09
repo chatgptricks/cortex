@@ -157,11 +157,25 @@ read access to reviewed dashboard product routes, independent of their UI role.
 Each internal read revalidates the original session and carries a private,
 route-bound in-process capability that cannot be supplied by an HTTP header.
 Identity reads retain the real caller. Normal browser/MCP roles do not change.
-Writes, credentials, binary exports, operational logs, paid refreshes and
-external-fetch GETs are excluded. Queue retention, stack bootstrapping and Hooks
+The read capability excludes mutations, credentials, binary exports, operational logs,
+paid refreshes and external-fetch GETs. Queue retention, stack bootstrapping and Hooks
 synchronization/categorization are suppressed in this read context. Sources and
 incomplete coverage are retained; failed reads produce a short localized notice.
-OpenAI Responses calls use `store: false`; no conversation is stored by Cortex.
+Explicit Queue action instructions enable a separate reviewed mutation catalogue.
+Each exact proposed operation is checked against the current user's instruction,
+then executes through ordinary Firebase authentication and that user's real Queue
+permissions, including approval rules. Extra notifications require explicit intent.
+The time-block action supports `reschedule_conflicts` and `move_remaining_after_block`
+for coordinators: it reserves personal time and moves the selected day's unstarted
+work atomically, preserving active/finished work, other users and existing future
+placements. The response includes moved request IDs and a count.
+
+Mutation turns require a stable browser `request_id` UUID. Durable per-user receipts
+prevent a lost response or another worker from repeating the same turn. Ambiguous
+writes require state reconciliation; no write is retried automatically. Confirmed
+changes emit `queue_updated`, refreshing Queue without reloading the chat.
+OpenAI Responses calls use `store: false`. Cortex stores only the request fingerprint
+and public final response for mutation-turn replay, rather than a conversation log.
 Each API process limits a user to one active answer, 10 requests per minute
 and 60 per hour, with a 120-second answer deadline.
 

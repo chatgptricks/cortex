@@ -11,3 +11,4 @@ psycopg-pool>=3.2,<4.0
 
 # Hosted Streamable HTTP MCP and typed tool validation.
 mcp==1.30.0
+jsonschema>=4.20,<5.0
