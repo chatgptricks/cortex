@@ -21,6 +21,8 @@ CHECK_EVERY_SECONDS = 10 * 60
 DISCOVERY_JOB_KEY = "scheduled-posts"
 ALERT_STATE_KEY = "posts_stale_alert"
 RETRY_ALERT_KEY = "posts_retry_alert"
+PROVIDER_ALERT_KEY = "posts_apify_alert"
+_PROVIDER_RETRY_REASONS = {"apify_auth", "apify_unavailable", "apify_pending"}
 # A slot retrying the same error this long is almost certainly stuck on a
 # deterministic failure; tell the DEVs long before the 2-hour stale alert.
 RETRY_ALERT_AFTER_SECONDS = 20 * 60
@@ -45,6 +47,7 @@ def _discovery_job() -> dict | None:
         state = {}
     return {"slot": row["slot"], "status": row["status"], "error": row["error"], "updated_at": row["updated_at"],
             "last_success_at": state.get("last_success_at"), "frozen_now": state.get("now"),
+            "retry_reason": state.get("retry_reason"), "retry_started_at": state.get("retry_started_at"),
             "abandoned": state.get("abandoned")}
 
 
@@ -54,31 +57,66 @@ def _cst(value: datetime) -> str:
     return value.astimezone(timezone(timedelta(hours=-6))).strftime("%b %d, %I:%M %p CST")
 
 
-def _check_retry_loop(job: dict, now: datetime) -> None:
-    """Alert once per (slot, error) when discovery keeps failing the same slot."""
+def _check_retry_loop(job: dict, now: datetime) -> bool:
+    """Report an Apify incident once, or a deterministic retry per slot/error."""
     from .scheduler import _state_get, _state_set
     from .slack_alerts import notify_devs
 
-    if job["status"] != "retry" or not job.get("frozen_now"):
-        return
-    started = datetime.fromisoformat(job["frozen_now"])
+    if job["status"] != "retry":
+        return False
+    reason = job.get("retry_reason")
+    provider_failure = reason in _PROVIDER_RETRY_REASONS
+    started_at = (job.get("retry_started_at") or job.get("frozen_now")) if provider_failure else job.get("frozen_now")
+    if not started_at and reason != "apify_auth":
+        return False
+    started = datetime.fromisoformat(started_at) if started_at else now
     if started.tzinfo is None:
         started = started.replace(tzinfo=UTC)
     minutes = (now - started).total_seconds() / 60
-    if minutes * 60 < RETRY_ALERT_AFTER_SECONDS:
-        return
+    if reason != "apify_auth" and minutes * 60 < RETRY_ALERT_AFTER_SECONDS:
+        return False
+    if provider_failure:
+        # Keep this marker until discovery catches up. A resumed paid run can
+        # advance an old frozen watermark while the live window is still stale.
+        if _state_get(PROVIDER_ALERT_KEY):
+            return False
+        marker = job.get("last_success_at") or f"uninitialized:{job['slot']}"
+        _state_set(PROVIDER_ALERT_KEY, marker)
+        if reason == "apify_auth":
+            title = "Apify rejected the ingestion credentials"
+            detail = (
+                "Apify credentials are missing or were rejected (HTTP 401/403). Check or replace APIFY_TOKEN in Render for both "
+                "`cortex-ingestion-worker` and `cortex-api`, then redeploy the affected services. "
+                "The saved discovery slot and any existing paid runs are retained for recovery."
+            )
+        elif reason == "apify_pending":
+            title = "New-post discovery is reconciling an Apify run"
+            detail = (
+                "Apify has not confirmed whether the run started or finished. Automatic retries "
+                "reconcile the saved run before starting another, preserving its recovery journal."
+            )
+        else:
+            title = "New-post discovery is waiting for Apify"
+            detail = (
+                "Apify requests are temporarily failing or being rate-limited. Discovery retries "
+                "with backoff and retains the saved slot and any existing paid runs."
+            )
+        notify_devs(title, f"{detail}\nError: `{(job.get('error') or 'unknown')[:400]}`")
+        logger.warning("Discovery waiting on %s; DEVs alerted", reason)
+        return True
     marker = f"{job['slot']}|{(job.get('error') or '')[:200]}"
     if _state_get(RETRY_ALERT_KEY) == marker:
-        return
+        return False
     _state_set(RETRY_ALERT_KEY, marker)
     notify_devs(
         "New-post discovery is stuck retrying",
         f"The discovery slot `{job['slot']}` has been retrying for {minutes:.0f} minutes and blocks every "
         f"later cycle.\nError: `{(job.get('error') or 'unknown')[:400]}`\n"
-        "Paid Apify runs are reused on every retry, so this costs nothing extra, but no new posts arrive "
+        "Existing paid Apify runs are retained and reused on retry, but no new posts arrive "
         "until the cause is fixed.",
     )
     logger.warning("Discovery slot %s stuck retrying for %.0f min; DEVs alerted", job["slot"], minutes)
+    return True
 
 
 ABANDON_ALERT_KEY = "posts_abandon_alert"
@@ -107,18 +145,23 @@ def check_once(now: datetime | None = None) -> str:
     from .slack_alerts import notify_devs
 
     job = _discovery_job()
-    if not job or not job["last_success_at"]:
+    if not job:
         return "ok"
     now = now or datetime.now(UTC)
-    _check_retry_loop(job, now)
+    retry_alerted = _check_retry_loop(job, now)
     _check_abandoned(job)
+    if not job["last_success_at"]:
+        return "alerted" if retry_alerted else "ok"
     last = datetime.fromisoformat(job["last_success_at"])
     if last.tzinfo is None:
         last = last.replace(tzinfo=UTC)
     age_hours = (now - last).total_seconds() / 3600
     alerted_for = _state_get(ALERT_STATE_KEY) or ""
+    provider_alerted_for = _state_get(PROVIDER_ALERT_KEY) or ""
 
     if age_hours * 3600 > STALE_AFTER_SECONDS:
+        if provider_alerted_for:
+            return "alerted" if retry_alerted else "ok"
         if alerted_for == job["last_success_at"]:
             return "ok"
         _state_set(ALERT_STATE_KEY, job["last_success_at"])
@@ -133,15 +176,21 @@ def check_once(now: datetime | None = None) -> str:
         logger.warning("New-post discovery stale for %.1fh; DEVs alerted", age_hours)
         return "alerted"
 
-    if alerted_for:
+    if provider_alerted_for:
+        # A still-retrying job, or an abandoned slot, is not a recovery even
+        # when its last successful reading happens to be under two hours old.
+        if job["status"] != "done" or job.get("error") or job["last_success_at"] == provider_alerted_for:
+            return "alerted" if retry_alerted else "ok"
+        _state_set(PROVIDER_ALERT_KEY, "")
+    if alerted_for or provider_alerted_for:
         _state_set(ALERT_STATE_KEY, "")
         notify_devs(
             "New-post discovery recovered",
             f"Discovery succeeded again (data as of *{_cst(last)}*). "
-            "The next cycle fetches everything published during the gap.",
+            "Automatic discovery has resumed and its recovery watermark is current.",
         )
         return "recovered"
-    return "ok"
+    return "alerted" if retry_alerted else "ok"
 
 
 def _loop(stop: threading.Event) -> None:

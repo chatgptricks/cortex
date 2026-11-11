@@ -8394,6 +8394,9 @@ def admin_ingestion_status(request: Request) -> dict[str, Any]:
             "lease_seconds_left": round(float(row["lease_until"] or 0) - now),
             "updated_at": row["updated_at"], "error": (row["error"] or "")[:500] or None,
             "last_success_at": state.get("last_success_at"), "frozen_now": state.get("now"),
+            "retry_reason": state.get("retry_reason"),
+            "retry_started_at": state.get("retry_started_at"),
+            "transient_attempts": state.get("transient_attempts", 0),
             "runs": runs,
         })
     return {"server_time": utc_now(), "jobs": jobs,
@@ -9254,12 +9257,12 @@ def temp_runs(request: Request, limit: int = 15) -> dict[str, Any]:
     from .apify_sync import APIFY_ACTOR_ID, APIFY_PROFILE_ACTOR_ID, APIFY_REEL_ACTOR_ID
 
     token = os.getenv("APIFY_TOKEN", "").strip()
-    with httpx.Client(timeout=30.0) as client:
+    with httpx.Client(timeout=30.0, headers={"Authorization": f"Bearer {token}"}) as client:
         items: list[dict[str, Any]] = []
         for actor_id in (APIFY_ACTOR_ID, APIFY_PROFILE_ACTOR_ID, APIFY_REEL_ACTOR_ID):
             r = client.get(
                 f"https://api.apify.com/v2/acts/{actor_id}/runs",
-                params={"token": token, "limit": limit, "desc": "true"},
+                params={"limit": limit, "desc": "true"},
             )
             r.raise_for_status()
             for item in r.json().get("data", {}).get("items", []):

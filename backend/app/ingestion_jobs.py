@@ -13,6 +13,40 @@ from . import db
 _current = ContextVar('ingestion_job', default=None)
 LEASE_SECONDS = 180
 RETRY_SECONDS = 120
+MAX_PROVIDER_RETRY_SECONDS = 30 * 60
+
+
+def classify_apify_failure(exc):
+    """Separate provider outages/unfinished paid work from poison input.
+
+    ApifySyncError wraps HTTPX failures, while reconciliation can raise them
+    directly. Inspect the chain and request host instead of matching error
+    text (a database or unrelated HTTP failure still uses the attempt cap).
+    """
+    import httpx
+
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        reason = getattr(exc, 'ingestion_retry_reason', None)
+        if reason in {'apify_auth', 'apify_pending'}:
+            return reason
+        if isinstance(exc, httpx.HTTPError):
+            try:
+                is_apify = exc.request.url.host == 'api.apify.com'
+            except RuntimeError:
+                is_apify = False
+            if is_apify:
+                if isinstance(exc, httpx.HTTPStatusError):
+                    status = exc.response.status_code
+                    if status in {401, 403}:
+                        return 'apify_auth'
+                    if status in {408, 429} or 500 <= status < 600:
+                        return 'apify_unavailable'
+                elif isinstance(exc, httpx.TransportError):
+                    return 'apify_unavailable'
+        exc = exc.__cause__ or exc.__context__
+    return None
 
 
 def initialize(conn):
@@ -67,6 +101,8 @@ def run(key, slot, callback, *, retain_result=False, max_attempts=None):
     retried forever: it is marked done WITHOUT advancing `last_success_at`,
     so the next slot starts and its window covers the abandoned one. A
     deterministic failure can then delay a scheduled pass, never stop it.
+    Provider outages and uncertain/unfinished paid runs retain their journal
+    and retry with backoff without consuming that deterministic-failure cap.
     """
     owner = uuid.uuid4().hex
     epoch = time.time()
@@ -122,6 +158,23 @@ def run(key, slot, callback, *, retain_result=False, max_attempts=None):
         return True
     except Exception as exc:
         error = re.sub(r"token=[^&\s]+", "token=REDACTED", str(exc))[:2000]
+        retry_reason = classify_apify_failure(exc)
+        if retry_reason:
+            failures = int(journal.state.get('transient_attempts') or 0) + 1
+            journal.state['transient_attempts'] = failures
+            journal.state['retry_reason'] = retry_reason
+            journal.state.setdefault('retry_started_at', db.utc_now())
+            delay = RETRY_SECONDS
+            if retry_reason != 'apify_pending':
+                delay = min(MAX_PROVIDER_RETRY_SECONDS, RETRY_SECONDS * 2 ** min(failures - 1, 10))
+            with db.connect() as conn:
+                conn.execute("UPDATE ingestion_jobs SET status = 'retry', lease_until = ?, error = ?, state = ?, updated_at = ? WHERE job_key = ? AND owner = ?",
+                             (time.time() + delay, error, json.dumps(journal.state), db.utc_now(), key, owner))
+            logging.warning('Ingestion %s waiting for %s; retry in %ss, journal retained: %s',
+                            key, retry_reason, delay, error[:300])
+            return False
+        for field in ('transient_attempts', 'retry_reason', 'retry_started_at'):
+            journal.state.pop(field, None)
         attempts = int(journal.state.get("attempts") or 0) + 1
         if max_attempts and attempts >= max_attempts:
             abandoned_state = {

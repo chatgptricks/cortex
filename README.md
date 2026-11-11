@@ -59,6 +59,17 @@ Configure both services before releasing a change that moves roster metadata.
 `GET /api/health` remains public. Its optional `verify=true` database readiness
 checks require an authenticated Admin or Dev and use private, noncached responses.
 
+Apify HTTP 408/429/5xx and transport failures retain the ingestion slot and its
+paid-run journal, retrying after 2, 4, 8, 16 and then 30 minutes. Unconfirmed
+starts and unfinished runs resume every 2 minutes. These retries do not consume
+the five-attempt cap for deterministic processing failures. Missing or rejected
+credentials (401/403) need a valid `APIFY_TOKEN` in both Render services:
+`cortex-ingestion-worker` and `cortex-api`. A redeploy preserves the retry deadline;
+allow up to 30 minutes before the next attempt. The discovery monitor reports
+one provider incident and one recovery once successful discovery is current.
+The DEV ingestion-status endpoint exposes `retry_reason`, `retry_started_at`
+and `transient_attempts` without returning saved payloads or credentials.
+
 ## What it actually serves today
 
 - `/api/dashboard/*` — posts, accounts, queue (tasks/assign/reorder), saved
