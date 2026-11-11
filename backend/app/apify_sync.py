@@ -55,6 +55,16 @@ class ApifySyncError(RuntimeError):
     pass
 
 
+class ApifyPendingError(ApifySyncError):
+    """An uncertain start or unfinished run must keep its durable journal."""
+
+    ingestion_retry_reason = "apify_pending"
+
+
+class ApifyAuthError(ApifySyncError):
+    ingestion_retry_reason = "apify_auth"
+
+
 class ProfileSnapshotError(ApifySyncError):
     """All bounded profile-data retries completed without a usable reading."""
 
@@ -959,7 +969,7 @@ def _run_apify_actor_and_fetch(
     """
     token = os.getenv("APIFY_TOKEN", "").strip()
     if not token:
-        raise ApifySyncError("APIFY_TOKEN is not configured on the server.")
+        raise ApifyAuthError("APIFY_TOKEN is not configured on the server.")
     try:
         import httpx
     except ImportError as exc:
@@ -1007,7 +1017,7 @@ def _run_apify_actor_and_fetch(
             age = (datetime.now(UTC) - datetime.fromisoformat(saved["starting_at"]).replace(tzinfo=UTC)).total_seconds()
             covered = len(candidates) < 100 or candidates[-1].get("startedAt", "") < saved["starting_at"]
             if age < 300 or not covered:
-                raise ApifySyncError("Unconfirmed Apify start; automatic reconciliation will retry.")
+                raise ApifyPendingError("Unconfirmed Apify start; automatic reconciliation will retry.")
             # The complete recent history confirms no run was created.
             saved.pop("starting_at", None)
             journal.save()
@@ -1028,7 +1038,7 @@ def _run_apify_actor_and_fetch(
                 journal.save()
             raise ApifySyncError(f"Failed to start Apify run: {exc}") from exc
         if not run.get("id"):
-            raise ApifySyncError("Apify did not return a run id.")
+            raise ApifyPendingError("Apify did not return a run id; automatic reconciliation will retry.")
         if journal:
             saved["run"] = run
             journal.save()
@@ -1071,6 +1081,8 @@ def _run_apify_actor_and_fetch(
             journal.save()
         return []
     if status != "SUCCEEDED" and not (accept_partial and status in {"FAILED", "ABORTED", "TIMED-OUT"} and dataset_id):
+        if status in {"READY", "RUNNING", "TIMING-OUT", "ABORTING"}:
+            raise ApifyPendingError(f"Apify run is still pending (status={status}); the same run will resume.")
         if journal and status in {"FAILED", "ABORTED", "TIMED-OUT"}:
             saved.pop("run", None)
             saved.pop("starting_at", None)
