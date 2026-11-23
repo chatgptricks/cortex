@@ -279,12 +279,15 @@ def test_ingestion_status_is_dev_only_and_summarizes_journal(database, monkeypat
     with database() as conn:
         jobs.initialize(conn)
         conn.execute("INSERT INTO ingestion_jobs VALUES ('scheduled-posts','s','running','w',0,?,NULL,'t')",
-                     (json.dumps({'last_success_at': 'x', 'now': 'y', 'run:0': {'run': {'id': 'r1', 'status': 'SUCCEEDED', 'token': 'secret'}, 'items': [1]}}),))
+                     (json.dumps({'last_success_at': 'x', 'now': 'y',
+                                  'provider_error': {'type': 'insufficient-permissions', 'message': 'Actor access denied', 'raw': 'secret'},
+                                  'run:0': {'run': {'id': 'r1', 'status': 'SUCCEEDED', 'token': 'secret'}, 'items': [1]}}),))
     with pytest.raises(HTTPException):
         main.admin_ingestion_status(SimpleNamespace(state=SimpleNamespace(is_dev=False)))
     body = main.admin_ingestion_status(SimpleNamespace(state=SimpleNamespace(is_dev=True)))
     job = body['jobs'][0]
     assert job['runs'] == [{'step': 'run:0', 'run_id': 'r1', 'run_status': 'SUCCEEDED', 'dataset_count': None, 'starting_at': None}]
+    assert job['provider_error'] == {'type': 'insufficient-permissions', 'message': 'Actor access denied'}
     assert 'secret' not in json.dumps(body) and job['frozen_now'] == 'y'
 
 
