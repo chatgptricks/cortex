@@ -51,11 +51,11 @@ def _seed(database, state):
         )
 
 
-def _http_error(status, host="api.apify.com"):
-    request = httpx.Request("POST", f"https://{host}/v2/acts/actor/runs?token=secret")
+def _http_error(status, host="api.apify.com", *, body=None, headers=None):
+    request = httpx.Request("POST", f"https://{host}/v2/acts/actor/runs?token=secret", headers=headers)
     return httpx.HTTPStatusError(
         f"HTTP {status}", request=request,
-        response=httpx.Response(status, request=request),
+        response=httpx.Response(status, request=request, json=body),
     )
 
 
@@ -69,9 +69,39 @@ def test_classification_follows_wrapped_apify_http_errors(status):
     assert jobs.classify_apify_failure(wrapped) == "apify_unavailable"
 
 
-@pytest.mark.parametrize("status", [401, 403])
-def test_classification_distinguishes_rejected_apify_credentials(status):
-    assert jobs.classify_apify_failure(_http_error(status)) == "apify_auth"
+@pytest.mark.parametrize("status,error_type,message,reason", [
+    (401, None, None, "apify_auth"),
+    (403, "invalid-token", "Invalid API token", "apify_auth"),
+    (403, "insufficient-permissions", "Access denied", "apify_forbidden"),
+    (403, None, None, "apify_forbidden"),
+    (403, "not-enough-usage-to-run-paid-actor", "Not enough usage", "apify_quota"),
+    (403, "platform-feature-disabled", "Monthly usage limit exceeded", "apify_quota"),
+    (403, "limit-reached", "The spending limit has been reached", "apify_quota"),
+    (403, "platform-feature-disabled", "Feature disabled", "apify_forbidden"),
+    (403, "limit-reached", "Actor memory usage limit exceeded", "apify_forbidden"),
+    (403, "concurrent-runs-limit-exceeded", "Concurrent run limit reached", "apify_forbidden"),
+    (402, None, None, "apify_quota"),
+])
+def test_classification_uses_explicit_provider_diagnosis(status, error_type, message, reason):
+    failure = _http_error(status, body={"error": {"type": error_type, "message": message}})
+    wrapped = apify_sync.ApifySyncError("Failed to start Apify run")
+    wrapped.__cause__ = failure
+    assert jobs.classify_apify_failure(wrapped) == reason
+
+
+@pytest.mark.parametrize("body", [[], {"error": []}, {"error": {"type": {}, "message": []}}])
+def test_malformed_error_objects_do_not_change_forbidden_classification(body):
+    failure = _http_error(403, body=body)
+    assert jobs.apify_error_details(failure) == {}
+    assert jobs.classify_apify_failure(failure) == "apify_forbidden"
+
+
+def test_non_json_and_oversized_bodies_are_not_retained():
+    for content in (b"<html>gateway failure</html>", b"x" * (64 * 1024 + 1)):
+        failure = _http_error(403)
+        failure.response = httpx.Response(403, content=content, request=failure.request)
+        assert jobs.apify_error_details(failure) == {}
+        assert jobs.classify_apify_failure(failure) == "apify_forbidden"
 
 
 def test_classification_does_not_hide_unrelated_http_or_processing_failures():
@@ -137,24 +167,88 @@ def test_provider_retries_preserve_journal_and_increase_bounded_backoff(database
     assert row["state"]["last_success_at"] == initial["last_success_at"]
 
 
-@pytest.mark.parametrize("status", [401, 403])
-def test_rejected_credentials_wait_for_repair_without_abandoning_the_slot(database, status):
-    _seed(database, {"last_success_at": "2026-11-11T19:00:00+00:00"})
+@pytest.mark.parametrize("status,body,reason", [
+    (401, None, "apify_auth"),
+    (403, {"error": {"type": "invalid-token"}}, "apify_auth"),
+    (403, {"error": {"type": "not-enough-usage-to-run-paid-actor"}}, "apify_quota"),
+    (403, None, "apify_forbidden"),
+])
+def test_account_restrictions_wait_for_repair_without_abandoning_the_slot(database, status, body, reason):
+    paid = {"run": {"id": "already-paid"}, "payload": {"directUrls": ["account"]}}
+    _seed(database, {"last_success_at": "2026-11-11T19:00:00+00:00", "run:0": paid})
 
     def fail():
-        raise apify_sync.ApifySyncError("rejected token") from _http_error(status)
+        raise apify_sync.ApifySyncError("provider restriction") from _http_error(status, body=body)
 
     for _ in range(7):
         assert not jobs.run("short", "02", fail, max_attempts=5)
         row = _job(database)
         assert row["status"] == "retry"
-        assert row["state"]["retry_reason"] == "apify_auth"
+        assert row["slot"] == "01"
+        assert row["state"]["retry_reason"] == reason
+        assert row["state"]["run:0"] == paid
         assert row["state"].get("attempts", 0) == 0
         _expire(database)
     assert jobs.run("short", "02", lambda: None, max_attempts=5)
     assert not any(key in _job(database)["state"] for key in (
-        "retry_reason", "transient_attempts", "retry_started_at", "abandoned",
+        "retry_reason", "transient_attempts", "retry_started_at", "abandoned", "provider_error",
     ))
+
+
+def test_provider_diagnostics_retain_only_safe_scalar_fields(database):
+    query_secret = "secret"
+    bearer_secret = "opaque-header-credential"
+    message = (f"Monthly usage limit reached. token={query_secret} Bearer {bearer_secret} "
+               f"echo={query_secret} apify_api_examplecredential https://example.com/?token=other "
+               "`quoted` <@everyone>\x00\n" + "details " * 100)
+    failure = _http_error(403, body={"error": {
+        "type": "platform-feature-disabled", "message": message,
+        "private": {"credential": "never-store-this"},
+    }}, headers={"Authorization": f"Bearer {bearer_secret}"})
+
+    def fail():
+        raise apify_sync.ApifySyncError("Failed to start Apify run") from failure
+
+    assert not jobs.run("short", "01", fail, max_attempts=1)
+    row = _job(database)
+    assert row["state"]["retry_reason"] == "apify_quota"
+    diagnostic = row["state"]["provider_error"]
+    assert set(diagnostic) == {"type", "message"}
+    assert diagnostic["type"] == "platform-feature-disabled"
+    assert 0 < len(diagnostic["message"]) <= 500
+    assert "Monthly usage limit reached" in row["error"]
+    saved = json.dumps(row)
+    for sensitive in (query_secret, bearer_secret, "apify_api_examplecredential", "never-store-this",
+                      "https://example.com", "<@everyone>", "`quoted`", "\\u0000"):
+        assert sensitive not in saved
+
+    _expire(database)
+    assert not jobs.run("short", "02", lambda: (_ for _ in ()).throw(RuntimeError("bad row")), max_attempts=2)
+    assert "provider_error" not in _job(database)["state"]
+
+
+def test_rejected_start_retains_diagnosis_and_can_retry_without_reconciling_a_nonexistent_run(database, monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test-token")
+    requests = []
+
+    def handler(request):
+        requests.append(request.method)
+        return httpx.Response(403, json={"error": {
+            "type": "insufficient-permissions", "message": "Actor access denied",
+        }})
+
+    real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(transport=httpx.MockTransport(handler)))
+    for _ in range(2):
+        assert not jobs.run("short", "01", lambda: apify_sync._run_apify_actor_and_fetch({"directUrls": ["account"]}), max_attempts=1)
+        state = _job(database)["state"]
+        assert state["retry_reason"] == "apify_forbidden"
+        assert state["provider_error"]["message"] == "Actor access denied"
+        assert "starting_at" not in state["run:0"]
+        assert "run" not in state["run:0"]
+        assert state["run:0"]["payload"] == {"directUrls": ["account"]}
+        _expire(database)
+    assert requests == ["POST", "POST"]
 
 
 def test_pending_runs_do_not_consume_poison_attempts_or_exponentially_delay_polling(database):

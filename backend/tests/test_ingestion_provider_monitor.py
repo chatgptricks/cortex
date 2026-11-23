@@ -63,7 +63,7 @@ def test_auth_failure_alerts_immediately_with_actionable_service_names(incident)
     assert len(alerts) == 1
     title, body = alerts[0]
     assert title == "Apify rejected the ingestion credentials"
-    assert all(value in body for value in ("401/403", "APIFY_TOKEN", "cortex-ingestion-worker", "cortex-api"))
+    assert all(value in body for value in ("HTTP 401", "explicit token error", "APIFY_TOKEN", "cortex-ingestion-worker", "cortex-api"))
     assert monitor.check_once(at(14, 1)) == "ok"
     assert len(alerts) == 1
 
@@ -75,6 +75,32 @@ def test_auth_failure_is_reported_before_the_first_success(incident):
     assert monitor.check_once(at(14)) == "alerted"
     assert monitor.check_once(at(14, 10)) == "ok"
     assert len(alerts) == 1
+
+
+@pytest.mark.parametrize("reason,title,error", [
+    ("apify_quota", "Apify blocked ingestion for an account usage or billing restriction",
+     "Apify HTTP 403 (platform-feature-disabled): Monthly usage limit exceeded"),
+    ("apify_forbidden", "Apify denied the ingestion request",
+     "Apify HTTP 403 (insufficient-permissions): Actor access denied"),
+])
+def test_account_restriction_alerts_immediately_without_claiming_bad_credentials(incident, reason, title, error):
+    record, alerts = incident
+    record(reason=reason, error=error, success=None, frozen=None)
+    assert monitor.check_once(at(14)) == "alerted"
+    assert alerts[0][0] == title
+    assert error in alerts[0][1]
+    assert "APIFY_TOKEN" not in alerts[0][1]
+    assert "retains" in alerts[0][1]
+    assert monitor.check_once(at(14, 10)) == "ok"
+    assert len(alerts) == 1
+
+    # An old resumed success cannot clear the incident while work still retries.
+    record(reason=reason, error=error, success="2026-11-11T13:45:00+00:00")
+    assert monitor.check_once(at(14, 15)) == "ok"
+    record(reason=None, status="done", error=None, success="2026-11-11T14:15:00+00:00")
+    assert monitor.check_once(at(14, 20)) == "recovered"
+    assert monitor.check_once(at(14, 25)) == "ok"
+    assert len(alerts) == 2
 
 
 def test_temporary_provider_failure_uses_retry_start_and_suppresses_stale_duplicates(incident):

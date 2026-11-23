@@ -14,6 +14,83 @@ _current = ContextVar('ingestion_job', default=None)
 LEASE_SECONDS = 180
 RETRY_SECONDS = 120
 MAX_PROVIDER_RETRY_SECONDS = 30 * 60
+PROVIDER_RETRY_REASONS = {
+    'apify_auth', 'apify_quota', 'apify_forbidden', 'apify_unavailable', 'apify_pending',
+}
+_AUTH_ERROR_TYPES = {'invalid-token', 'invalid-credentials', 'missing-api-token',
+                     'token-not-provided', 'user-or-token-not-found'}
+_QUOTA_ERROR_TYPES = {
+    'not-enough-usage-to-run-paid-actor', 'monthly-usage-limit-too-low',
+    'apify-plan-required-to-use-paid-actor', 'user-problem-with-card',
+    'failed-to-charge-user', 'missing-billing-info', 'no-payment-method-available',
+    'user-has-no-subscription',
+}
+
+
+def _exception_chain(exc):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+
+
+def _apify_http_error(exc):
+    import httpx
+
+    for cause in _exception_chain(exc):
+        if isinstance(cause, httpx.HTTPError):
+            try:
+                if cause.request.url.host == 'api.apify.com':
+                    return cause
+            except RuntimeError:
+                pass
+    return None
+
+
+def safe_error_text(value, *, secrets=(), limit=500):
+    """Keep diagnostic text without credentials, URLs or Slack markup."""
+    for secret in sorted((s for s in secrets if s), key=len, reverse=True):
+        value = value.replace(secret, '[redacted]')
+    value = re.sub(r'apify_api_[A-Za-z0-9_-]+', '[redacted]', value)
+    value = re.sub(r'(?i)\bbearer\s+\S+', 'Bearer [redacted]', value)
+    value = re.sub(r'''(?ix)\b(token|api[_-]?key|authorization|cookie|set-cookie|sessionid|csrftoken)\b
+                      \s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)''', r'\1=[redacted]', value)
+    value = re.sub(r'''https?://[^\s<>"']+''', '[redacted-url]', value, flags=re.I)
+    value = re.sub(r'[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u206f]', ' ', value)
+    value = value.translate(str.maketrans({'<': '(', '>': ')', '`': "'", '&': ' and '}))
+    return ' '.join(value.split())[:limit]
+
+
+def apify_error_details(exc):
+    """Read only bounded scalar fields from Apify's documented error object."""
+    import httpx
+
+    failure = _apify_http_error(exc)
+    if not isinstance(failure, httpx.HTTPStatusError):
+        return {}
+    try:
+        # Do not decode or retain arbitrary provider bodies (e.g. gateway HTML).
+        if len(failure.response.content) > 64 * 1024:
+            return {}
+        body = failure.response.json()
+    except (ValueError, httpx.ResponseNotRead):
+        return {}
+    error = body.get('error') if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return {}
+    result = {}
+    error_type = error.get('type')
+    if isinstance(error_type, str) and re.fullmatch(r'[a-z][a-z0-9-]{0,119}', error_type):
+        result['type'] = error_type
+    message = error.get('message')
+    if isinstance(message, str):
+        authorization = failure.request.headers.get('authorization', '')
+        secrets = [failure.request.url.params.get('token', '')]
+        if authorization.lower().startswith('bearer '):
+            secrets.append(authorization[7:].strip())
+        result['message'] = safe_error_text(message, secrets=secrets)
+    return result
 
 
 def classify_apify_failure(exc):
@@ -25,27 +102,34 @@ def classify_apify_failure(exc):
     """
     import httpx
 
-    seen = set()
-    while exc is not None and id(exc) not in seen:
-        seen.add(id(exc))
-        reason = getattr(exc, 'ingestion_retry_reason', None)
-        if reason in {'apify_auth', 'apify_pending'}:
+    for cause in _exception_chain(exc):
+        reason = getattr(cause, 'ingestion_retry_reason', None)
+        if reason in PROVIDER_RETRY_REASONS:
             return reason
-        if isinstance(exc, httpx.HTTPError):
-            try:
-                is_apify = exc.request.url.host == 'api.apify.com'
-            except RuntimeError:
-                is_apify = False
-            if is_apify:
-                if isinstance(exc, httpx.HTTPStatusError):
-                    status = exc.response.status_code
-                    if status in {401, 403}:
-                        return 'apify_auth'
-                    if status in {408, 429} or 500 <= status < 600:
-                        return 'apify_unavailable'
-                elif isinstance(exc, httpx.TransportError):
-                    return 'apify_unavailable'
-        exc = exc.__cause__ or exc.__context__
+    failure = _apify_http_error(exc)
+    if isinstance(failure, httpx.HTTPStatusError):
+        status = failure.response.status_code
+        details = apify_error_details(failure)
+        error_type = details.get('type')
+        if status == 401 or (status == 403 and error_type in _AUTH_ERROR_TYPES):
+            return 'apify_auth'
+        if status == 402 or (status == 403 and error_type in _QUOTA_ERROR_TYPES):
+            return 'apify_quota'
+        # These generic types also cover memory/concurrency restrictions. Only
+        # explicit account-spending wording can identify them as a billing limit.
+        if status == 403 and error_type in {None, 'limit-reached', 'platform-feature-disabled'}:
+            message = details.get('message', '').lower()
+            if re.search(r'(?:monthly|account) (?:usage|spending).*(?:limit|exceed|reach|exhaust)|'
+                         r'(?:monthly|spending) limit|'
+                         r'insufficient (?:funds|credits?|balance)|not enough (?:usage|credits?|funds)|'
+                         r'(?:credits?|balance) (?:is |are )?exhausted', message):
+                return 'apify_quota'
+        if status == 403:
+            return 'apify_forbidden'
+        if status in {408, 429} or 500 <= status < 600:
+            return 'apify_unavailable'
+    elif isinstance(failure, httpx.TransportError):
+        return 'apify_unavailable'
     return None
 
 
@@ -157,7 +241,18 @@ def run(key, slot, callback, *, retain_result=False, max_attempts=None):
                          (json.dumps(completed_state), db.utc_now(), key, owner))
         return True
     except Exception as exc:
-        error = re.sub(r"token=[^&\s]+", "token=REDACTED", str(exc))[:2000]
+        error = safe_error_text(str(exc), limit=2000)
+        provider_error = apify_error_details(exc)
+        if provider_error:
+            failure = _apify_http_error(exc)
+            error = f'Apify HTTP {failure.response.status_code}'
+            if provider_error.get('type'):
+                error += f" ({provider_error['type']})"
+            if provider_error.get('message'):
+                error += f": {provider_error['message']}"
+        journal.state.pop('provider_error', None)
+        if provider_error:
+            journal.state['provider_error'] = provider_error
         retry_reason = classify_apify_failure(exc)
         if retry_reason:
             failures = int(journal.state.get('transient_attempts') or 0) + 1

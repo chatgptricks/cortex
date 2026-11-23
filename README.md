@@ -63,12 +63,19 @@ Apify HTTP 408/429/5xx and transport failures retain the ingestion slot and its
 paid-run journal, retrying after 2, 4, 8, 16 and then 30 minutes. Unconfirmed
 starts and unfinished runs resume every 2 minutes. These retries do not consume
 the five-attempt cap for deterministic processing failures. Missing or rejected
-credentials (401/403) need a valid `APIFY_TOKEN` in both Render services:
+credentials (401 or an explicit token error) need a valid `APIFY_TOKEN` in both Render services:
 `cortex-ingestion-worker` and `cortex-api`. A redeploy preserves the retry deadline;
 allow up to 30 minutes before the next attempt. The discovery monitor reports
 one provider incident and one recovery once successful discovery is current.
 The DEV ingestion-status endpoint exposes `retry_reason`, `retry_started_at`
-and `transient_attempts` without returning saved payloads or credentials.
+and `transient_attempts` without returning saved payloads or credentials. HTTP 403
+alone does not identify a bad token: explicit usage or billing restrictions use
+`apify_quota`, and other forbidden requests use `apify_forbidden`. Both preserve
+the discovery slot and paid-run journal while retrying with the same backoff.
+The DEV endpoint's `provider_error` contains only the bounded, sanitized Apify
+`error.type` and `error.message` fields when available; it never includes the raw
+response body. Review these details and Apify account limits, billing or Actor
+permissions before replacing credentials.
 
 ## What it actually serves today
 

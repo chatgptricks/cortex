@@ -8368,7 +8368,7 @@ def admin_ingestion_status(request: Request) -> dict[str, Any]:
     """
     if not getattr(request.state, "is_dev", False):
         raise HTTPException(status_code=403, detail="Dev access is required.")
-    from .ingestion_jobs import initialize
+    from .ingestion_jobs import initialize, safe_error_text
 
     now = time.time()
     with connect() as conn:
@@ -8383,6 +8383,12 @@ def admin_ingestion_status(request: Request) -> dict[str, Any]:
             state = json.loads(row["state"] or "{}")
         except ValueError:
             state = {}
+        provider_error = state.get("provider_error")
+        if isinstance(provider_error, dict):
+            provider_error = {key: safe_error_text(provider_error[key], limit=120 if key == "type" else 500)
+                              for key in ("type", "message") if isinstance(provider_error.get(key), str)}
+        else:
+            provider_error = None
         runs = []
         for key in sorted(k for k in state if k.startswith("run:")):
             saved = state[key] if isinstance(state[key], dict) else {}
@@ -8397,6 +8403,7 @@ def admin_ingestion_status(request: Request) -> dict[str, Any]:
             "retry_reason": state.get("retry_reason"),
             "retry_started_at": state.get("retry_started_at"),
             "transient_attempts": state.get("transient_attempts", 0),
+            "provider_error": provider_error,
             "runs": runs,
         })
     return {"server_time": utc_now(), "jobs": jobs,

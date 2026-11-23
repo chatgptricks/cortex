@@ -12,6 +12,8 @@ import logging
 import threading
 from datetime import UTC, datetime
 
+from .ingestion_jobs import PROVIDER_RETRY_REASONS
+
 logger = logging.getLogger("uvicorn.error")
 
 # Discovery runs every 45 minutes by day and hourly overnight, so two hours
@@ -22,7 +24,7 @@ DISCOVERY_JOB_KEY = "scheduled-posts"
 ALERT_STATE_KEY = "posts_stale_alert"
 RETRY_ALERT_KEY = "posts_retry_alert"
 PROVIDER_ALERT_KEY = "posts_apify_alert"
-_PROVIDER_RETRY_REASONS = {"apify_auth", "apify_unavailable", "apify_pending"}
+_ACTIONABLE_RETRY_REASONS = {"apify_auth", "apify_quota", "apify_forbidden"}
 # A slot retrying the same error this long is almost certainly stuck on a
 # deterministic failure; tell the DEVs long before the 2-hour stale alert.
 RETRY_ALERT_AFTER_SECONDS = 20 * 60
@@ -65,15 +67,15 @@ def _check_retry_loop(job: dict, now: datetime) -> bool:
     if job["status"] != "retry":
         return False
     reason = job.get("retry_reason")
-    provider_failure = reason in _PROVIDER_RETRY_REASONS
+    provider_failure = reason in PROVIDER_RETRY_REASONS
     started_at = (job.get("retry_started_at") or job.get("frozen_now")) if provider_failure else job.get("frozen_now")
-    if not started_at and reason != "apify_auth":
+    if not started_at and reason not in _ACTIONABLE_RETRY_REASONS:
         return False
     started = datetime.fromisoformat(started_at) if started_at else now
     if started.tzinfo is None:
         started = started.replace(tzinfo=UTC)
     minutes = (now - started).total_seconds() / 60
-    if reason != "apify_auth" and minutes * 60 < RETRY_ALERT_AFTER_SECONDS:
+    if reason not in _ACTIONABLE_RETRY_REASONS and minutes * 60 < RETRY_ALERT_AFTER_SECONDS:
         return False
     if provider_failure:
         # Keep this marker until discovery catches up. A resumed paid run can
@@ -85,9 +87,22 @@ def _check_retry_loop(job: dict, now: datetime) -> bool:
         if reason == "apify_auth":
             title = "Apify rejected the ingestion credentials"
             detail = (
-                "Apify credentials are missing or were rejected (HTTP 401/403). Check or replace APIFY_TOKEN in Render for both "
+                "Apify credentials are missing or were rejected (HTTP 401 or an explicit token error). Check APIFY_TOKEN in Render for both "
                 "`cortex-ingestion-worker` and `cortex-api`, then redeploy the affected services. "
                 "The saved discovery slot and any existing paid runs are retained for recovery."
+            )
+        elif reason == "apify_quota":
+            title = "Apify blocked ingestion for an account usage or billing restriction"
+            detail = (
+                "Apify reported a usage or billing restriction. Review the account's usage limits, credits and billing in Apify. "
+                "Discovery retries with backoff and retains the saved slot and any existing paid runs."
+            )
+        elif reason == "apify_forbidden":
+            title = "Apify denied the ingestion request"
+            detail = (
+                "Apify returned HTTP 403. This does not establish that the token is invalid. Review Apify's error below "
+                "and the account or Actor permissions and restrictions. Discovery retries with backoff and retains "
+                "the saved slot and any existing paid runs."
             )
         elif reason == "apify_pending":
             title = "New-post discovery is reconciling an Apify run"
